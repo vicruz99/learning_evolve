@@ -35,9 +35,17 @@ class ICLConfig:
     topk_children: int = 2
 
     # --- ICL context ---
-    context_strategy: str = "best"                   # selector in context.STRATEGIES: best | recent
+    context_strategy: str = "best"                   # selector in context.STRATEGIES (see docs/strategies/)
     n_context: int = 32                              # number of past solutions injected into the prompt
     max_context_tokens: int | None = None            # None = no trimming (rely on n_context)
+    # strategy knobs (each strategy reads only the ones it needs):
+    mix_fraction: float = 0.5                        # x: share of n_context from the primary/"best" pool
+    mmr_lambda: float = 0.7                          # MMR quality<->diversity (1=quality only, 0=spread only)
+    jump_alpha: float = 0.5                          # informative: value(alpha) vs jump(1-alpha) blend
+    context_seed: int | None = None                  # seed for the `random` strategy
+    # rendering (orthogonal to selection; apply to every strategy):
+    include_code: bool = True                        # show each solution's code
+    include_strategy: bool = False                   # show each solution's <strategy> reasoning block
 
     # --- results storage ---
     save_completions: bool = True                    # write full raw completions per candidate

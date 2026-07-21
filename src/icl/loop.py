@@ -23,7 +23,7 @@ from puct import PUCTSampler, State
 from sandbox import init_ray
 from envs import EnvConfig, get_problem
 from generation import VLLMClient
-from context import build_context_block, get_strategy
+from context import build_context_block, get_strategy, SelectionParams
 from results import ExperimentTracker
 from icl.config import ICLConfig
 
@@ -78,6 +78,12 @@ class ICLRunner:
             max_concurrency=cfg.max_gen_concurrency,
         )
         self._select = get_strategy(cfg.context_strategy)   # context-selection strategy fn
+        self._select_params = SelectionParams(
+            mix_fraction=cfg.mix_fraction,
+            mmr_lambda=cfg.mmr_lambda,
+            jump_alpha=cfg.jump_alpha,
+            context_seed=cfg.context_seed,
+        )
         self.sampler: PUCTSampler | None = None  # created in run() after init_ray
         self.tracker: ExperimentTracker | None = None
         self._gen_latencies: list[float] = []    # per-group generate() latencies, reset each generation
@@ -96,27 +102,29 @@ class ICLRunner:
         )
 
     def _build_prompt(self, env, parent: State):
-        """Assemble the full prompt for one parent: base question + n-best context block.
+        """Assemble the full prompt for one parent: base question + selected-solutions context block.
 
-        Returns (prompt, ctx_states, base_prompt, block).
+        Returns (prompt, selection, base_prompt, block) where ``selection`` is a SelectionResult.
         """
         cfg, spec = self.cfg, self.spec
         base_prompt = env.get_question()
-        ctx_states = self._select(self.sampler._states, cfg.n_context, exclude_id=parent.id)
+        selection = self._select(self.sampler._states, cfg.n_context, self._select_params, exclude_id=parent.id)
         block = build_context_block(
-            ctx_states,
+            selection,
             metric_name=spec.metric_name,
             maximize=spec.maximize,
             max_context_tokens=cfg.max_context_tokens,
+            include_code=cfg.include_code,
+            include_strategy=cfg.include_strategy,
         )
-        return base_prompt + block, ctx_states, base_prompt, block
+        return base_prompt + block, selection, base_prompt, block
 
     async def _run_group(self, gen: int, slot: int, parent: State) -> list:
         cfg, spec = self.cfg, self.spec
         env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
-        prompt, ctx_states, _base, _block = self._build_prompt(env, parent)
+        prompt, selection, _base, _block = self._build_prompt(env, parent)
 
-        k, N = len(ctx_states), cfg.n_context
+        k, N = len(selection.all()), cfg.n_context
         shortfall = "" if k >= N else " (buffer filling)"
         logger.info(f"gen {gen} p{slot}: prompting LLM (n={cfg.group_size}, "
                     f"context={k}/{N}{shortfall}, prompt~{len(prompt)//4} tok)")
@@ -215,14 +223,19 @@ class ICLRunner:
             self.sampler = self._make_sampler(os.path.join(td, "puct_sampler.json"))
             parent = self.sampler.sample_states(cfg.groups_per_batch)[0]
             env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
-            prompt, ctx_states, base_prompt, block = self._build_prompt(env, parent)
+            prompt, selection, base_prompt, block = self._build_prompt(env, parent)
 
+        ctx_states = selection.all()
         approx_tokens = len(prompt) // 4
         bar = "=" * 80
         print(f"{bar}\nDRY RUN — problem={cfg.problem} model={cfg.model_name}\n{bar}")
         print(prompt)
         print(bar)
-        print(f"context solutions injected : {len(ctx_states)}  (n_context={cfg.n_context})")
+        print(f"strategy                   : {cfg.context_strategy}  "
+              f"(include_code={cfg.include_code}, include_strategy={cfg.include_strategy})")
+        print(f"context solutions injected : {len(ctx_states)}  "
+              f"(positives={len(selection.positives)}, negatives={len(selection.negatives)}, "
+              f"n_context={cfg.n_context})")
         print(f"base prompt chars          : {len(base_prompt)}")
         print(f"context block chars        : {len(block)}")
         print(f"total prompt chars         : {len(prompt)}  (~{approx_tokens} tokens @ 4 chars/tok)")
@@ -230,7 +243,8 @@ class ICLRunner:
             print("\nNOTE: no context solutions yet — this is generation 0, so the buffer holds only")
             print("the seed (which is the parent already shown above). Below is an ILLUSTRATIVE render")
             print("of what the context block will look like once the buffer has solutions:")
-            print(build_context_block([parent], metric_name=spec.metric_name, maximize=spec.maximize))
+            print(build_context_block([parent], metric_name=spec.metric_name, maximize=spec.maximize,
+                                      include_code=cfg.include_code, include_strategy=cfg.include_strategy))
         return prompt
 
 

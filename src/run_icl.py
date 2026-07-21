@@ -40,9 +40,25 @@ def parse_args() -> ICLConfig:
     p.add_argument("--topk-children", type=int, default=2)
 
     p.add_argument("--context-strategy", default="best", choices=sorted(STRATEGIES),
-                   help="Which past-solution selector to inject into the prompt.")
-    p.add_argument("--n-context", type=int, default=32)
+                   help="Which past-solution selector to inject into the prompt (see docs/strategies/).")
+    p.add_argument("--n-context", type=int, default=32,
+                   help="Number of past solutions to include in context (the main hyperparameter).")
     p.add_argument("--max-context-tokens", type=int, default=None)
+    # strategy knobs (used only by the strategies that read them)
+    p.add_argument("--mix-fraction", type=float, default=0.5,
+                   help="x: fraction of n-context from the 'best' pool (best_worst/best_jump/per_lineage/contrastive).")
+    p.add_argument("--mmr-lambda", type=float, default=0.7,
+                   help="MMR quality<->diversity (best_diverse/informative/contrastive); 1=quality only, 0=spread only.")
+    p.add_argument("--jump-alpha", type=float, default=0.5,
+                   help="informative: value(alpha) vs improvement-over-parent(1-alpha) blend.")
+    p.add_argument("--context-seed", type=int, default=None, help="Seed for the 'random' strategy.")
+    # rendering (orthogonal to selection)
+    p.add_argument("--include-code", dest="include_code", action="store_true", default=True,
+                   help="Show each context solution's code (default on).")
+    p.add_argument("--no-include-code", dest="include_code", action="store_false",
+                   help="Hide code (use with --include-strategy for a strategy-only context).")
+    p.add_argument("--include-strategy", dest="include_strategy", action="store_true", default=False,
+                   help="Show each context solution's <strategy> reasoning block (default off).")
     p.add_argument("--save-completions", dest="save_completions", action="store_true", default=True,
                    help="Save full raw completions per candidate (default on).")
     p.add_argument("--no-save-completions", dest="save_completions", action="store_false",
@@ -85,6 +101,12 @@ def parse_args() -> ICLConfig:
         context_strategy=a.context_strategy,
         n_context=a.n_context,
         max_context_tokens=a.max_context_tokens,
+        mix_fraction=a.mix_fraction,
+        mmr_lambda=a.mmr_lambda,
+        jump_alpha=a.jump_alpha,
+        context_seed=a.context_seed,
+        include_code=a.include_code,
+        include_strategy=a.include_strategy,
         save_completions=a.save_completions,
         log_level=a.log_level,
         eval_timeout=a.eval_timeout,

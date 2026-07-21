@@ -28,6 +28,7 @@ class State(ABC):
     parent_values: list[float]  # list of ancestor values (most recent first) for terminal value estimation
     parents: list[dict]  # list of parent refs [{"id": ..., "timestep": ...}, ...] (most recent first)
     observation: str  # stdout/logs from the code that created this state
+    strategy: str  # the <strategy>...</strategy> reasoning block the model emitted alongside the code
 
     def __init__(
         self,
@@ -39,6 +40,7 @@ class State(ABC):
         parents: list[dict] = None,
         id: str = None,
         observation: str = "",
+        strategy: str = "",
     ):
         self.id = id if id is not None else str(uuid.uuid4())
         self.timestep = timestep
@@ -48,6 +50,7 @@ class State(ABC):
         self.parent_values = parent_values if parent_values is not None else []
         self.parents = parents if parents is not None else []
         self.observation = observation
+        self.strategy = strategy
 
     def to_dict(self) -> dict:
         return {
@@ -60,8 +63,9 @@ class State(ABC):
             "observation": self.observation,
             "construction": to_json_serializable(self.construction),
             "code": self.code,
+            "strategy": self.strategy,
         }
-    
+
     @classmethod
     def from_dict(cls, d: dict) -> State:
         return cls(
@@ -73,6 +77,7 @@ class State(ABC):
             parents=d.get("parents", []),
             id=d.get("id"),
             observation=d.get("observation", ""),
+            strategy=d.get("strategy", ""),
         )
 
     def to_prompt(self, target, metric_name: str = "value", maximize: bool = True, language: str = ""):

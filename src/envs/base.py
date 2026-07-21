@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,16 @@ from puct.state import State
 from envs.codeblock import last_codeblock_postprocess
 
 logger = logging.getLogger(__name__)
+
+# The prompt asks the model to emit its plan between <strategy>...</strategy> before the code block.
+# We capture it so ICL context strategies can optionally show reasoning (not just code) as past experience.
+_STRATEGY_RE = re.compile(r"<strategy>(.*?)</strategy>", re.DOTALL | re.IGNORECASE)
+
+
+def parse_strategy_block(completion_text: str) -> str:
+    """Extract the last ``<strategy>...</strategy>`` block from a raw completion (``""`` if absent)."""
+    matches = _STRATEGY_RE.findall(completion_text or "")
+    return matches[-1].strip() if matches else ""
 
 
 @dataclass
@@ -98,13 +109,14 @@ class Environment(ABC):
     def is_maximize(self) -> bool:
         return True
 
-    def _create_next_state(self, step_idx: int, parsed_code: str, outs: VerifyResult) -> State:
+    def _create_next_state(self, step_idx: int, parsed_code: str, outs: VerifyResult, strategy: str = "") -> State:
         return self.state_type(
             timestep=step_idx,
             construction=outs.result_construction,
             code=parsed_code,
             value=outs.raw_score if self.is_maximize() else -outs.raw_score,  # higher = better
             observation=outs.stdout,
+            strategy=strategy,
         )
 
     def _get_code_languages(self) -> list[str]:
@@ -197,13 +209,14 @@ class Environment(ABC):
             keep_separators=self._should_keep_code_separators(),
         )
         correct_format = bool(self.check_format(parsed_code))
+        strategy = parse_strategy_block(completion_text)
 
         outs = await self.check_answer(parsed_code, step_idx)
 
         next_state: State | None = None
         if outs.correctness > 0:
             try:
-                next_state = self._create_next_state(step_idx, parsed_code, outs)
+                next_state = self._create_next_state(step_idx, parsed_code, outs, strategy)
                 self.sampler.update_states([next_state], [self.initial_state], save=False)
             except Exception as e:
                 logger.warning(f"Failed to create next state: {e}")
