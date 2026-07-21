@@ -24,6 +24,12 @@ def last_codeblock_postprocess(input_text, codeblock_seps=['python', 'cpp', 'jav
         language = last_match.group(1)
         code_content = last_match.group(2).rstrip()
 
+        # If the model put the closing ``` on the SAME line as the content (no preceding newline),
+        # the pattern's optional `\n```` cannot match it, so the fence leaks into the captured content.
+        # Strip any such trailing fence (a ``` is a delimiter, never part of the code/text itself).
+        while code_content.endswith('```'):
+            code_content = code_content[:-3].rstrip()
+
         # Check if content is empty
         if not code_content or code_content.strip() == '':
             if last_response_strict:

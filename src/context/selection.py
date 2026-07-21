@@ -20,7 +20,7 @@ Those two concerns are orthogonal:
   ``per_lineage``    lineage   quality (+worst via ``x``)        hard: <=1 per lineage-path
   ``best_diverse``   mmr       quality                           soft: tree-distance penalty
   ``informative``    mmr       quality + alpha*jump              soft: tree-distance penalty
-  ``contrastive``    mmr       quality + low->mid negatives      soft: tree-distance penalty
+  ``contrastive``    mmr       quality + worst negatives         soft: tree-distance penalty
   =================  ========  ================================  ==========================
 
 * **Rendering** (``build_context_block`` / ``render_solution``): per-run flags ``include_code`` and
@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 
 from puct.state import State
 from context.ranking import quality, jump, recent, get_key
-from context.lineage import same_lineage, tree_distance, lineage_similarity
+from context.lineage import same_lineage, lineage_similarity
 
 # Rough chars-per-token estimate for the budget guard (avoids a tokenizer dependency).
 _CHARS_PER_TOKEN = 4.0
@@ -82,9 +82,10 @@ class SelectionResult:
 def select_best_n(states: list[State], n: int, exclude_id: str | None = None) -> list[State]:
     """Top-``n`` states by value (higher = better), optionally excluding one id (the current parent).
 
-    Shortfall is graceful: if fewer than ``n`` candidates exist, ALL of them are returned (no error).
-    Early on, the buffer holds only the ``groups_per_batch`` seeds, so you get up to
-    ``groups_per_batch - 1`` context solutions until the buffer fills.
+    Shortfall is graceful: if fewer than ``n`` candidates exist, ALL of them are returned (no error) --
+    the context is never padded to ``n``, it just holds fewer solutions. The loop feeds a pool that has
+    already been seed-normalized (see :func:`dedupe_seeds`), so at generation 0 the pool is empty and
+    no context block is produced at all.
     """
     cands = _candidates(states, exclude_id)
     cands.sort(key=quality, reverse=True)
@@ -98,9 +99,50 @@ def select_recent_n(states: list[State], n: int, exclude_id: str | None = None) 
     return cands[:n]
 
 
+# ----------------------------------------------------------------------------- seed handling
+def dedupe_seeds(states: list[State], initial_ids: set[str], drop_initial: bool = False) -> list[State]:
+    """Normalize the buffer's seed (initial) states before selection.
+
+    The PUCT sampler seeds the buffer with ``groups_per_batch`` *identical* copies of the initial
+    state (distinct uuids, same code/value). Two things follow:
+
+    * Those copies must never appear as several "past solutions" -- that is pure duplication. We keep
+      at most **one** logical seed among the candidates.
+    * When the current rollout's parent *is* a seed (every rollout at generation 0, since we are
+      literally starting *from* the seed), the seed is not "past experience" to condition on -- pass
+      ``drop_initial=True`` to remove it entirely, so gen 0 gets a blank context (base question only).
+
+    Non-seed states pass through untouched and in order.
+    """
+    out: list[State] = []
+    seen_seed = False
+    for s in states:
+        if s.id in initial_ids:
+            if drop_initial or seen_seed:
+                continue
+            seen_seed = True
+        out.append(s)
+    return out
+
+
 # ----------------------------------------------------------------------------- shared internals
-def _candidates(states: list[State], exclude_id: str | None) -> list[State]:
-    return [s for s in states if s.value is not None and s.id != exclude_id]
+def _rng(params: SelectionParams) -> _random.Random:
+    """RNG used for the ``random`` strategy and for tie-breaking. Seeded (reproducible) when
+    ``context_seed`` is set, otherwise entropy-seeded so equal-score ties are resampled every call."""
+    return _random.Random(params.context_seed)
+
+
+def _candidates(states: list[State], exclude_id: str | None, rng: _random.Random | None = None) -> list[State]:
+    # Drop states with no code: an empty-code seed (or placeholder) carries no experience to show,
+    # and would otherwise render as a useless "(no code)" entry. Valid solutions always have code.
+    cands = [s for s in states
+             if s.value is not None and s.id != exclude_id and (s.code or "").strip()]
+    if rng is not None:
+        # Randomize order first so the subsequent stable sorts / MMR argmax break ties (solutions
+        # with equal scores) RANDOMLY, instead of always favoring buffer-insertion order. Distinct
+        # scores are unaffected -- a stable sort restores their strict order.
+        rng.shuffle(cands)
+    return cands
 
 
 def _minmax(vals: dict[str, float]) -> dict[str, float]:
@@ -154,34 +196,6 @@ def _greedy_lineage(ranked: list[State], n: int) -> list[State]:
     return picked
 
 
-def _split_bins(seq: list[State], k: int) -> list[list[State]]:
-    """Split ``seq`` into ``k`` contiguous near-equal bins (for stratified low->mid sampling)."""
-    if k <= 0:
-        return []
-    m = len(seq)
-    return [seq[(i * m) // k:((i + 1) * m) // k] for i in range(k)]
-
-
-def _stratified_diverse(pool: list[State], n: int) -> list[State]:
-    """Pick ``n`` states spanning the pool's value range (low->mid), one lineage-diverse rep per bin."""
-    if n <= 0 or not pool:
-        return []
-    ranked = sorted(pool, key=quality)          # ascending: worst -> least-bad
-    if len(ranked) <= n:
-        return ranked
-    picked: list[State] = []
-    for b in _split_bins(ranked, n):
-        if not b:
-            continue
-        if not picked:
-            choice = max(b, key=quality)         # top of the lowest bin
-        else:
-            # most lineage-distant from what we've taken; ties broken toward higher value
-            choice = max(b, key=lambda s: (min(tree_distance(s, p) for p in picked), quality(s)))
-        picked.append(choice)
-    return picked[:n]
-
-
 def _split_counts(n: int, x: float) -> tuple[int, int]:
     """Split ``n`` slots into (primary, secondary) by fraction ``x`` (clamped to [0,1])."""
     x = min(max(x, 0.0), 1.0)
@@ -192,20 +206,18 @@ def _split_counts(n: int, x: float) -> tuple[int, int]:
 # ----------------------------------------------------------------------------- engines (as strategy factories)
 def _topk_strategy(key_name: str):
     def strategy(states, n, params: SelectionParams, exclude_id=None) -> SelectionResult:
-        cands = _candidates(states, exclude_id)
+        cands = _candidates(states, exclude_id, _rng(params))
         if key_name == "random":
-            rng = _random.Random(params.context_seed)
-            rng.shuffle(cands)
-            picked = cands[:n]
+            picked = cands[:n]  # _candidates already shuffled
         else:
-            picked = sorted(cands, key=get_key(key_name), reverse=True)[:n]
+            picked = sorted(cands, key=get_key(key_name), reverse=True)[:n]  # stable: ties stay shuffled
         return SelectionResult(positives=picked, positives_label=_LABEL[key_name])
     return strategy
 
 
 def _mix_strategy(secondary_key: str, neg_label: str):
     def strategy(states, n, params: SelectionParams, exclude_id=None) -> SelectionResult:
-        cands = _candidates(states, exclude_id)
+        cands = _candidates(states, exclude_id, _rng(params))
         n_pos, n_neg = _split_counts(n, params.mix_fraction)
         positives = sorted(cands, key=quality, reverse=True)[:n_pos]
         pos_ids = {s.id for s in positives}
@@ -220,7 +232,7 @@ def _mix_strategy(secondary_key: str, neg_label: str):
 
 
 def _per_lineage_strategy(states, n, params: SelectionParams, exclude_id=None) -> SelectionResult:
-    cands = _candidates(states, exclude_id)
+    cands = _candidates(states, exclude_id, _rng(params))
     n_pos, n_neg = _split_counts(n, params.mix_fraction)
     positives = _greedy_lineage(sorted(cands, key=quality, reverse=True), n_pos)
     pos_ids = {s.id for s in positives}
@@ -232,7 +244,7 @@ def _per_lineage_strategy(states, n, params: SelectionParams, exclude_id=None) -
 
 def _mmr_strategy(quality_mode: str):
     def strategy(states, n, params: SelectionParams, exclude_id=None) -> SelectionResult:
-        cands = _candidates(states, exclude_id)
+        cands = _candidates(states, exclude_id, _rng(params))
         qual = _quality_vector(cands, quality_mode, params.jump_alpha)
         positives = _mmr_select(cands, n, qual, params.mmr_lambda)
         return SelectionResult(positives, positives_label=_LABEL["quality"])
@@ -240,16 +252,20 @@ def _mmr_strategy(quality_mode: str):
 
 
 def _contrastive_strategy(states, n, params: SelectionParams, exclude_id=None) -> SelectionResult:
-    cands = _candidates(states, exclude_id)
+    cands = _candidates(states, exclude_id, _rng(params))
     n_pos, n_neg = _split_counts(n, params.mix_fraction)
     qual = _quality_vector(cands, "value", params.jump_alpha)
     positives = _mmr_select(cands, n_pos, qual, params.mmr_lambda)
     pos_ids = {s.id for s in positives}
     pos_min = min((quality(s) for s in positives), default=float("inf"))
     pool = [s for s in cands if s.id not in pos_ids and quality(s) < pos_min]
-    negatives = _stratified_diverse(pool, n_neg)
+    # Negatives use the SAME MMR-lineage engine as the positives, but ranked by *badness* (worst
+    # first) instead of quality -- so we pick the genuinely lowest-scoring attempts that are still
+    # spread across distinct lineages, and ignore the mid tier entirely.
+    neg_qual = _minmax({s.id: -quality(s) for s in pool})
+    negatives = _mmr_select(pool, n_neg, neg_qual, params.mmr_lambda)
     return SelectionResult(positives, negatives, _LABEL["quality"],
-                           "Lower-scoring attempts, spanning low->mid, for contrast" if negatives else None)
+                           "Lowest-scoring attempts, spread across lineages, for contrast" if negatives else None)
 
 
 # ----------------------------------------------------------------------------- registry

@@ -8,6 +8,7 @@ from envs.base import Environment, EnvConfig, VerifyResult, RolloutResult
 from envs.erdos_min_overlap import ErdosMinOverlapEnv
 from envs.circle_packing import CirclePackingEnv
 from envs.ac_inequalities import AutoCorrInequalityEnv
+from envs.toy_ee import ToyEeEnv
 from envs.registry import REGISTRY, ProblemSpec, get_problem
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ErdosMinOverlapEnv",
     "CirclePackingEnv",
     "AutoCorrInequalityEnv",
+    "ToyEeEnv",
     "REGISTRY",
     "ProblemSpec",
     "get_problem",

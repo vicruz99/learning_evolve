@@ -9,6 +9,7 @@ from context.selection import (
     STRATEGIES,
     get_strategy,
     select,
+    dedupe_seeds,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "STRATEGIES",
     "get_strategy",
     "select",
+    "dedupe_seeds",
 ]

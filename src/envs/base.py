@@ -80,6 +80,7 @@ class Environment(ABC):
 
     reward_function: type          # concrete SandboxRewardEvaluator subclass
     state_type: type = State
+    uses_sandbox: bool = True      # set False for in-process evaluators; the loop then skips init_ray
 
     @classmethod
     def create_initial_state(cls, problem_type: str) -> State:

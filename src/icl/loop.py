@@ -23,7 +23,7 @@ from puct import PUCTSampler, State
 from sandbox import init_ray
 from envs import EnvConfig, get_problem
 from generation import VLLMClient
-from context import build_context_block, get_strategy, SelectionParams
+from context import build_context_block, get_strategy, SelectionParams, dedupe_seeds
 from results import ExperimentTracker
 from icl.config import ICLConfig
 
@@ -108,7 +108,12 @@ class ICLRunner:
         """
         cfg, spec = self.cfg, self.spec
         base_prompt = env.get_question()
-        selection = self._select(self.sampler._states, cfg.n_context, self._select_params, exclude_id=parent.id)
+        # The buffer seeds with groups_per_batch identical seed copies. Collapse them to one logical
+        # seed, and drop the seed entirely when this rollout starts *from* the seed (all of gen 0),
+        # so the seed is never duplicated nor shown as "past experience" for the state we started at.
+        initial_ids = {s.id for s in self.sampler._initial_states}
+        pool = dedupe_seeds(self.sampler._states, initial_ids, drop_initial=parent.id in initial_ids)
+        selection = self._select(pool, cfg.n_context, self._select_params, exclude_id=parent.id)
         block = build_context_block(
             selection,
             metric_name=spec.metric_name,
@@ -169,7 +174,10 @@ class ICLRunner:
                     f"grading parallelism ~= host_cpus // num_cpus_per_task (={self.num_cpus}); "
                     f"eval_timeout={self.eval_timeout}s")
 
-        init_ray(self.num_cpus)
+        if spec.env_type.uses_sandbox:
+            init_ray(self.num_cpus)
+        else:
+            logger.info("skipping Ray init: problem uses an in-process (sandbox-free) evaluator")
         # Tracker first: it creates the run-dir layout (incl. buffer/) the sampler writes into.
         self.tracker = ExperimentTracker(cfg.log_path, cfg.to_dict(), spec, cfg.save_completions)
         self.sampler = self._make_sampler(os.path.join(cfg.log_path, "buffer", "puct_sampler.json"))

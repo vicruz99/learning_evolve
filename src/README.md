@@ -41,3 +41,28 @@ Start a local vLLM server (see `../R2/LLMs/local/vllm_provider/run_model.md`; ra
 ```bash
 python run_icl.py --problem ac2 --n-context 32 --num-generations 20
 ```
+
+
+Experiment knobs at launch
+
+--context-strategy {best,recent} · --n-context · --group-size (solutions sampled/gen) · --groups-per-batch (parents/gen) · --num-generations — plus --save-completions/--no-save-completions and --dry-run.
+
+┌─────────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│           File / dir            │                                                     What it gives you                                                     │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ summary.json                    │ best-so-far, worst valid, #succeeded / #failed, unique solutions, and the same per generation — exactly your ask          │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ progress.csv                    │ one row per generation (plot-ready: gen_best, best_so_far, success rate, buffer size, PUCT T)                             │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ solutions/sol_NNNNNN.py         │ every valid proposed solution as its own runnable .py, de-fenced, with a header (gen, parent ref, score, entrypoint) +    │
+│                                 │ manifest.jsonl                                                                                                            │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ generations/gen_XXXX/meta.json  │ the parent→children view for that generation, each child referencing its sol_ file                                        │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ generations/gen_XXXX/parent_SS/ │ the exact prompt.txt sent + full raw child_CC.txt completions (incl. reasoning)                                           │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ events.jsonl                    │ one line per candidate (valid and failed) for programmatic analysis                                                       │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ buffer/                         │ authoritative PUCT snapshots                                                                                              │
+├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ runs/index.csv                  │ one row per experiment — a cross-run leaderboard

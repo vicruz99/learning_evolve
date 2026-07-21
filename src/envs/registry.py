@@ -11,6 +11,7 @@ from envs.base import Environment
 from envs.erdos_min_overlap import ErdosMinOverlapEnv
 from envs.circle_packing import CirclePackingEnv
 from envs.ac_inequalities import AutoCorrInequalityEnv
+from envs.toy_ee import ToyEeEnv
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,10 @@ REGISTRY: dict[str, ProblemSpec] = {
     "circle_packing_32": ProblemSpec(CirclePackingEnv,      "32",  1,  530, "sum of radii", True,  "run_packing"),
     "ac1":               ProblemSpec(AutoCorrInequalityEnv, "ac1", 2, 1100, "upper bound",  False, "propose_candidate"),
     "ac2":               ProblemSpec(AutoCorrInequalityEnv, "ac2", 2, 1100, "lower bound",  True,  "construct_function"),
+    # Synthetic smoke-test problem (in-process grading, no sandbox). metric_name is deliberately
+    # generic ("score") so the "ee"-counting mechanism stays hidden from the model. eval_timeout is
+    # unused by the in-process evaluator; entrypoint is documentary only (no code is executed).
+    "toy":               ProblemSpec(ToyEeEnv,               "toy",  1,   30, "score",        True,  "sentence"),
 }
 
 

@@ -4,7 +4,7 @@ import pytest
 from puct import State
 from context import (
     get_strategy, select, select_best_n, select_recent_n, build_context_block,
-    STRATEGIES, SelectionParams,
+    STRATEGIES, SelectionParams, dedupe_seeds,
 )
 
 
@@ -107,6 +107,37 @@ def test_contrastive_negatives_below_positives():
     assert all(s.value < pos_min for s in r.negatives)
 
 
+def test_contrastive_negatives_are_the_worst():
+    # Negatives should be the genuinely LOWEST-scoring attempts (worst-first MMR), not mid-tier.
+    # lambda=1 -> pure quality: positives are the top two (B=.9, C=.8), so pos_min=.8 and the pool
+    # below it is {S=0, A=.5, D=.7}; the two WORST of those are S and A.
+    r = select("contrastive", _tree(), 4, SelectionParams(mix_fraction=0.5, mmr_lambda=1.0))
+    assert set(_ids(r.negatives)) == {"S", "A"}
+
+
+def _ties():
+    # Five zero-score attempts on distinct lineages + one clear best, to exercise tie-breaking.
+    P = _mk(0.5, 0, "P", [{"id": "S", "timestep": -1}], [0.0])
+    best = _mk(0.9, 1, "BEST", [{"id": "P", "timestep": 0}], [0.5])
+    zeros = [_mk(0.0, 1, f"Z{i}", [{"id": "P", "timestep": 0}], [0.5]) for i in range(5)]
+    return [P, best] + zeros
+
+
+def test_ties_sampled_randomly():
+    # Among equal-score (0.0) solutions, different seeds must be able to pick different sets,
+    # while the strict order of DISTINCT scores is untouched (BEST always leads 'best').
+    pick = lambda seed: set(_ids(select("best", _ties(), 4,
+                                        SelectionParams(context_seed=seed)).positives))
+    seen = {frozenset(pick(s)) for s in range(20)}
+    assert len(seen) > 1                       # the tied zeros are resampled, not fixed
+    assert all("BEST" in s for s in seen)      # distinct top score is always included
+
+
+def test_ties_seed_is_reproducible():
+    p = SelectionParams(context_seed=7)
+    assert _ids(select("best", _ties(), 4, p).positives) == _ids(select("best", _ties(), 4, p).positives)
+
+
 # --- rendering flags -----------------------------------------------------------------------------
 def test_render_code_only_default():
     block = build_context_block(select_best_n(_tree(), 2), metric_name="score", maximize=True)
@@ -163,6 +194,40 @@ def test_parse_strategy_block_and_roundtrip():
     # survives State (de)serialization
     s = State(timestep=0, construction=[1], code="x=1", value=0.5, strategy=strat)
     assert State.from_dict(s.to_dict()).strategy == strat
+
+
+# --- seed handling & shortfall -------------------------------------------------------------------
+def _seeds(n, value=0.0):
+    # groups_per_batch identical seed copies: distinct ids, same code/value (as the sampler creates).
+    return [_mk(value, -1, f"seed{i}", [], []) for i in range(n)]
+
+
+def test_dedupe_seeds_collapses_duplicates():
+    seeds = _seeds(4)
+    ids = {s.id for s in seeds}
+    real = _mk(0.9, 1, "R", [{"id": "seed0", "timestep": -1}], [0.0])
+    pool = dedupe_seeds(seeds + [real], ids)
+    seed_ids = [s.id for s in pool if s.id in ids]
+    assert len(seed_ids) == 1                 # 4 identical seeds -> exactly one survives
+    assert "R" in _ids(pool)                  # real solution passes through
+
+
+def test_dedupe_seeds_drop_initial_blanks_gen0():
+    # gen 0: buffer holds only seeds and the parent IS a seed -> drop them all -> empty pool.
+    seeds = _seeds(3)
+    ids = {s.id for s in seeds}
+    pool = dedupe_seeds(seeds, ids, drop_initial=True)
+    assert pool == []
+    # and an empty pool yields no context block at all (truly blank, base question only)
+    assert build_context_block(select("best", pool, 5).all(), metric_name="score") == ""
+
+
+def test_shortfall_returns_all_available_no_padding():
+    # request 5 from a pool of 2 -> exactly 2 (never padded to 5, never errors)
+    st = _tree()[:2]                           # S, A
+    r = select("best", st, 5)
+    assert len(r.positives) == 2
+    assert len(select_best_n(st, 5)) == 2
 
 
 # --- registry ------------------------------------------------------------------------------------
