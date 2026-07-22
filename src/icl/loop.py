@@ -15,6 +15,7 @@ No weights ever change; improvement comes purely from search + in-context condit
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -23,7 +24,7 @@ from puct import PUCTSampler, State
 from sandbox import init_ray
 from envs import EnvConfig, get_problem
 from generation import VLLMClient
-from context import build_context_block, get_strategy, SelectionParams, dedupe_seeds
+from context import build_context_block, get_strategy, SelectionParams
 from results import ExperimentTracker
 from icl.config import ICLConfig
 
@@ -87,6 +88,11 @@ class ICLRunner:
         self.sampler: PUCTSampler | None = None  # created in run() after init_ray
         self.tracker: ExperimentTracker | None = None
         self._gen_latencies: list[float] = []    # per-group generate() latencies, reset each generation
+        # Context pool: EVERY valid solution graded in prior generations, not just the PUCT top-k buffer.
+        # Context selection draws from here so strategies (best_worst, contrastive, ...) can see genuine
+        # low-scoring negatives that `topk_children` prunes out of the buffer. PUCT search is untouched.
+        self._context_pool: list[State] = []
+        self._pool_fh = None                      # append-only JSONL mirror (for --resume-step)
 
     def _make_sampler(self, file_path: str) -> PUCTSampler:
         cfg, spec = self.cfg, self.spec
@@ -108,12 +114,13 @@ class ICLRunner:
         """
         cfg, spec = self.cfg, self.spec
         base_prompt = env.get_question()
-        # The buffer seeds with groups_per_batch identical seed copies. Collapse them to one logical
-        # seed, and drop the seed entirely when this rollout starts *from* the seed (all of gen 0),
-        # so the seed is never duplicated nor shown as "past experience" for the state we started at.
-        initial_ids = {s.id for s in self.sampler._initial_states}
-        pool = dedupe_seeds(self.sampler._states, initial_ids, drop_initial=parent.id in initial_ids)
-        selection = self._select(pool, cfg.n_context, self._select_params, exclude_id=parent.id)
+        # Select context from the pool of ALL valid solutions graded in previous generations (built in
+        # run()), NOT from the PUCT top-k buffer: the buffer holds only high-scoring survivors, so
+        # strategies like best_worst/contrastive would never see genuine low-scoring negatives. Seeds
+        # never enter this pool (they produce no graded solution), so no seed de-duplication is needed,
+        # and generation 0 sees an empty pool -> an empty context block.
+        selection = self._select(self._context_pool, cfg.n_context, self._select_params,
+                                 exclude_id=parent.id)
         block = build_context_block(
             selection,
             metric_name=spec.metric_name,
@@ -123,6 +130,27 @@ class ICLRunner:
             include_strategy=cfg.include_strategy,
         )
         return base_prompt + block, selection, base_prompt, block
+
+    def _open_context_pool(self, path: str, resume: bool = False) -> None:
+        """Open the append-only context-pool log. On resume, reload prior valid solutions into memory
+        first (so context is complete from the first resumed generation); otherwise start fresh."""
+        if resume and os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self._context_pool.append(State.from_dict(json.loads(line)))
+            logger.info(f"resumed context pool: {len(self._context_pool)} valid solutions from {path}")
+            self._pool_fh = open(path, "a")
+        else:
+            self._pool_fh = open(path, "w")
+
+    def _extend_context_pool(self, states: list[State]) -> None:
+        """Add a generation's valid solutions to the context pool (in-memory + on-disk mirror)."""
+        for s in states:
+            self._context_pool.append(s)
+            self._pool_fh.write(json.dumps(s.to_dict()) + "\n")
+        self._pool_fh.flush()
 
     async def _run_group(self, gen: int, slot: int, parent: State) -> list:
         cfg, spec = self.cfg, self.spec
@@ -181,6 +209,8 @@ class ICLRunner:
         # Tracker first: it creates the run-dir layout (incl. buffer/) the sampler writes into.
         self.tracker = ExperimentTracker(cfg.log_path, cfg.to_dict(), spec, cfg.save_completions)
         self.sampler = self._make_sampler(os.path.join(cfg.log_path, "buffer", "puct_sampler.json"))
+        self._open_context_pool(os.path.join(cfg.log_path, "buffer", "context_pool.jsonl"),
+                                resume=bool(cfg.resume_step))
 
         try:
             start = cfg.resume_step or 0
@@ -196,6 +226,11 @@ class ICLRunner:
                     *[self._run_group(gen, slot, p) for slot, p in enumerate(parents)]
                 )
                 self.sampler.flush(step=gen + 1)
+                # Feed this generation's valid solutions into the context pool for LATER generations
+                # (done after the whole generation so all parents in a generation share one snapshot).
+                new_valid = [r.next_state for group in group_results for r in group
+                             if r.correctness > 0 and r.next_state is not None]
+                self._extend_context_pool(new_valid)
                 self.tracker.end_generation(gen, self.sampler)
 
                 n_valid = sum(1 for group in group_results for r in group if r.correctness > 0)
@@ -207,7 +242,8 @@ class ICLRunner:
                 gen_latency = max(self._gen_latencies) if self._gen_latencies else 0.0
                 logger.info(
                     f"gen {gen}/{cfg.num_generations - 1} done | valid {n_valid}/{n_total} ({pct:.0f}%) "
-                    f"| buffer {stats.get('puct/buffer_size')} | puct_expansions {stats.get('puct/T')} "
+                    f"| buffer {stats.get('puct/buffer_size')} | ctx_pool {len(self._context_pool)} "
+                    f"| puct_expansions {stats.get('puct/T')} "
                     f"| best {spec.metric_name}={'n/a' if best is None else f'{best:.6f}'} "
                     f"| {gen_wall:.1f}s (generate {gen_latency:.1f}s)"
                 )
@@ -217,6 +253,9 @@ class ICLRunner:
             raise
         else:
             self.tracker.close(status="complete")
+        finally:
+            if self._pool_fh is not None:
+                self._pool_fh.close()
         logger.info("ICL run complete.")
 
     def dry_run(self) -> str:

@@ -17,7 +17,7 @@ Select one with `--context-strategy <name>`; tune with the knobs noted in each d
 | [`per_lineage`](./per_lineage.md) | quality + hard diversity | best (and worst) with same-lineage skipping |
 | [`best_diverse`](./best_diverse.md) | quality + soft diversity | MMR over quality |
 | [`informative`](./informative.md) | quality + improvement + diversity | MMR over quality+jump |
-| [`contrastive`](./contrastive.md) | quality + failures + diversity | diverse best + stratified low→mid negatives |
+| [`contrastive`](./contrastive.md) | quality + failures + diversity | diverse best + diverse worst negatives |
 
 These are ten *presets* over four engines (`topk`, `mix`, `per_lineage`, `mmr`); several differ only
 by parameters. See the table in `context/selection.py` for the engine mapping.

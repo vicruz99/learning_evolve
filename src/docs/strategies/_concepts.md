@@ -77,9 +77,35 @@ We capture that text on each `State` (`state.strategy`), so context can show rea
 "Strategy-only" = `--no-include-code --include-strategy`. Guard: if strategy display is requested but a
 solution has no `<strategy>` text, it falls back to showing code so a solution is never rendered empty.
 
+## What the strategies select over: the context pool (not the PUCT search buffer)
+
+There are **two** distinct pools, and context selection uses the second:
+
+- The **PUCT search buffer** (`sampler._states`) is what *parents* are sampled from. It is pruned:
+  `topk_children` keeps only the best few children per parent, and `max_buffer_size` caps the total,
+  biased toward the highest scorers. Good for search — but it holds almost no low-scoring solutions.
+- The **context pool** (built in `icl/loop.py`, mirrored to `buffer/context_pool.jsonl`) holds **every
+  valid solution graded in previous generations**, unpruned. All context-selection strategies operate
+  over *this* pool.
+
+This split is deliberate: drawing context from the pruned search buffer would leave `best_worst` /
+`contrastive` with no genuine low-scorers to use as negatives — their "worst" would just be the
+least-good survivor. Selecting over the full valid-solution pool is what makes the negative signal real.
+The pool is still a lineage tree (every `State` carries its ancestry), so all the tree/MMR machinery
+above applies unchanged.
+
 ## Note on "worst" / failures
 
-The PUCT buffer stores only **valid** solutions — a failed rollout never enters the archive (it only
-advances PUCT visit counts). So "worst" and the contrastive negatives mean **lowest-to-mid scoring
-valid** solutions, not broken code. Injecting genuine failures (code + error message) would need a
-separate failure log; that is intentionally deferred.
+The pool stores only **valid** solutions — a failed rollout is never graded valid, so it never enters
+the pool (it only advances PUCT visit counts). So "worst" and the contrastive negatives mean
+**lowest-scoring valid** solutions, not broken code. Injecting genuine failures (code + error message)
+would need a separate failure log; that is intentionally deferred.
+
+## Tie-breaking among equal scores
+
+Many solutions share a score (e.g. lots of zero-scoring attempts). To avoid always surfacing the same
+few — an artifact of stable sorting on ties — candidates are **pre-shuffled** before ranking, then
+sorted by score with a stable sort. Equal scores therefore come out in random order, while the order of
+*distinct* scores is untouched. So repeated calls resample which of the tied solutions appear (relevant
+for the "worst" blocks especially). Set `context_seed` to make this reproducible; leave it unset for a
+fresh draw each call.
