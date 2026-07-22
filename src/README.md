@@ -63,7 +63,7 @@ Experiment knobs at launch
 ├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ events.jsonl                    │ one line per candidate (valid and failed) for programmatic analysis                                                       │
 ├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ buffer/                         │ puct_sampler.json (PUCT snapshots) + context_pool.jsonl (all valid solutions: context source + resume)                    │
+│ buffer/                         │ authoritative PUCT snapshots                                                                                              │
 ├─────────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ runs/index.csv                  │ one row per experiment — a cross-run leaderboard
 
@@ -72,10 +72,12 @@ Experiment knobs at launch
 cd projects/phd/learning_evolve/src/
 source .venv/bin/activate
 
-python run_icl.py --problem circle_packing_26   --groups-per-batch 5 --group-size 12 --num-generations 30     --n-context 0    --reasoning-effort medium --vllm-base-url http://localhost:8000/v1 --model openai/gpt-oss-120b --log-path runs/cp_26_no_icl_g5x12_gen30
+taskset -c 0-11 python run_icl.py --problem circle_packing_26   --groups-per-batch 5 --group-size 12 --num-generations 30     --n-context 0    --reasoning-effort medium --vllm-base-url http://localhost:8000/v1 --model openai/gpt-oss-120b --log-path runs/cp_26_no_icl_g5x12_gen30
 
 python run_icl.py --problem circle_packing_26   --groups-per-batch 5 --group-size 12 --num-generations 30     --n-context 30 --context-strategy random    --reasoning-effort medium --vllm-base-url http://localhost:8000/v1 --model openai/gpt-oss-120b --log-path runs/cp_26_random_n_30_g5x12_gen30
 
 python run_icl.py --problem circle_packing_26   --groups-per-batch 5 --group-size 12 --num-generations 30     --n-context 30 --context-strategy best     --reasoning-effort medium --vllm-base-url http://localhost:8000/v1 --model openai/gpt-oss-120b --log-path runs/cp_26_best_n_30_g5x12_gen30
 
 python run_icl.py --problem circle_packing_26   --groups-per-batch 5 --group-size 12 --num-generations 30     --n-context 30 --context-strategy best_worst --mix-fraction 0.7     --reasoning-effort medium --vllm-base-url http://localhost:8000/v1 --model openai/gpt-oss-120b --log-path runs/cp_26_best_worst_n_30_g5x12_gen30
+
+python run_icl.py --problem circle_packing_26   --groups-per-batch 5 --group-size 12 --num-generations 30     --n-context 30 --context-strategy contrastive --mix-fraction 0.7 --mmr_lambda 0.7    --reasoning-effort medium --vllm-base-url http://localhost:8000/v1 --model openai/gpt-oss-120b --log-path runs/cp_26_contrastive_n_30_g5x12_gen30
