@@ -76,6 +76,8 @@ class ICLRunner:
             base_url=cfg.vllm_base_url,
             model=cfg.model_name,
             reasoning_effort=cfg.reasoning_effort,
+            thinking_token_budget=cfg.thinking_token_budget,
+            enable_thinking=cfg.enable_thinking,
             max_concurrency=cfg.max_gen_concurrency,
         )
         self._select = get_strategy(cfg.context_strategy)   # context-selection strategy fn

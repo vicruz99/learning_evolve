@@ -26,7 +26,12 @@ def parse_args() -> ICLConfig:
 
     p.add_argument("--model", dest="model_name", default="openai/gpt-oss-120b")
     p.add_argument("--vllm-base-url", default="http://localhost:8000/v1")
-    p.add_argument("--reasoning-effort", default="high", help="'none' to disable (e.g. non-gpt-oss models).")
+    p.add_argument("--reasoning-effort", default="high", help="gpt-oss; 'none' to disable (e.g. non-gpt-oss models).")
+    p.add_argument("--thinking-token-budget", type=int, default=None,
+                   help="Qwen3: cap reasoning tokens; vLLM forces </think> once hit. "
+                        "Needs the server launched with --reasoning-parser qwen3.")
+    p.add_argument("--no-thinking", dest="enable_thinking", action="store_false", default=None,
+                   help="Qwen3: disable thinking entirely (chat_template_kwargs enable_thinking=false).")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max-tokens", type=int, default=26000)
     p.add_argument("--max-gen-concurrency", type=int, default=8)
@@ -89,6 +94,8 @@ def parse_args() -> ICLConfig:
         model_name=a.model_name,
         vllm_base_url=a.vllm_base_url,
         reasoning_effort=reasoning_effort,
+        thinking_token_budget=a.thinking_token_budget,
+        enable_thinking=a.enable_thinking,
         temperature=a.temperature,
         max_tokens=a.max_tokens,
         max_gen_concurrency=a.max_gen_concurrency,

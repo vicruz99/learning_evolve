@@ -20,6 +20,8 @@ class ICLConfig:
     model_name: str = "openai/gpt-oss-120b"
     vllm_base_url: str = "http://localhost:8000/v1"
     reasoning_effort: str | None = "high"           # gpt-oss; set None for models without it
+    thinking_token_budget: int | None = None        # Qwen3: cap reasoning tokens (needs server --reasoning-parser qwen3)
+    enable_thinking: bool | None = None              # Qwen3: False disables thinking entirely; None = model default
     temperature: float = 1.0
     max_tokens: int = 26000                          # matches upstream phase1_max_tokens
     max_gen_concurrency: int = 8                      # in-flight requests to the vLLM server
