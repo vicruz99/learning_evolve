@@ -88,12 +88,12 @@ class ErdosMinOverlapRewardEvaluator(SandboxRewardEvaluator):
         return base + generation
 
     def get_reward(self, code: str, state: State) -> float:
-        output, error_msg = self.execute_code(code, state)
-        if error_msg: 
-            return self._get_failure_entry(error_msg)
+        output, error_msg, failure_type = self.execute_code(code, state)
+        if error_msg:
+            return self._get_failure_entry(error_msg, failure_type=failure_type)
 
         if not verify_erdos_solution(output):
-            return self._get_failure_entry("Invalid solution.")
+            return self._get_failure_entry("Invalid solution.", failure_type="invalid_result")
         h_values, c5_bound, n_points = output
         c5_bound = evaluate_erdos_solution(h_values, c5_bound, n_points)
 

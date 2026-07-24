@@ -35,6 +35,11 @@ def parse_args() -> ICLConfig:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max-tokens", type=int, default=26000)
     p.add_argument("--max-gen-concurrency", type=int, default=8)
+    p.add_argument("--grade-chunk-size", type=int, default=None,
+                   help="Completions per vLLM request within a parent's group; each chunk is graded "
+                        "as soon as it returns (overlaps grading with generation). Default: whole "
+                        "group in one request (grade only after all children arrive). Raise "
+                        "--max-gen-concurrency to groups_per_batch*ceil(group_size/chunk) when set.")
 
     p.add_argument("--groups-per-batch", type=int, default=8)
     p.add_argument("--group-size", type=int, default=64)
@@ -99,6 +104,7 @@ def parse_args() -> ICLConfig:
         temperature=a.temperature,
         max_tokens=a.max_tokens,
         max_gen_concurrency=a.max_gen_concurrency,
+        grade_chunk_size=a.grade_chunk_size,
         groups_per_batch=a.groups_per_batch,
         group_size=a.group_size,
         num_generations=a.num_generations,

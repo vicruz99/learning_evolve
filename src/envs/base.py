@@ -57,6 +57,7 @@ class VerifyResult:
     result_construction: Any
     stdout: str
     metrics: dict[str, Any] = field(default_factory=dict)
+    failure_type: str = ""            # "" when correctness>0; else a classify_failure category
 
 
 @dataclass
@@ -69,6 +70,7 @@ class RolloutResult:
     parsed_code: str
     correct_format: bool
     next_state: State | None          # the buffered child if the candidate was valid, else None
+    failure_type: str = ""            # "" when valid; else infra-vs-genuine category (see sandbox.classify_failure)
 
 
 # Shared ThreadPoolExecutor for all environments (grading runs off the event loop).
@@ -141,6 +143,7 @@ class Environment(ABC):
                 raw_score=0.0,
                 result_construction=None,
                 stdout="",
+                failure_type="no_code",
             )
         return await self._safe_grade(parsed_code, step)
 
@@ -160,6 +163,7 @@ class Environment(ABC):
             result_construction=out.get("result_construction", None),
             stdout=out.get("stdout", ""),
             metrics=out.get("metrics", {}),
+            failure_type=out.get("failure_type", ""),
         )
 
     async def _safe_grade(self, given_answer: str, step: int) -> VerifyResult:
@@ -186,7 +190,7 @@ class Environment(ABC):
             logger.warning(f"Timeout grading: took {elapsed:.1f}s, limit was {self.timeout:.1f}s")
             return VerifyResult(
                 reward=0.0, msg="Timeout grading", correctness=0.0, raw_score=0.0,
-                result_construction=None, stdout="",
+                result_construction=None, stdout="", failure_type="grade_timeout",
             )
         except Exception as e:
             import traceback
@@ -194,7 +198,7 @@ class Environment(ABC):
             logger.warning(f"Exception while grading: {e}")
             return VerifyResult(
                 reward=0.0, msg=f"Error grading: {error_msg}", correctness=0.0, raw_score=0.0,
-                result_construction=None, stdout="",
+                result_construction=None, stdout="", failure_type="grade_error",
             )
 
     async def rollout_step(self, completion_text: str, step_idx: int) -> RolloutResult:
@@ -215,6 +219,7 @@ class Environment(ABC):
         outs = await self.check_answer(parsed_code, step_idx)
 
         next_state: State | None = None
+        failure_type = outs.failure_type
         if outs.correctness > 0:
             try:
                 next_state = self._create_next_state(step_idx, parsed_code, outs, strategy)
@@ -222,6 +227,7 @@ class Environment(ABC):
             except Exception as e:
                 logger.warning(f"Failed to create next state: {e}")
                 next_state = None
+                failure_type = "state_error"
                 if hasattr(self.sampler, "record_failed_rollout"):
                     self.sampler.record_failed_rollout(self.initial_state)
         elif hasattr(self.sampler, "record_failed_rollout"):
@@ -235,4 +241,5 @@ class Environment(ABC):
             parsed_code=parsed_code,
             correct_format=correct_format,
             next_state=next_state,
+            failure_type=failure_type,
         )

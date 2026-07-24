@@ -154,6 +154,17 @@ class ICLRunner:
             self._pool_fh.write(json.dumps(s.to_dict()) + "\n")
         self._pool_fh.flush()
 
+    def _chunk_sizes(self, total: int) -> list[int]:
+        """Split ``total`` completions into per-request chunk sizes. ``grade_chunk_size`` None/0 ->
+        one chunk of ``total`` (original behavior); K -> chunks of K (last one smaller)."""
+        k = self.cfg.grade_chunk_size or total
+        k = max(1, min(k, total))
+        sizes, rem = [], total
+        while rem > 0:
+            sizes.append(min(k, rem))
+            rem -= sizes[-1]
+        return sizes
+
     async def _run_group(self, gen: int, slot: int, parent: State) -> list:
         cfg, spec = self.cfg, self.spec
         env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
@@ -161,32 +172,43 @@ class ICLRunner:
 
         k, N = len(selection.all()), cfg.n_context
         shortfall = "" if k >= N else " (buffer filling)"
-        logger.info(f"gen {gen} p{slot}: prompting LLM (n={cfg.group_size}, "
+        sizes = self._chunk_sizes(cfg.group_size)
+        chunk_note = "" if len(sizes) == 1 else f", {len(sizes)}x chunks<={sizes[0]} grade-as-ready"
+        logger.info(f"gen {gen} p{slot}: prompting LLM (n={cfg.group_size}{chunk_note}, "
                     f"context={k}/{N}{shortfall}, prompt~{len(prompt)//4} tok)")
 
         t0 = time.perf_counter()
-        try:
-            completions = await self.llm.generate(
-                prompt, n=cfg.group_size, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
+
+        async def _gen_grade_chunk(sz: int):
+            """Generate ``sz`` completions in one request, then grade them the moment they arrive.
+            Running these coroutines concurrently overlaps one chunk's grading (CPU/sandbox) with
+            another chunk's still-in-flight generation (GPU)."""
+            comps = await self.llm.generate(
+                prompt, n=sz, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
             )
+            res = await asyncio.gather(*[env.rollout_step(c, gen) for c in comps])
+            return comps, res
+
+        try:
+            chunk_out = await asyncio.gather(*[_gen_grade_chunk(sz) for sz in sizes])
         except Exception as e:
             logger.warning(f"gen {gen} p{slot}: generation FAILED: {e}")
             if self.tracker is not None:
                 self.tracker.record_group(gen, slot, parent, prompt, [], [])
             return []
-        gen_dt = time.perf_counter() - t0
-        self._gen_latencies.append(gen_dt)
-        logger.info(f"gen {gen} p{slot}: {len(completions)} completions in {gen_dt:.1f}s -> grading")
 
-        results = await asyncio.gather(*[env.rollout_step(c, gen) for c in completions])
+        completions = [c for comps, _ in chunk_out for c in comps]
+        results = [r for _, res in chunk_out for r in res]
+        grp_dt = time.perf_counter() - t0
+        self._gen_latencies.append(grp_dt)
         if self.tracker is not None:
             self.tracker.record_group(gen, slot, parent, prompt, completions, results)
 
         valid = [r for r in results if r.correctness > 0 and r.next_state is not None]
         best = max(valid, key=lambda r: r.next_state.value) if valid else None
         best_str = "n/a" if best is None else f"{best.raw_score:.6f}"
-        logger.info(f"gen {gen} p{slot}: {len(valid)}/{len(results)} valid, "
-                    f"best {spec.metric_name}={best_str}")
+        logger.info(f"gen {gen} p{slot}: {len(completions)} gen+graded in {grp_dt:.1f}s | "
+                    f"{len(valid)}/{len(results)} valid, best {spec.metric_name}={best_str}")
         return results
 
     async def run(self) -> None:
@@ -203,6 +225,18 @@ class ICLRunner:
                     f"(groups_per_batch vs max_gen_concurrency={cfg.max_gen_concurrency}); "
                     f"grading parallelism ~= host_cpus // num_cpus_per_task (={self.num_cpus}); "
                     f"eval_timeout={self.eval_timeout}s")
+        # With chunked grade-as-ready there are groups_per_batch * chunks_per_group concurrent gen
+        # requests; if max_gen_concurrency is below that, the semaphore throttles them and vLLM can't
+        # co-batch all sequences -> generation serializes into waves and gets much slower.
+        n_chunks = len(self._chunk_sizes(cfg.group_size))
+        if n_chunks > 1:
+            reqs = cfg.groups_per_batch * n_chunks
+            if cfg.max_gen_concurrency < reqs:
+                logger.warning(
+                    f"grade_chunk_size={cfg.grade_chunk_size}: {reqs} concurrent gen requests/generation "
+                    f"({cfg.groups_per_batch} parents x {n_chunks} chunks) but max_gen_concurrency="
+                    f"{cfg.max_gen_concurrency} -> vLLM will NOT co-batch them all (generation "
+                    f"throttled into waves). Set --max-gen-concurrency >= {reqs} to keep it parallel.")
 
         if spec.env_type.uses_sandbox:
             init_ray(self.num_cpus)

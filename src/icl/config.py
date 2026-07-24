@@ -25,6 +25,14 @@ class ICLConfig:
     temperature: float = 1.0
     max_tokens: int = 26000                          # matches upstream phase1_max_tokens
     max_gen_concurrency: int = 8                      # in-flight requests to the vLLM server
+    # How many completions of a parent's group to request per vLLM call. Each chunk is graded as soon
+    # as it returns, so smaller chunks let early-finishing completions grade while slower ones are
+    # still being generated (a vLLM request only returns once its slowest sequence finishes, so a big
+    # chunk withholds every completion until the slowest sibling is done). None/0 = whole group in one
+    # request = grade only after ALL group_size children arrive (original behavior). NOTE: with
+    # chunking there are groups_per_batch * ceil(group_size/chunk) concurrent requests, so
+    # max_gen_concurrency must be raised to that many or vLLM can't co-batch them (a warning fires).
+    grade_chunk_size: int | None = None
 
     # --- search shape (matches TTT-Discover: 8 parents x 64 children = 512/generation) ---
     groups_per_batch: int = 8

@@ -39,6 +39,32 @@ _SCHEDULER_HANDLE = None
 _EXEC_FN_CACHE: dict[tuple, Any] = {}
 
 
+def classify_failure(text: str) -> str:
+    """Map a raw failure message / traceback to a coarse ``failure_type``.
+
+    The distinction that matters for experiments is **infra vs. genuine**: a candidate that never
+    got a CPU (``cpu_starvation``) or whose worker died (``results_missing``) is an infrastructure
+    failure, unrelated to solution quality; a crash / eval-timeout / bad output is genuine (though
+    an ``eval_timeout`` can still be contention-induced — the recheck tool re-runs to disambiguate).
+
+    Every exception raised inside the Ray remote ``run_program`` is wrapped as a ``RayTaskError``
+    whose ``str()`` embeds the remote traceback, so matching on the terminal exception's text is
+    reliable. See the raising sites: ``cpu_scheduler.get_cpu_group`` ("No CPU group available"),
+    ``run_with_timeout`` ("Process timed out after" / "Process exited with code" /
+    "Program execution failed") and ``run_eval_code`` ("Results file ...").
+    """
+    t = text or ""
+    if "No CPU group available" in t:
+        return "cpu_starvation"
+    if "Process timed out after" in t or "timed out after" in t:
+        return "eval_timeout"
+    if "Process exited with code" in t or "Program execution failed" in t:
+        return "process_crash"
+    if "Results file" in t or "empty results path" in t:
+        return "results_missing"
+    return "unknown"
+
+
 def _get_scheduler(num_cpus_per_task: int, num_persistent_workers: int = 0):
     """Return the detached ``cpu_scheduler`` actor handle, looking it up (or creating it) once."""
     global _SCHEDULER_HANDLE
@@ -531,14 +557,20 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
         raise NotImplementedError("You must implement 'get_program_entrypoint' for a RewardTask.")
 
     def execute_code(self, solution_str: str, state) -> Any:
+        """Run the extracted code in the sandbox.
+
+        Returns ``(result, error_msg, failure_type)``: on success ``(result, None, "")``; on failure
+        ``(None, msg, failure_type)`` where ``failure_type`` is one of the ``classify_failure``
+        categories (or ``"no_code"`` when nothing was extractable).
+        """
         # Parse python code for solution
         code = self._extract_code(solution_str)
         if code is None:
-            return None, 'Cannot extract python code from model response'
+            return None, 'Cannot extract python code from model response', "no_code"
 
         # Any task specific modifications to the code
         code = self.preprocess_generation(code, state)
-        
+
         # Eval task
         with _timer("propose_candidate_time", dict()):
 
@@ -546,11 +578,11 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
                 result = self.run_eval_code(code)
 
             except ray.exceptions.GetTimeoutError:
-                return None, f'Evaluation timed out after {self.eval_timeout} minutes.'
+                return None, f'Evaluation timed out after {self.eval_timeout} minutes.', "eval_timeout"
             except Exception as e:
-                return None, f'Evaluation failed: {e}'
+                return None, f'Evaluation failed: {e}', classify_failure(str(e))
 
-        return result, None
+        return result, None, ""
 
     def run_eval_code(self, code_str: str):
         # Write code to nfs to avoid ray client overload
@@ -659,13 +691,14 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
         # Strip out actual python code
         return m.group(1).strip() if m is not None else None
 
-    def _get_failure_entry(self, msg):
+    def _get_failure_entry(self, msg, failure_type: str = "unknown"):
         return dict(
-            reward=self.fail_score, 
-            msg=msg, 
-            correctness=0.0, 
+            reward=self.fail_score,
+            msg=msg,
+            correctness=0.0,
             raw_score=self.worst_perf_log,
             stdout=getattr(self, '_last_stdout', ''),
+            failure_type=failure_type,
         )
     
 

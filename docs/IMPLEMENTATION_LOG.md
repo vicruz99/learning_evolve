@@ -136,3 +136,145 @@
 - ✅ PUCT confirmed faithful (one documented, accepted per-rollout counting quirk).
 - ✅ Extraction/failure rules pinned down and documented.
 - ✅ Docs consolidated under `docs/`.
+
+---
+
+## 2026-07-24 — Pipeline bottleneck analysis + failure-type instrumentation
+
+**Analysis (measured, from `runs/cp_26_best_n_30_g5x12_gen30` + live `localhost:8001` gpt-oss-120b on 1×A100)**
+- **Grading dominates, not generation.** gen 1: 1319s total = 317s generate + ~1000s grade. Grading
+  is gated by the **slowest candidate** because of hard barriers (per-group `asyncio.gather`, then a
+  per-generation barrier for PUCT). Eval-time distribution of *valid* circle-packing solutions:
+  p50=0.8s, p90=41s, p95=72s, max>120s — median is trivial, the tail is everything.
+- **`eval_timeout=530` (inherited from TTT-Discover) is ~7× beyond p95 of valid solves** → pure dead
+  weight on the tail. Recommended ~90s (keeps valid-but-slow, chops runaways). Not yet applied.
+- **LLM throughput scales with batch:** 127 tok/s (1 seq) → 519 (8) → 1023 (32), still climbing.
+  Biggest generation lever is the reasoning-token budget (`max_tokens`/`reasoning_effort`), and
+  `--max-model-len` on the server (131k starves KV cache / batch size).
+- **Ray is not the compute culprit.** It's a distributed process pool + CPU-affinity scheduler; the
+  real costs are the long-tail timeouts + the GPU/CPU serialization (GPU idle during grading, CPUs
+  idle during generation). The one Ray-design cost that *does* bite is **CPU starvation** (below).
+
+**Built — failure taxonomy so "failed" is no longer one opaque bucket**
+- `sandbox.classify_failure(text)` → `{no_code, invalid_result, process_crash, eval_timeout,
+  cpu_starvation, results_missing, grade_timeout, grade_error, unknown}`. `cpu_starvation` /
+  `results_missing` = **infra**; the rest = **genuine** (though `eval_timeout` can be contention-induced).
+- Threaded a `failure_type` field through `execute_code` (now returns `(result, msg, failure_type)`),
+  `_get_failure_entry`, the 3 env `get_reward`s, `VerifyResult`/`RolloutResult`, and the tracker.
+- **Stopped truncating the failure `msg`** (was `[:200]`/`[:500]` in `tracker.py`, which clipped the
+  *terminal* exception of the Ray traceback — the exact bytes that distinguish infra from genuine).
+  New cap `MAX_MSG_CHARS=4000`. `summary.json` now carries `totals.failure_types` + per-generation
+  `failure_types`.
+
+**Built — `src/results/recheck_failures.py`** (retroactive, no full rerun)
+- Static pass reclassifies a past run's failures from `events.jsonl` (works on old runs via the msg
+  traceback frame). Re-run pass re-extracts each candidate's code from its saved completion and grades
+  it **one-at-a-time** (contention-free) with a generous timeout → verdict: infra/contention vs.
+  genuinely-slow vs. genuine-crash.
+- Validated on `cp_26_best_n_30_g5x12_gen30`: static = 23 process_crash, 22 invalid_result,
+  3 cpu_starvation, 1 no_code, 7 unknown(=truncated-msg crashes), **0 genuine "Process timed out"**
+  (so the "timeouts" the user recalled were mostly crashes here). Re-running the 3 cpu_starvations:
+  **1 was a genuine infra loss** (graded valid in 20s uncontended — a real solution thrown away),
+  **2 were genuinely slow** (still time out at 120s). Confirms both failure modes are real and now
+  separable.
+
+**ShinkaEvolve eval-architecture comparison** (source: `shinka/core/async_runner.py`,
+`shinka/launch/{local.py,scheduler.py}`, `shinka/core/wrap_eval.py`, `examples/ttt_discover_math/circle_packing_26/`)
+
+| Aspect | Our harness | ShinkaEvolve |
+|---|---|---|
+| Process layers / candidate | **2** (Ray task → inner `subprocess.Popen`) | **1** (`subprocess.Popen python evaluate.py`; candidate imported in-process) |
+| Scheduler | Ray + `cpu_scheduler` **fixed CPU groups**, acquire-or-fail within `eval_timeout+10s` | asyncio + threadpool; **no CPU groups, no acquire step** |
+| CPU allocation | hard affinity pin to a reserved 1-core group | **soft**: BLAS/OMP thread-cap env (`cpu_count // max_evaluation_jobs`); OS spreads |
+| Can a candidate fail for lack of CPU? | **Yes** → `cpu_starvation` | **No** — it just waits its turn |
+| Per-eval timeout (circle packing) | `eval_timeout=530s` | wall-clock poll + `process.kill()`, `job_time` 5min (dev) / 15min (full) |
+| Eval body cost | validate + sum radii (all cost is in the evolved code) | same |
+| Local LLM | OpenAI-compatible `--vllm-base-url` | `local/<model>@<url>` grammar; also swap `meta/novelty/embedding` models + `SHINKA_PRICING_MODE=offline` |
+
+Takeaway: the **infra-timeout failure mode is specific to our fixed-group acquire-timeout design**;
+ShinkaEvolve's soft-thread-cap + no-reservation model cannot produce it. Motivates a deferred
+root-cause fix (decouple the CPU-group queue-wait from `eval_timeout` so a merely-queued candidate
+never *fails*; and/or drop the double-process nesting). Head-to-head timing run left for later.
+
+**Deferred (explicitly out of scope this pass)**
+- Cutting `eval_timeout` 530→~90, pipelining generation↔grading (overlap GPU/CPU), and the
+  CPU-request root-cause fix. All measured/justified above; not yet applied.
+
+**End-of-day summary**
+- ✅ Failures now self-classify (infra vs genuine) with untruncated messages; `summary.json` shows the split.
+- ✅ `recheck_failures.py` reclassifies + re-runs past failures without repeating an experiment.
+- ✅ ShinkaEvolve eval model documented; confirms our CPU-starvation mode is design-specific.
+- ⏳ Deferred: eval_timeout cut, gen↔grade pipelining, CPU-request root-cause fix.
+
+---
+
+## 2026-07-24 — Grade-as-ready pipelining (`grade_chunk_size`) + evaluation design notes
+
+**Built — configurable grade-as-ready chunking**
+- New `ICLConfig.grade_chunk_size` (CLI `--grade-chunk-size`, default `None` = whole group = original
+  behavior). It sets how many of a parent's `group_size` completions are requested per vLLM call;
+  each chunk is graded the moment it returns. `icl/loop.py`: `_chunk_sizes()` + `_run_group()` now
+  runs the per-chunk gen→grade coroutines concurrently, so one chunk's grading (CPU/sandbox) overlaps
+  another chunk's in-flight generation (GPU). A startup **warning** fires when `max_gen_concurrency`
+  is below `groups_per_batch * ceil(group_size/chunk)` (else vLLM can't co-batch the chunk requests).
+
+**Correction — when grading actually starts (this drove the design)**
+- Earlier I claimed per-parent grading overlaps other parents' generation. **Wrong.** The logs show
+  all parent requests are co-batched by vLLM and each returns only when *its slowest sequence*
+  finishes; the global-slowest sequences are spread across parents, so **all parent requests return
+  near-simultaneously** and grading is a hard phase *after* all generation. The real waste: a
+  completion ready at 300 s waits for its slowest sibling (~960 s) before it can be graded.
+- Chunking fixes it by **decoupling each completion from the slowest-in-request**: smaller `n` per
+  request → early finishers return and grade while slow ones still generate. Measured on a
+  `5×12` gen: generate ~960–1150 s, grade ~530 s, total ~1500–1680 s → overlapping should pull total
+  toward ~1000–1150 s.
+
+**vLLM / prefix-caching notes (for running with chunking)**
+- Automatic Prefix Caching reuses a shared prompt prefix **across requests**, so a parent's whole
+  prompt (incl. its big context block) is prefilled once and reused across *that parent's* chunks;
+  cross-parent, only the shared base-question head (~800 tok) is reused (context blocks diverge).
+- **Caveat at large context:** firing many chunk requests concurrently can *race* the prefill before
+  APC caches it → redundant prefill of the (67k–103k-tok) prompt. So on big-context gens use a
+  **moderate** chunk (~8), not `n=1`; optional "prime the prefix" (send 1 chunk, await, then fan out)
+  would remove the race — not yet built.
+- Suggested server flags: `--enable-prefix-caching` (V1 default on), `--kv-cache-dtype fp8`
+  (~2× KV capacity → more concurrent long-context seqs + better cache retention), size
+  `--max-model-len` to actual use (131k only justified because context reaches ~103k), keep
+  `--async-scheduling` + chunked prefill. Client `--max-gen-concurrency` should match `--max-num-seqs`.
+- Observed: prompt grows to **~103k tokens by gen 4** with `n_context=30` — prefill dominates
+  generation time. Independent lever: `max_context_tokens` / `n_context`.
+
+**Considerations & deferred decisions (evaluation), captured for later**
+- **Parallel experiments were the real starvation cause.** Each `run_icl.py` starts its *own* Ray +
+  its *own* `cpu_scheduler`, each assuming it owns all 96 cores; three runs launched together (03:00)
+  triple-booked the cores → contention + starvation. A single run is fine (96 groups ≥ 60 candidates).
+  Re-check proved it: `cp_26_random` lost **17/22** starved candidates that were actually valid
+  solutions; the contemporaneous `v2` runs (machine freer) had **0** starvation.
+  - **Fix (deferred, agreed):** run concurrent experiments against **one shared Ray cluster**
+    (`ray start --head` + `RAY_ADDRESS=auto`; `init_ray` already honors it) so they share one 96-slot
+    scheduler → no oversubscription. Add a `--ray-address` flag for convenience. Same-problem runs
+    only until the detached scheduler is keyed by `num_cpus_per_task`.
+- **Keep the CPU-acquire timeout, don't remove it** (user call): raise it a bit and add a loud
+  `get_cpu_group` **warning** ("waited Ns for a CPU; N queued — likely oversubscribed") so starvation
+  is visible in real time, not a post-hoc autopsy. (Not yet implemented.)
+- **`eval_timeout=530 s` left as-is for now** — re-runs show genuinely-slow solutions exist but we
+  haven't confirmed which valid solutions legitimately need long budgets; don't want to discard them.
+  Still the dominant single-run cost (slow candidate gates the per-gen barrier). Revisit later.
+- **`ac1`/`ac2` reserve 2 cores** — reference programs are single-threaded (no mp/threads/joblib), and
+  the sandbox caps `ProcessPoolExecutor` to `num_cpus_per_task` anyway, so 2 is likely overkill; but
+  the prompt advertises "2 CPUs" and no `ac` runs exist yet. **Verify on the first real `ac` run**
+  before dropping to 1. For circle packing, 1 core is correctly sized (single-threaded CPU-bound;
+  oversubscribing CPU-bound work doesn't raise throughput — wall ≈ core-seconds / cores).
+- **Warm start assessed, deferred as too brittle for now.** Measured cold start (fresh subprocess,
+  every candidate): numpy 0.37 s, +scipy 1.55 s, +cvxpy 3.04 s — bigger than the median useful
+  compute. But it's largely the *price of isolation* (fresh spawned, killable process). Fork-server
+  (fork a pre-imported parent) risks thread/BLAS-after-fork deadlocks; a persistent in-process pool
+  leaks state and loses clean timeout-kill. Gain is also tail-gated (near-zero until `eval_timeout`
+  is cut). Revisit only after the tail is cut, and then as a carefully-tested fork-server. Note:
+  ShinkaEvolve doesn't warm either (re-imports per eval subprocess).
+
+**End-of-day summary**
+- ✅ `grade_chunk_size` grade-as-ready pipelining landed (default off / unchanged behavior), verified live.
+- ✅ Corrected the mental model of when grading starts (co-batching → simultaneous returns).
+- 📝 Captured deferred evaluation decisions: shared-Ray-cluster for parallel runs, keep+warn CPU
+  timeout, eval_timeout untouched, `ac` cores to verify, warm start too brittle for now.

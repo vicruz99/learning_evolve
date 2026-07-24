@@ -173,15 +173,15 @@ class ACInequalitiesRewardEvaluator(SandboxRewardEvaluator):
             raise ValueError(f"Unknown problem_type: {self.problem_type}. Must be 'ac1' or 'ac2'")
 
     def get_reward(self, code: str, state: State) -> float:
-        output, error_msg = self.execute_code(code, state)
-        if error_msg: 
-            return self._get_failure_entry(error_msg)
+        output, error_msg, failure_type = self.execute_code(code, state)
+        if error_msg:
+            return self._get_failure_entry(error_msg, failure_type=failure_type)
 
         # NOTE: Be careful with conditional-expression precedence.
         # We want to reject invalid solutions for *both* AC1 and AC2.
         is_valid = verify_ac1_solution(output) if self.problem_type == "ac1" else verify_ac2_solution(output)
         if not is_valid:
-            return self._get_failure_entry("Invalid solution.")
+            return self._get_failure_entry("Invalid solution.", failure_type="invalid_result")
 
         if self.problem_type == "ac1":
             result = evaluate_sequence_ac1(output)

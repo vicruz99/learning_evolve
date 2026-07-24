@@ -27,6 +27,12 @@ import subprocess
 from datetime import datetime
 from typing import Any
 
+# Cap on the failure message stored per candidate. Big enough to keep the *terminal* exception of a
+# Ray traceback (the part that says "No CPU group available" / "Process timed out" / etc.), which the
+# old 200/500-char caps clipped — that clipping is exactly why infra-vs-genuine failures were
+# indistinguishable. See sandbox.classify_failure.
+MAX_MSG_CHARS = 4000
+
 
 def _git_sha() -> str | None:
     try:
@@ -109,6 +115,7 @@ class ExperimentTracker:
         self.total_candidates = 0
         self.total_success = 0
         self.total_failed = 0
+        self._failure_types: dict[str, int] = {}   # run-total counts by failure_type (failed only)
         self.best: dict | None = None          # ranked by value; native shown for display
         self.worst_valid: dict | None = None
         self._per_gen: list[dict] = []
@@ -137,6 +144,7 @@ class ExperimentTracker:
             "generation": gen,
             "valid_candidates": 0, "failed_candidates": 0,
             "gen_best_value": None, "gen_best_score": None, "gen_best_sol": None,
+            "failure_types": {},        # per-generation counts by failure_type (failed only)
             "parents": {},
         }
         for slot, p in enumerate(parents):
@@ -187,14 +195,19 @@ class ExperimentTracker:
             else:
                 self.total_failed += 1
                 self._cur["failed_candidates"] += 1
+                ft = res.failure_type or "unknown"
+                self._cur["failure_types"][ft] = self._cur["failure_types"].get(ft, 0) + 1
+                self._failure_types[ft] = self._failure_types.get(ft, 0) + 1
 
+            failure_type = "" if res.correctness > 0 else (res.failure_type or "unknown")
             child_rec = {
                 "child": child_idx,
                 "correctness": res.correctness,
                 "correct_format": res.correct_format,
                 "raw_score": res.raw_score if res.correctness > 0 else None,
                 "sol": sol,
-                "msg": res.msg[:200],
+                "failure_type": failure_type,
+                "msg": res.msg[:MAX_MSG_CHARS],
                 "completion_file": self._rel(completion_file) if completion_file else None,
             }
             pinfo["children"].append(child_rec)
@@ -210,7 +223,8 @@ class ExperimentTracker:
                 "raw_score": res.raw_score if res.correctness > 0 else None,
                 "reward": res.reward,
                 "sol": sol,
-                "msg": res.msg[:500],
+                "failure_type": failure_type,
+                "msg": res.msg[:MAX_MSG_CHARS],
                 "completion_chars": len(comp),
                 "completion_file": self._rel(completion_file) if completion_file else None,
                 "prompt_file": pinfo["prompt_file"],
@@ -275,6 +289,7 @@ class ExperimentTracker:
             "best_so_far_score": best_score,
             "buffer_size": buffer_size,
             "puct_expansions": puct_expansions,
+            "failure_types": dict(cur.get("failure_types", {})),
         }
         meta = {
             "generation": gen,
@@ -312,6 +327,7 @@ class ExperimentTracker:
                 "failed": self.total_failed,
                 "success_rate": round(self.total_success / total, 4) if total else 0.0,
                 "unique_solutions": self._sol_seq,
+                "failure_types": dict(self._failure_types),
             },
             "best": self.best,
             "worst_valid": self.worst_valid,

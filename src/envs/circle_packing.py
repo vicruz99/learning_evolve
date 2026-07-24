@@ -73,9 +73,9 @@ class CirclePackingReward(SandboxRewardEvaluator):
 
     # Just define get reward.
     def get_reward(self, code: str, state: State) -> float:
-        output, error_msg = self.execute_code(code, state)
-        if error_msg: 
-            return self._get_failure_entry(error_msg)
+        output, error_msg, failure_type = self.execute_code(code, state)
+        if error_msg:
+            return self._get_failure_entry(error_msg, failure_type=failure_type)
 
         # Extract output
         centers, radii, _ = output
@@ -86,7 +86,7 @@ class CirclePackingReward(SandboxRewardEvaluator):
 
         # Check if packing is valid
         if not check_packing_correctness(centers, radii, int(self.problem_type)):
-            return self._get_failure_entry("Packing is not valid.")
+            return self._get_failure_entry("Packing is not valid.", failure_type="invalid_result")
         
         # Final reward is sum of radii
         sum_of_radii = np.sum(radii)
