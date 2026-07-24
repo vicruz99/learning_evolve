@@ -15,9 +15,9 @@
 over the math benchmark problems. This is the ICL + low-level cell of Experiment 1 (§2),
 run first before RL and SFT.
 
-**Math problems (5).** Circle packing, first autocorrelation, second autocorrelation, and
-**two more still to be chosen**. Each starts from the **same initial solution TTT-Discover
-used** — these need to be pulled from the TTT-Discover setup.
+**Math problems (5).** Circle packing (n=26 and n=32), first autocorrelation, second autocorrelation, and
+Erdos' Minimum Overlap. Each starts from the **same initial solution TTT-Discover
+used** (pulled from the TTT-Discover setup to enable maximum comparison - i.e. using same initial solution and prompt)
 
 **The context / truncation challenge.** For a fully fair comparison with TTT-Discover we'd
 like all tried solutions in context, but TTT-Discover generates **25,600** solutions per
@@ -28,24 +28,25 @@ what actually goes in the prompt. Candidate strategies:
 - most-recent solutions,
 - a mixture of diverse + high-reward solutions.
 
-Realistically only a **few hundred** solutions fit. Both the strategy and the exact number
+Realistically only a **few tens of** solutions fit. Both the strategy and the exact number
 are **still to be defined**. Context budgets to work within: Qwen3.6-27B ~260k tokens,
-GPT-oss-120B ~131k tokens.
+GPT-oss-120B ~131k tokens. But context is also filled with output tokens (reasoning + answer; reasoning especially can take up a lot of tokens)
 
 **Cost framing.** Large-context ICL is compute-heavy, but so is RL — comparing them at a
 fixed budget is the intended fair framing (see `PROJECT_CONTEXT.md` §4.7).
 
 **Parallel task — ShinkaEvolve.** Run ShinkaEvolve with the **same two models** and
-**equal initial solutions**, to add an evolutionary-search reference point.
+**equal initial solutions**, to add an evolutionary-search ICL reference point.
 
 **Immediate to-dos for this experiment:**
 
-- [ ] Pick the remaining 2 math problems.
-- [ ] Retrieve TTT-Discover's initial solution for each problem and reuse it.
-- [ ] Decide the in-prompt selection/truncation strategy.
-- [ ] Decide the max number of in-prompt solutions.
+- [x] Pick the remaining 2 math problems.
+- [x] Retrieve TTT-Discover's initial solution for each problem and reuse it.
+- [x] Implementt the in-prompt selection/truncation strategies.
+- [x] Check if it's possible to recover the buffer and PUCT strategy directly from TTT-Discover repo
+- [ ] Optimize the pipeline (in terms of solutions evaluation and LLM inference) - check Ray
+- [ ] Test with different max number of in-prompt solutions and context selection strategies.
 - [ ] Set up the ShinkaEvolve runs with matched models and initial solutions.
-- [ ] Check if it's possible to recover the buffer and PUCT strategy directly from TTT-Discover repo
 
 ---
 

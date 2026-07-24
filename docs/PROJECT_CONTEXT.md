@@ -6,7 +6,7 @@
 
 ---
 
-## 1. One-line summary
+## 1. Research Question
 
 Under a **fixed test-time compute budget**, what is the most effective way to incorporate
 **past experience** into open-ended LLM-driven discovery: **in-context learning (ICL)**,
@@ -112,7 +112,7 @@ Q(s) + c · P(s) · sqrt(1 + T) / (1 + n(s))
 
 - **Low-level:** full trajectories, program edits, execution feedback.
 - **High-level:** distilled summaries, strategy-level regularities, repeated failure modes,
-  useful structural patterns — produced by a separate summarization/critique model.
+  useful structural patterns (can be produced by a separate summarization/critique model).
 
 ### 4.4 Models
 
