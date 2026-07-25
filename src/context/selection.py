@@ -347,8 +347,10 @@ def build_context_block(
     if not selection.positives and not selection.negatives:
         return ""
 
-    header = "\n\n--- Past solutions provided as context ---\n"
-    footer = "\n--- End of context ---\n"
+    header = "\n" \
+    "Before proposing a new solution, review the past solutions you've already tried below, along with their results, so you can see what has and hasn't worked. You don't need to reuse any of them — they're provided only as a reference for what has already been explored.\n" \
+    "\n--- Past solutions you've tried, with their results ---\n"
+    footer = "\n--- End of past solutions ---\n"
     budget_chars = None if max_context_tokens is None else int(max_context_tokens * _CHARS_PER_TOKEN)
     used = len(header) + len(footer)
 

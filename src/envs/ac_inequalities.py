@@ -230,28 +230,8 @@ class AutoCorrInequalityEnv(Environment):
         else:
             raise ValueError(f"Unknown problem_type: {self.problem_type}. Must be 'ac1' or 'ac2'")
 
-    def get_question(self) -> str:
-        """Build prompt from template, injecting previous code from state."""
-        state = self.initial_state
-
-        budget_s = 1000
-
-        if self.problem_type == "ac1":
-            metric_name = "upper bound"
-            target = 1.5030
-            is_maximize = False
-        elif self.problem_type == "ac2":
-            metric_name = "lower bound"
-            target = 0.97
-            is_maximize = True
-        else:
-            raise ValueError(f"Unknown problem_type: {self.problem_type}. Must be 'ac1' or 'ac2'")
-
-        state_ctx = self.initial_state.to_prompt(target, metric_name=metric_name, maximize=is_maximize)
-
-        if state.construction:
-            state_ctx += f"\nLength of the construction: {len(state.construction)}"
-
+    # --- Prompt zone 1: constant task + literature + search-function description (cached across parents) ---
+    def problem_intro(self) -> str:
         if self.problem_type == "ac1":
             return f'''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
 
@@ -260,18 +240,52 @@ Your task is to generate the sequence of non-negative heights of a step function
 {AC1_EVAL_FUNCTION}
 
 {AC1_LITERATURE}
+'''
+        elif self.problem_type == "ac2":
+            return f'''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
 
-Your task is to write a search function that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+Your task is to generate the sequence of non-negative heights of a step functions, that maximizes the following evaluation function:
+
+```python
+{ae_verifier_program}
+```
+
+{AC2_LITERATURE}
+'''
+        raise ValueError(f"Unknown problem_type: {self.problem_type}. Must be 'ac1' or 'ac2'")
+
+    # --- Prompt zone 3: start-note + improvement guidance + rules + current construction (rendered LAST) ---
+    def improvement_task(self) -> str:
+        budget_s = 1000
+        state = self.initial_state
+
+        if self.problem_type == "ac1":
+            metric_name, target, is_maximize = "upper bound", 1.5030, False
+        elif self.problem_type == "ac2":
+            metric_name, target, is_maximize = "lower bound", 0.97, True
+        else:
+            raise ValueError(f"Unknown problem_type: {self.problem_type}. Must be 'ac1' or 'ac2'")
+
+        state_ctx = self.initial_state.to_prompt(target, metric_name=metric_name, maximize=is_maximize)
+        if state.construction:
+            state_ctx += f"\nLength of the construction: {len(state.construction)}"
+
+        if self.problem_type == "ac1":
+            return f'''
+Your task is to write a search function, propose_candidate(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
 
 You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
 
-{state_ctx}
-
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable. 
+You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable.
 However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
 
-Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
+This is the current solution/search algorithm you should improve upon.
+
+--- Current solution to improve upon ---
+{state_ctx}
+
+
+Ideally, try to propose something different than the current solution. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc.
 Unless you make a meaningful improvement, you will not be rewarded.
 
 Rules:
@@ -284,30 +298,26 @@ Rules:
 - **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
 - Include a short docstring at the top summarizing your algorithm.
 
-Make sure to think and return the final program between ```python and ```.'''
+Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
+'''
 
         elif self.problem_type == "ac2":
-            return f''''Act as an expert software developer and inequality specialist specializing in creating step functions with certain properties.
-
-Your task is to generate the sequence of non-negative heights of a step functions, that maximizes the following evaluation function:
-
-```python
-{ae_verifier_program}
-```
-
-{AC2_LITERATURE}
+            return f'''
 Your task is to write a search function, construct_function(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
 
 You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
 
-{state_ctx}
-
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable. 
+You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable.
 However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
 
-Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
-Unless you make a meaningful improvement, you will not be rewarded, if you are stuck you should think about how to get unstuck.
+This is the current solution/search algorithm you should improve upon.
+
+--- Current solution to improve upon ---
+{state_ctx}
+
+
+Ideally, try to propose something different than the current solution. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc.
+Unless you make a meaningful improvement, you will not be rewarded.
 
 Rules:
 - You must define the `construct_function` function as this is what will be invoked.
@@ -319,4 +329,5 @@ Rules:
 - **Print statements**: Use `print()` to log progress, intermediate bounds, timing info, etc. Your output will be shown back to you.
 - Include a short docstring at the top summarizing your algorithm.
 
-Make sure to think and return the final program between ```python and ```.'''
+Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
+'''

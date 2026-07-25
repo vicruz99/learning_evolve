@@ -81,7 +81,21 @@ class ToyEeEnv(Environment):
         # Hand get_reward the bare sentence (no ```text ... ``` wrapper).
         return False
 
-    def get_question(self) -> str:
+    # --- Prompt zone 1: constant task description (cached across parents) ---
+    def problem_intro(self) -> str:
+        return """You are helping to test a software pipeline. This is a SYNTHETIC test task, not a \
+real problem, so do not overthink it and do not spend long reasoning about it.
+
+Your job: write ONE short, ordinary sentence about anything at all (a fact, an observation, a bit of \
+fiction — your choice). Keep it to a single sentence.
+
+An automatic scorer will assign your sentence a numeric score. You are NOT told how the score is \
+computed. Higher scores are better. If past attempts are shown below, look at their scores and try \
+to produce a sentence that scores as high as possible.
+"""
+
+    # --- Prompt zone 3: output-format rules + the current sentence to beat (rendered LAST) ---
+    def improvement_task(self) -> str:
         # The parent PUCT selected to expand. Show it (as the real envs do via State.to_prompt) so
         # the model actually sees the specific sentence it is meant to improve on. At gen 0 the parent
         # is the empty seed, so we ask for a fresh sentence instead.
@@ -90,23 +104,14 @@ class ToyEeEnv(Environment):
         if parent_sentence:
             score = st.value if self.is_maximize() else -st.value
             current_block = (
-                f"You are refining an existing sentence. Here is the current sentence "
-                f"(score = {score:.4f}):\n```text\n{parent_sentence}\n```\n"
-                f"Produce a NEW single sentence that scores higher than this one.\n\n"
+                f"--- Current sentence to improve upon (score = {score:.4f}) ---\n"
+                f"```text\n{parent_sentence}\n```\n"
+                f"Produce a NEW single sentence that scores higher than this one."
             )
         else:
-            current_block = "There is no starting sentence yet — write a fresh one.\n\n"
+            current_block = "There is no starting sentence yet — write a fresh one."
 
-        return f"""You are helping to test a software pipeline. This is a SYNTHETIC test task, not a \
-real problem, so do not overthink it and do not spend long reasoning about it.
-
-Your job: write ONE short, ordinary sentence about anything at all (a fact, an observation, a bit of \
-fiction — your choice). Keep it to a single sentence.
-
-An automatic scorer will assign your sentence a numeric score. You are NOT told how the score is \
-computed. Higher scores are better. {current_block}If past attempts are shown below, look at their \
-scores and try to produce a sentence that scores as high as possible.
-
+        return f"""
 Output format (follow it exactly):
 1. First, put a brief note about your approach between <strategy> and </strategy> tags.
 2. Then give your sentence, and nothing else, inside a fenced block marked ```text like this:
@@ -114,4 +119,6 @@ Output format (follow it exactly):
 ```text
 Your single sentence goes here.
 ```
+
+{current_block}
 """

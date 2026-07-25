@@ -110,12 +110,20 @@ class ICLRunner:
         )
 
     def _build_prompt(self, env, parent: State):
-        """Assemble the full prompt for one parent: base question + selected-solutions context block.
+        """Assemble the full prompt for one parent, in three cache-friendly zones:
 
-        Returns (prompt, selection, base_prompt, block) where ``selection`` is a SelectionResult.
+            [intro] + [ICL context block] + [rules + current-solution-to-improve]
+
+        The context block is woven BETWEEN the constant intro (``env.problem_intro()``) and the
+        rules/current-solution tail (``env.improvement_task()``). Because the current solution is
+        rendered last inside the tail, everything before it (intro + block + rules) is a shared
+        prefix across the generation's parents, so vLLM only re-prefills the trailing solution.
+
+        Returns (prompt, selection, intro, tail, block) where ``selection`` is a SelectionResult.
         """
         cfg, spec = self.cfg, self.spec
-        base_prompt = env.get_question()
+        intro = env.problem_intro()
+        tail = env.improvement_task()
         # Select context from the pool of ALL valid solutions graded in previous generations (built in
         # run()), NOT from the PUCT top-k buffer: the buffer holds only high-scoring survivors, so
         # strategies like best_worst/contrastive would never see genuine low-scoring negatives. Seeds
@@ -131,7 +139,7 @@ class ICLRunner:
             include_code=cfg.include_code,
             include_strategy=cfg.include_strategy,
         )
-        return base_prompt + block, selection, base_prompt, block
+        return intro + block + tail, selection, intro, tail, block
 
     def _open_context_pool(self, path: str, resume: bool = False) -> None:
         """Open the append-only context-pool log. On resume, reload prior valid solutions into memory
@@ -168,7 +176,7 @@ class ICLRunner:
     async def _run_group(self, gen: int, slot: int, parent: State) -> list:
         cfg, spec = self.cfg, self.spec
         env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
-        prompt, selection, _base, _block = self._build_prompt(env, parent)
+        prompt, selection, _intro, _tail, _block = self._build_prompt(env, parent)
 
         k, N = len(selection.all()), cfg.n_context
         shortfall = "" if k >= N else " (buffer filling)"
@@ -317,7 +325,7 @@ class ICLRunner:
             self.sampler = self._make_sampler(os.path.join(td, "puct_sampler.json"))
             parent = self.sampler.sample_states(cfg.groups_per_batch)[0]
             env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
-            prompt, selection, base_prompt, block = self._build_prompt(env, parent)
+            prompt, selection, intro, tail, block = self._build_prompt(env, parent)
 
         ctx_states = selection.all()
         approx_tokens = len(prompt) // 4
@@ -330,8 +338,9 @@ class ICLRunner:
         print(f"context solutions injected : {len(ctx_states)}  "
               f"(positives={len(selection.positives)}, negatives={len(selection.negatives)}, "
               f"n_context={cfg.n_context})")
-        print(f"base prompt chars          : {len(base_prompt)}")
-        print(f"context block chars        : {len(block)}")
+        print(f"intro (zone 1) chars       : {len(intro)}  [constant, before context block]")
+        print(f"context block chars        : {len(block)}  [woven between intro and rules]")
+        print(f"rules+solution (zone 3)    : {len(tail)}  [current solution rendered last]")
         print(f"total prompt chars         : {len(prompt)}  (~{approx_tokens} tokens @ 4 chars/tok)")
         if not ctx_states:
             print("\nNOTE: no context solutions yet — this is generation 0, so the buffer holds only")

@@ -323,3 +323,49 @@ default (whole group). Anything `conc ≥ 20` is within 3 % of optimal — not w
   25-min cap was only to bound the sweep.
 - **`--reasoning-effort medium` produced 0 empty children** (vs ~70 % `no_code` empties at `high`,
   where completions exhaust the 26 k token budget on hidden reasoning before emitting an answer).
+
+---
+
+## 2026-07-25 — Prompt reordering for prefix caching (env prompt-API split)
+
+**Built**
+- Split the `Environment` prompt surface into two zones (`envs/base.py`):
+  `problem_intro()` = constant motivation + high-level description (top, parent-independent) and
+  `improvement_task()` = rules + the current solution to improve upon, with the **current solution
+  rendered LAST**. `get_question()` is kept as `intro + task` for dry-runs.
+- `ICLRunner._build_prompt` now weaves the ICL context block **between** the two zones:
+  `intro + block + tail` (was `base + block`). Final layout per parent:
+  **`[intro] → [past-solutions block] → [rules + current-solution]`**.
+- Reordered all envs (circle_packing, ac1/ac2, erdos, toy) to this shape; moved the varying
+  `state_ctx` to the end and reworded "above / this" → "below / current".
+- Added a contextualizing header before the past-solutions block and renamed the delimiters
+  (`context/selection.py`): *"Before proposing a new solution, review the past solutions you've
+  already tried below … --- Past solutions you've tried, with their results ---"*.
+
+**Why** — within one parent all children share an identical prompt (already fully prefix-cached).
+Across parents in a generation, only the *initial solution* differs; putting it last makes
+`intro + context block + rules` a shared prefix, so vLLM re-prefills only the trailing current
+solution instead of re-prefilling the rules + the whole `n_context`-solution block for every parent.
+
+**Bugs caught while reviewing the (user's) reordering**
+- **erdos:** `code_section` was a plain `'''…'''` string containing `{state_ctx}` (not an f-string)
+  → the literal text `{state_ctx}` appeared in the prompt from gen ≥ 1 and the current construction
+  was never shown. Fixed (f-string in both branches; also render the current solution at gen 0).
+- **ac1:** prose said *"write a search function, `construct_function()`"* (copied from ac2) while
+  ac1's entrypoint and its own Rules line are `propose_candidate` → contradictory instruction the
+  grader would reject. Fixed to `propose_candidate()`.
+- Minor: leading blank lines + a spaces-only line in the ac tails, erdos trailing space — cleaned.
+
+**Verified** — dry-runs + programmatic offset checks, then real **2-gen × 2-parent × 3-child** runs
+on all 5 problems. Inspected the real gen-1 `prompt.txt` for each: ordering is
+`intro → context header → past solutions → rules → current solution`, no literal `{state_ctx}`,
+correct entrypoint names. Results sane (circle 2.541 → 2.611, ac1 100 %/83 % valid, erdos valid
+throughout).
+
+**What bit us — simultaneous run launches hang Ray.** Launching several `run_icl.py` at the *same
+instant* wedged all but one: each run starts its **own** Ray head that prestarts ~96 workers, and
+simultaneous bring-up deadlocks on Ray IPC — stuck mains sit in `unix_stream_data_wait`, the one
+healthy run in `ep_poll`. Parallel runs ARE fine once **staggered** (~120 s apart) or run
+sequentially — each then gets an isolated cluster (session dir keyed by pid, random ports); the
+earlier 3-way run only worked because its launches were ~5 min apart. A code-level fix would cap
+`num_cpus` / prestart workers in `sandbox/ray_setup.init_ray`.

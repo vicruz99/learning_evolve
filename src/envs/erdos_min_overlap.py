@@ -130,28 +130,9 @@ class ErdosMinOverlapEnv(Environment):
     def is_maximize(self) -> bool:
         return False # Minimize upper bound
 
-    def get_question(self) -> str:
-        state = self.initial_state
-        state_ctx = state.to_prompt(0.3808, metric_name="C₅ bound", maximize=False)
-        
-        # Construct construction section
-        construction_section = ""
-        if hasattr(state, 'construction') and state.construction is not None and len(state.construction) > 0:
-            construction_section = f"""
-You may want to start your search from the current construction, which you can access through the `initial_h_values` global variable (n={len(state.construction)} samples).
-You are encouraged to explore solutions that use other starting points to prevent getting stuck in a local optimum.
-"""
-
-        # Construct code section
-        if state.code and state.code.strip():
-            code_section = '''Reason about how you could further improve this construction.
-Ideally, try to do something different than the above algorithm. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc. 
-Unless you make a meaningful improvement, you will not be rewarded.'''
-        else:
-            code_section = '''Write code to optimize this construction.'''
-
-        # Construct final prompt
-        return f'''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
+    # --- Prompt zone 1: constant motivation + problem/rules (cached across parents) ---
+    def problem_intro(self) -> str:
+        return '''You are an expert in harmonic analysis, numerical optimization, and mathematical discovery.
 Your task is to find an improved upper bound for the Erdős minimum overlap problem constant C₅.
 
 ## Problem
@@ -174,6 +155,40 @@ The evaluation computes: C₅ = max(np.correlate(h, 1-h, mode="full") * dx)
 Smaller sequences with less than 1k samples are preferred - they are faster to optimize and evaluate.
 
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
+Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.38080.
+
+'''
+
+    # --- Prompt zone 3: improvement guidance + the current construction to improve (rendered LAST) ---
+    def improvement_task(self) -> str:
+        state = self.initial_state
+        state_ctx = state.to_prompt(0.3808, metric_name="C₅ bound", maximize=False)
+
+        # Construct construction section (mentions n, which varies per parent)
+        construction_section = ""
+        if hasattr(state, 'construction') and state.construction is not None and len(state.construction) > 0:
+            construction_section = f"""You may want to start your search from the current construction, which you can access through the `initial_h_values` global variable (n={len(state.construction)} samples).
+You are encouraged to explore solutions that use other starting points to prevent getting stuck in a local optimum.
+"""
+
+        # Construct code section (improvement guidance; constant once we have a prior solution)
+        if state.code and state.code.strip():
+            code_section = f'''Your task is to reason about how you could further improve the current construction and propose an improvement to the current solution. You may want to consider different algorithmic ideas, adjusting your heuristics, or sweeping your hyperparameters.
+Unless you make a meaningful improvement, you will not be rewarded.
+
+--- Current solution to improve upon ---
+{state_ctx}
+'''
+        else:
+            code_section = f'''Write code to optimize this construction.
+
+--- Current construction to improve upon ---
+{state_ctx}
+'''
+
+        return f'''
+{construction_section}
+{code_section}
 
 ## Budget & Resources
 - **Time budget**: 1000s for your code to run
@@ -187,9 +202,5 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 - `evaluate_erdos_solution()` and `initial_h_values` (an initial construction, if available) are pre-imported
 - Your function must complete within budget_s seconds and return the best solution found
 
-**Lower is better**. Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows C₅ ≤ 0.38080.
-
-{state_ctx}
-{construction_section}
-{code_section}
+Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 '''

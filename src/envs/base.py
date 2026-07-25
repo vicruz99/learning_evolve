@@ -106,8 +106,34 @@ class Environment(ABC):
         self.problem_type = config.problem_type
 
     @abstractmethod
+    def problem_intro(self) -> str:
+        """Zone 1 (top of prompt): the constant, parent-independent motivation and high-level
+        description of the problem.
+
+        This text is identical for every parent and every generation, so the loop places it first —
+        ahead of the ICL context block — which lets vLLM prefix-cache it across the whole run.
+        It must NOT embed anything that varies between parents (no current solution / construction).
+        """
+
+    @abstractmethod
+    def improvement_task(self) -> str:
+        """Zone 3 (bottom of prompt): the rules to honour for the next improvement, followed by the
+        current solution to improve upon.
+
+        The current solution (``initial_state.to_prompt(...)``) is the ONLY part of the prompt that
+        varies between parents, so it MUST be rendered LAST here. Everything above it — the intro,
+        the ICL context block the loop inserts, and these rules — then forms a shared prefix across
+        a generation's parents, so only the trailing current-solution differs.
+        """
+
     def get_question(self) -> str:
-        """Build the base prompt from the current ``initial_state``."""
+        """Full base prompt WITHOUT the ICL context block: ``problem_intro() + improvement_task()``.
+
+        In a real run the loop inserts the context block *between* the two zones (see
+        ``ICLRunner._build_prompt``); this combined form is kept for dry-runs and any caller that
+        does not weave in a block.
+        """
+        return self.problem_intro() + self.improvement_task()
 
     def is_maximize(self) -> bool:
         return True

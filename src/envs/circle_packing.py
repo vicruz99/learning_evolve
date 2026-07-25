@@ -104,14 +104,10 @@ class CirclePackingEnv(Environment):
     reward_function = CirclePackingReward
     state_type = State
 
-    def get_question(self) -> str:
-        """Build prompt from template"""
+    # --- Prompt zone 1: constant motivation + high-level problem description (cached across parents) ---
+    def problem_intro(self) -> str:
         assert self.problem_type in {"26", "32"}
         validator_src = inspect.getsource(validate_packing)
-        # Assume we do 26
-        target = 2.636 if self.problem_type == "26" else 2.940
-        state_ctx = self.initial_state.to_prompt(target, metric_name="sum of radii")
-
         return f"""You are an expert mathematician specializing in circle packing problems and computational geometry.
 
 Your task is to pack {self.problem_type} circles in a unit square [0,1]×[0,1] to maximize the sum of radii.
@@ -120,10 +116,16 @@ We will run the below validation function (read-only, do not modify this):
 ```python
 {validator_src}
 ```
+"""
 
-{state_ctx}
+    # --- Prompt zone 3: rules + the current packing to improve (rendered LAST, varies per parent) ---
+    def improvement_task(self) -> str:
+        assert self.problem_type in {"26", "32"}
+        target = 2.636 if self.problem_type == "26" else 2.940
+        state_ctx = self.initial_state.to_prompt(target, metric_name="sum of radii")
 
-Reason about how you could further improve this packing. Consider:
+        return f"""
+Reason about how you could further improve the current packing (shown at the end of this prompt). Consider:
 - Are circles placed optimally near boundaries and corners?
 - Could a different arrangement (hexagonal, nested, hybrid) yield better results?
 - Are there gaps that could be filled with repositioned or resized circles?
@@ -138,6 +140,9 @@ Rules:
 - Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions.
 - No filesystem or network IO.
 - You need to get really creative and think from first principles.
+
+--- Current packing solution to improve upon ---
+{state_ctx}
 
 Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 """
