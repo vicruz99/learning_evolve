@@ -31,12 +31,23 @@ def init_ray(num_cpus_per_task: int, num_persistent_workers: int = 0) -> None:
     if not ray.is_initialized():
         # namespace= silences the "detached actor in an anonymous namespace" warning; the other
         # flags drop the dashboard URL line and per-worker log spam from the console.
-        ray.init(
+        common = dict(
             namespace=RAY_NAMESPACE,
             include_dashboard=False,
             log_to_driver=False,
             logging_level=logging.WARNING,
         )
+        # Prefer a shared head started out-of-band (`ray start --head`): every concurrent experiment
+        # then connects to ONE 96-CPU pool + one cpu_scheduler, so Ray caps *total* grading across all
+        # runs (no core oversubscription) and simultaneous launches don't each boot their own head
+        # (which deadlocks). address="auto" reads the local head's address file — no RAY_ADDRESS env
+        # needed. If no shared head is running, fall back to a private per-run cluster (original path).
+        try:
+            ray.init(address="auto", **common)
+            logger.info("Connected to shared Ray head (address=auto).")
+        except ConnectionError:
+            ray.init(**common)
+            logger.info("No shared Ray head found; started a private Ray cluster for this run.")
 
     try:
         ray.get_actor("cpu_scheduler")

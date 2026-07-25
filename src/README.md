@@ -63,6 +63,31 @@ python run_icl.py --problem circle_packing_26 --context-strategy best --n-contex
 `--dry-run` builds and prints one assembled prompt (base question + context block) and exits — no
 server/Ray needed. A copy-paste log of the actual experiment commands lives in `docs/ICL_RUNS.md`.
 
+### Running several experiments at once (shared Ray server)
+
+By default each `run_icl.py` starts its **own** private Ray cluster. Launching several at the same
+instant is then a problem: each one grabs all CPU cores (oversubscribing the box), and their Ray
+heads can deadlock while booting simultaneously. To run experiments concurrently, start **one shared
+Ray head first** — same idea as the vLLM server: launch it once, every run connects to it.
+
+```bash
+cd .../src
+.venv/bin/ray start --head --disable-usage-stats   # once per session, BEFORE launching runs
+# ... now launch as many run_icl.py as you like, even all at once ...
+.venv/bin/ray stop                                 # when you're done (optional)
+```
+
+Nothing else to do — `run_icl.py` **auto-detects** the shared head and connects to it (via
+`address="auto"` in `sandbox/ray_setup.init_ray`; no `RAY_ADDRESS` to export). If no head is running
+it silently falls back to a private cluster, so single runs work exactly as before. With one shared
+head all experiments draw from a single 96-CPU pool, so Ray caps *total* grading across every run
+(no core oversubscription) and simultaneous launches no longer race.
+
+**Caveat — mixing problem families.** The shared CPU scheduler is sized by the *first* run's
+cpus-per-task (`circle_packing`/`erdos`/`toy` = 1, `ac1`/`ac2` = 2). Running the *same* family
+concurrently is optimal. If you switch between a 1-cpu and a 2-cpu family on the same head, restart
+it (`.venv/bin/ray stop && .venv/bin/ray start --head`) so the scheduler re-sizes.
+
 ### Options (`python run_icl.py --help` for the full list)
 
 **Problem / output**

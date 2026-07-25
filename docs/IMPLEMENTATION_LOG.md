@@ -369,3 +369,30 @@ healthy run in `ep_poll`. Parallel runs ARE fine once **staggered** (~120 s apar
 sequentially — each then gets an isolated cluster (session dir keyed by pid, random ports); the
 earlier 3-way run only worked because its launches were ~5 min apart. A code-level fix would cap
 `num_cpus` / prestart workers in `sandbox/ray_setup.init_ray`.
+
+---
+
+## 2026-07-25 — Shared Ray head for concurrent experiments (`init_ray` auto-connect)
+
+**Built** — `sandbox/ray_setup.init_ray` now tries `ray.init(address="auto")` first and only falls
+back to a private `ray.init()` if that raises `ConnectionError`. So if a shared head was started
+out-of-band (`ray start --head`), every `run_icl.py` **auto-connects** to it; otherwise single runs
+behave exactly as before. No `RAY_ADDRESS` env needed (verified both paths: private fallback on a
+clean box → random-port GCS; shared head up → connects to `:6379`, and the head persists after the
+run exits).
+
+**Why** — this is the fix for the simultaneous-launch hang + N× core oversubscription from the prior
+entry. One shared head = one 96-CPU pool, so Ray's own `num_cpus` admission caps *total* grading
+across **all** concurrent experiments (each `run_program` is `ray.remote(num_cpus=num_cpus_per_task)`),
+and there's no per-run head boot to race. Chose the "start it yourself, like the vLLM server" model
+(documented in `src/README.md` + memory) over an env-activation hook — simpler, and the user keeps
+explicit control. Ritual: `.venv/bin/ray start --head --disable-usage-stats` once per session, launch
+runs, `.venv/bin/ray stop` when done.
+
+**Known caveat (not yet addressed)** — the detached `cpu_scheduler` actor is created once with the
+*first* run's `num_cpus_per_task` and reused by name (`"cpu_scheduler"`); it partitions cores into
+fixed-size groups. So concurrent **mixed families** (circle/erdos = 1 cpu, ac = 2 cpu) share a
+wrong-sized scheduler (functional — Ray admission still bounds total load — but suboptimal pinning /
+throughput). Same-family concurrent is optimal. Workaround: `ray stop && ray start` when switching
+families. Proper fix (deferred): name the actor `cpu_scheduler_{num_cpus_per_task}` in
+`_get_scheduler` + `run_program` so each family self-sizes.
