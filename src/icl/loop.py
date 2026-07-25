@@ -178,15 +178,26 @@ class ICLRunner:
                     f"context={k}/{N}{shortfall}, prompt~{len(prompt)//4} tok)")
 
         t0 = time.perf_counter()
+        multi_chunk = len(sizes) > 1
+        graded_done = 0  # completions graded so far in this group (across concurrent chunks)
 
         async def _gen_grade_chunk(sz: int):
             """Generate ``sz`` completions in one request, then grade them the moment they arrive.
             Running these coroutines concurrently overlaps one chunk's grading (CPU/sandbox) with
             another chunk's still-in-flight generation (GPU)."""
+            nonlocal graded_done
             comps = await self.llm.generate(
                 prompt, n=sz, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
             )
+            if multi_chunk:
+                logger.info(f"gen {gen} p{slot}: chunk returned ({sz} completion(s)), grading "
+                            f"[{graded_done}/{cfg.group_size} graded so far]")
             res = await asyncio.gather(*[env.rollout_step(c, gen) for c in comps])
+            if multi_chunk:
+                graded_done += len(res)
+                nv = sum(1 for r in res if r.correctness > 0 and r.next_state is not None)
+                logger.info(f"gen {gen} p{slot}: chunk graded ({nv}/{len(res)} valid) "
+                            f"[{graded_done}/{cfg.group_size} graded]")
             return comps, res
 
         try:

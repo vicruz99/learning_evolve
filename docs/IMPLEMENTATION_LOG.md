@@ -278,3 +278,48 @@ never *fails*; and/or drop the double-process nesting). Head-to-head timing run 
 - ✅ Corrected the mental model of when grading starts (co-batching → simultaneous returns).
 - 📝 Captured deferred evaluation decisions: shared-Ray-cluster for parallel runs, keep+warn CPU
   timeout, eval_timeout untouched, `ac` cores to verify, warm start too brittle for now.
+
+---
+
+## 2026-07-25 — Sweep: `max_gen_concurrency` × `grade_chunk_size` (circle_packing_26)
+
+**Question:** for gpt-oss-120b on **2×A100**, `--reasoning-effort medium`, fixed shape
+6 parents × 15 = 90 candidates/gen, `n_context=20` — what `(max_gen_concurrency, grade_chunk_size)`
+minimizes wall time? Rough answer only, extremes, few runs.
+
+**Method:** 4 runs, sequential (one owns the box), 3 gens each, 25-min safety cap. Metric =
+**per-generation wall** (all runs completed gen 0 cleanly; the cap truncated later gens — each gen is
+~740 s so 3 gens can't fit in 25 min, expected). `grade_chunk_size=15` (= whole group, no pipelining)
+collapses the concurrency axis (only 6 requests), so the meaningful corners are the extremes below.
+
+| grade_chunk_size | max_gen_concurrency | seqs co-batched on GPU | gen-0 wall | valid |
+|---|---|---|---|---|
+| 15 | 6  | 90 (all at once)   | **739 s** | 53/90 |
+| 1  | 90 | 90 (all at once)   | 746 s | 58/90 |
+| 1  | 20 | 20 (waves of 20)   | 762 s | 56/90 |
+| 1  | 6  | 6  (waves of 6)    | 787 s | 57/90 |
+
+**Verdict — the knobs barely matter for speed on this problem (~6 % spread total):**
+- **Generation dominates (~740 s/gen); grading is cheap.** So `grade_chunk_size` — whose only job is
+  to overlap grading with generation — buys ~nothing here; `chunk=1/conc=90` was even ~7 s *slower*
+  than the no-chunk control (noise).
+- **The 2×A100 is already saturated at conc≈20.** Adding sequences (90) doesn't speed each up; cutting
+  to 20 doesn't slow them, you just pay a slightly longer wave *tail*. Only **conc=6 genuinely starves
+  the GPU** (6 seqs can't fill it + 15 sequential waves) and even that is only +6 %.
+- Note: `conc=6` did **not** under-utilize when `chunk=15` (still 90 seqs on the GPU). Only
+  `chunk=1 + conc=6` starves it. (Corrected an earlier wrong hunch that low conc always underutilizes.)
+
+**Recommendation:** for fastest wall time, **max out concurrency and don't chunk** — set
+`--max-gen-concurrency = groups_per_batch × group_size` (90 here) and leave `--grade-chunk-size` at
+default (whole group). Anything `conc ≥ 20` is within 3 % of optimal — not worth tuning further.
+
+**Caveats:**
+- **Circle-packing-specific.** Holds whenever *generation ≫ grading*. On `ac`/`erdos` a single eval
+  can take many minutes, so grade-as-ready (`chunk=1` + moderate conc) may genuinely cut wall there —
+  re-check before assuming. (Not yet run.)
+- **`grade_chunk_size=1` still earns its keep for observability** (live `[k/15 graded]` trickle,
+  added this session) at only ~3 % cost at conc=20 — a monitoring aid, not a speed lever.
+- **Sizing:** ~12–13 min per generation at this shape/effort → a real 3-gen run needs ~40 min; the
+  25-min cap was only to bound the sweep.
+- **`--reasoning-effort medium` produced 0 empty children** (vs ~70 % `no_code` empties at `high`,
+  where completions exhaust the 26 k token budget on hidden reasoning before emitting an answer).
