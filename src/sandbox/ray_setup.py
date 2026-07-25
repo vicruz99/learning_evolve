@@ -49,15 +49,14 @@ def init_ray(num_cpus_per_task: int, num_persistent_workers: int = 0) -> None:
             ray.init(**common)
             logger.info("No shared Ray head found; started a private Ray cluster for this run.")
 
-    try:
-        ray.get_actor("cpu_scheduler")
-        logger.debug("Found existing cpu_scheduler actor.")
-    except ValueError:
-        logger.debug("Creating new cpu_scheduler actor.")
-        CpuScheduler.options(
-            name="cpu_scheduler",
-            lifetime="detached",
-        ).remote(
-            num_cpus_per_task=num_cpus_per_task,
-            num_persistent_workers=num_persistent_workers,
-        )
+    # get_if_exists makes this atomic: returns the existing detached actor or creates it, with no
+    # get-then-create race. Without it, several runs starting against a shared head at the same instant
+    # can all see "no scheduler" and all try to create it -> all but one crash with "actor already exists".
+    CpuScheduler.options(
+        name="cpu_scheduler",
+        lifetime="detached",
+        get_if_exists=True,
+    ).remote(
+        num_cpus_per_task=num_cpus_per_task,
+        num_persistent_workers=num_persistent_workers,
+    )

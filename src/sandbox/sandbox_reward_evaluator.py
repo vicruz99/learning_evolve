@@ -69,18 +69,16 @@ def _get_scheduler(num_cpus_per_task: int, num_persistent_workers: int = 0):
     """Return the detached ``cpu_scheduler`` actor handle, looking it up (or creating it) once."""
     global _SCHEDULER_HANDLE
     if _SCHEDULER_HANDLE is None:
-        try:
-            _SCHEDULER_HANDLE = ray.get_actor("cpu_scheduler")
-            logger.debug("Found existing cpu_scheduler actor.")
-        except ValueError:
-            logger.debug("Creating new cpu_scheduler actor.")
-            _SCHEDULER_HANDLE = CpuScheduler.options(
-                name="cpu_scheduler",
-                lifetime="detached",
-            ).remote(
-                num_cpus_per_task=num_cpus_per_task,
-                num_persistent_workers=num_persistent_workers,
-            )
+        # get_if_exists: atomic get-or-create, so concurrent runs against a shared head don't race
+        # on the named actor (see sandbox.ray_setup.init_ray for the same guard).
+        _SCHEDULER_HANDLE = CpuScheduler.options(
+            name="cpu_scheduler",
+            lifetime="detached",
+            get_if_exists=True,
+        ).remote(
+            num_cpus_per_task=num_cpus_per_task,
+            num_persistent_workers=num_persistent_workers,
+        )
     return _SCHEDULER_HANDLE
 
 
