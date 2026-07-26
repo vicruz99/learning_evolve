@@ -61,11 +61,25 @@ class GenResult:
         return sum(1 for r in self.finish_reasons if r == "length")
 
 
+# Field name vLLM uses for the hidden chain of thought. It varies by version and reasoning parser
+# (`openai_gptoss` on vLLM 0.11 emits `reasoning`; the qwen/deepseek parsers emit `reasoning_content`),
+# and the OpenAI SDK passes unknown fields straight through, so we accept either.
+REASONING_FIELDS = ("reasoning_content", "reasoning")
+
+
+def _reasoning_of(message) -> str:
+    for field in REASONING_FIELDS:
+        value = getattr(message, field, None)
+        if value:
+            return value
+    return ""
+
+
 def _to_result(resp, latency: float) -> GenResult:
     """Convert a chat-completion response into a GenResult, tolerating omitted usage fields."""
     return GenResult(
         texts=[(c.message.content or "") for c in resp.choices],
-        reasonings=[(getattr(c.message, "reasoning_content", None) or "") for c in resp.choices],
+        reasonings=[_reasoning_of(c.message) for c in resp.choices],
         finish_reasons=[(c.finish_reason or "") for c in resp.choices],
         prompt_tokens=_int_attr(resp, "usage", "prompt_tokens"),
         cached_prompt_tokens=_int_attr(resp, "usage", "prompt_tokens_details", "cached_tokens"),
@@ -114,6 +128,7 @@ class VLLMClient:
         self.thinking_token_budget = thinking_token_budget
         self.enable_thinking = enable_thinking
         self._sem = asyncio.Semaphore(max_concurrency)
+        self._tokenize_unavailable = False   # so the /tokenize fallback warning fires at most once
 
     async def cache_counters(self) -> dict[str, int]:
         """Scrape the server's cumulative prefix-cache counters from ``/metrics``.
@@ -143,6 +158,42 @@ class VLLMClient:
         except Exception as e:                             # noqa: BLE001 - diagnostics only
             logger.debug(f"could not scrape {self._base_url} /metrics: {e}")
             return {}
+
+    async def count_tokens(self, texts: list[str]) -> list[int]:
+        """Exact token counts for ``texts``, via the server's ``/tokenize`` (the served model's own
+        tokenizer — no local transformers dependency).
+
+        Needed because this vLLM build omits ``usage.completion_tokens_details`` entirely, so the
+        server never reports how much of ``completion_tokens`` was reasoning. Counting the captured
+        reasoning text here turns that into a real measurement instead of a chars/4 estimate.
+
+        ``/tokenize`` takes one string per request, so these are fired concurrently (they are
+        CPU-only and fast). Empty strings cost no request. Returns ``[]`` if the endpoint is
+        unavailable, so callers fall back to the character-based estimate.
+        """
+        if not texts:
+            return []
+        url = self._base_url.rstrip("/").removesuffix("/v1") + "/tokenize"
+        sem = asyncio.Semaphore(16)          # separate from _sem: must not compete for generation slots
+
+        async def one(http: httpx.AsyncClient, text: str) -> int:
+            if not text:
+                return 0
+            async with sem:
+                resp = await http.post(url, json={"model": self.model, "prompt": text,
+                                                  "add_special_tokens": False})
+            resp.raise_for_status()
+            return int(resp.json()["count"])
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as http:
+                return list(await asyncio.gather(*[one(http, t) for t in texts]))
+        except Exception as e:                             # noqa: BLE001 - measurement only
+            if not self._tokenize_unavailable:
+                self._tokenize_unavailable = True
+                logger.warning(f"/tokenize unavailable ({e}); reasoning token counts will be "
+                               f"estimated from character counts instead")
+            return []
 
     async def generate(
         self,

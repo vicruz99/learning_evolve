@@ -45,7 +45,7 @@ vllm serve openai/gpt-oss-120b \
 | Flag | Recommendation | Why / expected effect |
 |---|---|---|
 | `--max-model-len` | **Size it to `largest_prompt + max_tokens`** (48000 at `n_context=20`) | 131000 is the one setting worth changing regardless. **Risk:** at `n_context=30` prompts reached ~103k, so 103k + 26k = 129k sits 2k under the ceiling — one context-growth away from truncated or rejected requests. Cap the prompt with `--max-context-tokens` too. |
-| `--reasoning-parser openai_gptoss` | **Add it** | Without it the server returns empty `reasoning_content` and counts reasoning silently inside `completion_tokens`. Costs nothing; makes `--save-reasoning` actually write traces (and is needed for later SFT/RL). |
+| `--reasoning-parser` | **Add it** (`openai_gptoss` for gpt-oss, `qwen3` for Qwen3) | Separates the chain of thought from the answer, so `--save-reasoning` writes traces and code extraction can't pick up a fence from the reasoning. **Note the field name differs by parser** — `openai_gptoss` emits `reasoning`, the qwen/deepseek parsers emit `reasoning_content`; the client accepts either. Verify with a raw `curl` of `/v1/chat/completions` before concluding a field is missing. |
 | `--max-num-seqs` | ≥ your peak in-flight sequences (128 is plenty) | Below the peak, the excess queues server-side instead of co-batching. Above it, harmless. |
 | `--max-num-batched-tokens` | 16384 | Helps the prefill fraction only, so ~1–2 % overall. Cheap, do it, don't expect more. |
 | `--tensor-parallel-size` | 2 for one shared server | MoE TP scaling is sublinear, but 2×TP1 servers would split the KV pool and 63 GB of MXFP4 weights on an 80 GB card leaves ~12 GB for KV — too tight for 17k-token prompts at batch. One TP=2 server shared by several runs beats two TP=1 servers. |
@@ -71,7 +71,7 @@ curl -s localhost:8001/metrics | grep -E "num_requests_(running|waiting)|prefix_
 | Flag | Recommendation | Why / expected effect |
 |---|---|---|
 | `--reasoning-effort` | `medium`; **A/B `low`** | The highest-leverage untested knob. Decode volume *is* wall-clock, so if `low` roughly halves reasoning tokens without hurting the best score, it's close to a 2× speedup. `high` is strictly bad: ~70 % `no_code` because completions exhaust the budget on hidden reasoning. |
-| `--max-tokens` | 26000 → **set near measured p99** | A request returns only when its **slowest** sequence finishes, so this sets the worst case for every parent. Any completion that hits the cap burns the full budget and usually emits no code. Read `tokens_per_completion` and `truncated` from one generation, then cut. |
+| `--max-tokens` | 26000 → **set near the measured `decode_p99`** | A request returns only when its **slowest** sequence finishes, so this sets the worst case for every parent. Any completion that hits the cap burns the full budget and usually emits no code. Read the `decode/candidate` log line (or `decode_p99` in `progress.csv`) from one generation and size off it — *not* off the mean, which sits below the median on this workload. |
 | `--max-gen-concurrency` | `groups_per_batch × group_size` | Anything ≥ 20 is within 3 % of optimal. Only `conc=6 + chunk=1` genuinely starves the GPU. Not worth tuning. |
 | `--grade-chunk-size` | Default (off) for circle_packing; `1` for `ac`/`erdos` | Its only job is overlapping grading with generation. Where generation ≫ grading it buys ~nothing (measured 7 s *slower*). Keep `1` in mind for observability (live `[k/15 graded]`) at ~3 % cost. |
 | `--eval-timeout` | 530 → **120** for circle_packing | p95 of valid solves is 72 s; 530 is 7× dead weight on the per-generation barrier whenever a straggler appears. Use `results/recheck_failures.py` to see what you'd lose first. |
@@ -120,10 +120,32 @@ GPU while the other grades. This is the largest available campaign-level win.
 Each generation logs, and `progress.csv` / `summary.json` / `events.jsonl` persist:
 
 ```
-gen 3 tokens | prompt 104,821 (91% cached) | decode 486,220 (5402/completion, 657 tok/s) | truncated 2/90
+gen 1 tokens | prompt 4,954 (75% cached) | decode 24,515 (3064/completion, 147 tok/s) | reasoning 12,084 + answer 12,431 (49% of decode is reasoning) | truncated 0/8
+gen 1 decode/candidate | p50 3,021 p90 4,298 p99 4,298 max 4,298 | max_tokens=8,000 (54% used by the longest) — size --max-tokens off p99, the tail gates each request
 ```
 
+Everything except the labelled `/completion` mean and the rates is a **total** for the generation.
+
+- **`reasoning` / `answer` split** — measured, not estimated: this vLLM build omits
+  `usage.completion_tokens_details`, so the reasoning text is counted with the served model's own
+  tokenizer via the server's `/tokenize`. Cost is ~0.7 s per 90-candidate generation (CPU-only on the
+  API server, overlapped with grading) ≈ 0.1 %. If the endpoint is unavailable it falls back to a
+  chars÷4 estimate, marked `~… est`, and warns once. Measured on circle_packing_26 at
+  `--reasoning-effort medium`: **reasoning is 49–70 % of all decode**, which is why
+  `--reasoning-effort` is the biggest single speed lever. (The chars÷4 estimate ran ~23 % low, so use
+  the real counts.)
+- **`decode/candidate` percentiles** — exact per-candidate `reasoning_tokens` + `answer_tokens` from
+  `events.jsonl`, summarised per generation (`decode_p50/p90/p99/max` in `progress.csv`). This is the
+  distribution to size `--max-tokens` from. Observed spread within one generation: **6.7×** (1,009 →
+  6,747 tokens), and the mean sat *below* the median — the tail is invisible in averages.
+  Kept out of the `usage` block deliberately: usage fields are summed into run totals, and summing
+  percentiles is meaningless.
 - `truncated` — completions with `finish_reason == "length"`. Non-zero fires a warning.
+- If a whole generation returns no reasoning text while `--save-reasoning` is on, a one-time warning
+  names the parser flag to add. That is a **correctness** matter, not just a lost trace: without a
+  parser the chain of thought stays inside `content`, and code extraction takes the last ```python
+  fence there — so a completion that fences code while thinking but not in its answer yields code
+  parsed out of the reasoning.
 - `% cached` — prefix-cache hit rate from the server's `/metrics`. **Server-global** (mixes concurrent
   runs) and counted **per sequence**, so `cache_queries ≈ n × prompt_tokens` — only the ratio means
   anything.

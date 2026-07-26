@@ -64,8 +64,23 @@ def _sum_usage(results: list[GenResult]) -> dict:
         "cached_prompt_tokens": sum(r.cached_prompt_tokens for r in results),
         "completion_tokens": sum(r.completion_tokens for r in results),
         "reasoning_tokens": sum(r.reasoning_tokens for r in results),
+        # Char count, not tokens: servers that expose the reasoning text often omit
+        # completion_tokens_details.reasoning_tokens, so this is the reliable volume signal.
+        "reasoning_chars": sum(len(x) for r in results for x in r.reasonings),
         "truncated": sum(r.truncated for r in results),
     }
+
+
+def _percentiles(values: list[int]) -> dict[str, int]:
+    """Per-candidate decode-length distribution. The MEAN is the wrong statistic for sizing
+    ``--max-tokens``: a vLLM request returns only when its slowest sequence finishes, so the tail is
+    what gates a generation. Nearest-rank (no interpolation) — these are token counts, not estimates."""
+    if not values:
+        return {}
+    ordered = sorted(values)
+    def at(p: float) -> int:
+        return ordered[min(len(ordered) - 1, int(p * len(ordered)))]
+    return {"p50": at(0.50), "p90": at(0.90), "p99": at(0.99), "max": ordered[-1]}
 
 
 def _counter_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
@@ -94,8 +109,14 @@ def _format_usage(u: dict, wall: float) -> str:
         f"decode {ct:,} ({ct / comps:.0f}/completion, {ct / max(wall, 1e-9):.0f} tok/s)",
     ]
     if u["reasoning_tokens"]:
-        parts.append(f"reasoning {u['reasoning_tokens']:,} "
-                     f"({100.0 * u['reasoning_tokens'] / max(ct, 1):.0f}% of decode)")
+        rt = u["reasoning_tokens"]
+        parts.append(f"reasoning {rt:,} + answer {max(0, ct - rt):,} "
+                     f"({100.0 * rt / max(ct, 1):.0f}% of decode is reasoning)")
+    elif u.get("reasoning_chars"):
+        # Reasoning text captured but neither the server nor /tokenize gave us a count: fall back to a
+        # chars/4 estimate, clearly marked, so the share of decode is still visible.
+        est = u["reasoning_chars"] // 4
+        parts.append(f"reasoning ~{est:,} est ({100.0 * est / max(ct, 1):.0f}% of decode)")
     parts.append(f"truncated {u['truncated']}/{u['completions']}")
     return " | ".join(parts)
 
@@ -141,6 +162,8 @@ class ICLRunner:
         self.tracker: ExperimentTracker | None = None
         self._gen_latencies: list[float] = []    # per-group generate() latencies, reset each generation
         self._gen_results: list[GenResult] = []  # every vLLM request of the current generation (token accounting)
+        self._gen_decode: list[int] = []          # per-candidate decode tokens this generation (percentiles)
+        self._reasoning_warned = False            # "server exposes no reasoning" warning fires at most once
         # Context pool: EVERY valid solution graded in prior generations, not just the PUCT top-k buffer.
         # Context selection draws from here so strategies (best_worst, contrastive, ...) can see genuine
         # low-scoring negatives that `topk_children` prunes out of the buffer. PUCT search is untouched.
@@ -281,9 +304,18 @@ class ICLRunner:
         results = [r for _, res in chunk_out for r in res]
         grp_dt = time.perf_counter() - t0
         self._gen_latencies.append(grp_dt)
+        # The server does not break completion_tokens into reasoning vs answer, so count the captured
+        # reasoning text with its own tokenizer. Written back onto each GenResult so the
+        # generation-level _sum_usage reports real tokens, not an estimate.
+        reasoning_tokens, answer_tokens = await self._count_decode_tokens(
+            gen_results, reasonings, completions)
+        # Per-candidate decode totals feed this generation's percentiles (the --max-tokens signal).
+        self._gen_decode.extend(r + a for r, a in zip(reasoning_tokens, answer_tokens))
         if self.tracker is not None:
             self.tracker.record_group(gen, slot, parent, prompt, completions, results,
                                       reasonings=reasonings, finish_reasons=finish_reasons,
+                                      reasoning_tokens=reasoning_tokens,
+                                      answer_tokens=answer_tokens,
                                       usage=_sum_usage(gen_results))
 
         valid = [r for r in results if r.correctness > 0 and r.next_state is not None]
@@ -292,6 +324,59 @@ class ICLRunner:
         logger.info(f"gen {gen} p{slot}: {len(completions)} gen+graded in {grp_dt:.1f}s | "
                     f"{len(valid)}/{len(results)} valid, best {spec.metric_name}={best_str}")
         return results
+
+    async def _count_decode_tokens(self, gen_results: list[GenResult], reasonings: list[str],
+                                   completions: list[str]) -> tuple[list[int], list[int]]:
+        """Exact per-candidate (reasoning_tokens, answer_tokens), counted with the served model's own
+        tokenizer via the server's ``/tokenize``.
+
+        The API reports ``usage`` per *request*, so per-candidate decode cost is otherwise invisible —
+        yet that is exactly what sets ``--max-tokens``, because a request returns only when its
+        slowest sequence finishes. Measured cost: ~0.7 s per 90-candidate generation (CPU-only on the
+        API server, off the GPU, and overlapped with grading), i.e. ~0.1 % of a generation.
+
+        Reasoning totals are mirrored onto ``gen_results`` so the generation-level ``_sum_usage``
+        reports real tokens; if a server ever reports ``reasoning_tokens`` itself, that authoritative
+        value wins and is left untouched.
+        """
+        if not any(reasonings) and not any(completions):
+            return [], []
+        # One gather for both lists: the calls are concurrent anyway, so this is a single round of work.
+        counts = await self.llm.count_tokens(reasonings + completions)
+        if not counts:
+            return [], []
+        split = len(reasonings)
+        r_counts, a_counts = counts[:split], counts[split:]
+        i = 0
+        for g in gen_results:
+            n = len(g.texts)
+            if not g.reasoning_tokens:
+                g.reasoning_tokens = sum(r_counts[i:i + n])
+            i += n
+        return r_counts, a_counts
+
+    def _warn_if_no_reasoning(self, usage: dict) -> None:
+        """Warn once if a whole generation came back with no reasoning text while we were asked to save it.
+
+        Almost always means the server has no reasoning parser for this model, which is not merely a
+        lost trace: the chain of thought then stays inside ``content``, and code extraction takes the
+        LAST ```python fence in ``content`` — so a completion that fences code while thinking but not
+        in its final answer silently yields code parsed out of the *reasoning*. Cheaper to catch here
+        than to debug as mysterious `invalid_result`s a generation later.
+        """
+        if self._reasoning_warned or not self.cfg.save_reasoning:
+            return
+        if not usage.get("completions") or usage.get("reasoning_chars"):
+            return
+        self._reasoning_warned = True
+        logger.warning(
+            f"--save-reasoning is on but all {usage['completions']} completions of this generation "
+            f"returned NO reasoning text (decode was {usage['completion_tokens']:,} tokens, so the "
+            f"model is reasoning — it just isn't being separated out). Launch the vLLM server with a "
+            f"reasoning parser for this model (gpt-oss: --reasoning-parser openai_gptoss; Qwen3: "
+            f"--reasoning-parser qwen3). Until then the chain of thought stays inside the answer text, "
+            f"which can make code extraction pick up a fence from the reasoning. "
+            f"Pass --no-save-reasoning to silence this.")
 
     async def run(self) -> None:
         cfg, spec = self.cfg, self.spec
@@ -350,6 +435,7 @@ class ICLRunner:
                 t_gen = time.perf_counter()
                 self._gen_latencies = []
                 self._gen_results = []
+                self._gen_decode = []
                 cache0 = await self.llm.cache_counters()
                 parents = self.sampler.sample_states(cfg.groups_per_batch)
                 logger.info(f"gen {gen}/{cfg.num_generations - 1} | sampling {len(parents)} parents "
@@ -368,7 +454,9 @@ class ICLRunner:
                 usage = _sum_usage(self._gen_results)
                 usage.update(_counter_delta(cache0, await self.llm.cache_counters()))
                 gen_wall = time.perf_counter() - t_gen
-                self.tracker.end_generation(gen, self.sampler, usage=usage, wall_seconds=gen_wall)
+                decode_pct = _percentiles(self._gen_decode)
+                self.tracker.end_generation(gen, self.sampler, usage=usage, wall_seconds=gen_wall,
+                                            decode_percentiles=decode_pct)
 
                 n_valid = sum(1 for group in group_results for r in group if r.correctness > 0)
                 n_total = sum(len(group) for group in group_results)
@@ -384,6 +472,14 @@ class ICLRunner:
                     f"| {gen_wall:.1f}s (generate {gen_latency:.1f}s)"
                 )
                 logger.info(f"gen {gen} tokens | {_format_usage(usage, gen_wall)}")
+                if decode_pct:
+                    headroom = 100.0 * decode_pct["max"] / cfg.max_tokens
+                    logger.info(
+                        f"gen {gen} decode/candidate | p50 {decode_pct['p50']:,} p90 "
+                        f"{decode_pct['p90']:,} p99 {decode_pct['p99']:,} max {decode_pct['max']:,} "
+                        f"| max_tokens={cfg.max_tokens:,} ({headroom:.0f}% used by the longest) "
+                        f"— size --max-tokens off p99, the tail gates each request")
+                self._warn_if_no_reasoning(usage)
                 if usage["truncated"]:
                     logger.warning(
                         f"gen {gen}: {usage['truncated']}/{usage['completions']} completions hit the "

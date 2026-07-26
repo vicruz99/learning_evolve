@@ -42,7 +42,7 @@ MAX_MSG_CHARS = 4000
 #     cache_hits by prompt_tokens.
 #   * they are server-GLOBAL, so they mix traffic when several runs share one vLLM server.
 USAGE_KEYS = ("requests", "completions", "prompt_tokens", "cached_prompt_tokens",
-              "completion_tokens", "reasoning_tokens", "truncated",
+              "completion_tokens", "reasoning_tokens", "reasoning_chars", "truncated",
               "cache_queries", "cache_hits")
 
 
@@ -55,10 +55,15 @@ def _usage_derived(u: dict) -> dict:
     pt, ct, comps = u.get("prompt_tokens", 0), u.get("completion_tokens", 0), u.get("completions", 0)
     queries, hits = u.get("cache_queries", 0), u.get("cache_hits", 0)
     hit_rate = (hits / queries) if queries else (u.get("cached_prompt_tokens", 0) / pt if pt else 0.0)
+    rt = u.get("reasoning_tokens", 0)
     return {
         **{k: u.get(k, 0) for k in USAGE_KEYS},
         "cache_hit_rate": round(hit_rate, 4),
         "tokens_per_completion": round(ct / comps, 1) if comps else 0.0,
+        # The reasoning/answer split of decode -- the number that says how much of the wall clock went
+        # to hidden thinking. answer_tokens is the remainder, so it absorbs any template/special tokens.
+        "answer_tokens": max(0, ct - rt),
+        "reasoning_share": round(rt / ct, 4) if ct else 0.0,
     }
 
 
@@ -138,6 +143,8 @@ class ExperimentTracker:
             # token accounting (0 if the server reports no usage) — see USAGE_KEYS
             "prompt_tokens", "cached_prompt_tokens", "cache_hit_rate", "completion_tokens",
             "reasoning_tokens", "tokens_per_completion", "truncated",
+            # per-candidate decode distribution — the tail is what sizes --max-tokens
+            "decode_p50", "decode_p90", "decode_p99", "decode_max",
         ]
         if not os.path.exists(self._progress_path):
             with open(self._progress_path, "w", newline="") as f:
@@ -195,11 +202,15 @@ class ExperimentTracker:
 
     def record_group(self, gen: int, slot: int, parent, prompt: str, completions: list, results: list,
                      reasonings: list | None = None, finish_reasons: list | None = None,
+                     reasoning_tokens: list | None = None, answer_tokens: list | None = None,
                      usage: dict | None = None) -> None:
-        """Record one parent's group. ``reasonings`` / ``finish_reasons`` are per candidate (same order
-        as ``completions``); ``usage`` is the group's request-level token accounting (see _sum_usage)."""
+        """Record one parent's group. ``reasonings`` / ``finish_reasons`` / ``reasoning_tokens`` /
+        ``answer_tokens`` are per candidate (same order as ``completions``); ``usage`` is the group's
+        request-level token accounting (see _sum_usage)."""
         reasonings = reasonings or []
         finish_reasons = finish_reasons or []
+        reasoning_tokens = reasoning_tokens or []
+        answer_tokens = answer_tokens or []
         if usage:
             for k, v in usage.items():
                 self._cur["usage"][k] = self._cur["usage"].get(k, 0) + v
@@ -219,6 +230,12 @@ class ExperimentTracker:
             self.total_candidates += 1
             reasoning = reasonings[child_idx] if child_idx < len(reasonings) else ""
             finish_reason = finish_reasons[child_idx] if child_idx < len(finish_reasons) else ""
+            r_tokens = reasoning_tokens[child_idx] if child_idx < len(reasoning_tokens) else None
+            a_tokens = answer_tokens[child_idx] if child_idx < len(answer_tokens) else None
+            # Total decode this candidate cost. This is the per-candidate number to build a
+            # distribution from when sizing --max-tokens; it may sum slightly below a request's
+            # usage.completion_tokens, which also covers per-sequence template/special tokens.
+            d_tokens = None if r_tokens is None or a_tokens is None else r_tokens + a_tokens
             completion_file = None
             if self.save_completions:
                 completion_file = os.path.join(pdir, f"child_{child_idx:02d}.txt")
@@ -261,6 +278,8 @@ class ExperimentTracker:
                 "sol": sol,
                 "failure_type": failure_type,
                 "finish_reason": finish_reason,   # "length" = truncated by max_tokens
+                "reasoning_tokens": r_tokens,
+                "answer_tokens": a_tokens,
                 "msg": res.msg[:MAX_MSG_CHARS],
                 "completion_file": self._rel(completion_file) if completion_file else None,
             }
@@ -282,6 +301,10 @@ class ExperimentTracker:
                 "msg": res.msg[:MAX_MSG_CHARS],
                 "completion_chars": len(comp),
                 "reasoning_chars": len(reasoning),
+                # exact, from the server's /tokenize; None if that endpoint was unavailable
+                "reasoning_tokens": r_tokens,
+                "answer_tokens": a_tokens,
+                "decode_tokens": d_tokens,
                 "completion_file": self._rel(completion_file) if completion_file else None,
                 "prompt_file": pinfo["prompt_file"],
             }) + "\n")
@@ -322,7 +345,8 @@ class ExperimentTracker:
         return sol
 
     def end_generation(self, gen: int, sampler, usage: dict | None = None,
-                       wall_seconds: float | None = None) -> None:
+                       wall_seconds: float | None = None,
+                       decode_percentiles: dict | None = None) -> None:
         try:
             stats = sampler.get_sample_stats()
         except Exception:
@@ -354,6 +378,9 @@ class ExperimentTracker:
             "wall_seconds": round(wall_seconds, 1) if wall_seconds is not None else None,
             "failure_types": dict(cur.get("failure_types", {})),
             "usage": gen_usage,
+            # Kept OUT of `usage` on purpose: usage fields are summed into run totals, and summing
+            # percentiles is meaningless. Per-candidate decode tokens; see icl.loop._percentiles.
+            "decode_percentiles": dict(decode_percentiles or {}),
         }
         meta = {
             "generation": gen,
@@ -372,6 +399,7 @@ class ExperimentTracker:
                 gen_usage["cache_hit_rate"], gen_usage["completion_tokens"],
                 gen_usage["reasoning_tokens"], gen_usage["tokens_per_completion"],
                 gen_usage["truncated"],
+                *(gen_stats["decode_percentiles"].get(k) for k in ("p50", "p90", "p99", "max")),
             ])
 
         self._per_gen.append(gen_stats)

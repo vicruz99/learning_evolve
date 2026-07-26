@@ -499,3 +499,65 @@ lever is generating fewer tokens, and the biggest campaign lever is 2 runs shari
 - ✅ `--exclude-parent` / `--no-exclude-parent` landed; shared-prefix effect measured (50 % → 92 %).
 - ✅ Gen-0 "no seed in context" invariant pinned by tests; `dedupe_seeds` identified as dead.
 - ✅ Perf knobs consolidated in `docs/PERF_KNOBS.md`; 38 tests pass.
+
+---
+
+## 2026-07-26 — Real reasoning/answer token split + per-candidate decode percentiles
+
+**Bug found: we were reading the wrong field name.** vLLM's `openai_gptoss` reasoning parser emits
+`message.reasoning`, **not** `message.reasoning_content` (the qwen/deepseek parsers use the latter).
+`vllm_client` only checked `reasoning_content`, so `reasoning` came back `""` and the earlier
+conclusion "this server doesn't expose reasoning" was **wrong** — it was exposing it all along, under
+another name. Fixed with `_reasoning_of` accepting either (`REASONING_FIELDS`). Lesson recorded: dump
+the raw `/v1/chat/completions` JSON before concluding a field is missing; the OpenAI SDK passes
+unknown fields straight through, so a `getattr` on the wrong name is indistinguishable from absence.
+Corollary: it is still unproven whether `--reasoning-parser openai_gptoss` is strictly *required* —
+the pre-relaunch probe checked the same wrong field, so that comparison was invalid. Keep the flag
+(it's free and it guarantees the CoT stays out of `content`).
+
+**`reasoning_tokens` was 0 while reasoning was clearly happening.** Cause: this build omits
+`usage.completion_tokens_details` entirely, so the server never reports the reasoning/answer split of
+`completion_tokens`. Fixed by counting the captured text with the served model's own tokenizer via the
+server's **`/tokenize`** endpoint (no local `transformers` dependency):
+- `VLLMClient.count_tokens(texts)` — one request per string (the endpoint rejects lists), fired
+  concurrently under its own semaphore so it never competes for generation slots. Best-effort:
+  falls back to a chars÷4 estimate (marked `~… est`) and warns once.
+- `ICLRunner._count_decode_tokens` counts reasoning **and** answer text per candidate, mirrors the
+  per-request reasoning total back onto each `GenResult` so generation-level `_sum_usage` reports real
+  tokens, and yields per-candidate `reasoning_tokens` / `answer_tokens` / `decode_tokens` for
+  `events.jsonl`. If a server ever reports `reasoning_tokens` itself, that value wins and the extra
+  work is skipped.
+- Derived per generation: `answer_tokens` (= `completion_tokens − reasoning_tokens`, so it absorbs
+  per-sequence template/special tokens) and `reasoning_share`. **Verified reconciliation:**
+  17,447+8,187 = 25,634 and 12,084+12,431 = 24,515, exactly matching `completion_tokens`.
+- **Measured overhead: 0.72 s for 180 calls** (90 candidates × 2) on real completion texts, i.e.
+  ~0.1 % of a 740 s generation. CPU-only on the API server, off the GPU, overlapped with grading.
+- The chars÷4 estimate it replaced was **~23 % low** (10,982 est vs 13,527 real); chars-per-token
+  ranges 3.2–3.9 on this content, so the heuristic was biased, not just noisy.
+
+**Per-candidate decode percentiles (`decode_p50/p90/p99/max`)** — new `icl.loop._percentiles`
+(nearest-rank, no interpolation: these are token counts). Logged per generation next to the configured
+cap, and written to `progress.csv` + `summary.json.decode_percentiles`. Deliberately **not** inside
+`usage`, whose fields are summed into run totals — summing percentiles is meaningless.
+
+**Why it matters (the point of the whole exercise):** a vLLM request returns only when its *slowest*
+sequence finishes, so the tail sizes `--max-tokens`, not the mean. Measured in one 8-candidate
+generation: decode ranged **1,009 → 6,747 tokens (6.7×)**, and `tokens_per_completion` (mean 3,204)
+sat *below* `decode_p50` (3,602) — the distribution is left-skewed, so averages actively mislead here.
+
+**Also confirmed live:** reasoning is **49–70 % of all decode** at `--reasoning-effort medium`, so the
+`--reasoning-effort low` A/B is the highest-value speed experiment available. The truncation warning
+fired for real (`1/6 completions hit the max_tokens=8000 cap`). Reasoning traces show the model
+explicitly consuming the ICL block ("From prior solutions best sum 2.488826 … The target 2.636
+better"), which is direct evidence the context is being reasoned over rather than ignored.
+
+**Verified** — `runs/test_reasoning` (circle_packing_26, 2 gens × 2 parents × 4): reasoning + answer
+files written per candidate with clean separation (no CoT in the answer file), both generations
+reconciling exactly, percentiles in `progress.csv`. 40 tests pass (2 new: nearest-rank percentiles,
+reasoning field-name fallback).
+
+**Gotcha worth remembering** — with a shared Ray head up, runs must use the env that *started* it:
+the head came from `src/.venv` (Python 3.12.12) while conda `phd-r2` is 3.12.11, and Ray refuses to
+attach across a patch-version mismatch. Worse, `init_ray` only falls back to a private cluster on
+`ConnectionError`, so the version mismatch (a `RuntimeError`) kills the run instead of degrading.
+Widening that `except` is an open suggestion.

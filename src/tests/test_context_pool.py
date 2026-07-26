@@ -134,3 +134,31 @@ def test_exclude_id_is_the_only_parent_input_to_a_strategy():
         first = [s.id for s in strategy(pool, 3, params, exclude_id=None).all()]
         again = [s.id for s in strategy(pool, 3, params, exclude_id=None).all()]
         assert first == again, f"{name} is not deterministic given a fixed context_seed"
+
+
+# --- decode-token accounting -----------------------------------------------------------------------
+def test_percentiles_use_nearest_rank_and_handle_small_n():
+    from icl.loop import _percentiles
+    assert _percentiles([]) == {}
+    assert _percentiles([5]) == {"p50": 5, "p90": 5, "p99": 5, "max": 5}
+    vals = list(range(1, 101))                    # 1..100
+    pct = _percentiles(vals)
+    assert pct["p50"] == 51 and pct["p90"] == 91 and pct["max"] == 100
+    # no interpolation: every reported value is one of the observed token counts
+    assert all(v in vals for v in pct.values())
+
+
+def test_reasoning_field_name_fallback():
+    """vLLM names the field `reasoning` (gpt-oss parser) or `reasoning_content` (qwen/deepseek);
+    reading only one silently loses the trace."""
+    from generation.vllm_client import _reasoning_of
+
+    class Msg:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    assert _reasoning_of(Msg(reasoning="via reasoning")) == "via reasoning"
+    assert _reasoning_of(Msg(reasoning_content="via content")) == "via content"
+    assert _reasoning_of(Msg(reasoning_content="wins", reasoning="loses")) == "wins"
+    assert _reasoning_of(Msg(content="answer only")) == ""
+    assert _reasoning_of(Msg(reasoning=None)) == ""
