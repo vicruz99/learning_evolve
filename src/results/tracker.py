@@ -33,6 +33,34 @@ from typing import Any
 # indistinguishable. See sandbox.classify_failure.
 MAX_MSG_CHARS = 4000
 
+# Token-accounting fields summed per generation and per run (produced by icl.loop._sum_usage).
+# All are exact server-reported counts; any the server omits stay 0.
+#
+# cache_queries/cache_hits come from the server's /metrics counters. Two things about them:
+#   * they are counted PER SEQUENCE, while prompt_tokens counts each prompt once per request, so with
+#     n>1 queries ~= n * prompt_tokens. Only their RATIO (cache_hit_rate) is meaningful — never divide
+#     cache_hits by prompt_tokens.
+#   * they are server-GLOBAL, so they mix traffic when several runs share one vLLM server.
+USAGE_KEYS = ("requests", "completions", "prompt_tokens", "cached_prompt_tokens",
+              "completion_tokens", "reasoning_tokens", "truncated",
+              "cache_queries", "cache_hits")
+
+
+def _usage_derived(u: dict) -> dict:
+    """Add the two ratios worth reading at a glance: prefix-cache hit rate and decode per completion.
+
+    The hit rate prefers the /metrics counters; some vLLM builds report ``cached_tokens = 0`` in the
+    per-request usage even while the cache is serving most of the prefill.
+    """
+    pt, ct, comps = u.get("prompt_tokens", 0), u.get("completion_tokens", 0), u.get("completions", 0)
+    queries, hits = u.get("cache_queries", 0), u.get("cache_hits", 0)
+    hit_rate = (hits / queries) if queries else (u.get("cached_prompt_tokens", 0) / pt if pt else 0.0)
+    return {
+        **{k: u.get(k, 0) for k in USAGE_KEYS},
+        "cache_hit_rate": round(hit_rate, 4),
+        "tokens_per_completion": round(ct / comps, 1) if comps else 0.0,
+    }
+
 
 def _git_sha() -> str | None:
     try:
@@ -64,10 +92,12 @@ def _native(value: float | None, maximize: bool) -> float | None:
 
 
 class ExperimentTracker:
-    def __init__(self, run_dir: str, cfg_dict: dict[str, Any], spec, save_completions: bool = True):
+    def __init__(self, run_dir: str, cfg_dict: dict[str, Any], spec, save_completions: bool = True,
+                 save_reasoning: bool = True):
         self.run_dir = run_dir
         self.spec = spec
         self.save_completions = save_completions
+        self.save_reasoning = save_reasoning
         self.problem = cfg_dict.get("problem")
         self.metric = spec.metric_name
         self.maximize = spec.maximize
@@ -104,6 +134,10 @@ class ExperimentTracker:
         self._progress_cols = [
             "generation", "valid_candidates", "failed_candidates", "success_rate",
             "gen_best_score", "best_so_far_score", "buffer_size", "puct_expansions",
+            "wall_seconds",
+            # token accounting (0 if the server reports no usage) — see USAGE_KEYS
+            "prompt_tokens", "cached_prompt_tokens", "cache_hit_rate", "completion_tokens",
+            "reasoning_tokens", "tokens_per_completion", "truncated",
         ]
         if not os.path.exists(self._progress_path):
             with open(self._progress_path, "w", newline="") as f:
@@ -116,6 +150,7 @@ class ExperimentTracker:
         self.total_success = 0
         self.total_failed = 0
         self._failure_types: dict[str, int] = {}   # run-total counts by failure_type (failed only)
+        self._usage: dict[str, int] = dict.fromkeys(USAGE_KEYS, 0)   # run-total token accounting
         self.best: dict | None = None          # ranked by value; native shown for display
         self.worst_valid: dict | None = None
         self._per_gen: list[dict] = []
@@ -145,6 +180,7 @@ class ExperimentTracker:
             "valid_candidates": 0, "failed_candidates": 0,
             "gen_best_value": None, "gen_best_score": None, "gen_best_sol": None,
             "failure_types": {},        # per-generation counts by failure_type (failed only)
+            "usage": dict.fromkeys(USAGE_KEYS, 0),
             "parents": {},
         }
         for slot, p in enumerate(parents):
@@ -157,7 +193,17 @@ class ExperimentTracker:
                 "children": [],
             }
 
-    def record_group(self, gen: int, slot: int, parent, prompt: str, completions: list, results: list) -> None:
+    def record_group(self, gen: int, slot: int, parent, prompt: str, completions: list, results: list,
+                     reasonings: list | None = None, finish_reasons: list | None = None,
+                     usage: dict | None = None) -> None:
+        """Record one parent's group. ``reasonings`` / ``finish_reasons`` are per candidate (same order
+        as ``completions``); ``usage`` is the group's request-level token accounting (see _sum_usage)."""
+        reasonings = reasonings or []
+        finish_reasons = finish_reasons or []
+        if usage:
+            for k, v in usage.items():
+                self._cur["usage"][k] = self._cur["usage"].get(k, 0) + v
+
         pinfo = self._cur["parents"].setdefault(slot, {
             "slot": slot, "parent_sol": self._parent_ref(parent), "parent_state_id": parent.id,
             "parent_score": _native(parent.value, self.maximize), "prompt_file": None, "children": [],
@@ -171,11 +217,18 @@ class ExperimentTracker:
 
         for child_idx, (comp, res) in enumerate(zip(completions, results)):
             self.total_candidates += 1
+            reasoning = reasonings[child_idx] if child_idx < len(reasonings) else ""
+            finish_reason = finish_reasons[child_idx] if child_idx < len(finish_reasons) else ""
             completion_file = None
             if self.save_completions:
                 completion_file = os.path.join(pdir, f"child_{child_idx:02d}.txt")
                 with open(completion_file, "w") as f:
                     f.write(comp)
+            # Reasoning goes to its OWN file, never appended to child_NN.txt: recheck_failures.py
+            # re-extracts code from the completion file, so that file must stay the raw answer text.
+            if self.save_reasoning and reasoning:
+                with open(os.path.join(pdir, f"child_{child_idx:02d}.reasoning.txt"), "w") as f:
+                    f.write(reasoning)
 
             sol = None
             if res.correctness > 0 and res.next_state is not None:
@@ -207,6 +260,7 @@ class ExperimentTracker:
                 "raw_score": res.raw_score if res.correctness > 0 else None,
                 "sol": sol,
                 "failure_type": failure_type,
+                "finish_reason": finish_reason,   # "length" = truncated by max_tokens
                 "msg": res.msg[:MAX_MSG_CHARS],
                 "completion_file": self._rel(completion_file) if completion_file else None,
             }
@@ -224,8 +278,10 @@ class ExperimentTracker:
                 "reward": res.reward,
                 "sol": sol,
                 "failure_type": failure_type,
+                "finish_reason": finish_reason,
                 "msg": res.msg[:MAX_MSG_CHARS],
                 "completion_chars": len(comp),
+                "reasoning_chars": len(reasoning),
                 "completion_file": self._rel(completion_file) if completion_file else None,
                 "prompt_file": pinfo["prompt_file"],
             }) + "\n")
@@ -265,7 +321,8 @@ class ExperimentTracker:
         self._manifest.flush()
         return sol
 
-    def end_generation(self, gen: int, sampler) -> None:
+    def end_generation(self, gen: int, sampler, usage: dict | None = None,
+                       wall_seconds: float | None = None) -> None:
         try:
             stats = sampler.get_sample_stats()
         except Exception:
@@ -279,6 +336,11 @@ class ExperimentTracker:
         success_rate = (n_valid / total) if total else 0.0
         best_score = self.best["score"] if self.best else None
 
+        # Prefer the generation-level usage passed in by the loop (it covers every request of the
+        # generation); fall back to the sum accumulated from record_group calls.
+        gen_usage = _usage_derived(usage if usage is not None else cur.get("usage", {}))
+        for k in USAGE_KEYS:      # run totals stay exactly the sum of the per-generation totals
+            self._usage[k] += gen_usage[k]
         gen_stats = {
             "generation": gen,
             "valid_candidates": n_valid,
@@ -289,7 +351,9 @@ class ExperimentTracker:
             "best_so_far_score": best_score,
             "buffer_size": buffer_size,
             "puct_expansions": puct_expansions,
+            "wall_seconds": round(wall_seconds, 1) if wall_seconds is not None else None,
             "failure_types": dict(cur.get("failure_types", {})),
+            "usage": gen_usage,
         }
         meta = {
             "generation": gen,
@@ -303,6 +367,11 @@ class ExperimentTracker:
             csv.writer(f).writerow([
                 gen, n_valid, n_failed, round(success_rate, 4),
                 cur["gen_best_score"], best_score, buffer_size, puct_expansions,
+                gen_stats["wall_seconds"],
+                gen_usage["prompt_tokens"], gen_usage["cached_prompt_tokens"],
+                gen_usage["cache_hit_rate"], gen_usage["completion_tokens"],
+                gen_usage["reasoning_tokens"], gen_usage["tokens_per_completion"],
+                gen_usage["truncated"],
             ])
 
         self._per_gen.append(gen_stats)
@@ -329,6 +398,7 @@ class ExperimentTracker:
                 "unique_solutions": self._sol_seq,
                 "failure_types": dict(self._failure_types),
             },
+            "usage": _usage_derived(self._usage),
             "best": self.best,
             "worst_valid": self.worst_valid,
             "per_generation": self._per_gen,

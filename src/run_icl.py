@@ -18,7 +18,12 @@ from icl.config import ICLConfig
 from icl.loop import run
 
 
-def parse_args() -> ICLConfig:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface of a single ICL run.
+
+    Exposed separately from ``parse_args`` so ``run_sweep.py`` can validate a sweep file's keys
+    against the real flags (and their bool/negative-flag pairings) instead of duplicating the list.
+    """
     p = argparse.ArgumentParser(description="ICL discovery run (PUCT buffer + in-context past solutions).")
     p.add_argument("--problem", required=True, choices=sorted(REGISTRY), help="Problem to run.")
     p.add_argument("--log-path", default=None,
@@ -26,7 +31,7 @@ def parse_args() -> ICLConfig:
 
     p.add_argument("--model", dest="model_name", default="openai/gpt-oss-120b")
     p.add_argument("--vllm-base-url", default="http://localhost:8000/v1")
-    p.add_argument("--reasoning-effort", default="high", help="gpt-oss; 'none' to disable (e.g. non-gpt-oss models).")
+    p.add_argument("--reasoning-effort", default="medium", help="gpt-oss; 'none' to disable (e.g. non-gpt-oss models).")
     p.add_argument("--thinking-token-budget", type=int, default=None,
                    help="Qwen3: cap reasoning tokens; vLLM forces </think> once hit. "
                         "Needs the server launched with --reasoning-parser qwen3.")
@@ -62,6 +67,15 @@ def parse_args() -> ICLConfig:
     p.add_argument("--jump-alpha", type=float, default=0.5,
                    help="informative: value(alpha) vs improvement-over-parent(1-alpha) blend.")
     p.add_argument("--context-seed", type=int, default=None, help="Seed for the 'random' strategy.")
+    p.add_argument("--exclude-parent", dest="exclude_parent_from_context",
+                   action="store_true", default=True,
+                   help="Drop each parent from its own context block (default on): it is already "
+                        "shown as the current solution in the prompt tail.")
+    p.add_argument("--no-exclude-parent", dest="exclude_parent_from_context", action="store_false",
+                   help="Let a parent also appear among its own past solutions. Combined with "
+                        "--context-seed this makes the context block IDENTICAL for every parent in a "
+                        "generation, so vLLM prefills it once for the whole generation instead of once "
+                        "per parent — at the cost of prompt diversity between parents.")
     # rendering (orthogonal to selection)
     p.add_argument("--include-code", dest="include_code", action="store_true", default=True,
                    help="Show each context solution's code (default on).")
@@ -73,6 +87,10 @@ def parse_args() -> ICLConfig:
                    help="Save full raw completions per candidate (default on).")
     p.add_argument("--no-save-completions", dest="save_completions", action="store_false",
                    help="Do not save raw completions (smaller runs).")
+    p.add_argument("--save-reasoning", dest="save_reasoning", action="store_true", default=True,
+                   help="Save each candidate's reasoning_content to child_NN.reasoning.txt (default on).")
+    p.add_argument("--no-save-reasoning", dest="save_reasoning", action="store_false",
+                   help="Do not save reasoning traces (smaller runs; token counts are still recorded).")
 
     p.add_argument("--eval-timeout", type=int, default=None)
     p.add_argument("--num-cpus-per-task", type=int, default=None)
@@ -84,7 +102,11 @@ def parse_args() -> ICLConfig:
     p.add_argument("--dry-run", action="store_true",
                    help="Build & print one assembled prompt (base + context block), then exit. No server/ray.")
 
-    a = p.parse_args()
+    return p
+
+
+def parse_args() -> ICLConfig:
+    a = build_parser().parse_args()
     if a.log_path:
         log_path = a.log_path
     else:
@@ -118,9 +140,11 @@ def parse_args() -> ICLConfig:
         mmr_lambda=a.mmr_lambda,
         jump_alpha=a.jump_alpha,
         context_seed=a.context_seed,
+        exclude_parent_from_context=a.exclude_parent_from_context,
         include_code=a.include_code,
         include_strategy=a.include_strategy,
         save_completions=a.save_completions,
+        save_reasoning=a.save_reasoning,
         log_level=a.log_level,
         eval_timeout=a.eval_timeout,
         num_cpus_per_task=a.num_cpus_per_task,

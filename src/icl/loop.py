@@ -23,7 +23,7 @@ import time
 from puct import PUCTSampler, State
 from sandbox import init_ray
 from envs import EnvConfig, get_problem
-from generation import VLLMClient
+from generation import GenResult, VLLMClient
 from context import build_context_block, get_strategy, SelectionParams
 from results import ExperimentTracker
 from icl.config import ICLConfig
@@ -48,6 +48,56 @@ def _setup_logging(log_path: str, console_level: str = "INFO") -> None:
     sh.setFormatter(fmt)
     root.addHandler(fh)
     root.addHandler(sh)
+
+
+def _sum_usage(results: list[GenResult]) -> dict:
+    """Sum token accounting over vLLM requests.
+
+    ``prompt_tokens`` is counted per *request*, so with chunking a parent's prompt is counted once
+    per chunk — which is the truth we want to see: those are the tokens the server actually had to
+    (re)process, and ``cached_prompt_tokens`` shows how many of them the prefix cache served for free.
+    """
+    return {
+        "requests": len(results),
+        "completions": sum(len(r) for r in results),
+        "prompt_tokens": sum(r.prompt_tokens for r in results),
+        "cached_prompt_tokens": sum(r.cached_prompt_tokens for r in results),
+        "completion_tokens": sum(r.completion_tokens for r in results),
+        "reasoning_tokens": sum(r.reasoning_tokens for r in results),
+        "truncated": sum(r.truncated for r in results),
+    }
+
+
+def _counter_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    """Delta of the server's cumulative prefix-cache counters over one generation. Empty if either
+    snapshot is missing (metrics unavailable), so downstream code just sees no cache fields."""
+    if not before or not after:
+        return {}
+    return {k: max(0, after.get(k, 0) - v) for k, v in before.items()}
+
+
+def _format_usage(u: dict, wall: float) -> str:
+    """One-line token report for a generation: where the compute went and how much was cached.
+
+    ``decode`` is the aggregate decode rate over the whole generation (the number to compare against
+    single-sequence throughput to see how much batching is buying). ``cached`` is the share of prompt
+    tokens the prefix cache served — the direct measure of whether the prompt layout is paying off.
+    """
+    comps = u["completions"] or 1
+    pt, ct = u["prompt_tokens"], u["completion_tokens"]
+    # Prefer the /metrics counters (queried/hit prompt tokens); fall back to usage.cached_tokens,
+    # which some vLLM builds leave at 0 even with prefix caching on.
+    q, h = u.get("cache_queries", 0), u.get("cache_hits", 0)
+    hit = (100.0 * h / q) if q else ((100.0 * u["cached_prompt_tokens"] / pt) if pt else 0.0)
+    parts = [
+        f"prompt {pt:,} ({hit:.0f}% cached)",
+        f"decode {ct:,} ({ct / comps:.0f}/completion, {ct / max(wall, 1e-9):.0f} tok/s)",
+    ]
+    if u["reasoning_tokens"]:
+        parts.append(f"reasoning {u['reasoning_tokens']:,} "
+                     f"({100.0 * u['reasoning_tokens'] / max(ct, 1):.0f}% of decode)")
+    parts.append(f"truncated {u['truncated']}/{u['completions']}")
+    return " | ".join(parts)
 
 
 def _best_native(states: list[State], maximize: bool) -> float | None:
@@ -90,6 +140,7 @@ class ICLRunner:
         self.sampler: PUCTSampler | None = None  # created in run() after init_ray
         self.tracker: ExperimentTracker | None = None
         self._gen_latencies: list[float] = []    # per-group generate() latencies, reset each generation
+        self._gen_results: list[GenResult] = []  # every vLLM request of the current generation (token accounting)
         # Context pool: EVERY valid solution graded in prior generations, not just the PUCT top-k buffer.
         # Context selection draws from here so strategies (best_worst, contrastive, ...) can see genuine
         # low-scoring negatives that `topk_children` prunes out of the buffer. PUCT search is untouched.
@@ -129,8 +180,13 @@ class ICLRunner:
         # strategies like best_worst/contrastive would never see genuine low-scoring negatives. Seeds
         # never enter this pool (they produce no graded solution), so no seed de-duplication is needed,
         # and generation 0 sees an empty pool -> an empty context block.
+        #
+        # exclude_id is what makes the block differ per parent (each parent drops itself, shifting a
+        # different solution in). With exclude_parent_from_context=False it is the same block for every
+        # parent -> a shared prefix vLLM prefills once per generation. See ICLConfig.
+        exclude_id = parent.id if cfg.exclude_parent_from_context else None
         selection = self._select(self._context_pool, cfg.n_context, self._select_params,
-                                 exclude_id=parent.id)
+                                 exclude_id=exclude_id)
         block = build_context_block(
             selection,
             metric_name=spec.metric_name,
@@ -194,9 +250,11 @@ class ICLRunner:
             Running these coroutines concurrently overlaps one chunk's grading (CPU/sandbox) with
             another chunk's still-in-flight generation (GPU)."""
             nonlocal graded_done
-            comps = await self.llm.generate(
+            gen_res = await self.llm.generate(
                 prompt, n=sz, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
             )
+            self._gen_results.append(gen_res)
+            comps = gen_res.texts
             if multi_chunk:
                 logger.info(f"gen {gen} p{slot}: chunk returned ({sz} completion(s)), grading "
                             f"[{graded_done}/{cfg.group_size} graded so far]")
@@ -206,7 +264,7 @@ class ICLRunner:
                 nv = sum(1 for r in res if r.correctness > 0 and r.next_state is not None)
                 logger.info(f"gen {gen} p{slot}: chunk graded ({nv}/{len(res)} valid) "
                             f"[{graded_done}/{cfg.group_size} graded]")
-            return comps, res
+            return gen_res, res
 
         try:
             chunk_out = await asyncio.gather(*[_gen_grade_chunk(sz) for sz in sizes])
@@ -216,12 +274,17 @@ class ICLRunner:
                 self.tracker.record_group(gen, slot, parent, prompt, [], [])
             return []
 
-        completions = [c for comps, _ in chunk_out for c in comps]
+        gen_results = [g for g, _ in chunk_out]
+        completions = [c for g, _ in chunk_out for c in g.texts]
+        reasonings = [r for g, _ in chunk_out for r in g.reasonings]
+        finish_reasons = [f for g, _ in chunk_out for f in g.finish_reasons]
         results = [r for _, res in chunk_out for r in res]
         grp_dt = time.perf_counter() - t0
         self._gen_latencies.append(grp_dt)
         if self.tracker is not None:
-            self.tracker.record_group(gen, slot, parent, prompt, completions, results)
+            self.tracker.record_group(gen, slot, parent, prompt, completions, results,
+                                      reasonings=reasonings, finish_reasons=finish_reasons,
+                                      usage=_sum_usage(gen_results))
 
         valid = [r for r in results if r.correctness > 0 and r.next_state is not None]
         best = max(valid, key=lambda r: r.next_state.value) if valid else None
@@ -238,6 +301,19 @@ class ICLRunner:
         gen_par = min(cfg.groups_per_batch, cfg.max_gen_concurrency)
         logger.info(f"ICL run: problem={cfg.problem} model={cfg.model_name} strategy={cfg.context_strategy} "
                     f"n_context={cfg.n_context}")
+        # Whether a generation's parents share one context block decides whether vLLM prefills that
+        # block once per generation or once per parent -- worth seeing at a glance, since at n_context=20
+        # the block is ~16k of a ~17k prompt.
+        if cfg.n_context:
+            if cfg.exclude_parent_from_context:
+                logger.info("context block: per-parent (each parent excludes itself) -> no cross-parent "
+                            "prefix reuse; pass --no-exclude-parent --context-seed N to share it")
+            elif cfg.context_seed is None:
+                logger.info("context block: shared selection but tie-breaking is random per parent "
+                            "-> blocks may still differ; add --context-seed N to make them identical")
+            else:
+                logger.info("context block: IDENTICAL across parents (--no-exclude-parent + "
+                            "--context-seed) -> prefilled once per generation")
         logger.info(f"shape: {cfg.groups_per_batch} parents x {cfg.group_size} candidates "
                     f"= {n_cand} candidates/generation, {cfg.num_generations} generations")
         logger.info(f"throughput levers: generation parallelism={gen_par} "
@@ -262,7 +338,8 @@ class ICLRunner:
         else:
             logger.info("skipping Ray init: problem uses an in-process (sandbox-free) evaluator")
         # Tracker first: it creates the run-dir layout (incl. buffer/) the sampler writes into.
-        self.tracker = ExperimentTracker(cfg.log_path, cfg.to_dict(), spec, cfg.save_completions)
+        self.tracker = ExperimentTracker(cfg.log_path, cfg.to_dict(), spec, cfg.save_completions,
+                                         cfg.save_reasoning)
         self.sampler = self._make_sampler(os.path.join(cfg.log_path, "buffer", "puct_sampler.json"))
         self._open_context_pool(os.path.join(cfg.log_path, "buffer", "context_pool.jsonl"),
                                 resume=bool(cfg.resume_step))
@@ -272,6 +349,8 @@ class ICLRunner:
             for gen in range(start, cfg.num_generations):
                 t_gen = time.perf_counter()
                 self._gen_latencies = []
+                self._gen_results = []
+                cache0 = await self.llm.cache_counters()
                 parents = self.sampler.sample_states(cfg.groups_per_batch)
                 logger.info(f"gen {gen}/{cfg.num_generations - 1} | sampling {len(parents)} parents "
                             f"(buffer={len(self.sampler._states)})")
@@ -286,14 +365,16 @@ class ICLRunner:
                 new_valid = [r.next_state for group in group_results for r in group
                              if r.correctness > 0 and r.next_state is not None]
                 self._extend_context_pool(new_valid)
-                self.tracker.end_generation(gen, self.sampler)
+                usage = _sum_usage(self._gen_results)
+                usage.update(_counter_delta(cache0, await self.llm.cache_counters()))
+                gen_wall = time.perf_counter() - t_gen
+                self.tracker.end_generation(gen, self.sampler, usage=usage, wall_seconds=gen_wall)
 
                 n_valid = sum(1 for group in group_results for r in group if r.correctness > 0)
                 n_total = sum(len(group) for group in group_results)
                 pct = (100 * n_valid / n_total) if n_total else 0.0
                 best = _best_native(self.sampler._states, spec.maximize)
                 stats = self.sampler.get_sample_stats()
-                gen_wall = time.perf_counter() - t_gen
                 gen_latency = max(self._gen_latencies) if self._gen_latencies else 0.0
                 logger.info(
                     f"gen {gen}/{cfg.num_generations - 1} done | valid {n_valid}/{n_total} ({pct:.0f}%) "
@@ -302,6 +383,13 @@ class ICLRunner:
                     f"| best {spec.metric_name}={'n/a' if best is None else f'{best:.6f}'} "
                     f"| {gen_wall:.1f}s (generate {gen_latency:.1f}s)"
                 )
+                logger.info(f"gen {gen} tokens | {_format_usage(usage, gen_wall)}")
+                if usage["truncated"]:
+                    logger.warning(
+                        f"gen {gen}: {usage['truncated']}/{usage['completions']} completions hit the "
+                        f"max_tokens={cfg.max_tokens} cap (finish_reason=length) — these burn the full "
+                        f"budget, usually emit no code block, and gate their request's return. "
+                        f"Consider lowering --reasoning-effort or raising --max-tokens.")
         except BaseException:
             if self.tracker is not None:
                 self.tracker.close(status="failed")

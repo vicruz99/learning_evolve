@@ -53,12 +53,25 @@ class ICLConfig:
     mmr_lambda: float = 0.7                          # MMR quality<->diversity (1=quality only, 0=spread only)
     jump_alpha: float = 0.5                          # informative: value(alpha) vs jump(1-alpha) blend
     context_seed: int | None = None                  # seed for the `random` strategy
+    # Whether a parent is dropped from its own context block. True (default) = a parent never sees
+    # itself listed as a "past solution" it should improve on -- it is already rendered, once, as the
+    # current solution in the prompt tail.
+    #
+    # Setting this False is also the only way to make the context block IDENTICAL across a
+    # generation's parents (together with a fixed `context_seed`, which pins tie-breaking): the block
+    # then becomes a genuine shared prefix that vLLM prefills once for the whole generation instead of
+    # once per parent. The cost is less prompt diversity between a generation's parents.
+    exclude_parent_from_context: bool = True
     # rendering (orthogonal to selection; apply to every strategy):
     include_code: bool = True                        # show each solution's code
     include_strategy: bool = False                   # show each solution's <strategy> reasoning block
 
     # --- results storage ---
     save_completions: bool = True                    # write full raw completions per candidate
+    # Write each candidate's reasoning_content to child_NN.reasoning.txt. Reasoning is the bulk of the
+    # decode cost and is invisible in the completion text, so keeping it is what makes the token
+    # accounting interpretable; SFT/RL variants need it too. Off = smaller runs.
+    save_reasoning: bool = True
 
     # --- logging ---
     log_level: str = "INFO"                          # console level; icl.log always captures DEBUG

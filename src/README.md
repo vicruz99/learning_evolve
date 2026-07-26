@@ -121,11 +121,37 @@ it (`.venv/bin/ray stop && .venv/bin/ray start --head`) so the scheduler re-size
   - `--mix-fraction` (0.5) — fraction of `n_context` filled from the primary ("best") pool; the remaining `1 − x` comes from the secondary pool (worst / biggest-jump / low-scoring). Used by `best_worst`, `best_jump`, `per_lineage`, `contrastive`.
   - `--mmr-lambda` (0.7) — MMR quality↔diversity trade-off (1 = quality only, 0 = spread only). Used by `best_diverse`, `informative`, `contrastive`.
   - `--jump-alpha` (0.5) — `informative` only: how much the MMR quality term weights absolute value (`alpha`) vs. improvement-over-parent/"jump" (`1 − alpha`).
-  - `--context-seed` — seed for the `random` strategy (reproducibility).
+  - `--context-seed` — seed for the `random` strategy and for equal-score tie-breaking (reproducibility).
+- `--exclude-parent` (default on) / `--no-exclude-parent` — whether a parent is dropped from its own context block. On, each parent never sees itself listed as a past solution (it is already rendered once as the current solution in the prompt tail) — and because each parent drops a *different* solution, the block differs per parent. Off **plus `--context-seed N`** makes the block byte-identical for every parent in a generation, so vLLM prefills it once per generation instead of once per parent (~5 % at `n_context=20`, more at 30) at the cost of prompt diversity between parents. See `../docs/PERF_KNOBS.md`.
+
+> The **seed program is never shown as a past solution**: the context pool only ever receives *graded*
+> solutions, so generation 0 has an empty pool and a blank context block regardless of these flags
+> (locked in by `tests/test_context_pool.py`). From generation 1 on, everything valid is fair game.
 
 **Rendering** (orthogonal to selection) — `--include-code`/`--no-include-code`, `--include-strategy` (show each solution's `<strategy>` block; `--no-include-code --include-strategy` = strategy-only).
 
 **Eval / misc**
 - `--eval-timeout`, `--num-cpus-per-task`, `--grade-timeout` (8000).
 - `--save-completions` (on) / `--no-save-completions` — a *completion* is one candidate's full raw LLM output text (reasoning + `<strategy>` + code block) before parsing; saving keeps them per candidate for inspection, `--no-save-completions` skips them for smaller runs.
+- `--save-reasoning` (on) / `--no-save-reasoning` — write each candidate's `reasoning_content` to `child_NN.reasoning.txt` (separate from the completion file, which must stay the raw answer text). Requires the server to expose reasoning separately — launch vLLM with `--reasoning-parser openai_gptoss` for gpt-oss, else the field comes back empty and only the token *counts* are recorded.
+
+### Token accounting
+
+Every generation logs exactly where the compute went, and the same numbers land in `progress.csv`
+(new columns), `summary.json` (`usage`, per generation and run-total), and `events.jsonl`
+(`finish_reason`, `reasoning_chars` per candidate):
+
+```
+gen 3 tokens | prompt 104,821 (91% cached) | decode 486,220 (5402/completion, 657 tok/s) | truncated 2/90
+```
+
+- **`truncated`** counts completions with `finish_reason == "length"` — they burned the whole
+  `--max-tokens` budget, usually emit no code block, and gate their request's return. A warning fires
+  whenever it is non-zero; it is the signal for tuning `--max-tokens` / `--reasoning-effort`.
+- **`% cached`** is the prefix-cache hit rate, scraped from the server's `/metrics` at generation
+  boundaries — some vLLM builds report `usage.cached_tokens = 0` even with caching on. Two caveats:
+  the counters are **server-global** (they mix runs sharing one server) and counted **per sequence**,
+  so only the ratio is meaningful — never divide `cache_hits` by `prompt_tokens`.
+- **`wall_seconds`** per generation is also recorded, so `tok/s` and per-generation cost are
+  reconstructable after the fact.
 - `--log-level` (`INFO`), `--dry-run`.

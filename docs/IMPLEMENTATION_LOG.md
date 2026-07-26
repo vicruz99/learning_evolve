@@ -372,6 +372,66 @@ earlier 3-way run only worked because its launches were ~5 min apart. A code-lev
 
 ---
 
+## 2026-07-25 — Token accounting (exact per-generation token/cache/truncation numbers)
+
+**Measurement that reset the priorities: this workload is decode-bound, not prefill-bound.**
+From `runs/_sweep_c15_g6` (n_context=20, medium, 6×15=90, 739 s/gen):
+- gen-1 prompt is **17.2k tokens**, not the ~100k the earlier note assumed (that was n_context=30).
+  6 parents × 17.2k ≈ 104k prefill tokens/gen ≈ **30–50 s**, i.e. ~5 % of the generation.
+- Aggregate decode ≈ 700–1100 tok/s accounts for essentially all of the remaining wall time, matching
+  the earlier batch-scaling numbers. So `--kv-cache-dtype fp8` / `--max-num-batched-tokens` (the
+  `notes` file's vLLM items) are worth single-digit percent at n_context=20; they only matter once
+  prompts approach ~100k.
+- Corollary: since the sweep showed the 2×A100 saturated at conc≈20, **no server flag makes one run
+  much faster**. The campaign-level lever is one TP=2 server with **several run_icl.py clients sharing
+  it** — vLLM co-batches across experiments, so run B's generation fills the batch while run A grades.
+
+**Measured, and it kills the "prime the prefix" idea for now.** The 2026-07-25 prompt reordering
+assumed `intro + context block + rules` is a shared prefix across a generation's parents. It is not:
+with `strategy=best, n_context=20` the longest common prefix across gen-1 parents is **500 tok /
+2.9 %** of a 17.2k prompt, because `_build_prompt` passes `exclude_id=parent.id` and tie-breaking is
+random, so every parent gets a *different* context block. Priming a 500-token head buys nothing.
+Unlocking it requires selecting **one context block per generation** instead of per parent — a
+semantic change (incompatible with the parent-dependent strategies `per_lineage`/`mmr`), which is
+exactly the open question in `notes` line 92. Deferred, not built.
+
+**Built — exact token accounting (`generation/vllm_client.py`, `icl/loop.py`, `results/tracker.py`)**
+- `generate()` now returns a `GenResult` (was `list[str]`): `texts`, `reasonings`, `finish_reasons`,
+  `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens`, `reasoning_tokens`, `latency`.
+- Per generation: `_sum_usage` + a log line — `prompt 104,821 (91% cached) | decode 486,220
+  (5402/completion, 657 tok/s) | truncated 2/90`. Persisted to `progress.csv` (new columns incl.
+  `wall_seconds`), `summary.json` (`usage`, per-generation + run total), `events.jsonl`
+  (`finish_reason`, `reasoning_chars` per candidate).
+- **`finish_reason == "length"`** is the per-candidate truncation signal (exact, unlike token counts —
+  see caveat below) and now fires a warning. This is what `--max-tokens` tuning was missing.
+- `--save-reasoning` (default on) writes `child_NN.reasoning.txt`. Deliberately a *separate* file:
+  `recheck_failures.py` re-extracts code from the completion file, so that file must stay raw answer text.
+
+**Three facts the live server taught us (all verified against `localhost:8001`)**
+- **`usage` is per *request*, summed over the `n` choices** — exact per-candidate token counts are
+  impossible when `n > 1`. Hence per-candidate = `finish_reason` + char counts, per-request = tokens.
+- **This server returns empty `reasoning_content`** and silently counts reasoning inside
+  `completion_tokens` (a 3-token answer cost 44). Capturing traces needs the server relaunched with
+  `--reasoning-parser openai_gptoss`; the plumbing is in place and starts writing files when it is.
+- **`usage.prompt_tokens_details.cached_tokens` is always 0** on this build while `/metrics` shows a
+  92 % hit rate → the cache signal is scraped from `/metrics` at generation boundaries instead
+  (`VLLMClient.cache_counters`). Two caveats baked into the docstrings: those counters are
+  **server-global** (they mix concurrent runs) and counted **per sequence**, so `cache_queries ≈
+  n × prompt_tokens` — only the *ratio* is meaningful.
+
+**Verified** — a 2-gen `toy` ICL run confirmed the token log line, the new `progress.csv` columns,
+`summary.json.usage` (per generation + run total), and the `events.jsonl` fields.
+
+**Deferred**
+- Shared per-generation context block (the prerequisite for prefix priming) — semantic change, open
+  question. *(Landed the next day as `--no-exclude-parent`, below.)*
+- Server relaunch with `--reasoning-parser openai_gptoss` to actually capture reasoning traces.
+- `--kv-cache-dtype fp8` / `--max-num-batched-tokens 16384` / sizing `--max-model-len` down from 131k:
+  worth doing, but measured as small at n_context=20. **Risk flagged:** at n_context=30 the prompt hit
+  ~103k, so 103k + `max_tokens` 26k = 129k is within 2k of the 131k ceiling.
+
+---
+
 ## 2026-07-25 — Shared Ray head for concurrent experiments (`init_ray` auto-connect)
 
 **Built** — `sandbox/ray_setup.init_ray` now tries `ray.init(address="auto")` first and only falls
@@ -396,3 +456,46 @@ wrong-sized scheduler (functional — Ray admission still bounds total load — 
 throughput). Same-family concurrent is optimal. Workaround: `ray stop && ray start` when switching
 families. Proper fix (deferred): name the actor `cpu_scheduler_{num_cpus_per_task}` in
 `_get_scheduler` + `run_program` so each family self-sizes.
+
+---
+
+## 2026-07-26 — `--exclude-parent` option + gen-0 seed invariant pinned + `docs/PERF_KNOBS.md`
+
+**Built — `exclude_parent_from_context` (CLI `--exclude-parent` / `--no-exclude-parent`, default on)**
+- `_build_prompt` now passes `exclude_id = parent.id if cfg.exclude_parent_from_context else None`
+  (was unconditionally `parent.id`).
+- **Why it matters for speed:** `exclude_id` was the *only* thing making a generation's context blocks
+  differ per parent — each parent drops itself, shifting a different solution into the block. Turning
+  it off, **with `--context-seed N` to pin tie-breaking**, makes the block byte-identical across
+  parents, i.e. a genuine shared prefix vLLM prefills once per generation instead of once per parent.
+- **Measured on `toy` (n_context=4, 2 parents):** cross-parent common prefix **50.3 % → 91.6 %** of the
+  prompt; the remaining 8 % is the trailing current-solution, exactly the design intent of the
+  2026-07-25 reordering. (On circle_packing at n_context=20 the default is only 2.9 %, so the headroom
+  there is larger — worth ~5 % of wall at n_context=20, ~15 % at 30.)
+- New startup log line states which of the three regimes is active (per-parent / shared-selection-but-
+  random-ties / fully identical), since it is otherwise invisible.
+- Explicitly a **science trade**, not a free win: it costs prompt diversity between a generation's parents.
+
+**Correction to 2026-07-25's note:** I wrote that a shared block is "incompatible with the
+parent-dependent strategies `per_lineage`/`mmr`". Wrong — reading the code, `_greedy_lineage` and
+`_mmr_select` compute lineage relationships **among the candidates**, never against the parent.
+`exclude_id` is the only parent input to any of the ten strategies, so the option works with all of them.
+
+**Pinned — the seed program is never shown as a "past solution"** (`tests/test_context_pool.py`, 8 tests)
+- Already true structurally: `_extend_context_pool` is the only writer and the loop feeds it *graded*
+  children only, so a seed (never graded) cannot reach the pool → generation 0 has an empty pool and a
+  blank context block. Now locked in by tests, including with `--no-exclude-parent` on (the option must
+  not open a back door), plus a counterpart test that later generations *do* inject context.
+- Noted: **`context.dedupe_seeds` is now dead code** — exported and unit-tested but called nowhere. It
+  became redundant on 2026-07-22 when selection moved from the PUCT buffer to the all-valid pool. Left
+  in place (harmless, tested, would be needed again if selection ever reads the buffer).
+
+**Built — `docs/PERF_KNOBS.md`:** one reference table for the vLLM + `run_icl.py` throughput knobs, each
+with its measured effect, and a ranked "what to do next". Leads with the framing that matters: the
+workload is decode-bound with the GPU saturated at ~20 concurrent sequences, so the only single-run
+lever is generating fewer tokens, and the biggest campaign lever is 2 runs sharing one server.
+
+**End-of-day summary**
+- ✅ `--exclude-parent` / `--no-exclude-parent` landed; shared-prefix effect measured (50 % → 92 %).
+- ✅ Gen-0 "no seed in context" invariant pinned by tests; `dedupe_seeds` identified as dead.
+- ✅ Perf knobs consolidated in `docs/PERF_KNOBS.md`; 38 tests pass.
