@@ -156,7 +156,7 @@ class ICLRunner:
             mix_fraction=cfg.mix_fraction,
             mmr_lambda=cfg.mmr_lambda,
             jump_alpha=cfg.jump_alpha,
-            context_seed=cfg.context_seed,
+            context_seed=cfg.context_seed if cfg.context_seed is not None else cfg.seed,
         )
         self.sampler: PUCTSampler | None = None  # created in run() after init_ray
         self.tracker: ExperimentTracker | None = None
@@ -181,7 +181,14 @@ class ICLRunner:
             resume_step=cfg.resume_step,
             puct_c=cfg.puct_c,
             topk_children=cfg.topk_children,
+            rng_seed=cfg.seed,
         )
+
+    def _sample_parents(self, n: int) -> list[State]:
+        """This generation's parents: PUCT-selected from the buffer, or always the seed (Best-of-N)."""
+        if self.cfg.parent_source == "initial":
+            return self.sampler.sample_initial_states(n)
+        return self.sampler.sample_states(n)
 
     def _build_prompt(self, env, parent: State):
         """Assemble the full prompt for one parent, in three cache-friendly zones:
@@ -385,7 +392,16 @@ class ICLRunner:
         n_cand = cfg.groups_per_batch * cfg.group_size
         gen_par = min(cfg.groups_per_batch, cfg.max_gen_concurrency)
         logger.info(f"ICL run: problem={cfg.problem} model={cfg.model_name} strategy={cfg.context_strategy} "
-                    f"n_context={cfg.n_context}")
+                    f"n_context={cfg.n_context} seed={cfg.seed}")
+        if cfg.parent_source == "initial":
+            logger.info("parents: ALWAYS the seed solution (--parent-source initial) -> Best-of-N; the "
+                        "buffer is still recorded but never read to pick a parent"
+                        + ("" if cfg.n_context else " and no context is injected: no past experience "
+                                                    "reaches the model at all"))
+        else:
+            logger.info("parents: PUCT-selected from the buffer"
+                        + ("" if cfg.n_context else " (no context injected: past experience reaches the "
+                                                    "model only through which parent it is given)"))
         # Whether a generation's parents share one context block decides whether vLLM prefills that
         # block once per generation or once per parent -- worth seeing at a glance, since at n_context=20
         # the block is ~16k of a ~17k prompt.
@@ -437,7 +453,7 @@ class ICLRunner:
                 self._gen_results = []
                 self._gen_decode = []
                 cache0 = await self.llm.cache_counters()
-                parents = self.sampler.sample_states(cfg.groups_per_batch)
+                parents = self._sample_parents(cfg.groups_per_batch)
                 logger.info(f"gen {gen}/{cfg.num_generations - 1} | sampling {len(parents)} parents "
                             f"(buffer={len(self.sampler._states)})")
                 self.tracker.start_generation(gen, parents)
@@ -507,7 +523,7 @@ class ICLRunner:
         cfg, spec = self.cfg, self.spec
         with tempfile.TemporaryDirectory() as td:
             self.sampler = self._make_sampler(os.path.join(td, "puct_sampler.json"))
-            parent = self.sampler.sample_states(cfg.groups_per_batch)[0]
+            parent = self._sample_parents(cfg.groups_per_batch)[0]
             env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
             prompt, selection, intro, tail, block = self._build_prompt(env, parent)
 

@@ -53,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--puct-c", type=float, default=1.0)
     p.add_argument("--max-buffer-size", type=int, default=1000)
     p.add_argument("--topk-children", type=int, default=2)
+    p.add_argument("--parent-source", default="puct", choices=["puct", "initial"],
+                   help="Where each generation's parents come from. 'puct': select from the buffer "
+                        "(TTT-Discover's search). 'initial': always the problem's seed solution => "
+                        "Best-of-N; with --n-context 0 that is the no-past-experience baseline.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Replicate seed. Seeds the sampler's random initial construction (ac1/ac2) and "
+                        "the 'random' context strategy unless --context-seed is given. Recorded in "
+                        "config.json. Does NOT make a run bit-reproducible — vLLM sampling is unseeded.")
 
     p.add_argument("--context-strategy", default="best", choices=sorted(STRATEGIES),
                    help="Which past-solution selector to inject into the prompt (see docs/strategies/).")
@@ -111,7 +119,11 @@ def parse_args() -> ICLConfig:
         log_path = a.log_path
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        auto = f"{a.problem}_{a.context_strategy}_n{a.n_context}_g{a.group_size}x{a.groups_per_batch}_{ts}"
+        # A Best-of-N run has no context strategy in play; label it as such rather than inheriting the
+        # (unused) --context-strategy default, which would read as an ICL run in the runs/ listing.
+        tag = "bon" if a.parent_source == "initial" else a.context_strategy
+        seed = f"_s{a.seed}" if a.seed is not None else ""
+        auto = (f"{a.problem}_{tag}_n{a.n_context}_g{a.group_size}x{a.groups_per_batch}{seed}_{ts}")
         log_path = os.path.join("runs", auto)
     reasoning_effort = None if a.reasoning_effort.lower() == "none" else a.reasoning_effort
 
@@ -133,6 +145,8 @@ def parse_args() -> ICLConfig:
         puct_c=a.puct_c,
         max_buffer_size=a.max_buffer_size,
         topk_children=a.topk_children,
+        parent_source=a.parent_source,
+        seed=a.seed,
         context_strategy=a.context_strategy,
         n_context=a.n_context,
         max_context_tokens=a.max_context_tokens,

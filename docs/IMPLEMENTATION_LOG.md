@@ -372,7 +372,7 @@ earlier 3-way run only worked because its launches were ~5 min apart. A code-lev
 
 ---
 
-## 2026-07-25 — Token accounting (exact per-generation token/cache/truncation numbers)
+## 2026-07-25 — Token accounting + `run_sweep.py` coordinated launcher
 
 **Measurement that reset the priorities: this workload is decode-bound, not prefill-bound.**
 From `runs/_sweep_c15_g6` (n_context=20, medium, 6×15=90, 739 s/gen):
@@ -419,8 +419,29 @@ exactly the open question in `notes` line 92. Deferred, not built.
   **server-global** (they mix concurrent runs) and counted **per sequence**, so `cache_queries ≈
   n × prompt_tokens` — only the *ratio* is meaningful.
 
-**Verified** — a 2-gen `toy` ICL run confirmed the token log line, the new `progress.csv` columns,
-`summary.json.usage` (per generation + run total), and the `events.jsonl` fields.
+**Built — `src/run_sweep.py` + `src/sweeps/*.yaml`: coordinated multi-run launcher**
+- One YAML file: `sweep:` (name / max_parallel / stagger / server_max_num_seqs), `common:`, `grid:`
+  (cross-product), `runs:` (explicit overrides). Precedence `common` < `grid`/`runs`.
+- **Keys are `run_icl.py` long flags verbatim**, validated against the real parser (`run_icl.build_parser`,
+  split out for this) — no second vocabulary, nothing to keep in sync. Typos fail *before* launching,
+  with a suggestion; `log-path`/`resume-step` are launcher-owned and rejected; bools map to the right
+  polarity (`include-code: false` → `--no-include-code`).
+- Supervisor: `max_parallel` queue + `stagger` between launches (the Ray-hang mitigation), starts a
+  shared `ray start --head` if none is up, children in their own process session so killing the
+  supervisor doesn't kill the runs. Preflight warns if the server doesn't serve the requested model
+  or if peak concurrency exceeds `server_max_num_seqs`.
+- `--status` / `--resume` / `--stop` / `--print-cmds`. Status reconciles the manifest against reality
+  and reports **`DIED`** (manifest says running, pid gone) — previously invisible. Table shows
+  gens, best, gen wall, tok/s, age.
+- Runs land in `runs/<sweep>/<run>/`, so the tracker's `index.csv` becomes a per-sweep index and
+  `results/analysis.py` pointed at `runs/<sweep>` sees exactly that sweep.
+
+**Verified** — 44 tests pass (14 new in `tests/test_sweep.py`: grid expansion/naming, flag +
+bool-polarity validation, reserved keys, manifest paths, `DIED` reconciliation, half-written summary
+tolerance). Live end-to-end: a 3-run `toy` sweep with `max_parallel=2` staggered correctly, queued the
+third when the first finished, all exited 0, and the status table + per-sweep `index.csv` came out right.
+A 2-gen `toy` ICL run confirmed the token line, `progress.csv` columns, `summary.json.usage`, and
+`events.jsonl` fields.
 
 **Deferred**
 - Shared per-generation context block (the prerequisite for prefix priming) — semantic change, open
@@ -498,7 +519,7 @@ lever is generating fewer tokens, and the biggest campaign lever is 2 runs shari
 **End-of-day summary**
 - ✅ `--exclude-parent` / `--no-exclude-parent` landed; shared-prefix effect measured (50 % → 92 %).
 - ✅ Gen-0 "no seed in context" invariant pinned by tests; `dedupe_seeds` identified as dead.
-- ✅ Perf knobs consolidated in `docs/PERF_KNOBS.md`; 38 tests pass.
+- ✅ Perf knobs consolidated in `docs/PERF_KNOBS.md`; 52 tests pass.
 
 ---
 
@@ -553,7 +574,7 @@ better"), which is direct evidence the context is being reasoned over rather tha
 
 **Verified** — `runs/test_reasoning` (circle_packing_26, 2 gens × 2 parents × 4): reasoning + answer
 files written per candidate with clean separation (no CoT in the answer file), both generations
-reconciling exactly, percentiles in `progress.csv`. 40 tests pass (2 new: nearest-rank percentiles,
+reconciling exactly, percentiles in `progress.csv`. 54 tests pass (2 new: nearest-rank percentiles,
 reasoning field-name fallback).
 
 **Gotcha worth remembering** — with a shared Ray head up, runs must use the env that *started* it:
@@ -561,3 +582,59 @@ the head came from `src/.venv` (Python 3.12.12) while conda `phd-r2` is 3.12.11,
 attach across a patch-version mismatch. Worse, `init_ray` only falls back to a private cluster on
 `ConnectionError`, so the version mismatch (a `RuntimeError`) kills the run instead of degrading.
 Widening that `except` is an open suggestion.
+
+---
+
+## 2026-07-26 (later) — Baseline plumbing: Best-of-N parent source, replicate seeds, campaign sweep files
+
+**Built — two flags that Experiment 0 needs and the harness did not have**
+- `--parent-source {puct,initial}` (`PUCTSampler.sample_initial_states`). `initial` returns fresh seed
+  states every generation, so **Best-of-N** = `--parent-source initial --n-context 0`: no past
+  experience via the prompt *and* none via parent selection. The buffer is still *written* during
+  grading (best-so-far, context pool, `events.jsonl` stay correct) — it is only never *read* to pick a
+  parent. Mirrors the branch `sample_states` already took on an empty buffer, including the AC random
+  construction, so `_last_sampled_*` stays consistent for the tracker.
+- `--seed` → `ICLConfig.seed` → `PUCTSampler(rng_seed=…)`. PUCT selection is a deterministic score
+  sort; the sampler's *only* stochastic surface is the AC problems' random initial construction, which
+  used a fresh unseeded `default_rng()` per call. Now one seeded generator per run. Also becomes the
+  default for `--context-seed`. **It does not make a run bit-reproducible** — replicate-to-replicate
+  variation comes from vLLM sampling at temperature 1.0, which is unseeded on purpose (a fixed request
+  seed would make Best-of-N's identical per-parent prompts return identical children).
+- `run_sweep.py` naming: a `grid` over `problem` no longer produces `erdos_p-erdos_s-1` — `problem` is
+  already the prefix. `run_icl.py` auto log-path labels a Best-of-N run `bon` instead of inheriting the
+  unused `--context-strategy` default.
+- 5 sweep files: `baselines_{gptoss,qwen}.yaml` (50 runs each: 5 problems × 5 seeds × 2 baselines),
+  `calibrate_{gptoss,qwen}.yaml` (2 runs × 3 gens), `smoke_sweep.yaml` (4 toy runs, ~2 min, to test
+  the launcher itself). Each carries its cluster's vLLM command and the reasoning it encodes.
+- 65 tests pass (11 new in `tests/test_baselines.py` + 2 sweep-naming tests). Best-of-N verified
+  end-to-end on `toy`: generation 1's prompt is still the 222-token seed prompt, not the evolved
+  parent, while the buffer keeps growing.
+
+**Found — the cost of the requested design, and what actually drives it**
+- Measured aggregate decode on 2×A100 for gpt-oss-120b: **~500 tok/s** (368k tokens in a 739 s,
+  90-candidate generation). Cost is then purely tokens/candidate: at the measured *medium*-effort
+  3.5k that's 15 h per 7,500-candidate run (~31 days for 50 runs); if `high` effort averages ~20k —
+  consistent with the earlier "~70 % no_code at a 26k cap" observation — it is **~7 months**. Hence
+  the calibration sweeps: 3 generations settle it before the campaign commits.
+- **Why TTT-Discover's 26,000 is not our 26,000.** `TwoPhaseTokenCompleter` (their
+  `tinker_utils/completers.py`): `phase1_max_tokens=26000` bounds **prompt + thinking**, and when
+  phase 1 runs out *without stopping* they re-prompt with `"... okay, I am out of thinking tokens. I
+  need to send my final message now."` + `<|end|><|start|>assistant<|channel|>final<|message|>` and
+  let it answer inside a 32,768 window. So their runs routinely truncate thinking and **always get an
+  answer**. Qwen reproduces this natively (`thinking_token_budget` forces `</think>`); gpt-oss has no
+  equivalent, so a long-thinking candidate just returns nothing after burning the full budget. If
+  calibration shows high truncation on gpt-oss, porting the two-phase completer is the fix.
+- **CPU-family footgun, avoided by pinning:** the shared Ray head's `cpu_scheduler` is a detached
+  actor created by the *first* run and partitions cores into fixed-size groups, so a queue mixing
+  1-cpu (circle_packing, erdos) and 2-cpu (ac1, ac2) problems silently mis-sizes one family. The sweep
+  files set `num-cpus-per-task: 2` for everything: one head stays valid for all 5 problems, at the
+  price of some grading parallelism on the 1-cpu problems (irrelevant while decode-bound).
+
+**Measured — context length vs `n_context`** (2,247 saved prompts across 39 runs, tokenized with the
+served model's own tokenizer). `prompt ≈ base + n × per_solution`, base 0.2–4.9k by problem;
+per-solution 1.2k (ac1) / 1.4k (erdos) / 1.7k (circle_packing) / 2.9k (ac2). The slope is **not**
+constant within a run: on circle_packing it drifts 835 → 2,224 tokens/solution from gen 1 to gen 29 as
+programs elaborate, so n=30 means 27k of prompt early and ~71k late (max seen 104k of a 131k window).
+Late-run, `random` costs 2,537 tokens/solution against `contrastive`'s 1,796. Worst-case sizing for
+the ICL runs: 4k/solution for cp/erdos/ac1 and ~8k for ac2 (the latter projected from cp's drift —
+only gen-1 data exists for ac2).

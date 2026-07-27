@@ -88,6 +88,73 @@ cpus-per-task (`circle_packing`/`erdos`/`toy` = 1, `ac1`/`ac2` = 2). Running the
 concurrently is optimal. If you switch between a 1-cpu and a 2-cpu family on the same head, restart
 it (`.venv/bin/ray stop && .venv/bin/ray start --head`) so the scheduler re-sizes.
 
+### Sweeps: `run_sweep.py` (several coordinated runs from one file)
+
+For anything beyond one or two runs, drive them from a **sweep file** instead of separate shells:
+shared settings in one place, per-run overrides, staggered launches, a bounded queue, and a single
+status table. It starts the shared Ray head for you if none is up.
+
+```bash
+tmux new -s sweep                                  # the supervisor must stay alive (see below)
+python run_sweep.py sweeps/ctx_strategies.yaml
+```
+
+```yaml
+# sweeps/ctx_strategies.yaml — keys are run_icl.py long flags without the leading `--`
+sweep:
+  name: ctx_strategies       # -> runs/ctx_strategies/<run>/  (and that dir's own index.csv)
+  max_parallel: 2            # runs in flight at once
+  stagger: 120               # seconds between launches
+  server_max_num_seqs: 256   # optional: only used to warn about oversubscribing the server
+
+common:                      # applies to every run
+  problem: circle_packing_26
+  groups-per-batch: 6
+  group-size: 15
+  num-generations: 30
+  reasoning-effort: medium
+  vllm-base-url: http://localhost:8001/v1
+
+grid:                        # cross-product; run names derive from the varying keys
+  context-strategy: [best, random, best_worst, contrastive]
+
+runs:                        # optional explicit entries, each overriding `common`
+  - name: cp26_best_n30
+    context-strategy: best
+    n-context: 30
+```
+
+| Command | What it does |
+|---|---|
+| `run_sweep.py FILE` | Expand, preflight-check, launch, and supervise the queue. |
+| `run_sweep.py FILE --print-cmds` | Print the exact `run_icl.py` commands; launch nothing. |
+| `run_sweep.py --status DIR` | Status table (works any time, even after the supervisor exits). |
+| `run_sweep.py --resume DIR` | Relaunch every run that is not `complete`, from its last generation. |
+| `run_sweep.py --stop DIR` | `SIGTERM` every live run of the sweep. |
+
+```
+run                  pid       state     gens   best    gen wall  tok/s  updated
+cp26_cs-best         41207     running   7/30   2.6312  742s      658    12s ago
+cp26_cs-random       41455     running   6/30   2.6109  751s      641    31s ago
+cp26_cs-best_worst   -         complete  30/30  2.6350  738s      -      2h ago
+cp26_cs-contrastive  -         DIED      3/30   2.5904  744s      -      1h ago
+```
+
+`DIED` means the manifest says the run should be alive but its pid is gone — the failure mode that
+was previously invisible. Overrides: `--max-parallel`, `--stagger`, `--refresh`, `--sweep-dir`,
+`--ray-head {auto,require,skip}`.
+
+**Notes**
+- Keys are validated against `run_icl.py`'s real parser, so a typo (`n-contexts`) or an
+  inexpressible bool fails *before* anything launches, with a suggestion. `log-path` and
+  `resume-step` are owned by the launcher and rejected.
+- Booleans take `true`/`false` and map to the right flag (`include-code: false` →
+  `--no-include-code`).
+- Runs are started in their own process session, so killing the supervisor (or losing the terminal)
+  does **not** kill them — but the queue stops advancing, which is why long sweeps want `tmux`.
+- Each run writes to `runs/<sweep>/<run>/`, so `results/analysis.py` pointed at `runs/<sweep>` sees
+  exactly that sweep's runs.
+
 ### Options (`python run_icl.py --help` for the full list)
 
 **Problem / output**
@@ -112,6 +179,10 @@ it (`.venv/bin/ray stop && .venv/bin/ray start --head`) so the scheduler re-size
 - `--puct-c` (1.0) — exploration coefficient `c` in the PUCT score `Q + c·scale·P·√(1+T)/(1+n)`; higher = more exploration of under-visited states.
 - `--max-buffer-size` (1000) — max states kept in the search buffer.
 - `--topk-children` (2) — children per parent retained in the buffer on flush.
+- `--parent-source` (`puct`) — where a generation's parents come from. `puct` selects from the buffer. `initial` always returns the problem's seed solution, i.e. **Best-of-N**: combined with `--n-context 0` no past experience reaches the model at all (none in the prompt, none through parent selection). The buffer is still written — best-so-far, the context pool and `events.jsonl` stay correct — it is just never read to pick a parent.
+
+**Reproducibility**
+- `--seed N` — replicate seed, recorded in `config.json`. Seeds the sampler's only stochastic surface (the random initial construction of `ac1`/`ac2`) and, unless `--context-seed` is given, the `random` context strategy. It does **not** make a run bit-reproducible: PUCT selection is a deterministic score sort, and replicate-to-replicate variation comes from vLLM sampling at `temperature 1.0`, which is deliberately left unseeded (a fixed request seed would make Best-of-N's identical per-parent prompts return identical children).
 
 **Context selection** (which past solutions enter the prompt; see `../docs/strategies/`)
 - `--context-strategy` (`best`) — `random`, `best`, `recent`, `biggest_jump`, `best_worst`, `best_jump`, `per_lineage`, `best_diverse`, `informative`, `contrastive`. Use `--n-context 0` for the **no-ICL baseline**.

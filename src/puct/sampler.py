@@ -96,6 +96,7 @@ class PUCTSampler(StateSampler):
         resume_step: int | None = None,
         puct_c: float = 1.0,
         topk_children: int = 2,
+        rng_seed: int | None = None,
     ):
         self.file_path = file_path
         self.env_type = env_type
@@ -104,7 +105,11 @@ class PUCTSampler(StateSampler):
         self.batch_size = batch_size
         self.topk_children = topk_children
         self.puct_c = float(puct_c)
-        
+        # PUCT selection itself is deterministic (a score sort). The only randomness in this class is
+        # the AC problems' random initial construction, so one seeded generator covers the sampler's
+        # entire stochastic surface -> replicate runs differ reproducibly instead of by OS entropy.
+        self._rng = np.random.default_rng(rng_seed)
+
         self._states: list[State] = []
         self._initial_states: list[State] = []
         self._last_sampled_states: list[State] = []
@@ -161,7 +166,7 @@ class PUCTSampler(StateSampler):
         # For ac
         if not getattr(self.env_type, "construction_length_limits", None):
             return
-        rng = np.random.default_rng()
+        rng = self._rng
         state.construction = [rng.random()] * rng.integers(1000, 8000)
         # Lazy import (AC-only path): keeps `puct` free of any import-time dependency on `envs`.
         if self.problem_type == "ac1":
@@ -220,6 +225,26 @@ class PUCTSampler(StateSampler):
                     lineage.add(child_id)
                     queue.append(child_id)
         return lineage
+
+    def sample_initial_states(self, num_states: int) -> list[State]:
+        """Return ``num_states`` fresh initial states, ignoring the buffer entirely.
+
+        This is the **Best-of-N** parent source: every generation restarts from the problem's seed
+        solution, so no past experience reaches the model through parent selection (and, with
+        ``n_context=0``, none reaches it through the prompt either) — the run is N independent samples
+        from the same starting point, batched into generations only for scheduling.
+
+        The buffer is still *written* (``update_states`` runs during grading, so best-so-far and the
+        context pool stay correct); it is only never *read* to choose a parent. Mirrors what
+        ``sample_states`` already does on an empty buffer, including the AC random construction.
+        """
+        picked = [create_initial_state(self.env_type, self.problem_type) for _ in range(num_states)]
+        for s in picked:
+            self._refresh_random_construction(s)
+        self._last_sampled_states = picked
+        self._last_sampled_indices = []
+        self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
+        return picked
 
     def sample_states(self, num_states: int) -> list[State]:
         initial_ids = {s.id for s in self._initial_states}

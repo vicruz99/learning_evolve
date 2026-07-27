@@ -43,6 +43,18 @@ class ICLConfig:
     puct_c: float = 1.0
     max_buffer_size: int = 1000
     topk_children: int = 2
+    # Where each generation's parents come from:
+    #   "puct"    — PUCT-select from the buffer (TTT-Discover's search; the default)
+    #   "initial" — always the problem's seed solution => Best-of-N. Combined with n_context=0 this is
+    #               the no-past-experience baseline: no history via parent selection, none via prompt.
+    parent_source: str = "puct"
+
+    # --- reproducibility ---
+    # Seeds the sampler's only stochastic surface (the AC problems' random initial construction) and,
+    # unless --context-seed is given explicitly, the `random` context strategy. It does NOT make a run
+    # bit-reproducible: vLLM sampling is temperature>0 and unseeded, which is where replicate-to-
+    # replicate variation actually comes from. Its job is provenance + distinct replicate identities.
+    seed: int | None = None
 
     # --- ICL context ---
     context_strategy: str = "best"                   # selector in context.STRATEGIES (see docs/strategies/)

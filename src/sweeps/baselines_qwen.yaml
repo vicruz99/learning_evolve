@@ -1,0 +1,133 @@
+# =================================================================================================
+# EXPERIMENT 0 — no-past-experience baselines, Qwen3.6-27B  (Bosch, B200; H200 works unchanged)
+#
+# Same design as sweeps/baselines_gptoss.yaml — read that file's header for what the two baselines
+# are and why. Only the model, its reasoning controls, and the server command differ.
+#
+#   parent-source: initial  -> BEST-OF-N (no past experience anywhere)
+#   parent-source: puct     -> TTT-DISCOVER WITHOUT RL (past experience only via parent selection)
+#
+# 5 problems x 5 REPLICATES x 2 baselines = 50 runs, 7,500 candidates each. `seed` is a replicate
+# index, not a control variable — see the gpt-oss file's header for what does and does not differ
+# between replicates.
+#
+# ---------------------------------------------------------------------------------------------
+# 1. START THE SERVER (once, in its own tmux window)
+# ---------------------------------------------------------------------------------------------
+#   HF_HOME=<scratch> \
+#   vllm serve Qwen/Qwen3.6-27B-FP8 \
+#       --tensor-parallel-size 1 \
+#       --async-scheduling \
+#       --gpu-memory-utilization 0.90 \
+#       --max-model-len 128000 \
+#       --max-num-seqs 128 \
+#       --max-num-batched-tokens 16384 \
+#       --reasoning-parser qwen3 \
+#       --port 8000
+#
+#   --max-num-seqs 128 < the 300 sequences the clients want in flight (2 runs x 5 parents x 30
+#       children), for the same reason as the gpt-oss file — read that header. Short version: past
+#       GPU saturation extra concurrency buys no throughput, while 300 long reasoning chains can
+#       overflow the KV pool and get preempted (KV dropped and re-prefilled, paying twice for tokens
+#       already decoded). 128 rather than 96 because a 27B FP8 model on a 180 GB B200 leaves a far
+#       bigger pool than 120B-MXFP4 on 2x80 GB, and Qwen3.6's linear-attention layers keep a
+#       constant-size state instead of growing per token. Confirm rather than assume, during
+#       calibration:
+#         curl -s localhost:8001/metrics | grep -E "num_preemptions|kv_cache_usage"
+#       0 preemptions and kv_cache_usage_perc well under 1.0 => raise it; preemptions climbing =>
+#       lower it. `thinking_token_budget` also bounds the worst case here, which gpt-oss cannot.
+#
+#   vLLM >= 0.19.0 IS REQUIRED, 0.26.0 recommended. Two independent reasons:
+#     * `thinking_token_budget` (below) landed in 0.19.0. Earlier versions accept the field and
+#       SILENTLY IGNORE it (vLLM request models are extra="allow"), so the runs would look fine and
+#       have no reasoning cap at all.
+#     * Qwen3.6-27B declares architecture Qwen3_5ForConditionalGeneration, absent from the model
+#       registry before 0.19.1.
+#   FP8 over BF16: native FP8 on Blackwell/Hopper, ~27 GB of weights instead of ~54, and this
+#   workload is decode-bound (bandwidth on weights). Keep the precision FIXED for the whole campaign
+#   and recorded — switching mid-way would confound the comparison more than quantization does.
+#
+#   VERIFY THE REASONING CAP IS LIVE before launching 50 runs (a silent no-op is the failure mode):
+#     curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{
+#       "model":"Qwen/Qwen3.6-27B-FP8","messages":[{"role":"user","content":"Prove sqrt(2) is irrational."}],
+#       "max_tokens":2000,"thinking_token_budget":64}' | python -c \
+#       'import json,sys; m=json.load(sys.stdin)["choices"][0]["message"]; \
+#        print("reasoning chars:", len(m.get("reasoning_content") or m.get("reasoning") or "")); \
+#        print("answer starts:", (m.get("content") or "")[:80])'
+#     A ~64-token reasoning block (a few hundred chars) plus a real answer = enforced. Thousands of
+#     chars of reasoning = the field was ignored; check the server version.
+#
+# ---------------------------------------------------------------------------------------------
+# 2. LAUNCH
+# ---------------------------------------------------------------------------------------------
+#   cd src && tmux new -s bl_qwen
+#   python run_sweep.py sweeps/baselines_qwen.yaml --print-cmds
+#   python run_sweep.py sweeps/baselines_qwen.yaml --sweep-dir <big-disk>/runs/baselines_qwen
+#   python run_sweep.py --status <big-disk>/runs/baselines_qwen
+#
+#   Budget ~60-100 KB/candidate for completions + reasoning traces => ~0.5-0.75 GB/run => ~30 GB for
+#   the 50 runs. Put the sweep dir on scratch, not on a home quota.
+#
+# ---------------------------------------------------------------------------------------------
+# 3. COST
+# ---------------------------------------------------------------------------------------------
+# Cheaper than the gpt-oss side on two counts: a 27B dense model on a B200 should decode roughly
+# 4-6x faster than 120B-MoE on 2xA100 (~27 GB of weights against ~8 TB/s, versus ~63 GB against
+# 2x1.94 TB/s), and `thinking_token_budget` puts a HARD ceiling on the per-candidate cost that
+# gpt-oss simply does not have. Order of magnitude at ~2,500 aggregate decode tok/s and ~15k
+# tokens/candidate: ~6 s/candidate -> ~12 h/run -> ~26 days for all 50 runs at max_parallel 2.
+#
+# None of that is measured on this hardware. Run sweeps/calibrate_qwen.yaml first (2 runs x 3
+# generations) and re-derive from its `tokens_per_completion` / `wall_seconds`.
+# =================================================================================================
+
+sweep:
+  name: baselines_qwen
+  max_parallel: 2                # worth testing 3-4 here: a 27B model on a B200 has more compute
+                                 # headroom per token than gpt-oss on the A100s did. Watch
+                                 # `curl -s localhost:8001/metrics | grep num_requests_waiting` — a
+                                 # persistently non-zero queue means you have gone past useful.
+  stagger: 180
+  server_max_num_seqs: 128       # must match the server's --max-num-seqs (see header: the 300
+                                 # sequences behind these requests exceeding it is intended)
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: Qwen/Qwen3.6-27B-FP8
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: none         # gpt-oss-only knob; `none` keeps it out of the request entirely
+
+  # --- token budgets (fixed across every experiment in this project) --------------------------
+  thinking-token-budget: 26000   # HARD cap on reasoning tokens; vLLM force-emits </think> at the
+                                 # limit so the candidate still produces an answer. Mirrors
+                                 # TTT-Discover's phase1 budget of 26,000 — note theirs counts
+                                 # prompt + thinking, so at these ~2-5k prompts it is the slightly
+                                 # more generous setting of the two.
+  max-tokens: 34000              # reasoning + answer; ~26k thinking + ~8k answer
+  max-context-tokens: 94000      # inert at n-context 0; kept for budget parity with the ICL runs
+  temperature: 1.0
+
+  # --- search shape --------------------------------------------------------------------------
+  n-context: 0
+  groups-per-batch: 5
+  group-size: 30                 # 150 candidates/generation
+  num-generations: 50            # 7,500 candidates/run
+
+  # --- execution -----------------------------------------------------------------------------
+  max-gen-concurrency: 5         # = groups-per-batch; no chunking
+  num-cpus-per-task: 2           # uniform across problems so ONE shared Ray head serves the whole
+                                 # queue — see the note in baselines_gptoss.yaml. If the Bosch box
+                                 # has noticeably fewer cores than 96, check the grading barrier in
+                                 # the first run's log (`gen N ... (generate X s)` vs total) before
+                                 # trusting 150 candidates/generation.
+
+grid:
+  seed: [1, 2, 3, 4, 5]        # replicate index: 5 independent repeats, not 5 configs
+  parent-source: [initial, puct]
+  problem: [circle_packing_26, circle_packing_32, erdos, ac1, ac2]
+  # -> 50 runs named e.g. erdos_s-1_ps-puct
+
+# =================================================================================================
+# SCALED-DOWN ALTERNATIVE: as in baselines_gptoss.yaml — num-generations: 25 and seed: [1, 2, 3]
+# gives 30 runs of 3,750 candidates (3.3x cheaper).
+# =================================================================================================
