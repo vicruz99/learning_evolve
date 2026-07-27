@@ -119,6 +119,9 @@ def check_resources(ray) -> int:
 
     info(f"Ray CPU={ray_cpus}  available now={avail.get('CPU', 0):g}   "
          f"GPU={total.get('GPU', 0):g}   nodes={len([n for n in ray.nodes() if n['Alive']])}")
+    if ray_cpus and avail.get("CPU", 0) < 0.05 * ray_cpus:
+        info("cluster is FULLY COMMITTED right now — every section below will measure contention as "
+             "well as health. Re-run when idle before concluding anything is misconfigured.")
     info(f"this process: sched_getaffinity={affinity}  os.cpu_count()={nproc}")
 
     if ray_cpus == 0:
@@ -251,6 +254,11 @@ def _probe(group_size: int) -> dict:
     import ray as _ray
     from sandbox.cpu_scheduler import get_cpu_group, release_cpu_group
 
+    # Wall clock (not perf_counter): the driver compares this against its own submit time to separate
+    # "Ray took a long time to START me" (cluster full) from "Ray is slow" (broken). Same host, so
+    # time.time() is comparable across the two processes; perf_counter would not be.
+    t_task_start = time.time()
+
     t0 = time.perf_counter()
     actor = _ray.get_actor("cpu_scheduler")
     group = get_cpu_group(actor, timeout_s=120)
@@ -272,7 +280,7 @@ def _probe(group_size: int) -> dict:
         while time.perf_counter() - spin_t0 < 0.3:
             x += 1
         return {"group": group, "child_cpus": child_cpus, "queue_s": t_queue,
-                "pid": os.getpid(), "spins": x}
+                "pid": os.getpid(), "spins": x, "t_task_start": t_task_start}
     finally:
         # ALWAYS release. A group that is not returned is lost from the deque for the lifetime of
         # the head, permanently shrinking every future run's grading parallelism.
@@ -295,14 +303,27 @@ def check_exec(ray, n: int, ray_cpus: int, num_cpus_per_task: int) -> None:
     fn = ray.remote(num_cpus=group_size, max_calls=0)(_probe)
 
     t0 = time.perf_counter()
+    submit_wall = time.time()
     try:
-        results = ray.get([fn.remote(group_size) for _ in range(n)], timeout=600)
+        results = ray.get([fn.remote(group_size) for _ in range(n)], timeout=3600)
     except Exception as e:
         fail(f"tasks did not complete: {type(e).__name__}: {e}")
         return
     wall = time.perf_counter() - t0
 
     ok(f"{len(results)}/{n} tasks completed in {wall:.1f}s")
+
+    # Admission wait is the single most misread number here. A task that sits for minutes before it
+    # even STARTS means the cluster is fully committed to other work (a live sweep), NOT that Ray is
+    # broken. Crucially, this wait is invisible to queue_seconds -- that clock only starts once the
+    # task is already running -- so a saturated cluster shows queue_seconds ~0 while candidates wait
+    # ages. It IS included in grade_seconds, so grade_seconds - eval_seconds is where it surfaces.
+    adm = sorted(r["t_task_start"] - submit_wall for r in results)
+    info(f"Ray admission wait (submit -> task starts): p50 {adm[len(adm)//2]:.1f}s  max {adm[-1]:.1f}s")
+    if adm[-1] > 30:
+        warn(f"tasks waited up to {adm[-1]:.0f}s just to be ADMITTED. Ray's CPU pool is fully "
+             "committed (check 'available now' in section 2). Expected while a sweep is running; it "
+             "is contention, not a misconfiguration — and note queue_seconds cannot see it.")
 
     bad_pin = [r for r in results if r["child_cpus"] != sorted(r["group"])]
     if bad_pin:
@@ -338,9 +359,9 @@ def check_exec(ray, n: int, ray_cpus: int, num_cpus_per_task: int) -> None:
     t0 = time.perf_counter()
     ray.get(fn.remote(group_size))
     rt = time.perf_counter() - t0
-    info(f"single warm task round trip: {rt:.2f}s = 0.30s of work + {rt - 0.3:.2f}s of Ray "
-         "dispatch/pickle/actor RPCs (INESC reference: 0.06s idle, 0.85s with a sweep loading the "
-         "box — so read this against how busy the machine is, not as an absolute)")
+    info(f"single task round trip: {rt:.2f}s (0.30s of it is work). On an IDLE cluster the remainder "
+         "is Ray's dispatch cost — INESC reference 0.06s. On a BUSY cluster it is mostly admission "
+         "wait, so read it together with the admission line above, never as an absolute.")
 
     # THE HARNESS FLOOR. Every eval pays a fresh interpreter + `import numpy` before running a single
     # line of the candidate's algorithm, and it pays it from wherever the venv lives. This is the
