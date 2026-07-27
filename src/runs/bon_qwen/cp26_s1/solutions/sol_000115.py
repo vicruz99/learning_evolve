@@ -1,0 +1,130 @@
+# sol_000115 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4a327247) state=904287ad sum of radii=2.588628 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Pack 26 circles in a unit square to maximize sum of radii.
+    """
+    n_circles = 26
+    
+    # --- 1. Initialization: Hexagonal Lattice ---
+    centers = []
+    r_init = 0.08  # Safe starting radius
+    
+    # Hexagonal grid parameters
+    # Vertical spacing is sqrt(3)/2 * diameter = sqrt(3) * r
+    # Horizontal spacing is diameter = 2 * r
+    # Rows alternate shift by r
+    
+    row_idx = 0
+    count = 0
+    
+    while count < n_circles:
+        y = r_init + row_idx * (np.sqrt(3) * r_init)
+        if y + r_init > 1.0:
+            row_idx += 1
+            continue
+            
+        # Determine x-offset for this row
+        # Even rows (0, 2...) aligned with 0 (offset 0)
+        # Odd rows (1, 3...) shifted by r
+        offset = r_init if (row_idx % 2 == 1) else 0.0
+        
+        # Iterate over columns in this row
+        x = r_init + offset
+        while x + r_init <= 1.0:
+            if count < n_circles:
+                centers.append([x, y])
+                count += 1
+            x += 2 * r_init
+            
+        row_idx += 1
+        
+    # Fill remaining if we somehow stopped early (unlikely with this logic)
+    while len(centers) < n_circles:
+        centers.append([0.5, 0.5])
+        
+    centers = np.array(centers)
+    radii = np.full(n_circles, r_init)
+    
+    # --- 2. Optimization ---
+    
+    def objective(vars_vec):
+        # vars_vec layout: [x_0, y_0, r_0, x_1, y_1, r_1, ...]
+        # Or simpler: [all_x, all_y, all_r]
+        # Let's use [x, y, r] interleaved for easier indexing if needed, 
+        # but separate arrays are easier for vectorization.
+        # Let's stick to separate blocks: x[0:n], y[n:2n], r[2n:3n]
+        
+        r = vars_vec[2 * n_circles:]
+        return -np.sum(r)
+
+    def constraint_walls(vars_vec):
+        x = vars_vec[:n_circles]
+        y = vars_vec[n_circles:2 * n_circles]
+        r = vars_vec[2 * n_circles:]
+        
+        constraints = []
+        # x - r >= 0
+        constraints.extend(x - r)
+        # 1 - x - r >= 0
+        constraints.extend(1.0 - x - r)
+        # y - r >= 0
+        constraints.extend(y - r)
+        # 1 - y - r >= 0
+        constraints.extend(1.0 - y - r)
+        return np.array(constraints)
+
+    def constraint_non_overlap(vars_vec):
+        x = vars_vec[:n_circles]
+        y = vars_vec[n_circles:2 * n_circles]
+        r = vars_vec[2 * n_circles:]
+        
+        constraints = []
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                # dist >= r_i + r_j  =>  dist - r_i - r_j >= 0
+                dist = np.sqrt((x[i] - x[j])**2 + (y[i] - y[j])**2)
+                constraints.append(dist - r[i] - r[j])
+        return np.array(constraints)
+
+    # Initial guess vector
+    x0 = np.concatenate([centers[:, 0], centers[:, 1], radii])
+    
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0.0, 1.0)] * n_circles + \
+             [(0.0, 1.0)] * n_circles + \
+             [(0.0, 0.5)] * n_circles
+
+    # Constraints definitions for SLSQP
+    cons = (
+        {'type': 'ineq', 'fun': constraint_walls},
+        {'type': 'ineq', 'fun': constraint_non_overlap}
+    )
+
+    # Run optimization
+    # SLSQP is good for constrained non-linear problems
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'ftol': 1e-9, 'maxiter': 500, 'disp': False})
+
+    # Extract results
+    best_x = res.x[:n_circles]
+    best_y = res.x[n_circles:2 * n_circles]
+    best_r = res.x[2 * n_circles:]
+
+    # --- 3. Post-processing ---
+    # Shrink radii slightly to ensure strict validity against numerical errors
+    # The validator allows 1e-12 error, but shrinking by 0.1% is safer and keeps sum high
+    best_r = best_r * 0.999
+    
+    final_centers = np.column_stack((best_x, best_y))
+    final_radii = best_r
+    sum_radii = np.sum(final_radii)
+
+    return final_centers, final_radii, sum_radii

@@ -1,0 +1,387 @@
+# sol_000109 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state a3c1a30f) state=d3d56a72 sum of radii=1.950000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize
+import math
+
+def softplus(x, beta=100):
+    """Smooth approximation of max(0, x)"""
+    return np.log1p(np.exp(beta * x)) / beta
+
+def compute_violations(centers, radii, beta=100):
+    """
+    Computes a smooth penalty score for violations.
+    Lower is better. 0 means valid.
+    """
+    n = centers.shape[0]
+    penalty = 0.0
+    
+    # Boundary violations
+    # x - r < 0 => r - x > 0
+    # x + r > 1 => x + r - 1 > 0
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        
+        # Left
+        v = r - x
+        if v > 1e-9: penalty += softplus(v, beta)
+        # Right
+        v = x + r - 1.0
+        if v > 1e-9: penalty += softplus(v, beta)
+        # Bottom
+        v = r - y
+        if v > 1e-9: penalty += softplus(v, beta)
+        # Top
+        v = y + r - 1.0
+        if v > 1e-9: penalty += softplus(v, beta)
+        
+        # Negative radius
+        if r < 0: penalty += softplus(-r, beta)
+
+    # Overlap violations
+    # dist < r1 + r2 => r1 + r2 - dist > 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = math.sqrt(dx*dx + dy*dy)
+            sum_r = radii[i] + radii[j]
+            
+            # Avoid division by zero or singularities if dist is very small
+            if dist < 1e-12:
+                dist = 1e-12
+            
+            v = sum_r - dist
+            if v > 1e-9: penalty += softplus(v, beta)
+
+    return penalty
+
+def objective_function(params, n_circles):
+    """
+    Objective to minimize: -Sum(Radii) + Penalty
+    """
+    # params: [x0, y0, r0, x1, y1, r1, ...]
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        centers[i, 0] = params[3*i]
+        centers[i, 1] = params[3*i + 1]
+        radii[i] = params[3*i + 2]
+        
+    # We want to maximize sum of radii, so minimize negative sum
+    obj = -np.sum(radii)
+    
+    # Add penalty for violations
+    # We use a high weight to force feasibility
+    penalty_weight = 1000.0 
+    obj += penalty_weight * compute_violations(centers, radii, beta=20)
+    
+    return obj
+
+def get_hexagonal_init(n):
+    """Generate initial positions on a hexagonal grid"""
+    centers = []
+    radii = []
+    
+    # Try to fit n circles in a hexagonal pattern
+    # Estimate radius based on area
+    # N * pi * r^2 approx 0.85 (packing density)
+    # r approx sqrt(0.85 / (N * pi))
+    r_est = math.sqrt(0.85 / (n * math.pi))
+    
+    # Grid parameters
+    # Row height = sqrt(3) * r
+    # Col width = 2 * r
+    # But we don't know r exactly yet, so we place centers in a normalized grid
+    # and scale later or just place them densely.
+    
+    # Let's place points in a unit square [0,1]x[0,1] with a specific density
+    # Then we will optimize radii.
+    
+    # A simple way: place in rows
+    rows = int(math.sqrt(n))
+    if rows < 2: rows = 2
+    
+    # Hexagonal shift
+    row_h = 1.0 / rows
+    col_w = 1.0 / rows 
+    
+    # Actually, let's just put them in a grid and perturb
+    # Better: generate points on triangular lattice
+    # x = i * a + (j%2) * a/2
+    # y = j * a * sqrt(3)/2
+    
+    # We want to cover the square.
+    # Let's try to fit points with separation approx 0.2
+    sep = 0.15
+    pts = []
+    y = 0.1 # margin
+    while y < 0.9:
+        x = 0.1
+        offset = 0 if int(y / (sep * math.sqrt(3)/2)) % 2 == 0 else sep/2
+        while x < 0.9:
+            pts.append((x + offset, y))
+            x += sep
+        y += sep * math.sqrt(3)/2
+        
+    # If we have too few, add random
+    while len(pts) < n:
+        pts.append((np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)))
+    
+    # If too many, trim
+    pts = pts[:n]
+    
+    centers = np.array(pts)
+    # Initial radii: small enough to not overlap
+    radii = np.ones(n) * 0.01
+    
+    return centers, radii
+
+def run_packing():
+    n = 26
+    
+    # Try multiple restarts to find global optimum
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Equal radii optimization
+    # We optimize positions for a fixed radius, then scale radius up?
+    # Or optimize both.
+    
+    # Let's try optimizing both centers and radii
+    # We will run a few trials
+    
+    for trial in range(10):
+        if trial == 0:
+            centers, radii = get_hexagonal_init(n)
+        else:
+            # Random initialization with some spread
+            centers = np.random.uniform(0.2, 0.8, (n, 2))
+            radii = np.random.uniform(0.05, 0.12, n)
+            
+        # Flatten to 1D array for optimizer
+        params = np.zeros(3 * n)
+        for i in range(n):
+            params[3*i] = centers[i, 0]
+            params[3*i + 1] = centers[i, 1]
+            params[3*i + 2] = radii[i]
+            
+        # Bounds: x, y in [0, 1], r in [0, 0.5]
+        bounds = []
+        for _ in range(n):
+            bounds.append((0.0, 1.0)) # x
+            bounds.append((0.0, 1.0)) # y
+            bounds.append((0.0, 0.5)) # r
+            
+        # Optimize
+        # Using L-BFGS-B or SLSQP. SLSQP handles constraints but we used penalty method.
+        # L-BFGS-B is fast.
+        try:
+            res = scipy.optimize.minimize(
+                objective_function, 
+                params, 
+                args=(n,), 
+                method='L-BFGS-B', 
+                bounds=bounds,
+                options={'maxiter': 2000, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            
+            opt_params = res.x
+            
+            # Extract results
+            opt_centers = np.zeros((n, 2))
+            opt_radii = np.zeros(n)
+            for i in range(n):
+                opt_centers[i, 0] = opt_params[3*i]
+                opt_centers[i, 1] = opt_params[3*i + 1]
+                opt_radii[i] = opt_params[3*i + 2]
+                
+            # Check validity and sum
+            # Compute exact violations to be sure
+            valid = True
+            # Check overlaps
+            for i in range(n):
+                for j in range(i+1, n):
+                    d = np.sqrt(np.sum((opt_centers[i] - opt_centers[j])**2))
+                    if d < opt_radii[i] + opt_radii[j] - 1e-12:
+                        valid = False
+                        break
+                if not valid: break
+                
+            # Check boundaries
+            for i in range(n):
+                if opt_centers[i, 0] < opt_radii[i] - 1e-12 or \
+                   opt_centers[i, 0] > 1.0 - opt_radii[i] + 1e-12 or \
+                   opt_centers[i, 1] < opt_radii[i] - 1e-12 or \
+                   opt_centers[i, 1] > 1.0 - opt_radii[i] + 1e-12:
+                    valid = False
+                    break
+            
+            if valid:
+                current_sum = np.sum(opt_radii)
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = opt_centers.copy()
+                    best_radii = opt_radii.copy()
+                    
+        except Exception:
+            pass
+
+    # If the first approach didn't yield a great result, try a specific heuristic:
+    # Start with equal radii, pack tightly, then see if we can expand.
+    # The penalty method usually finds a local optimum.
+    # Let's try to boost radii if there is slack.
+    
+    # Check if we can uniformly scale radii up
+    if best_centers is not None:
+        # Find the tightest constraint
+        min_dist_ratio = float('inf')
+        
+        # Pairwise
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.sqrt(np.sum((best_centers[i] - best_centers[j])**2))
+                sum_r = best_radii[i] + best_radii[j]
+                if sum_r > 0:
+                    ratio = d / sum_r
+                    if ratio < min_dist_ratio:
+                        min_dist_ratio = ratio
+        
+        # Boundary
+        for i in range(n):
+            r = best_radii[i]
+            if r > 0:
+                # Distance to closest wall
+                dist_wall = min(best_centers[i, 0], 1-best_centers[i, 0], 
+                                best_centers[i, 1], 1-best_centers[i, 1])
+                ratio = dist_wall / r
+                if ratio < min_dist_ratio:
+                    min_dist_ratio = ratio
+                    
+        # If min_dist_ratio > 1, we can scale up?
+        # Wait, ratio = d / (r_i + r_j). If ratio > 1, no overlap.
+        # If we scale radii by k, new sum_r = k(r_i + r_j).
+        # Condition: d >= k(r_i + r_j) => k <= d / (r_i + r_j).
+        # So max k is min(ratios).
+        
+        if min_dist_ratio > 1.0001:
+            # Scale up radii
+            scale = min_dist_ratio
+            # Actually we can't just scale radii because centers might move out of bounds?
+            # Center constraint: x >= r => x >= k*r => k <= x/r.
+            # This is covered by the boundary ratio check.
+            
+            # However, scaling radii doesn't change centers, so boundary checks are valid.
+            # But we must ensure centers stay inside [0,1] (they do) and circles inside [0,1].
+            # The boundary ratio check ensures circles stay inside.
+            
+            best_radii *= scale
+            best_sum = np.sum(best_radii)
+            
+            # After scaling, run a quick local optimization to adjust centers for better fit
+            # Re-optimize centers with fixed radii?
+            # Or just re-run the full optimization with these as start?
+            
+            # Let's re-run optimization with this improved start
+            params = np.zeros(3 * n)
+            for i in range(n):
+                params[3*i] = best_centers[i, 0]
+                params[3*i + 1] = best_centers[i, 1]
+                params[3*i + 2] = best_radii[i]
+                
+            try:
+                res = scipy.optimize.minimize(
+                    objective_function, 
+                    params, 
+                    args=(n,), 
+                    method='L-BFGS-B', 
+                    bounds=bounds,
+                    options={'maxiter': 1000}
+                )
+                opt_params = res.x
+                opt_centers = np.zeros((n, 2))
+                opt_radii = np.zeros(n)
+                for i in range(n):
+                    opt_centers[i, 0] = opt_params[3*i]
+                    opt_centers[i, 1] = opt_params[3*i + 1]
+                    opt_radii[i] = opt_params[3*i + 2]
+                
+                # Validate
+                valid = True
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.sqrt(np.sum((opt_centers[i] - opt_centers[j])**2))
+                        if d < opt_radii[i] + opt_radii[j] - 1e-12:
+                            valid = False; break
+                    if not valid: break
+                for i in range(n):
+                    if opt_centers[i, 0] < opt_radii[i] - 1e-12 or \
+                       opt_centers[i, 0] > 1.0 - opt_radii[i] + 1e-12 or \
+                       opt_centers[i, 1] < opt_radii[i] - 1e-12 or \
+                       opt_centers[i, 1] > 1.0 - opt_radii[i] + 1e-12:
+                        valid = False; break
+                
+                if valid:
+                    current_sum = np.sum(opt_radii)
+                    if current_sum > best_sum:
+                        best_sum = current_sum
+                        best_centers = opt_centers.copy()
+                        best_radii = opt_radii.copy()
+                        
+            except Exception:
+                pass
+
+    # Final sanity check and clamping
+    if best_centers is None:
+        # Fallback: Grid
+        best_centers = np.zeros((n, 2))
+        best_radii = np.zeros(n)
+        side = 5
+        r = 0.1
+        idx = 0
+        for r_idx in range(side):
+            for c_idx in range(side):
+                if idx < n:
+                    best_centers[idx, 0] = 0.1 + c_idx * 0.2
+                    best_centers[idx, 1] = 0.1 + r_idx * 0.2
+                    best_radii[idx] = 0.1
+                    idx += 1
+        # Fill remaining if any (should be exactly 25 for 5x5, we need 26)
+        # If n=26, grid fails.
+        # Just place last one in center?
+        if n > 25:
+             best_centers[25] = [0.5, 0.5]
+             best_radii[25] = 0.0 # Small radius
+             
+        # Re-optimize this fallback
+        params = np.zeros(3 * n)
+        for i in range(n):
+            params[3*i] = best_centers[i, 0]
+            params[3*i + 1] = best_centers[i, 1]
+            params[3*i + 2] = best_radii[i]
+        
+        try:
+            res = scipy.optimize.minimize(
+                objective_function, params, args=(n,), method='L-BFGS-B', 
+                bounds=bounds, options={'maxiter': 3000}
+            )
+            for i in range(n):
+                best_centers[i, 0] = res.x[3*i]
+                best_centers[i, 1] = res.x[3*i + 1]
+                best_radii[i] = res.x[3*i + 2]
+        except: pass
+
+    # Ensure radii are non-negative
+    best_radii = np.maximum(best_radii, 0)
+    
+    # Recalculate sum
+    final_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, final_sum

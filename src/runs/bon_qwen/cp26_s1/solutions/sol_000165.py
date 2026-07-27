@@ -1,0 +1,284 @@
+# sol_000165 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1d84d4eb) state=6fef62cc sum of radii=0.814312 correctness=1.0
+# stdout(first 200): Circle 25 at (0.15742566715844428, 0.0) with radius 0.03060939049197436 is outside the unit square Circle 25 at (0.15742566715844428, 0.0) with radius 0.03057884219807019 is outside the unit square Ci
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # --- 1. Initialization ---
+    # Start with a hexagonal grid pattern, slightly scaled to fit 25 circles, 
+    # plus one extra circle placed in a gap or random spot.
+    # This gives a much better starting point than pure random.
+    
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Hexagonal lattice parameters
+    # We want to fit 26 circles. A 5x5 grid is 25.
+    # Let's generate a dense hex grid and pick the first 26 points that fit in [0,1]x[0,1]
+    
+    candidates = []
+    spacing = 0.21 # Rough guess for spacing to fit many points
+    
+    # Generate points in hexagonal pattern
+    # Basis vectors
+    v1 = np.array([spacing, 0])
+    v2 = np.array([spacing * 0.5, spacing * np.sqrt(3)/2])
+    
+    # Cover the square with a bit of padding
+    for i in range(-5, 15):
+        for j in range(-5, 15):
+            p = i * v1 + j * v2
+            if 0.01 <= p[0] <= 0.99 and 0.01 <= p[1] <= 0.99:
+                candidates.append(p)
+                
+    # If we don't have enough candidates, add random ones
+    if len(candidates) < n:
+        while len(candidates) < n:
+            p = rng.random(2)
+            candidates.append(p)
+            
+    candidates = np.array(candidates)
+    
+    # Select n candidates that are most spread out or just take first n
+    # Taking first n from hex grid is fine
+    centers = candidates[:n].copy()
+    
+    # Initial small radius
+    init_r = 0.02
+    radii[:] = init_r
+
+    # --- 2. Force-Directed Expansion Simulation ---
+    
+    # Parameters
+    max_iter = 2000
+    growth_factor = 1.002
+    repulsion_strength = 10.0
+    
+    current_r = init_r
+    
+    # Store best valid state
+    best_sum = 0.0
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+
+    for step in range(max_iter):
+        # 1. Try to grow radii
+        # We grow them all uniformly to maximize sum
+        new_r = current_r * growth_factor
+        radii[:] = new_r
+        
+        # 2. Resolve collisions
+        # We perform multiple passes to resolve overlaps
+        for _ in range(20):
+            forces = np.zeros_like(centers)
+            valid = True
+            
+            # Inter-circle repulsion
+            for i in range(n):
+                for j in range(i + 1, n):
+                    vec = centers[i] - centers[j]
+                    dist = np.linalg.norm(vec)
+                    min_dist = radii[i] + radii[j]
+                    
+                    if dist < min_dist and dist > 1e-9:
+                        overlap = min_dist - dist
+                        # Force direction: push i away from j
+                        direction = vec / dist
+                        # Apply force proportional to overlap
+                        f = overlap * repulsion_strength
+                        forces[i] += direction * f
+                        forces[j] -= direction * f
+                        valid = False
+            
+            # Wall repulsion
+            for i in range(n):
+                x, y = centers[i]
+                r = radii[i]
+                
+                # Left wall
+                if x - r < 0:
+                    forces[i, 0] += (r - x) * repulsion_strength * 5
+                    valid = False
+                # Right wall
+                if x + r > 1:
+                    forces[i, 0] -= (x + r - 1) * repulsion_strength * 5
+                    valid = False
+                # Bottom wall
+                if y - r < 0:
+                    forces[i, 1] += (r - y) * repulsion_strength * 5
+                    valid = False
+                # Top wall
+                if y + r > 1:
+                    forces[i, 1] -= (y + r - 1) * repulsion_strength * 5
+                    valid = False
+
+            # Apply forces
+            centers += forces
+            
+            # Clamp centers to [0, 1] to prevent explosion, though forces should handle it
+            centers = np.clip(centers, 0, 1)
+            
+            # If valid, we can break early to save time, but usually we need to settle
+            if valid:
+                break
+        
+        # 3. Check validity and update best
+        # Due to numerical drift, we clamp radii slightly if they cause issues, 
+        # but our force loop ensures centers are pushed back.
+        # However, we need to ensure radii don't grow if they can't fit.
+        # If valid, we keep the new radius. If not valid after settling, we reduce radius?
+        # Actually, the simulation keeps increasing radius. If it can't resolve, 
+        # the centers will be stuck at boundaries and forces will be high.
+        # We rely on the fact that if it converges, it's valid.
+        
+        # Check validity strictly
+        if validate_packing(centers, radii):
+            current_sum = np.sum(radii)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                current_r = new_r
+        else:
+            # If invalid, revert radius growth and try again with smaller growth or just stop growing?
+            # To make progress, we revert the radius increase
+            radii[:] = current_r
+            # And maybe reduce growth factor
+            growth_factor = max(1.001, growth_factor * 0.99)
+
+    # --- 3. Local Optimization with scipy ---
+    # Use the best state found by simulation as initial guess
+    # We optimize centers to maximize the minimum distance (which allows larger radii)
+    # Or directly optimize sum of radii with constraints.
+    
+    # Let's try to optimize centers to maximize the "clearance"
+    # Clearance = min( dist(i,j) - (r_i+r_j), dist_to_walls - r_i )
+    # If clearance > 0, we can increase r.
+    
+    # Better: Fix radii to best_radii, optimize centers to minimize overlap/penalty.
+    # Then increase radii slightly.
+    
+    x0 = best_centers.flatten()
+    
+    def objective(vars):
+        c = vars.reshape(-1, 2)
+        penalty = 0.0
+        # Boundary penalty
+        for i in range(n):
+            x, y = c[i]
+            r = best_radii[i]
+            # Soft penalty for going out of bounds
+            if x < r: penalty += (r - x)**2 * 1000
+            if x > 1 - r: penalty += (x - (1 - r))**2 * 1000
+            if y < r: penalty += (r - y)**2 * 1000
+            if y > 1 - r: penalty += (y - (1 - r))**2 * 1000
+            
+            # Overlap penalty
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(c[i] - c[j])
+                min_d = best_radii[i] + best_radii[j]
+                if dist < min_d:
+                    penalty += (min_d - dist)**2 * 1000
+        return penalty
+
+    res = minimize(objective, x0, method='L-BFGS-B')
+    
+    if res.fun < 1e-6:
+        best_centers = res.x.reshape(-1, 2)
+    
+    # Try to increase radii one last time
+    # We can try to scale up radii and re-optimize centers
+    for _ in range(5):
+        best_radii *= 1.005
+        # Re-optimize centers
+        res = minimize(objective, best_centers.flatten(), method='L-BFGS-B')
+        if res.fun < 1e-6:
+            best_centers = res.x.reshape(-1, 2)
+        else:
+            # Revert
+            best_radii /= 1.005
+            break
+
+    # Final validation and return
+    if not validate_packing(best_centers, best_radii):
+        # Fallback to simulation result if optimization failed
+        best_centers = best_centers # keep last valid from sim if possible, but logic above keeps best
+        # Actually best_radii might be invalid now. 
+        # Let's rely on the simulation's best_radii if scipy fails.
+        # But we need to return something valid.
+        # The variable 'best_radii' tracks valid states in simulation loop.
+        # The scipy part might have corrupted it if not checked.
+        # Let's re-assign from simulation best if needed.
+        # But we didn't store simulation best separately after scipy.
+        # Let's fix:
+        pass
+
+    # Ensure validity
+    if not validate_packing(best_centers, best_radii):
+        # Just return the simulation best if we had it stored.
+        # Since I didn't strictly separate, let's just run a quick shrink if invalid.
+        factor = 0.99
+        while not validate_packing(best_centers, best_radii) and factor > 0.5:
+            best_radii *= factor
+            factor -= 0.01
+            
+    # Return
+    # Centers must be (26, 2), Radii (26,)
+    return best_centers, best_radii, float(np.sum(best_radii))

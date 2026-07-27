@@ -1,0 +1,255 @@
+
+
+<strategy>
+To solve the circle packing problem for 26 circles in a unit square, we need to maximize the sum of radii $\sum r_i$. This is a non-convex optimization problem with many local optima. A purely random search is inefficient, and a single run of a local optimizer might get stuck.
+
+The strategy involves a two-phase approach:
+1.  **Heuristic Initialization (Force-Directed Repulsion):**
+    *   Start with 26 circles placed randomly or on a grid with small radii.
+    *   Run a physical simulation where circles repel each other and the walls.
+    *   Iteratively increase the radii while resolving overlaps using repulsive forces.
+    *   This phase finds a dense, valid packing configuration that serves as an excellent starting point for the optimizer, ensuring we are far from trivial solutions (like all circles being tiny).
+
+2.  **Constrained Optimization (`scipy.optimize.minimize`):**
+    *   Use the `SLSQP` method, which handles non-linear constraints effectively.
+    *   **Objective:** Minimize $-\sum r_i$ (equivalent to maximizing sum of radii).
+    *   **Variables:** $x_i, y_i, r_i$ for all 26 circles (78 variables).
+    *   **Constraints:**
+        *   Boundary constraints: $r_i \le x_i \le 1-r_i$ and $r_i \le y_i \le 1-r_i$.
+        *   Non-overlap constraints: $(x_i - x_j)^2 + (y_i - y_j)^2 \ge (r_i + r_j)^2$ for all pairs $i < j$.
+        *   Non-negative radii.
+    *   **Vectorization:** The constraint function is implemented using NumPy broadcasting to efficiently compute pairwise distances and constraint violations for all 325 pairs simultaneously, ensuring the solver runs within time limits.
+
+To improve robustness, we will run the optimizer with a few different initial configurations (derived from the heuristic) and select the one with the highest sum of radii.
+
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    """
+    n = 26
+    
+    # Function to calculate pairwise distances and check constraints efficiently
+    def get_constraints(vars):
+        # vars shape (78,) -> (26, 3)
+        # cols: 0=x, 1=y, 2=r
+        state = vars.reshape(n, 3)
+        xs = state[:, 0]
+        ys = state[:, 1]
+        rs = state[:, 2]
+        
+        constraints = []
+        
+        # Boundary constraints: x - r >= 0, 1 - x - r >= 0, etc.
+        # x - r >= 0  => r <= x
+        # 1 - x - r >= 0 => x + r <= 1
+        # y - r >= 0 => r <= y
+        # 1 - y - r >= 0 => y + r <= 1
+        constraints.append(xs - rs)
+        constraints.append(1.0 - xs - rs)
+        constraints.append(ys - rs)
+        constraints.append(1.0 - ys - rs)
+        
+        # Non-overlap constraints: dist^2 >= (r_i + r_j)^2
+        # dist^2 - (r_i + r_j)^2 >= 0
+        # Vectorized computation of pairwise squared distances
+        # diff_xy shape (n, n, 2)
+        diff_xy = xs[:, None, None] - xs[None, :, None] # This is wrong broadcasting, fix below
+        # Correct broadcasting:
+        # xs shape (n,), xs[:, None] is (n, 1), xs[None, :] is (1, n)
+        dx = xs[:, None] - xs[None, :] # (n, n)
+        dy = ys[:, None] - ys[None, :] # (n, n)
+        dist_sq = dx**2 + dy**2
+        
+        # Sum of radii matrix (n, n)
+        r_sum = rs[:, None] + rs[None, :]
+        r_sum_sq = r_sum**2
+        
+        # We only need upper triangle to avoid duplicates and self-interaction
+        # Mask for i < j
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        
+        pairwise_constraints = dist_sq[mask] - r_sum_sq[mask]
+        constraints.append(pairwise_constraints)
+        
+        # Concatenate all constraints into a single array
+        # Constraints must be >= 0
+        return np.concatenate(constraints)
+
+    def objective(vars):
+        # Maximize sum of radii -> Minimize -sum(radii)
+        rs = vars.reshape(n, 3)[:, 2]
+        return -np.sum(rs)
+
+    # Bounds for variables: x in [0, 1], y in [0, 1], r in [0, 0.5]
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+
+    # Strategy: Run force-directed expansion to get a good initial guess
+    def force_directed_init():
+        # Initial positions: Grid-like but jittered
+        # Try to fit 26 circles. 5x6 grid has 30 spots.
+        # Let's place them roughly evenly.
+        # 6 columns, 5 rows?
+        # Or random with repulsion.
+        
+        # Simple grid init
+        rows = 5
+        cols = 6
+        step_x = 1.0 / (cols + 1)
+        step_y = 1.0 / (rows + 1)
+        
+        centers = []
+        r_init = 0.03
+        count = 0
+        for r_idx in range(1, rows + 1):
+            for c_idx in range(1, cols + 1):
+                if count >= n: break
+                cx = c_idx * step_x
+                cy = r_idx * step_y
+                # Add small jitter
+                cx += (np.random.rand() - 0.5) * 0.05
+                cy += (np.random.rand() - 0.5) * 0.05
+                centers.append([cx, cy])
+                count += 1
+        
+        centers = np.array(centers[:n])
+        radii = np.ones(n) * r_init
+        
+        # Run repulsion steps to expand and settle
+        # This is a simple iterative solver
+        lr = 0.05
+        for step in range(200):
+            forces = np.zeros((n, 2))
+            
+            # Pairwise repulsion
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dx = centers[j, 0] - centers[i, 0]
+                    dy = centers[j, 1] - centers[i, 1]
+                    dist = np.hypot(dx, dy)
+                    if dist == 0: dist = 1e-9
+                    repulsion = radii[i] + radii[j] - dist
+                    if repulsion > 0:
+                        # Push apart
+                        f = repulsion / dist
+                        forces[i, 0] -= f * dx
+                        forces[i, 1] -= f * dy
+                        forces[j, 0] += f * dx
+                        forces[j, 1] += f * dy
+            
+            # Wall repulsion
+            for i in range(n):
+                if centers[i, 0] < radii[i]:
+                    forces[i, 0] += (radii[i] - centers[i, 0])
+                elif centers[i, 0] > 1.0 - radii[i]:
+                    forces[i, 0] -= (centers[i, 0] - (1.0 - radii[i]))
+                
+                if centers[i, 1] < radii[i]:
+                    forces[i, 1] += (radii[i] - centers[i, 1])
+                elif centers[i, 1] > 1.0 - radii[i]:
+                    forces[i, 1] -= (centers[i, 1] - (1.0 - radii[i]))
+            
+            # Update positions
+            centers += lr * forces
+            
+            # Clamp to valid region (loosely) to prevent explosion
+            centers = np.clip(centers, 0.0, 1.0)
+            
+            # Try to expand radii slightly if no overlaps
+            # Check max overlap
+            max_overlap = 0
+            for i in range(n):
+                for j in range(i+1, n):
+                    dist = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                    if dist < radii[i] + radii[j]:
+                        max_overlap = max(max_overlap, radii[i] + radii[j] - dist)
+            
+            if max_overlap < 1e-4:
+                radii *= 1.001
+                # Clamp radii
+                radii = np.minimum(radii, 0.5)
+        
+        # Final cleanup: reduce radii slightly to ensure strict validity for optimizer
+        radii *= 0.95
+        
+        return centers, radii
+
+    best_sum_radii = -1.0
+    best_centers = None
+    best_radii = None
+
+    # Try multiple runs with different random seeds/jitters
+    for run_id in range(5):
+        try:
+            centers, radii = force_directed_init()
+            
+            # Flatten variables: x1, y1, r1, x2, y2, r2, ...
+            x0 = np.zeros(n * 3)
+            for i in range(n):
+                x0[3*i] = centers[i, 0]
+                x0[3*i + 1] = centers[i, 1]
+                x0[3*i + 2] = radii[i]
+            
+            # Define constraints for scipy
+            # SLSQP expects a list of dicts or a single dict with 'fun' returning array
+            constr = {'type': 'ineq', 'fun': lambda vars: get_constraints(vars)}
+            
+            # Run optimizer
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constr, 
+                           options={'maxiter': 200, 'ftol': 1e-8})
+            
+            if res.success or (np.isnan(get_constraints(res.x).min()) == False and get_constraints(res.x).min() > -1e-6):
+                current_sum = -res.fun
+                # Validate manually to be sure
+                final_centers = res.x.reshape(n, 3)[:, :2]
+                final_radii = res.x.reshape(n, 3)[:, 2]
+                
+                # Quick validation check
+                valid = True
+                for i in range(n):
+                    if final_radii[i] < 0 or final_centers[i, 0] < -1e-9 or final_centers[i, 0] > 1 + 1e-9 or \
+                       final_centers[i, 1] < -1e-9 or final_centers[i, 1] > 1 + 1e-9:
+                        valid = False
+                        break
+                    if final_centers[i, 0] < final_radii[i] - 1e-9 or final_centers[i, 0] > 1 - final_radii[i] + 1e-9 or \
+                       final_centers[i, 1] < final_radii[i] - 1e-9 or final_centers[i, 1] > 1 - final_radii[i] + 1e-9:
+                        valid = False
+                        break
+                    for j in range(i + 1, n):
+                        dist = np.hypot(final_centers[i, 0] - final_centers[j, 0], final_centers[i, 1] - final_centers[j, 1])
+                        if dist < final_radii[i] + final_radii[j] - 1e-9:
+                            valid = False
+                            break
+                    if not valid: break
+                
+                if valid and current_sum > best_sum_radii:
+                    best_sum_radii = current_sum
+                    best_centers = final_centers.copy()
+                    best_radii = final_radii.copy()
+                    
+        except Exception as e:
+            print(f"Optimization run {run_id} failed: {e}")
+            continue
+
+    # If optimizer failed all runs, return the best heuristic result
+    if best_centers is None:
+        centers, radii = force_directed_init()
+        # Scale down to ensure validity
+        radii *= 0.8
+        best_centers = centers
+        best_radii = radii
+        best_sum_radii = np.sum(radii)
+
+    return best_centers, best_radii, float(np.sum(best_radii))
+
+if __name__ == "__main__":
+    centers, radii, sum_r = run_packing()
+    print(f"Sum of radii: {sum_r}")
+    print(f"First 3 centers: {centers[:3]}")
+    print(f"First 3 radii: {radii[:3]}")
+```

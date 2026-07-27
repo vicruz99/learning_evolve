@@ -1,0 +1,300 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat this as a geometric optimization problem. The strategy involves two main steps:
+1.  **Initial Placement**: We place the 26 circle centers using a hexagonal (staggered) grid pattern. This is a known efficient packing structure that provides a better starting point than a rectangular grid. We will also run a few random restarts to avoid poor local optima.
+2.  **Optimization Loop**: We use a bi-level optimization approach. 
+    *   **Inner Loop (LP)**: For a fixed set of center positions, the problem of finding the maximum radii is a Linear Program (LP) with linear constraints ($r_i + r_j \le \text{distance}$ and $r_i \le \text{distance to wall}$). We solve this to find optimal radii and their "shadow prices" (dual variables).
+    *   **Outer Loop (Gradient/Force-Directed)**: We update the center positions based on the dual variables. High dual variables indicate constraints that are actively limiting the radii; we move centers apart (for neighbor constraints) or away from walls (for boundary constraints) to relax these constraints and allow larger radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Solves the 26-circle packing problem in a unit square to maximize sum of radii.
+    """
+    n_circles = 26
+    
+    # Helper to solve the LP for a fixed set of centers
+    def solve_radii_lp(centers):
+        n = centers.shape[0]
+        c_obj = -np.ones(n) # Maximize sum of radii
+        
+        A_ub = []
+        b_ub = []
+        
+        # 1. Pairwise distance constraints: r_i + r_j <= dist(i, j)
+        # To save time, we can check all pairs. 26*25/2 = 325 constraints.
+        # Optimization: Only add constraints if dist < some threshold? 
+        # For robustness, we add all, but maybe limit to nearest neighbors if slow.
+        # 325 is small for LP.
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                b_ub.append(dist)
+        
+        # 2. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+        for i in range(n):
+            x, y = centers[i]
+            
+            # x >= r  => r - x <= 0 ? No, r <= x.
+            # Constraint: 1*r_i <= x
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(x)
+            
+            # 1-x >= r => r <= 1-x
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(1.0 - x)
+            
+            # y >= r
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(y)
+            
+            # 1-y >= r
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(1.0 - y)
+
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        # Bounds for radii: r >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                return res.x, res.ineqlin.marginals
+            else:
+                return None, None
+        except Exception:
+            return None, None
+
+    def get_forces(centers, marginals, n):
+        forces = np.zeros((n, 2))
+        idx = 0
+        
+        # Pairwise forces
+        # Marginals correspond to constraints in order added.
+        # First n*(n-1)/2 are pair constraints.
+        n_pairs = n * (n - 1) // 2
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                if idx < n_pairs:
+                    lam = marginals[idx]
+                    # Constraint: r_i + r_j <= dist. 
+                    # Increasing dist helps.
+                    # Direction of increasing dist for i is away from j.
+                    if lam > 1e-9: # Significant dual
+                        c_i = centers[i]
+                        c_j = centers[j]
+                        diff = c_i - c_j
+                        dist = np.linalg.norm(diff)
+                        if dist > 1e-9:
+                            unit_vec = diff / dist
+                            # Force repulsive
+                            forces[i] += lam * unit_vec
+                            forces[j] -= lam * unit_vec
+                    idx += 1
+        
+        # Wall forces
+        # Next 4*n constraints
+        # For each circle i, 4 constraints: x, 1-x, y, 1-y
+        for i in range(n):
+            x, y = centers[i]
+            
+            # Constraint r <= x. Dual > 0 means increase x helps.
+            # Force in +x direction.
+            mu_x_pos = marginals[idx]
+            forces[i, 0] += mu_x_pos * 1.0
+            idx += 1
+            
+            # Constraint r <= 1-x. Dual > 0 means increase (1-x) helps -> decrease x.
+            # Force in -x direction.
+            mu_x_neg = marginals[idx]
+            forces[i, 0] -= mu_x_neg * 1.0
+            idx += 1
+            
+            # Constraint r <= y. Dual > 0 means increase y helps.
+            # Force in +y direction.
+            mu_y_pos = marginals[idx]
+            forces[i, 1] += mu_y_pos * 1.0
+            idx += 1
+            
+            # Constraint r <= 1-y. Dual > 0 means increase (1-y) helps -> decrease y.
+            # Force in -y direction.
+            mu_y_neg = marginals[idx]
+            forces[i, 1] -= mu_y_neg * 1.0
+            idx += 1
+            
+        return forces
+
+    def run_optimization(centers_init, max_iter=200, lr=0.05):
+        centers = centers_init.copy()
+        n = centers.shape[0]
+        
+        for iteration in range(max_iter):
+            radii, marginals = solve_radii_lp(centers)
+            if radii is None:
+                break
+            
+            forces = get_forces(centers, marginals, n)
+            
+            # Update centers
+            centers = centers + lr * forces
+            
+            # Project centers back to [0, 1] x [0, 1]
+            # Although forces push inwards, numerical errors or strong repulsion might push out?
+            # Actually forces from walls push inwards. 
+            # But repulsion might push a corner circle out?
+            # E.g. circle at (0.1, 0.1) pushed by another might go to (-0.01, ...).
+            # We must enforce bounds.
+            centers = np.clip(centers, 0.0, 1.0)
+            
+            # Decay learning rate slightly to settle
+            if iteration > max_iter * 0.8:
+                 lr *= 0.95 # Slow down at end? 
+                 # Actually lr is local var, need to pass or manage.
+                 # Let's just use a fixed schedule or adaptive.
+                 # For simplicity, fixed small steps is fine if iterations high.
+                 pass
+
+        # Final solve for exact radii
+        final_radii, _ = solve_radii_lp(centers)
+        return centers, final_radii
+
+    # Strategy: Hexagonal Grid Initialization
+    # Rows and columns. 
+    # 26 circles. 
+    # Try fitting in 6 rows.
+    # Pattern: 5, 4, 5, 4, 5, 3? Sum = 26.
+    # Or 5, 5, 5, 5, 5, 1?
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Configuration 1: Hexagonal-like grid
+    # 6 rows
+    row_counts = [5, 4, 5, 4, 5, 3] # Sum 26
+    # Adjust to fit in square
+    # Width 1.0. 5 circles need spacing ~ 1/4? 
+    # Hex packing: horizontal spacing 2r, vertical r*sqrt(3).
+    # But we optimize radii, so just provide distinct coordinates.
+    
+    # Let's generate coordinates
+    y_step = 1.0 / 7.0 # 8 slots for 6 rows to have margin?
+    # Actually just center them.
+    
+    centers_hex = []
+    current_y = 0.2 # Start a bit in
+    
+    for r_idx, count in enumerate(row_counts):
+        current_y = 0.1 + r_idx * (0.8 / 5.0) # Spread over 0.1 to 0.9
+        
+        # X positions centered
+        if count > 0:
+            # Stagger even rows?
+            if r_idx % 2 == 1:
+                # Shifted
+                # x from 1/(2*(count+1))?
+                # Let's just linearly space
+                x_coords = np.linspace(0.1, 0.9, count)
+                # Shift
+                x_coords = x_coords + (0.9 - 0.1)/(2*count) # shift by half spacing?
+                # Simpler: just linspace
+                pass 
+            else:
+                x_coords = np.linspace(0.1, 0.9, count)
+            
+            for x in x_coords:
+                centers_hex.append([x, current_y])
+    
+    centers_hex = np.array(centers_hex)
+    
+    # Random restarts to be safe
+    rng = np.random.RandomState(42)
+    
+    candidates = []
+    candidates.append(centers_hex)
+    
+    # Generate 5 random initial configurations
+    for _ in range(5):
+        # Scatter
+        cx = rng.rand(n_circles)
+        cy = rng.rand(n_circles)
+        # Ensure some spread? 
+        # Maybe add jitter to grid
+        grid_x = np.linspace(0.1, 0.9, 6)
+        grid_y = np.linspace(0.1, 0.9, 5)
+        # Fill 6x5 = 30, remove 4
+        pts = []
+        for gx in grid_x:
+            for gy in grid_y:
+                pts.append([gx, gy])
+        # Shuffle and take 26
+        rng.shuffle(pts)
+        candidates.append(np.array(pts[:26]))
+
+    best_val = -1.0
+    
+    for init_centers in candidates:
+        # Run optimization
+        # Use a few stages with decreasing step size
+        centers_opt = init_centers.copy()
+        
+        # Stage 1: High step size
+        lr = 0.02
+        for i in range(100):
+            radii, marginals = solve_radii_lp(centers_opt)
+            if radii is None: break
+            forces = get_forces(centers_opt, marginals, n_circles)
+            centers_opt = centers_opt + lr * forces
+            centers_opt = np.clip(centers_opt, 0.0, 1.0)
+            # Decay lr
+            lr *= 0.995
+            
+        # Stage 2: Fine tune
+        lr = 0.005
+        for i in range(100):
+            radii, marginals = solve_radii_lp(centers_opt)
+            if radii is None: break
+            forces = get_forces(centers_opt, marginals, n_circles)
+            centers_opt = centers_opt + lr * forces
+            centers_opt = np.clip(centers_opt, 0.0, 1.0)
+            lr *= 0.995
+
+        final_radii, _ = solve_radii_lp(centers_opt)
+        current_sum = np.sum(final_radii)
+        
+        if current_sum > best_val:
+            best_val = current_sum
+            best_centers = centers_opt
+            best_radii = final_radii
+
+    # Final validation check (internal)
+    # Just to be sure radii are consistent with centers
+    # The LP ensures r_i + r_j <= dist and r_i <= walls.
+    # So it should be valid.
+    
+    return best_centers, best_radii, float(best_val)
+```

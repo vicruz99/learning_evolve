@@ -1,0 +1,160 @@
+
+
+<strategy>
+To pack 26 circles in a unit square maximizing the sum of radii, I will use a **penalty-based gradient optimization** approach. This method transforms the constrained maximization problem into an unconstrained (or box-constrained) minimization problem by adding smooth penalty terms for constraint violations.
+
+**Key Steps:**
+1. **Variable Representation:** Pack centers $(x_i, y_i)$ and radii $r_i$ into a single vector of length $3n = 78$. Layout: `[x0, y0, x1, y1, ..., r0, r1, ..., r25]`.
+2. **Objective Function:** Minimize $L = -\sum r_i + \frac{\mu}{2} P(\text{constraints})$, where $P$ sums squared violations of:
+   - Non-overlap: $\max(0, r_i + r_j - \|c_i - c_j\|)^2$
+   - Boundaries: $\max(0, r_i - x_i)^2$, $\max(0, r_i - (1-x_i))^2$, etc.
+3. **Gradient Computation:** Analytical gradients are derived for fast, stable convergence with `L-BFGS-B`.
+4. **Adaptive Penalty Schedule:** Start with moderate $\mu$, run optimization, then double $\mu$ iteratively. This gradually forces the solution to satisfy constraints tightly while pushing radii to their maximum feasible values.
+5. **Multiple Restarts:** Initialize with a hexagonal lattice (good packing structure) and several random configurations to avoid poor local minima. Track the best sum of radii across all runs.
+6. **Cleanup:** Clip final positions to $[0,1]^2$ and radii to $[0, 0.5]$ to guarantee validity within numerical tolerance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_loss_and_grad(vars, n, mu):
+    """
+    Computes the penalized objective and its gradient for circle packing.
+    vars: flattened array [x0, y0, x1, y1, ..., r0, r1, ..., rn-1]
+    n: number of circles
+    mu: penalty weight
+    Returns: (loss, grad)
+    """
+    centers = vars[:2*n].reshape(n, 2)
+    radii = vars[2*n:]
+
+    # Base objective: maximize sum of radii => minimize -sum(radii)
+    loss = -np.sum(radii)
+    grad = np.zeros_like(vars)
+    grad[2*n:] = -1.0
+
+    # --- Pairwise non-overlap constraints ---
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2) + 1e-15)
+    np.fill_diagonal(dists, np.inf)
+
+    rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    overlap = rad_sum - dists
+    active = overlap > 0
+    overlap_active = np.where(active, overlap, 0.0)
+
+    loss += 0.5 * mu * np.sum(overlap_active**2)
+
+    # Gradient w.r.t radii from pairwise constraints
+    grad_r_pw = mu * np.sum(overlap_active, axis=1)
+    grad[2*n:] += grad_r_pw
+
+    # Gradient w.r.t centers from pairwise constraints
+    inv_dists = np.where(active, 1.0 / dists, 0.0)
+    grad_c_pw = mu * np.sum(overlap_active[:, :, np.newaxis] * inv_dists[:, :, np.newaxis] * diffs, axis=1)
+    grad[:2*n] += grad_c_pw.flatten()
+
+    # --- Boundary constraints ---
+    # Left: r <= x  => viol = max(0, r - x)
+    viol = np.maximum(0.0, radii - centers[:, 0])
+    loss += 0.5 * mu * np.sum(viol**2)
+    grad[2*n:] += mu * viol
+    grad[0::2] -= mu * viol
+
+    # Right: r <= 1-x => viol = max(0, r + x - 1)
+    viol = np.maximum(0.0, radii + centers[:, 0] - 1.0)
+    loss += 0.5 * mu * np.sum(viol**2)
+    grad[2*n:] += mu * viol
+    grad[0::2] += mu * viol
+
+    # Bottom: r <= y
+    viol = np.maximum(0.0, radii - centers[:, 1])
+    loss += 0.5 * mu * np.sum(viol**2)
+    grad[2*n:] += mu * viol
+    grad[1::2] -= mu * viol
+
+    # Top: r <= 1-y
+    viol = np.maximum(0.0, radii + centers[:, 1] - 1.0)
+    loss += 0.5 * mu * np.sum(viol**2)
+    grad[2*n:] += mu * viol
+    grad[1::2] += mu * viol
+
+    return loss, grad
+
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = 26
+    best_sum = 0.0
+    best_vars = None
+
+    # Prepare initial configurations
+    inits = []
+    
+    # 1. Hexagonal lattice initialization (dense packing structure)
+    pts = []
+    row = 0
+    while len(pts) < n:
+        col = 0
+        while len(pts) < n and col < 6:
+            x = col * 0.18 + (row % 2) * 0.09
+            y = row * 0.156
+            pts.append((x, y))
+            col += 1
+        row += 1
+    pts = np.array(pts[:n])
+    # Normalize to center of square with some margin
+    pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.6 + 0.2
+    inits.append(np.hstack([pts.flatten(), np.full(n, 0.05)]))
+
+    # 2. Random initializations to escape poor local minima
+    for _ in range(4):
+        c = np.random.rand(n, 2) * 0.6 + 0.2
+        r = np.full(n, 0.05)
+        inits.append(np.hstack([c.flatten(), r]))
+
+    # Box constraints for optimizer
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+
+    for init_vars in inits:
+        mu = 100.0
+        vars_curr = init_vars.copy()
+        
+        # Adaptive penalty schedule: increase mu until constraints are tightly satisfied
+        for _ in range(20):
+            res = minimize(compute_loss_and_grad, vars_curr, args=(n, mu), method='L-BFGS-B',
+                           jac=True, bounds=bounds, options={'maxiter': 1000, 'ftol': 1e-10})
+            vars_curr = res.x
+            
+            # Check maximum constraint violation
+            centers = vars_curr[:2*n].reshape(n, 2)
+            radii = vars_curr[2*n:]
+            diffs = centers[:, None, :] - centers[None, :, :]
+            dists = np.sqrt(np.sum(diffs**2, axis=2) + 1e-15)
+            np.fill_diagonal(dists, np.inf)
+            overlap = np.maximum(0.0, radii[:, None] + radii[None, :] - dists)
+            
+            if np.max(overlap) < 1e-7:
+                break
+                
+            mu *= 2.0
+            # Small perturbation to help navigate the energy landscape
+            vars_curr += np.random.normal(0, 5e-4, size=vars_curr.shape)
+            vars_curr[:2*n] = np.clip(vars_curr[:2*n], 0.0, 1.0)
+            vars_curr[2*n:] = np.maximum(vars_curr[2*n:], 0.0)
+
+        current_sum = np.sum(vars_curr[2*n:])
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_vars = vars_curr.copy()
+
+    centers = best_vars[:2*n].reshape(n, 2)
+    radii = best_vars[2*n:]
+    
+    # Final safety clamping
+    centers = np.clip(centers, 0.0, 1.0)
+    radii = np.clip(radii, 0.0, 0.5)
+    
+    return centers, radii, float(np.sum(radii))
+```

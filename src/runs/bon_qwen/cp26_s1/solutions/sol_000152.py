@@ -1,0 +1,391 @@
+# sol_000152 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b47bdf6c) state=43a42569 sum of radii=2.605965 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the positions and radii of 26 circles in a unit square
+    to maximize the sum of radii.
+    """
+    n_circles = 26
+    
+    # Helper function to calculate objective and constraints for the optimizer
+    def optimize_pack(x0):
+        # Variables: x is a flat array of size 26*3 = 78
+        # Format: [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+        
+        def objective(vars_flat):
+            radii = vars_flat[2::3]
+            return -np.sum(radii) # Minimize negative sum => Maximize sum
+        
+        # Constraints
+        # 1. Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+        #    => x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+        # 2. Non-overlap: (xi-xj)^2 + (yi-yj)^2 >= (ri+rj)^2
+        #    => (xi-xj)^2 + (yi-yj)^2 - (ri+rj)^2 >= 0
+        
+        constraints = []
+        
+        # Boundary constraints
+        for i in range(n_circles):
+            idx = i * 3
+            xi = vars_flat[idx]
+            yi = vars_flat[idx+1]
+            ri = vars_flat[idx+2]
+            
+            # x - r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[i*3] - v[i*3+2]})
+            # 1 - x - r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[i*3] - v[i*3+2]})
+            # y - r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[i*3+1] - v[i*3+2]})
+            # 1 - y - r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[i*3+1] - v[i*3+2]})
+
+        # Overlap constraints
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                idx_i = i * 3
+                idx_j = j * 3
+                constraints.append({
+                    'type': 'ineq',
+                    'fun': lambda v, i=i, j=j: 
+                        (v[i*3] - v[j*3])**2 + (v[i*3+1] - v[j*3+1])**2 - (v[i*3+2] + v[j*3+2])**2
+                })
+        
+        # Non-negative radii
+        for i in range(n_circles):
+             constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[i*3+2]})
+
+        bounds = [(0, 1) if i % 3 != 2 else (0, 1) for i in range(n_circles * 3)]
+        # Radii can technically go up to 0.5, but 1 is safe bound.
+        # Actually radii bounded by 0.5 effectively by boundary constraints.
+
+        result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-9})
+        return result
+
+    # Initialization: Hexagonal grid pattern
+    # We want to fit 26 circles.
+    # A hexagonal packing is denser.
+    # Let's try to place them in rows.
+    # Row spacing approx sqrt(3)/2 * diameter.
+    # If diameter ~ 0.2, spacing ~ 0.173.
+    # 1 / 0.173 ~ 5.7 rows. So maybe 5 or 6 rows.
+    
+    # Let's try a simple perturbed grid first to ensure feasibility, 
+    # or a specific hexagonal layout.
+    
+    # Layout: 5 rows.
+    # Row 0: 5 circles
+    # Row 1: 5 circles
+    # Row 2: 5 circles
+    # Row 3: 5 circles
+    # Row 4: 6 circles? No, 26 total.
+    # 5+5+5+5+6 = 26.
+    
+    # Let's distribute x coordinates.
+    # Width 1. 5 circles -> spacing 1/6 ~ 0.166. Centers at 0.083, 0.25, ...
+    # 6 circles -> spacing 1/7 ~ 0.142.
+    
+    # Better: Hexagonal.
+    # Row 0 (y=0.1): 5 circles at x = 0.1, 0.3, 0.5, 0.7, 0.9
+    # Row 1 (y=0.25): 5 circles at x = 0.2, 0.4, 0.6, 0.8, 1.0? (1.0 is boundary)
+    # Let's just use a dense grid and let optimizer fix it.
+    
+    # A 6x5 grid has 30 points. We need 26.
+    # Remove 4 points from corners?
+    
+    # Let's generate a hexagonal grid of 26 points.
+    # Approx radius r = 0.1. Diameter 0.2.
+    # x step 0.2, y step 0.1732.
+    
+    centers_init = []
+    r_init = 0.08 # Start small to be safe
+    
+    # Try to fill with hexagonal pattern
+    # Rows
+    y_step = 0.18
+    x_step = 0.2
+    
+    # We need 26 points.
+    # Let's try 5 rows.
+    # Row 0: 6 points?
+    # If x starts at 0.1, ends at 0.9. 0.1 + 5*0.2 = 1.1 (too big).
+    # 0.1 + 4*0.2 = 0.9. So 5 points fit with spacing 0.2.
+    # 5 rows * 5 points = 25. Need 1 more.
+    # Add one in the middle or adjust spacing.
+    
+    # Let's try to fit 26 points in a grid.
+    # 6 columns, 5 rows = 30. Too many.
+    # 5 columns, 6 rows = 30.
+    # 4 columns, 7 rows = 28.
+    # 5 columns, 5 rows = 25. +1.
+    
+    # Let's place 25 in 5x5 grid and 1 in center of a cell or gap?
+    # Actually, optimizer is robust. Let's just place them somewhat evenly.
+    
+    points = []
+    # 5 rows, 5 cols
+    for r in range(5):
+        for c in range(5):
+            x = 0.1 + c * 0.2
+            y = 0.1 + r * 0.2
+            points.append([x, y])
+    
+    # Add 26th point. Maybe in the middle of the square? 0.5, 0.5 is occupied?
+    # 0.5, 0.5 is at r=2, c=2.
+    # Shift one row?
+    # Let's just add a point at (0.5, 0.05) or something?
+    # Or better, perturb the grid to be hexagonal.
+    
+    # Reset and make hexagonal
+    points = []
+    # Row 0: 5 points
+    for c in range(5):
+        points.append([0.1 + c*0.2, 0.1])
+    # Row 1: 5 points, shifted
+    for c in range(5):
+        points.append([0.2 + c*0.2, 0.1 + 0.1732])
+    # Row 2: 5 points
+    for c in range(5):
+        points.append([0.1 + c*0.2, 0.2 + 0.3464])
+    # Row 3: 5 points, shifted
+    for c in range(5):
+        points.append([0.2 + c*0.2, 0.3 + 0.5196])
+    # Row 4: 6 points? 1+5=11? No, we have 20 so far. Need 6 more.
+    # Row 4: 6 points
+    for c in range(6):
+        # Spacing needs to be smaller for 6 points in width 1?
+        # 0.1 to 0.9 is 0.8 width. 5 intervals of 0.166.
+        # Let's just use 0.15 spacing.
+        points.append([0.1 + c*0.14, 0.4 + 0.6928])
+        
+    # We might have > 26 or < 26.
+    # Let's count. 5+5+5+5+6 = 26.
+    # Check bounds.
+    # Last row y = 0.4 + 0.6928 = 1.0928 > 1.
+    # Need to scale down or shift.
+    
+    # Let's just use a simple initialization:
+    # Randomly place 26 points and let optimizer handle it?
+    # Or a grid 5x5 plus 1.
+    
+    points = []
+    # 5x5 grid
+    for i in range(5):
+        for j in range(5):
+            points.append([0.1 + i*0.2, 0.1 + j*0.2])
+    # Add 1 point at (0.5, 0.05) - wait 0.05 is outside if r=0.1.
+    # Add at (0.5, 0.5) - occupied.
+    # Add at (0.5, 0.95)?
+    # Let's just add at (0.5, 0.5) but shift others?
+    # Better: 6x5 grid is 30 points. Remove 4.
+    # Remove (0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9).
+    # This leaves 26 points in a rectangle [0.1, 0.9]x[0.1, 0.9] roughly?
+    # No, 6x5 grid: x=0.1, 0.28, 0.46, 0.64, 0.82, 1.0?
+    # Let's define a 6x5 grid with proper spacing.
+    # Width 1. 6 circles. 5 gaps + 2 margins?
+    # If r=0.1, diameter 0.2. 6*0.2 = 1.2 > 1.
+    # So 6 circles don't fit in a row with r=0.1.
+    # 5 circles fit.
+    
+    # So 5x5 = 25 is max for r=0.1 grid.
+    # To fit 26, we need smaller r or better packing.
+    # Let's initialize with r=0.09.
+    # 6 circles of diameter 0.18 -> 1.08 > 1.
+    # Maybe 5 circles with spacing 0.2, and 1 circle squeezed somewhere.
+    
+    # Let's use the optimizer's ability to handle overlaps if we start with small radii.
+    # Initialize centers randomly?
+    # Or a dense grid.
+    
+    # Let's try a 6x6 grid, take first 26.
+    # Spacing 1/6 ~ 0.166.
+    # x = 0.166, 0.333, ...
+    # y = 0.166, 0.333, ...
+    
+    points = []
+    step = 1.0 / 7 # 7 intervals for 6 points? No.
+    # Let's just use linspace.
+    # 6 points in [0.1, 0.9]
+    x_vals = np.linspace(0.1, 0.9, 6)
+    y_vals = np.linspace(0.1, 0.9, 5) # 5 points
+    
+    # This gives 30 points.
+    grid_points = []
+    for y in y_vals:
+        for x in x_vals:
+            grid_points.append([x, y])
+    
+    # We need 26. Remove 4.
+    # Remove corners?
+    # grid_points[0] -> (0.1, 0.1)
+    # grid_points[-1] -> (0.9, 0.9)
+    # Let's remove 4 random ones or just take first 26.
+    points = grid_points[:26]
+    
+    # Initial radii
+    r_start = 0.08
+    
+    x0 = []
+    for p in points:
+        x0.extend([p[0], p[1], r_start])
+    
+    x0 = np.array(x0)
+    
+    # Run optimization
+    res = optimize_pack(x0)
+    
+    # Extract results
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        centers[i] = [res.x[i*3], res.x[i*3+1]]
+        radii[i] = res.x[i*3+2]
+        
+    # Clip radii to 0 just in case
+    radii = np.maximum(radii, 0)
+    
+    # Final validation and cleanup (though optimizer should handle it)
+    # Sometimes optimizer might produce slightly negative radii or out of bounds due to float errors
+    # But constraints should prevent this.
+    
+    sum_radii = np.sum(radii)
+    
+    # To ensure validity, we can do a quick check and clamp if needed
+    # But for the submission, we trust the optimizer result if it converged.
+    # However, we might want to run a few iterations or restarts if sum is low.
+    # Given the constraints, a single run with good init should be decent.
+    
+    # Let's try to improve by running a second pass if sum is low?
+    # But time limit is a concern.
+    # We'll stick to one run with a decent initialization.
+    
+    return centers, radii, sum_radii
+
+# Note: The function above defines run_packing. 
+# To be safe against local minima, we could run multiple times, 
+# but for a single function call, we provide the best logic.
+# The initialization with a grid and SLSQP is standard.
+
+# Let's refine the initialization to be more "circle-like"
+# Hexagonal packing is better.
+# Let's construct 26 points in a hexagonal pattern.
+def get_hexagonal_init(n):
+    points = []
+    # Approximate radius 0.1 -> diameter 0.2
+    # Row height 0.1732
+    # x step 0.2
+    
+    # Try to fit rows
+    y = 0.1
+    row_idx = 0
+    while len(points) < n:
+        if row_idx % 2 == 0:
+            # 5 points
+            xs = np.linspace(0.1, 0.9, 5)
+        else:
+            # 5 points shifted or fewer?
+            # Shifted by 0.1
+            xs = np.linspace(0.2, 0.8, 5) # 5 points
+            
+        for x in xs:
+            if len(points) < n:
+                points.append([x, y])
+            else:
+                break
+        y += 0.18
+        row_idx += 1
+    return np.array(points[:n])
+
+# Re-define run_packing to use this better init if needed, 
+# but the grid init is also fine. The optimizer will move points.
+# I will stick to the grid init inside run_packing for simplicity and robustness.
+# Actually, let's use the hexagonal init inside run_packing.
+
+def run_packing_final() -> tuple[np.ndarray, np.ndarray, float]:
+    n_circles = 26
+    
+    # Initialization: Hexagonal grid
+    points = []
+    y = 0.1
+    row_idx = 0
+    while len(points) < n_circles:
+        if row_idx % 2 == 0:
+            # 5 points
+            xs = np.linspace(0.1, 0.9, 5)
+        else:
+            # 5 points, shifted
+            xs = np.linspace(0.2, 0.8, 5)
+        
+        for x in xs:
+            if len(points) < n_circles:
+                points.append([x, y])
+            else:
+                break
+        y += 0.18
+        row_idx += 1
+    
+    points = np.array(points[:n_circles])
+    
+    # If we have fewer points (unlikely with loop), pad
+    while len(points) < n_circles:
+        points = np.vstack([points, [0.5, 0.5]])
+        
+    r_init = 0.08
+    
+    def objective(vars_flat):
+        radii = vars_flat[2::3]
+        return -np.sum(radii)
+    
+    constraints = []
+    
+    # Boundary constraints
+    for i in range(n_circles):
+        idx = i * 3
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[i*3] - v[i*3+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[i*3] - v[i*3+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[i*3+1] - v[i*3+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[i*3+1] - v[i*3+2]})
+
+    # Overlap constraints
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda v, i=i, j=j: 
+                    (v[i*3] - v[j*3])**2 + (v[i*3+1] - v[j*3+1])**2 - (v[i*3+2] + v[j*3+2])**2
+            })
+    
+    # Non-negative radii
+    for i in range(n_circles):
+         constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[i*3+2]})
+
+    bounds = [(0, 1) if i % 3 != 2 else (0, 0.5) for i in range(n_circles * 3)]
+
+    x0 = []
+    for p in points:
+        x0.extend([p[0], p[1], r_init])
+    x0 = np.array(x0)
+
+    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 2000, 'ftol': 1e-10})
+    
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        centers[i] = [result.x[i*3], result.x[i*3+1]]
+        radii[i] = result.x[i*3+2]
+        
+    radii = np.maximum(radii, 0)
+    
+    return centers, radii, np.sum(radii)
+
+# The problem requires the function to be named run_packing
+run_packing = run_packing_final

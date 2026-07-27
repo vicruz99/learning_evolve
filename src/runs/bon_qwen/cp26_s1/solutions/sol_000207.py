@@ -1,0 +1,161 @@
+# sol_000207 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state cccf4974) state=2685d3a9 sum of radii=1.300000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+VAR_PER_CIRCLE = 3
+TOTAL_VARS = N_CIRCLES * VAR_PER_CIRCLE
+
+def objective(z):
+    """Objective function: negative sum of radii."""
+    return -np.sum(z[2::3])
+
+def objective_jac(z):
+    """Gradient of the objective function."""
+    jac = np.zeros_like(z)
+    jac[2::3] = -1.0
+    return jac
+
+def constraints_fun_and_jac(z):
+    """Computes constraint values and Jacobian matrix."""
+    n_con = 4 * N_CIRCLES + N_CIRCLES * (N_CIRCLES - 1) // 2
+    vals = np.zeros(n_con)
+    jac = np.zeros((n_con, TOTAL_VARS))
+    
+    idx = 0
+    # Boundary constraints
+    for i in range(N_CIRCLES):
+        base = 3 * i
+        xi, yi, ri = z[base], z[base+1], z[base+2]
+        
+        # x - r >= 0
+        vals[idx] = xi - ri
+        jac[idx, base] = 1.0
+        jac[idx, base+2] = -1.0
+        idx += 1
+        
+        # y - r >= 0
+        vals[idx] = yi - ri
+        jac[idx, base+1] = 1.0
+        jac[idx, base+2] = -1.0
+        idx += 1
+        
+        # 1 - x - r >= 0
+        vals[idx] = 1.0 - xi - ri
+        jac[idx, base] = -1.0
+        jac[idx, base+2] = -1.0
+        idx += 1
+        
+        # 1 - y - r >= 0
+        vals[idx] = 1.0 - yi - ri
+        jac[idx, base+1] = -1.0
+        jac[idx, base+2] = -1.0
+        idx += 1
+        
+    # Pairwise non-overlap constraints
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            base_i = 3 * i
+            base_j = 3 * j
+            dx = z[base_i] - z[base_j]
+            dy = z[base_i+1] - z[base_j+1]
+            dr = z[base_i+2] + z[base_j+2]
+            
+            vals[idx] = dx*dx + dy*dy - dr*dr
+            jac[idx, base_i] = 2.0 * dx
+            jac[idx, base_i+1] = 2.0 * dy
+            jac[idx, base_i+2] = -2.0 * dr
+            jac[idx, base_j] = -2.0 * dx
+            jac[idx, base_j+1] = -2.0 * dy
+            jac[idx, base_j+2] = -2.0 * dr
+            idx += 1
+            
+    return vals, jac
+
+def cons_fun(z):
+    return constraints_fun_and_jac(z)[0]
+
+def cons_jac(z):
+    return constraints_fun_and_jac(z)[1]
+
+CONS = {'type': 'ineq', 'fun': cons_fun, 'jac': cons_jac}
+BOUNDS = [(0.0, 1.0) if k % 3 < 2 else (0.0, 0.5) for k in range(TOTAL_VARS)]
+
+def run_packing():
+    best_sum_r = -np.inf
+    best_centers = None
+    best_radii = None
+    
+    # Run multiple restarts to find global optimum
+    for trial in range(10):
+        np.random.seed(42 + trial)
+        
+        # Generate initial hexagonal lattice points
+        pts = []
+        for row in range(6):
+            for col in range(5):
+                x = 0.15 + col * 0.18 + (0.09 if row % 2 else 0.0)
+                y = 0.15 + row * 0.16
+                if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+                    pts.append([x, y])
+        
+        np.random.shuffle(pts)
+        init_centers = np.array(pts[:N_CIRCLES])
+        init_radii = np.full(N_CIRCLES, 0.05)
+        z0 = np.hstack([init_centers, init_radii[:, None]])
+        
+        try:
+            res = minimize(objective, z0, jac=objective_jac, bounds=BOUNDS, 
+                           constraints=CONS, method='SLSQP', 
+                           options={'maxiter': 1000, 'ftol': 1e-10, 'disp': False})
+            
+            if res.success:
+                curr_sum_r = -res.fun
+                if curr_sum_r > best_sum_r:
+                    best_sum_r = curr_sum_r
+                    best_centers = res.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+                    best_radii = res.x[2*N_CIRCLES:]
+        except Exception:
+            continue
+            
+    # Fallback if optimization fails
+    if best_centers is None:
+        best_centers = np.random.uniform(0.2, 0.8, (N_CIRCLES, 2))
+        best_radii = np.full(N_CIRCLES, 0.05)
+        
+    # Ensure radii are non-negative
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    # Post-processing: resolve overlaps and enforce boundaries
+    for _ in range(100):
+        overlaps = False
+        for i in range(N_CIRCLES):
+            for j in range(i+1, N_CIRCLES):
+                dx = best_centers[i,0] - best_centers[j,0]
+                dy = best_centers[i,1] - best_centers[j,1]
+                dist_sq = dx*dx + dy*dy
+                min_dist = best_radii[i] + best_radii[j]
+                
+                if dist_sq < min_dist * min_dist:
+                    overlaps = True
+                    dist = np.sqrt(dist_sq)
+                    if dist < 1e-9: dist = 1e-9
+                    overlap = min_dist - dist
+                    nx, ny = dx/dist, dy/dist
+                    # Asymmetric push to avoid oscillation
+                    best_centers[i,0] += nx * overlap * 0.51
+                    best_centers[i,1] += ny * overlap * 0.51
+                    best_centers[j,0] -= nx * overlap * 0.49
+                    best_centers[j,1] -= ny * overlap * 0.49
+                    
+        if not overlaps: break
+        
+    # Final boundary clipping
+    best_centers = np.clip(best_centers, best_radii[:, None], 1.0 - best_radii[:, None])
+    
+    return best_centers, best_radii, np.sum(best_radii)

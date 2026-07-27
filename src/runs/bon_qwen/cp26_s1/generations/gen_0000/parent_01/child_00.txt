@@ -1,0 +1,152 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we formulate this as a non-linear optimization problem. The objective is to maximize $\sum r_i$ subject to non-overlap and boundary constraints. 
+
+**Strategy:**
+1. **Initialization**: Start with a perturbed hexagonal/grid layout. This provides a good dense starting configuration that avoids trivial local minima (like all circles clustered in one corner).
+2. **Penalty Method with L-BFGS-B**: We use a smooth penalty function to convert inequality constraints into the objective. The penalty term $\lambda \sum \max(0, \text{violation})^2$ is added to $-\sum r_i$. This is differentiable almost everywhere and works exceptionally well with quasi-Newton methods like L-BFGS-B.
+3. **Adaptive Penalty Weight**: We start with a moderate penalty weight and iteratively increase it. This allows the optimizer to first find a valid configuration and then aggressively push radii to their limits without getting trapped by hard constraint boundaries early on.
+4. **Multiple Restarts**: Due to the non-convex nature of circle packing, we run the optimization with 5 different random seeds and keep the best valid result.
+5. **Post-processing**: After optimization, we strictly enforce boundary constraints by clamping radii. If minor numerical overlaps remain, we apply a tiny uniform scaling factor to guarantee validity while preserving the high sum of radii.
+6. **Vectorization**: All constraint evaluations are fully vectorized using NumPy for speed, avoiding Python loops during the optimization process.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(z, n, i_idx, j_idx, weight):
+    """
+    Computes the objective function: -sum(radii) + penalty for constraint violations.
+    z: flattened array of [x1, y1, r1, x2, y2, r2, ...]
+    """
+    x = z[::3]
+    y = z[1::3]
+    r = z[2::3]
+    
+    # Base objective: maximize sum of radii
+    obj = -np.sum(r)
+    
+    # Boundary constraint penalties: circles must stay inside [0,1]x[0,1]
+    # x - r >= 0
+    v = np.maximum(r - x, 0.0)
+    obj += weight * np.sum(v**2)
+    # 1 - x - r >= 0
+    v = np.maximum(x + r - 1.0, 0.0)
+    obj += weight * np.sum(v**2)
+    # y - r >= 0
+    v = np.maximum(r - y, 0.0)
+    obj += weight * np.sum(v**2)
+    # 1 - y - r >= 0
+    v = np.maximum(y + r - 1.0, 0.0)
+    obj += weight * np.sum(v**2)
+    
+    # Pairwise non-overlap constraint penalties: dist^2 >= (ri + rj)^2
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    d_sq = dx**2 + dy**2
+    sum_r = r[i_idx] + r[j_idx]
+    v = np.maximum(sum_r**2 - d_sq, 0.0)
+    obj += weight * np.sum(v**2)
+    
+    return obj
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Bounds: x, y in [0, 1], r in [1e-5, 1]
+    bounds = [(0.0, 1.0)] * 2 + [(1e-5, 1.0)]
+    bounds = bounds * n
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Run multiple restarts to avoid local minima
+    for seed in range(5):
+        np.random.seed(seed)
+        
+        # Initialize with a perturbed grid layout
+        x_grid = np.linspace(0.15, 0.85, 6)
+        y_grid = np.linspace(0.15, 0.85, 6)
+        pts = np.array(np.meshgrid(x_grid, y_grid)).T.reshape(-1, 2)
+        
+        idx = np.random.choice(len(pts), n, replace=False)
+        centers = pts[idx] + np.random.randn(n, 2) * 0.02
+        centers = np.clip(centers, 0.1, 0.9)
+        
+        radii = np.full(n, 0.1)
+        
+        z = np.zeros(3 * n)
+        z[::3] = centers[:, 0]
+        z[1::3] = centers[:, 1]
+        z[2::3] = radii
+        
+        # Adaptive penalty weight schedule
+        weight = 200.0
+        for _ in range(40):
+            res = minimize(
+                compute_objective, 
+                z, 
+                args=(n, i_idx, j_idx, weight), 
+                method='L-BFGS-B', 
+                bounds=bounds,
+                options={'ftol': 1e-14, 'gtol': 1e-10, 'maxiter': 2000}
+            )
+            z = res.x
+            
+            # Check if constraints are satisfied within tolerance
+            current_obj = compute_objective(z, n, i_idx, j_idx, 1.0)
+            base_obj = -np.sum(z[2::3])
+            if current_obj - base_obj < 1e-7:
+                break
+                
+            weight *= 2.0
+            if weight > 1e7:
+                break
+                
+        centers_opt = np.column_stack((z[::3], z[1::3]))
+        radii_opt = z[2::3]
+        
+        # Strictly enforce boundary constraints
+        radii_opt = np.minimum(radii_opt, np.minimum(centers_opt[:, 0], 1.0 - centers_opt[:, 0]))
+        radii_opt = np.minimum(radii_opt, np.minimum(centers_opt[:, 1], 1.0 - centers_opt[:, 1]))
+        
+        # Verify pairwise non-overlap
+        valid = True
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.hypot(centers_opt[i, 0] - centers_opt[j, 0], centers_opt[i, 1] - centers_opt[j, 1])
+                if dist < radii_opt[i] + radii_opt[j] - 1e-9:
+                    valid = False
+                    break
+            if not valid:
+                break
+                
+        # If slight overlaps remain due to numerical precision, scale down radii slightly
+        if not valid:
+            scale = 0.999
+            safety_iter = 0
+            while not valid and safety_iter < 100:
+                radii_opt *= scale
+                valid = True
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        dist = np.hypot(centers_opt[i, 0] - centers_opt[j, 0], centers_opt[i, 1] - centers_opt[j, 1])
+                        if dist < radii_opt[i] + radii_opt[j] - 1e-9:
+                            valid = False
+                            break
+                    if not valid:
+                        break
+                safety_iter += 1
+                
+        s = np.sum(radii_opt)
+        if s > best_sum:
+            best_sum = s
+            best_centers = centers_opt.copy()
+            best_radii = radii_opt.copy()
+            
+    return best_centers, best_radii, float(best_sum)
+```

@@ -1,0 +1,289 @@
+# sol_000126 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 92361807) state=38162004 sum of radii=2.414049 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n_circles = 26
+    
+    # 1. Initialize centers in a hexagonal grid pattern
+    centers = []
+    # We want to fit 26 circles. 
+    # A rough hexagonal layout: rows of 5, 6, 5, 6, 4 circles? 
+    # Or just a dense grid and we let the optimizer sort it out.
+    # Let's try a 6x5 grid (30 points) and pick 26 well-spaced ones.
+    # Actually, a specific pattern might help convergence.
+    # Let's generate points on a hex lattice scaled to fit [0,1]^2.
+    
+    # Approximate density: 26 circles in area 1.
+    # Let's try to place them in 5 rows.
+    rows = 5
+    # Distribution of circles per row to sum to 26: 5, 6, 5, 6, 4
+    cols_per_row = [5, 6, 5, 6, 4]
+    
+    # Vertical spacing for 5 rows
+    # We want to leave margin.
+    # Let's map indices to coordinates
+    y_coords = np.linspace(0.1, 0.9, rows) # Just a starting spread
+    
+    for r_idx, row_y in enumerate(y_coords):
+        count = cols_per_row[r_idx]
+        # Horizontal spacing
+        # For hex packing, odd rows are offset
+        offset = 0.1 if r_idx % 2 == 1 else 0.0
+        # We want to distribute 'count' circles in [offset, 1-offset] roughly
+        # Or just uniform distribution [0,1]
+        
+        # Let's try uniform distribution for x, shifted
+        # To maximize space, centers should be somewhat uniform.
+        # Using linspace
+        if count > 0:
+            x_coords = np.linspace(0.1 + offset, 0.9 + offset, count)
+            # Ensure within bounds
+            x_coords = np.clip(x_coords, 0, 1)
+            for x in x_coords:
+                centers.append([x, row_y])
+                
+    centers = np.array(centers[:n_circles])
+    
+    # If we have fewer or more, adjust. 
+    # The logic above generates 5+6+5+6+4 = 26 exactly.
+    
+    # 2. Optimization Loop (Gradient Ascent on Sum of Radii)
+    # We treat the centers as variables and move them to maximize the sum of valid radii.
+    
+    step_size = 0.02
+    decay = 0.995
+    
+    # Run for a fixed number of iterations
+    for iteration in range(3000):
+        gradients = np.zeros((n_circles, 2))
+        current_radii = np.zeros(n_circles)
+        
+        # Compute radii and gradients for each circle
+        for i in range(n_circles):
+            c_i = centers[i]
+            x, y = c_i
+            
+            # Calculate distances to boundaries
+            d_left = x
+            d_right = 1.0 - x
+            d_bottom = y
+            d_top = 1.0 - y
+            
+            # Calculate distances to other centers
+            # We need min distance to any other circle j
+            # dist_ij / 2 is the constraint
+            
+            min_dist = np.inf
+            active_grads = []
+            
+            # Check walls
+            # Gradient for radius wrt position is direction away from wall
+            if d_left < min_dist:
+                min_dist = d_left
+                active_grads = [(1.0, 0.0)]
+            elif abs(d_left - min_dist) < 1e-9:
+                active_grads.append((1.0, 0.0))
+                
+            if d_right < min_dist:
+                min_dist = d_right
+                active_grads = [(-1.0, 0.0)]
+            elif abs(d_right - min_dist) < 1e-9:
+                active_grads.append((-1.0, 0.0))
+                
+            if d_bottom < min_dist:
+                min_dist = d_bottom
+                active_grads = [(0.0, 1.0)]
+            elif abs(d_bottom - min_dist) < 1e-9:
+                active_grads.append((0.0, 1.0))
+                
+            if d_top < min_dist:
+                min_dist = d_top
+                active_grads = [(0.0, -1.0)]
+            elif abs(d_top - min_dist) < 1e-9:
+                active_grads.append((0.0, -1.0))
+            
+            # Check neighbors
+            # Vectorized distance calculation could be faster, but N=26 is small
+            # We need to find neighbors that are closest
+            diffs = centers - c_i
+            dists = np.linalg.norm(diffs, axis=1)
+            dists[i] = np.inf # Ignore self
+            
+            # We are looking for min(dists[j] / 2)
+            # But we also need to compare with wall distances
+            # So we check if any neighbor is closer than current min_dist * 2
+            # Actually min_dist is the radius limit.
+            # Constraint is r <= dist_ij / 2 => 2r <= dist_ij.
+            # If min_dist (radius) is limited by neighbor j, then min_dist = dist_ij / 2.
+            
+            # Let's find indices of neighbors that are "close"
+            # A neighbor j limits radius i if dist_ij / 2 <= min_dist
+            # Actually, strictly, we want the minimum over all constraints.
+            # So if dist_ij / 2 < min_dist, then neighbor j is the new limiting factor.
+            
+            half_dists = dists / 2.0
+            
+            # Find neighbors that are limiting
+            # Since we already checked walls, min_dist holds the current min radius from walls.
+            # If a neighbor is closer, it becomes the limit.
+            
+            # Identify all neighbors that are effectively at the minimum distance
+            # Tolerance for "active" constraints
+            tol = 1e-7
+            
+            # Update min_dist with neighbors
+            # We iterate to find the true min
+            # Optimization: only check neighbors if dists[i] < 2 * min_dist ?
+            # No, just compute all.
+            
+            # To avoid O(N^2) inside loop too much, but N=26 is fine.
+            # Let's find the index of the closest neighbor
+            # But there might be multiple closest neighbors.
+            
+            # Find min half_dist
+            min_half_dist = np.min(half_dists)
+            
+            if min_half_dist < min_dist:
+                min_dist = min_half_dist
+                active_grads = [] # Reset, walls are no longer limiting
+                
+            elif abs(min_half_dist - min_dist) < tol:
+                # Tie between walls and neighbors or neighbors
+                pass 
+            else:
+                # Walls are strictly limiting, neighbors don't add gradient (derivative 0)
+                # Wait, if neighbor is further, derivative of r w.r.t c_i due to neighbor is 0.
+                # So we only care about active constraints.
+                pass
+            
+            # If neighbors are limiting (or tied), add their gradients
+            if min_half_dist <= min_dist + tol:
+                # Find all neighbors that are at the min distance
+                limiting_indices = np.where(half_dists <= min_dist + tol)[0]
+                
+                for j in limiting_indices:
+                    if j == i: continue
+                    # Gradient of r_i w.r.t c_i due to neighbor j
+                    # r_i = 0.5 * ||c_i - c_j||
+                    # grad = 0.5 * (c_i - c_j) / ||c_i - c_j||
+                    diff = c_i - centers[j]
+                    d = np.linalg.norm(diff)
+                    if d > 1e-9:
+                        grad = 0.5 * diff / d
+                        active_grads.append(grad)
+            
+            current_radii[i] = max(0.0, min_dist)
+            
+            # Compute average gradient for active constraints
+            if active_grads:
+                avg_grad = np.mean(active_grads, axis=0)
+                # Normalize? 
+                # The magnitude of wall gradients is 1.
+                # The magnitude of neighbor gradients is 0.5.
+                # To balance forces, maybe scale neighbor grads by 2? 
+                # Or just keep as is. 
+                # Actually, wall constraint r = x, dr/dx = 1.
+                # Neighbor constraint r = d/2, dr/dx = 0.5 * cos(theta). Max 0.5.
+                # So walls are "stronger" in gradient terms.
+                # We might want to scale neighbor gradients by 2 to balance sensitivity.
+                # Let's try scaling neighbor gradients by 2.
+                # But active_grads might contain mixed types.
+                # Let's distinguish.
+                
+                scaled_grads = []
+                for g in active_grads:
+                    # Heuristic: if gradient is exactly (1,0), (-1,0), (0,1), (0,-1), it's a wall.
+                    # Check if it's a unit vector aligned with axes.
+                    is_wall = False
+                    if abs(g[0]) > 0.9 or abs(g[1]) > 0.9:
+                         if abs(g[0]) + abs(g[1]) == 1.0:
+                             is_wall = True
+                    
+                    # Better check: check original logic? 
+                    # We can't easily tag them here.
+                    # But neighbor gradients have magnitude 0.5. Wall gradients have magnitude 1.
+                    mag = np.linalg.norm(g)
+                    if mag < 0.9: # Likely neighbor
+                        scaled_grads.append(g * 2.0)
+                    else:
+                        scaled_grads.append(g)
+                
+                gradients[i] = np.mean(scaled_grads, axis=0)
+            else:
+                gradients[i] = np.array([0.0, 0.0])
+
+        # Update centers
+        # Gradient ascent: move in direction of gradient
+        centers += step_size * gradients
+        
+        # Clip to bounds
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Decay step size
+        step_size *= decay
+        
+        # Add small jitter to escape local minima if stuck?
+        # Not necessary if step size decay is good.
+
+    # 3. Final Radius Computation
+    # Recompute radii strictly to ensure validity
+    final_radii = np.zeros(n_circles)
+    for i in range(n_circles):
+        c_i = centers[i]
+        x, y = c_i
+        
+        # Walls
+        r = min(x, 1-x, y, 1-y)
+        
+        # Neighbors
+        diffs = centers - c_i
+        dists = np.linalg.norm(diffs, axis=1)
+        dists[i] = np.inf
+        min_d = np.min(dists)
+        r = min(r, min_d / 2.0)
+        
+        final_radii[i] = r
+
+    sum_radii = np.sum(final_radii)
+    
+    # Final validation check (debug)
+    # if not validate_packing(centers, final_radii):
+    #     raise Exception("Packing invalid")
+
+    return centers, final_radii, sum_radii
+
+# Run the function to verify
+if __name__ == "__main__":
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # print(centers)
+    # print(radii)

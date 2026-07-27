@@ -1,0 +1,228 @@
+# sol_000097 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state bf51a1cd) state=bf618918 sum of radii=2.584537 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+# Global constant for number of circles
+N_CIRCLES = 26
+VAR_SIZE = 3 * N_CIRCLES
+
+def objective(v):
+    """
+    Objective function: Minimize negative sum of radii.
+    Layout: x0..xN, y0..yN, r0..rN
+    """
+    r = v[2 * N_CIRCLES:]
+    return -np.sum(r)
+
+def objective_grad(v):
+    """
+    Gradient of the objective function.
+    """
+    grad = np.zeros(VAR_SIZE)
+    grad[2 * N_CIRCLES:] = -1.0
+    return grad
+
+def constraints(v):
+    """
+    Constraint functions (must be >= 0).
+    Returns a vector of constraint values.
+    """
+    x = v[:N_CIRCLES]
+    y = v[N_CIRCLES:2 * N_CIRCLES]
+    r = v[2 * N_CIRCLES:]
+    
+    c = []
+    
+    # Boundary constraints
+    for i in range(N_CIRCLES):
+        c.append(x[i] - r[i])           # Left
+        c.append(1.0 - x[i] - r[i])     # Right
+        c.append(y[i] - r[i])           # Bottom
+        c.append(1.0 - y[i] - r[i])     # Top
+        
+    # Pairwise non-overlap constraints
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            dist_sq = dx * dx + dy * dy
+            r_sum = r[i] + r[j]
+            c.append(dist_sq - r_sum * r_sum)
+            
+    return np.array(c)
+
+def constraints_jac(v):
+    """
+    Jacobian matrix of constraints.
+    Shape: (num_constraints, VAR_SIZE)
+    """
+    x = v[:N_CIRCLES]
+    y = v[N_CIRCLES:2 * N_CIRCLES]
+    r = v[2 * N_CIRCLES:]
+    
+    num_bound = 4 * N_CIRCLES
+    num_pairs = N_CIRCLES * (N_CIRCLES - 1) // 2
+    total_constraints = num_bound + num_pairs
+    
+    jac = np.zeros((total_constraints, VAR_SIZE))
+    
+    # Boundary constraints gradients
+    for i in range(N_CIRCLES):
+        # 1. x[i] - r[i] >= 0
+        row = 4 * i
+        jac[row, i] = 1.0
+        jac[row, 2 * N_CIRCLES + i] = -1.0
+        
+        # 2. 1 - x[i] - r[i] >= 0
+        row = 4 * i + 1
+        jac[row, i] = -1.0
+        jac[row, 2 * N_CIRCLES + i] = -1.0
+        
+        # 3. y[i] - r[i] >= 0
+        row = 4 * i + 2
+        jac[row, N_CIRCLES + i] = 1.0
+        jac[row, 2 * N_CIRCLES + i] = -1.0
+        
+        # 4. 1 - y[i] - r[i] >= 0
+        row = 4 * i + 3
+        jac[row, N_CIRCLES + i] = -1.0
+        jac[row, 2 * N_CIRCLES + i] = -1.0
+
+    # Pairwise constraints gradients
+    pair_idx = 0
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            r_sum = r[i] + r[j]
+            
+            row = num_bound + pair_idx
+            
+            # Constraint: (xi-xj)^2 + (yi-yj)^2 - (ri+rj)^2 >= 0
+            # Gradients:
+            # d/dxi = 2(xi-xj)
+            # d/dxj = -2(xi-xj)
+            # d/dyi = 2(yi-yj)
+            # d/dyj = -2(yi-yj)
+            # d/dri = -2(ri+rj)
+            # d/drj = -2(ri+rj)
+            
+            jac[row, i] = 2.0 * dx
+            jac[row, j] = -2.0 * dx
+            jac[row, N_CIRCLES + i] = 2.0 * dy
+            jac[row, N_CIRCLES + j] = -2.0 * dy
+            jac[row, 2 * N_CIRCLES + i] = -2.0 * r_sum
+            jac[row, 2 * N_CIRCLES + j] = -2.0 * r_sum
+            
+            pair_idx += 1
+            
+    return jac
+
+def generate_initial_guess(n, seed=None):
+    """
+    Generates an initial valid configuration for n circles.
+    Uses a hexagonal grid pattern with small radii.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        
+    v = np.zeros(3 * n)
+    
+    # Hexagonal packing parameters
+    # We want to fit n circles. 
+    # Estimate row/col counts. sqrt(2n/1.15) approx
+    # Let's try to fill the square with a hexagonal grid
+    
+    # Simple grid generation
+    points = []
+    # Try to fit rows
+    # Spacing
+    s = 0.15 
+    
+    y = 0.1
+    row = 0
+    while y <= 0.95:
+        # Offset for odd rows
+        offset = s / 2 if row % 2 == 1 else 0
+        x = 0.1 + offset
+        while x <= 0.95:
+            points.append((x, y))
+            x += s
+        y += s * np.sqrt(3) / 2
+        row += 1
+        
+    points = np.array(points)
+    
+    # If we have more points than needed, shuffle and take first n
+    if len(points) > n:
+        np.random.shuffle(points)
+        points = points[:n]
+    
+    # If fewer, repeat or just use what we have (optimizer will handle)
+    # But for N=26, this grid should be dense enough.
+    
+    # Set initial radii to a small valid value
+    init_r = 0.01
+    
+    for i, (px, py) in enumerate(points):
+        # Ensure strictly inside to satisfy constraints initially
+        px = max(init_r + 1e-6, min(1 - init_r - 1e-6, px))
+        py = max(init_r + 1e-6, min(1 - init_r - 1e-6, py))
+        
+        v[i] = px
+        v[n + i] = py
+        v[2 * n + i] = init_r
+        
+    return v
+
+def run_packing():
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0, 1)] * N_CIRCLES + [(0, 1)] * N_CIRCLES + [(0, 0.5)] * N_CIRCLES
+    
+    # Define constraint object for SLSQP
+    cons = {'type': 'ineq', 'fun': constraints, 'jac': constraints_jac}
+    
+    best_res = None
+    best_val = -np.inf
+    
+    # Run optimization multiple times with different seeds to find global optimum
+    for seed in range(10):
+        v0 = generate_initial_guess(N_CIRCLES, seed=seed)
+        
+        try:
+            res = minimize(
+                objective, 
+                v0, 
+                args=(), 
+                method='SLSQP', 
+                jac=objective_grad,
+                bounds=bounds,
+                constraints=cons,
+                options={'maxiter': 2000, 'ftol': 1e-9}
+            )
+            
+            if res.success or (-res.fun > best_val):
+                best_val = -res.fun
+                best_res = res
+        except Exception:
+            continue
+            
+    if best_res is None:
+        # Fallback
+        v0 = generate_initial_guess(N_CIRCLES, seed=0)
+        best_res = minimize(objective, v0, method='SLSQP', jac=objective_grad, bounds=bounds, constraints=cons)
+
+    v_opt = best_res.x
+    
+    centers = np.column_stack((v_opt[:N_CIRCLES], v_opt[N_CIRCLES:2 * N_CIRCLES]))
+    radii = v_opt[2 * N_CIRCLES:]
+    
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

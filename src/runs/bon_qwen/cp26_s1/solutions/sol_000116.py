@@ -1,0 +1,338 @@
+# sol_000116 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4a327247) state=b3643b8a sum of radii=2.616872 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        return False
+
+    if np.isnan(radii).any():
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        elif np.isnan(radii[i]):
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+
+    return True
+
+def get_hex_lattice_coords(n):
+    """
+    Generate coordinates for n circles in a hexagonal lattice packing inside a unit square.
+    Returns a list of (x, y) tuples.
+    """
+    coords = []
+    # Try to fit rows
+    # Approximate number of columns based on hex packing density?
+    # Let's just generate a dense grid of hex points and pick the best n or fit n.
+    
+    # Heuristic for number of columns/rows
+    # For n=26, maybe 5-6 columns.
+    
+    max_radius_guess = 0.12 # generous guess
+    r = max_radius_guess
+    dy = r * math.sqrt(3)
+    dx = 2 * r
+    
+    rows = []
+    y = r # first row center height
+    row_idx = 0
+    
+    while y + r <= 1.0:
+        row_coords = []
+        x_start = r if row_idx % 2 == 0 else 2 * r # Shift odd rows
+        # Actually for hex packing, shift is r. 
+        # Even row: r, 3r, 5r...
+        # Odd row: 2r, 4r... (if we want them in dimples)
+        # But if we just want a grid of hex points:
+        
+        # Let's stick to standard hex grid points
+        # (i*dx + shift, j*dy)
+        
+        x = r # Start at r
+        shift = 0
+        if row_idx % 2 == 1:
+            shift = r # Shift by r
+        
+        # Recalculate start x for shifted row to fit in [0,1]
+        # Center must be >= r. 
+        # If shift=r, first center at r+r = 2r. Leftmost point r. OK.
+        
+        curr_x = r + shift
+        while curr_x + r <= 1.0:
+            row_coords.append((curr_x, y))
+            curr_x += dx
+        rows.append(row_coords)
+        y += dy
+        row_idx += 1
+        
+    # Flatten and select first n
+    all_coords = []
+    for row in rows:
+        all_coords.extend(row)
+        
+    if len(all_coords) >= n:
+        return all_coords[:n]
+    
+    # If not enough, reduce r and retry? 
+    # Or just return what we have.
+    # For n=26, this loop should generate enough.
+    return all_coords
+
+def run_packing():
+    n = 26
+    
+    # 1. Generate Initial Guess
+    # Try to find a valid packing with reasonable radius
+    # We search for a radius r such that we can place n circles in hex pattern
+    
+    best_init_coords = None
+    best_init_r = 0.0
+    
+    # Binary search or simple decrement to find a fitting hex packing
+    # Range for r: [0.01, 0.15]
+    r_low = 0.01
+    r_high = 0.15
+    
+    # Simple search
+    current_r = 0.1
+    while True:
+        coords = []
+        dy = current_r * math.sqrt(3)
+        dx = 2 * current_r
+        
+        rows = []
+        y = current_r
+        row_idx = 0
+        
+        while y + current_r <= 1.0:
+            row_coords = []
+            shift = current_r if row_idx % 2 == 1 else 0
+            curr_x = current_r + shift
+            while curr_x + current_r <= 1.0:
+                row_coords.append((curr_x, y))
+                curr_x += dx
+            rows.append(row_coords)
+            y += dy
+            row_idx += 1
+            
+        for row in rows:
+            coords.extend(row)
+            
+        if len(coords) >= n:
+            best_init_coords = coords[:n]
+            best_init_r = current_r
+            break
+        
+        current_r -= 0.001
+        if current_r < 0.01:
+            break
+            
+    if best_init_coords is None:
+        # Fallback to random
+        best_init_coords = np.random.rand(n, 2) * 0.6 + 0.2
+        best_init_r = 0.01
+    else:
+        best_init_coords = np.array(best_init_coords)
+
+    # 2. Prepare Optimization Variables
+    # Variables: [r_0, u_x_0, u_y_0, r_1, u_x_1, u_y_1, ...]
+    # Size: 3 * n
+    
+    def unpack(v, n):
+        rs = v[0::3]
+        ux = v[1::3]
+        uy = v[2::3]
+        # x = r + (1 - 2r) * ux
+        # y = r + (1 - 2r) * uy
+        xs = rs + (1.0 - 2.0 * rs) * ux
+        ys = rs + (1.0 - 2.0 * rs) * uy
+        return rs, xs, ys
+
+    def objective(v):
+        rs, _, _ = unpack(v, n)
+        return -np.sum(rs)
+
+    def constraint_func(v):
+        rs, xs, ys = unpack(v, n)
+        # We need to return a list of constraint values >= 0
+        # Constraints: dist^2 >= (r_i + r_j)^2
+        # dist^2 - (r_i + r_j)^2 >= 0
+        
+        constraints = []
+        xs_arr = xs.reshape(-1, 1)
+        ys_arr = ys.reshape(-1, 1)
+        rs_arr = rs.reshape(-1, 1)
+        
+        # Compute pairwise squared distances
+        # Using broadcasting
+        # diff_x = xs_arr - xs_arr.T
+        # This creates n x n matrix
+        # We only need upper triangle
+        
+        # Efficient calculation
+        # dist_sq_ij = (xi-xj)^2 + (yi-yj)^2
+        # rad_sum_sq_ij = (ri + rj)^2
+        
+        # To avoid O(N^2) memory blowup or slow loop, we can iterate
+        # But N=26 is small.
+        
+        cons_vals = np.zeros(n * (n - 1) // 2)
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = xs[i] - xs[j]
+                dy = ys[i] - ys[j]
+                d_sq = dx*dx + dy*dy
+                r_sum = rs[i] + rs[j]
+                val = d_sq - r_sum*r_sum
+                cons_vals[idx] = val
+                idx += 1
+        return cons_vals
+
+    # Define constraints for SLSQP
+    # SLSQP expects a list of dictionaries or a single constraint function returning array
+    # We can use a single constraint dict with fun returning the array
+    
+    cons = {
+        'type': 'ineq',
+        'fun': constraint_func
+    }
+
+    # Bounds
+    # r_i in [0, 0.5]
+    # u_x, u_y in [0, 1]
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 0.5)) # r
+        bounds.append((0.0, 1.0)) # ux
+        bounds.append((0.0, 1.0)) # uy
+
+    # Initial guess in (r, ux, uy) format
+    # We have best_init_coords (xs, ys) and best_init_r
+    # We need to find corresponding u's.
+    # x = r + (1-2r)u => u = (x-r)/(1-2r)
+    
+    v0 = np.zeros(3 * n)
+    # Initialize r's
+    v0[0::3] = best_init_r
+    
+    # Initialize u's
+    for i in range(n):
+        x = best_init_coords[i, 0]
+        y = best_init_coords[i, 1]
+        r = best_init_r
+        denom = 1.0 - 2.0 * r
+        if denom > 1e-9:
+            ux = (x - r) / denom
+            uy = (y - r) / denom
+            # Clamp to [0, 1] just in case
+            v0[3*i + 1] = np.clip(ux, 0.0, 1.0)
+            v0[3*i + 2] = np.clip(uy, 0.0, 1.0)
+        else:
+            v0[3*i + 1] = 0.5
+            v0[3*i + 2] = 0.5
+
+    # Optimization Options
+    # SLSQP might need tuning. Maxiter increase.
+    options = {
+        'maxiter': 1000,
+        'ftol': 1e-12,
+        'disp': False
+    }
+
+    best_res = None
+    best_sum = -1.0
+    
+    # Multi-start strategy
+    num_starts = 5
+    
+    for k in range(num_starts):
+        # Perturb initial guess slightly for variety
+        current_v0 = v0.copy()
+        if k > 0:
+            # Add noise to u's
+            noise = np.random.normal(0, 0.05, size=(n, 2))
+            for i in range(n):
+                current_v0[3*i + 1] += noise[i, 0]
+                current_v0[3*i + 2] += noise[i, 1]
+            # Clip bounds
+            for i in range(n):
+                current_v0[3*i + 1] = np.clip(current_v0[3*i + 1], 0.0, 1.0)
+                current_v0[3*i + 2] = np.clip(current_v0[3*i + 2], 0.0, 1.0)
+        
+        # Also maybe vary r slightly?
+        # Keep r same or slight perturbation
+        # current_v0[0::3] *= (1 + np.random.normal(0, 0.05)) # risky if invalid
+        
+        try:
+            res = minimize(objective, current_v0, method='SLSQP', 
+                           bounds=bounds, constraints=cons, options=options)
+            
+            if res.success:
+                rs, xs, ys = unpack(res.x, n)
+                centers = np.column_stack((xs, ys))
+                radii = rs
+                current_sum = np.sum(radii)
+                
+                # Validate
+                if validate_packing(centers, radii):
+                    if current_sum > best_sum:
+                        best_sum = current_sum
+                        best_res = (centers, radii, current_sum)
+        except Exception as e:
+            print(f"Optimization failed: {e}")
+            continue
+
+    # If best_res is still None (should not happen), return a fallback
+    if best_res is None:
+        # Return the initial valid packing
+        centers = best_init_coords
+        radii = np.full(n, best_init_r)
+        # Validate and adjust if needed
+        if not validate_packing(centers, radii):
+             # Fallback to small random packing
+             centers = np.random.rand(n, 2) * 0.8 + 0.1
+             radii = np.full(n, 0.01)
+        
+        best_res = (centers, radii, np.sum(radii))
+
+    return best_res
+
+# Helper to run and print
+if __name__ == "__main__":
+    centers, radii, total_sum = run_packing()
+    print(f"Valid: {validate_packing(centers, radii)}")
+    print(f"Sum of radii: {total_sum}")
+    print(f"Circles: {len(radii)}")
+    # Print first few to check
+    print(centers[:5])
+    print(radii[:5])

@@ -1,0 +1,211 @@
+# sol_000053 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b794a107) state=09596b16 sum of radii=2.581732 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import random
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    
+    # --- Stage 1: Initialization ---
+    # Create a grid of points, add jitter, and select 26.
+    # A 5x5 grid has 25 points. We generate a 6x6 grid (36 points), 
+    # pick 26 that are somewhat evenly distributed.
+    
+    # Generate a grid
+    grid_size = 6
+    points = []
+    for i in range(grid_size):
+        for j in range(grid_size):
+            x = (i + 0.5) / grid_size
+            y = (j + 0.5) / grid_size
+            points.append([x, y])
+    
+    # Shuffle and take 26
+    random.seed(42) # Deterministic for reproducibility
+    points = points.copy()
+    random.shuffle(points)
+    centers = np.array(points[:n])
+    
+    # Initial radii: small enough to not overlap
+    # Max possible radius in a 6x6 grid is 1/12 approx 0.083
+    # Let's start with 0.05
+    radii = np.ones(n) * 0.05
+    
+    # --- Stage 2: Heuristic Expansion (JPSGA-like) ---
+    # Iteratively expand radii and resolve overlaps by repulsion
+    # This helps find a good local configuration
+    
+    for step in range(500):
+        # Increase radii slightly
+        radii *= 1.001
+        
+        # Repulsion step
+        for _ in range(5):
+            moved = False
+            for i in range(n):
+                fx, fy = 0.0, 0.0
+                xi, yi = centers[i]
+                ri = radii[i]
+                
+                # Boundary repulsion
+                if xi - ri < 0: fx += (0 - (xi - ri))
+                if xi + ri > 1: fx -= (xi + ri - 1)
+                if yi - ri < 0: fy += (0 - (yi - ri))
+                if yi + ri > 1: fy -= (yi + ri - 1)
+                
+                # Inter-circle repulsion
+                for j in range(i + 1, n):
+                    rj = radii[j]
+                    xj, yj = centers[j]
+                    dx = xj - xi
+                    dy = yj - yi
+                    dist_sq = dx*dx + dy*dy
+                    min_dist = ri + rj
+                    
+                    if dist_sq < min_dist * min_dist:
+                        # Overlap detected
+                        dist = np.sqrt(dist_sq) if dist_sq > 0 else 1e-12
+                        overlap = min_dist - dist
+                        # Force proportional to overlap
+                        if dist > 1e-12:
+                            force_mag = overlap / dist
+                            fx -= force_mag * dx
+                            fy -= force_mag * dy
+                            moved = True
+            
+            # Apply forces (simple gradient step)
+            if moved:
+                # Normalize forces roughly by radius to prevent small circles moving too much?
+                # Or just a fixed step size.
+                step_size = 0.5
+                for i in range(n):
+                    centers[i, 0] += fx * step_size
+                    centers[i, 1] += fy * step_size
+                    # Clamp to [0, 1] roughly, but constraints will handle it
+                    centers[i, 0] = np.clip(centers[i, 0], 0, 1)
+                    centers[i, 1] = np.clip(centers[i, 1], 0, 1)
+        
+        # Check if we reached a stable state (optional)
+        # In this loop, radii grow, so it's a continuous expansion
+        
+        # Safety break if radii get too big (shouldn't happen if logic is correct)
+        if np.any(radii > 0.5):
+            break
+
+    # --- Stage 3: Precise Optimization ---
+    # Use SLSQP to maximize sum of radii exactly
+    
+    # Variable vector: [x1, y1, r1, x2, y2, r2, ...]
+    # Size: 3 * n
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+    
+    # Bounds
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+        bounds.append((0, 0.5)) # r
+    
+    # Objective: Maximize sum of radii -> Minimize -sum(r)
+    def objective(vars):
+        r_vals = vars[2::3]
+        return -np.sum(r_vals)
+    
+    # Constraints
+    constraints = []
+    
+    # 1. Boundary constraints
+    # r_i <= x_i => x_i - r_i >= 0
+    # r_i <= 1 - x_i => 1 - x_i - r_i >= 0
+    # r_i <= y_i => y_i - r_i >= 0
+    # r_i <= 1 - y_i => 1 - y_i - r_i >= 0
+    def boundary_constraint(vars):
+        vals = []
+        for i in range(n):
+            xi = vars[3*i]
+            yi = vars[3*i+1]
+            ri = vars[3*i+2]
+            vals.append(xi - ri)
+            vals.append(1 - xi - ri)
+            vals.append(yi - ri)
+            vals.append(1 - yi - ri)
+        return vals
+    
+    # Add as inequality constraints (func >= 0)
+    # SLSQP takes 'ineq' constraints where function value >= 0
+    # But scipy.optimize expects constraints as a list of dicts or a function returning array?
+    # Actually, for SLSQP, we can pass a list of constraint dictionaries.
+    
+    # However, constructing 4*n separate dictionaries is slow.
+    # We can group them or use a sparse Jacobian if needed, but for 26 it's fine.
+    # Let's use a single function that returns an array of constraint violations >= 0.
+    # Wait, scipy minimize constraints specification:
+    # type 'ineq' means fun(x) >= 0.
+    # We can pass a function that returns an array.
+    
+    constraints.append({
+        'type': 'ineq',
+        'fun': boundary_constraint
+    })
+    
+    # 2. Non-overlap constraints
+    # (xi - xj)^2 + (yi - yj)^2 >= (ri + rj)^2
+    # fun = dist_sq - (ri + rj)^2 >= 0
+    
+    def non_overlap_constraint(vars):
+        vals = []
+        for i in range(n):
+            xi = vars[3*i]
+            yi = vars[3*i+1]
+            ri = vars[3*i+2]
+            for j in range(i + 1, n):
+                xj = vars[3*j]
+                yj = vars[3*j+1]
+                rj = vars[3*j+2]
+                
+                dx = xi - xj
+                dy = yi - yj
+                dist_sq = dx*dx + dy*dy
+                sum_r = ri + rj
+                vals.append(dist_sq - sum_r * sum_r)
+        return vals
+    
+    constraints.append({
+        'type': 'ineq',
+        'fun': non_overlap_constraint
+    })
+    
+    # Run optimization
+    # Maxiter might need to be high
+    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                      options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+    
+    # Extract result
+    final_vars = result.x
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i, 0] = final_vars[3*i]
+        final_centers[i, 1] = final_vars[3*i+1]
+        final_radii[i] = final_vars[3*i+2]
+        
+    # Ensure non-negative radii (numerical issues might cause tiny negatives)
+    final_radii = np.maximum(final_radii, 0.0)
+    
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii

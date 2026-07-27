@@ -1,0 +1,120 @@
+# sol_000085 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 9821b492) state=f4a149d0 sum of radii=2.554984 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(x):
+    # x is interleaved: [x1, y1, r1, x2, y2, r2, ..., xN, yN, rN]
+    # We maximize sum of radii by minimizing the negative sum
+    radii = x[2::3]
+    return -np.sum(radii)
+
+def constraints_func(x):
+    N = 26
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    vals = []
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    # x >= r  => x - r >= 0
+    vals.extend(cx - r)
+    # 1 - x >= r  => 1 - x - r >= 0
+    vals.extend(1.0 - cx - r)
+    # y >= r  => y - r >= 0
+    vals.extend(cy - r)
+    # 1 - y >= r  => 1 - y - r >= 0
+    vals.extend(1.0 - cy - r)
+    
+    # Overlap constraints: distance between centers >= sum of radii
+    # dist^2 - (r_i + r_j)^2 >= 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            d2 = (cx[i] - cx[j])**2 + (cy[i] - cy[j])**2
+            vals.append(d2 - (r[i] + r[j])**2)
+            
+    return np.array(vals)
+
+def generate_initial_config():
+    N = 26
+    centers = np.zeros((N, 2))
+    radii = np.full(N, 0.04)
+    
+    # Hexagonal-like arrangement to promote dense packing
+    y_pos = 0.06
+    dy = 0.14
+    dx = 0.15
+    counts = [6, 5, 6, 5, 4]
+    
+    idx = 0
+    for row, count in enumerate(counts):
+        x_start = 0.06 if row % 2 == 0 else 0.06 + dx / 2
+        for k in range(count):
+            centers[idx, 0] = x_start + k * dx
+            centers[idx, 1] = y_pos
+            idx += 1
+        y_pos += dy
+        
+    return centers, radii
+
+def run_packing():
+    N = 26
+    # Bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints_func}
+    
+    best_sum = -np.inf
+    best_x = None
+    
+    # Multiple restarts with perturbed initial configurations
+    seeds = [42, 123, 456, 789]
+    for seed in seeds:
+        np.random.seed(seed)
+        centers, radii = generate_initial_config()
+        
+        # Add small random noise to escape local minima
+        centers += np.random.uniform(-0.01, 0.01, centers.shape)
+        centers = np.clip(centers, 0.02, 0.98)
+        radii += np.random.uniform(-0.005, 0.005, N)
+        radii = np.clip(radii, 0.01, 0.2)
+        
+        # Flatten to optimization variable format
+        x0 = np.zeros(3 * N)
+        for i in range(N):
+            x0[3 * i] = centers[i, 0]
+            x0[3 * i + 1] = centers[i, 1]
+            x0[3 * i + 2] = radii[i]
+            
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-9, 'disp': False})
+            
+            if res.success and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    # Fallback if optimization fails
+    if best_x is None:
+        centers, radii = generate_initial_config()
+        best_x = np.zeros(3 * N)
+        for i in range(N):
+            best_x[3 * i] = centers[i, 0]
+            best_x[3 * i + 1] = centers[i, 1]
+            best_x[3 * i + 2] = radii[i]
+        best_sum = np.sum(radii)
+        
+    # Extract final configuration
+    centers = np.zeros((N, 2))
+    radii = np.zeros(N)
+    for i in range(N):
+        centers[i, 0] = best_x[3 * i]
+        centers[i, 1] = best_x[3 * i + 1]
+        radii[i] = best_x[3 * i + 2]
+        
+    return centers, radii, np.sum(radii)

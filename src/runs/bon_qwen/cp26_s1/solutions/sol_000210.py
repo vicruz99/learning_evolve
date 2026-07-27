@@ -1,0 +1,134 @@
+# sol_000210 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state cccf4974) state=6849ce22 sum of radii=1.185165 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    num_iterations = 1000
+    
+    # 1. Initialize centers in a dense 5x5 grid with one extra circle
+    grid_coords = []
+    step = 0.2
+    for i in range(5):
+        for j in range(5):
+            grid_coords.append((0.1 + i * step, 0.1 + j * step))
+    
+    # Add 26th circle in the center of a gap or center of square
+    # Center of square is (0.5, 0.5), which is already in the grid (i=2, j=2)
+    # So we shift one slightly or place in a different configuration
+    # Let's use a 6x5 grid pattern compressed to fit better
+    centers = np.zeros((n, 2))
+    
+    # 5 rows of 5 circles + 1 extra in middle
+    # To make space, we scale the grid slightly to fit 26 in [0,1]
+    # Actually, let's just place them in a 6x5 grid logic
+    # 6 cols, 5 rows = 30 spots, we pick 26.
+    # Spacing 1/5 = 0.2. 
+    # x in {0.1, 0.3, 0.5, 0.7, 0.9, 1.1? No}
+    # Let's use linspace for 6 points: 0.1, 0.3, 0.5, 0.7, 0.9 -> 5 points.
+    # To fit 6, spacing 0.2, width 1.0? No, 1.0/6?
+    # Let's just use random valid positions to avoid grid bias
+    np.random.seed(42)
+    centers = np.random.rand(n, 2)
+    # Scale to center them roughly
+    centers = (centers - 0.5) * 0.8 + 0.5
+    
+    best_sum = 0.0
+    best_centers = centers.copy()
+    best_radii = np.zeros(n)
+    
+    for it in range(num_iterations):
+        # 2. Solve LP to find optimal radii for current centers
+        c_obj = np.ones(n) * -1  # Maximize sum(r) => Minimize -sum(r)
+        
+        A_ub = []
+        b_ub = []
+        
+        # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+        for i in range(n):
+            x, y = centers[i]
+            # r_i <= x
+            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(x)
+            # r_i <= 1 - x
+            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(1.0 - x)
+            # r_i <= y
+            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(y)
+            # r_i <= 1 - y
+            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(1.0 - y)
+            
+        # Pairwise constraints: r_i + r_j <= dist(i, j)
+        dists = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                dists[i, j] = d
+                dists[j, i] = d
+                row = np.zeros(n); row[i] = 1.0; row[j] = 1.0; A_ub.append(row); b_ub.append(d)
+                
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        bounds = [(0, None)] * n
+        
+        # Use Highs solver for speed and stability
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        except:
+            continue
+            
+        if res.success:
+            radii = res.x
+            current_sum = -res.fun
+            
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                
+            # 3. Compute Gradient from LP marginals (shadow prices)
+            # Marginals indicate how much the objective (min -sum r) changes per unit increase in RHS.
+            # For our max problem, sum_radii sensitivity = marginal.
+            grad_centers = np.zeros((n, 2))
+            marginal_idx = 0
+            
+            # Boundary constraints (4 per circle)
+            for i in range(n):
+                x, y = centers[i]
+                
+                # r_i <= x_i: marginal m. dx_i = 1. Gradient += m * (1, 0)
+                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 0] += m; marginal_idx += 1
+                # r_i <= 1 - x_i: marginal m. d(1-x_i) = -1. Gradient += m * (-1, 0)
+                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 0] -= m; marginal_idx += 1
+                # r_i <= y_i: marginal m. dy_i = 1. Gradient += m * (0, 1)
+                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 1] += m; marginal_idx += 1
+                # r_i <= 1 - y_i: marginal m. d(1-y_i) = -1. Gradient += m * (0, -1)
+                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 1] -= m; marginal_idx += 1
+                
+            # Pairwise constraints (n*(n-1)/2 constraints)
+            # r_i + r_j <= dist(i, j). Gradient of dist wrt c_i is (c_i - c_j) / dist
+            # Note: We need to match the order in A_ub. A_ub was built with i < j.
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = dists[i, j]
+                    if d < 1e-12: continue 
+                    
+                    m = res.ineqlin.marginals[marginal_idx]
+                    dir_ij = (centers[i] - centers[j]) / d
+                    
+                    grad_centers[i] += m * dir_ij
+                    grad_centers[j] -= m * dir_ij
+                    marginal_idx += 1
+            
+            # 4. Update centers
+            # Learning rate decay
+            lr = 0.01 / (1 + it * 0.005)
+            centers = centers + lr * grad_centers
+            
+            # Clip to [0, 1]
+            centers = np.clip(centers, 0.0, 1.0)
+            
+    return best_centers, best_radii, float(best_sum)

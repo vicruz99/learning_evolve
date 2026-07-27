@@ -1,0 +1,71 @@
+# sol_000051 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b794a107) state=d420dfdf sum of radii=2.470852 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    # Hexagonal initial placement (staggered rows)
+    centers = np.zeros((n, 2))
+    # Arrange 6 rows: 5, 4, 5, 4, 5, 3 circles (total 26)
+    counts = [5, 4, 5, 4, 5, 3]
+    idx = 0
+    for i, c in enumerate(counts):
+        y = 0.1 + i * 0.1732  # Vertical spacing (sqrt(3)/10 approx)
+        for j in range(c):
+            x = 0.1 + j * 0.2
+            if i % 2 == 1:
+                x += 0.1  # Stagger for odd rows
+            centers[idx] = [x, y]
+            idx += 1
+
+    # Optimization to relax positions
+    def obj_func(x):
+        pos = x.reshape((n, 2))
+        r = 0.1  # Fixed radius for repulsion
+        penalty = 0.0
+        # Boundary penalties
+        pos = np.clip(pos, 0, 1)
+        for k in range(n):
+            dist_to_bound = min(pos[k, 0], 1 - pos[k, 0], pos[k, 1], 1 - pos[k, 1])
+            if dist_to_bound < r:
+                penalty += (r - dist_to_bound) ** 2
+        
+        # Overlap penalties
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(pos[i] - pos[j])
+                if dist < 2 * r:
+                    penalty += (2 * r - dist) ** 2
+        return penalty
+
+    res = minimize(obj_func, centers.flatten(), method='BFGS')
+    centers = res.x.reshape((n, 2))
+    centers = np.clip(centers, 0.0, 1.0)
+
+    # Calculate maximum radii
+    radii = np.full(n, 1.0)
+    for i in range(n):
+        # Distance to boundaries
+        max_r = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        # Distance to other centers
+        for j in range(n):
+            if i != j:
+                d = np.linalg.norm(centers[i] - centers[j])
+                max_r = min(max_r, d / 2)
+        radii[i] = max_r
+
+    # Uniform scaling to handle minor numerical overlaps
+    min_ratio = 1.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            if radii[i] + radii[j] > d:
+                min_ratio = min(min_ratio, d / (radii[i] + radii[j]))
+    
+    radii *= min_ratio
+    return centers, radii, np.sum(radii)

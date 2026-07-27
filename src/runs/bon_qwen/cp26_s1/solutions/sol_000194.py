@@ -1,0 +1,231 @@
+# sol_000194 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 9dd6f42d) state=c951d806 sum of radii=2.610742 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = 26
+    np.random.seed(42)
+
+    # 1. Initialization: Hexagonal-like Grid
+    # We create a 6x5 grid of points (30 points) spaced appropriately,
+    # then select 26 points.
+    # Spacing roughly 1/5 = 0.2.
+    # We place points in a dense pattern.
+    
+    centers = []
+    
+    # We will try to fit circles in rows. 
+    # A hexagonal packing pattern allows for denser packing.
+    # Let's generate a large number of potential spots and pick 26 
+    # that are reasonably spread out, or just generate 26 directly.
+    
+    # Approach: 6 rows of roughly equal count, alternating shift.
+    # 26 circles. 26/6 approx 4.3.
+    # Let's do rows with counts: 4, 5, 4, 5, 4, 4 (Sum 26)
+    # Or 5, 5, 5, 5, 6?
+    # Let's use a grid of 6x5 = 30 points and pick 26.
+    
+    # Grid parameters
+    rows = 6
+    cols = 5
+    # Spacing
+    dx = 1.0 / (cols + 1) * 1.1 # slightly tighter
+    dy = 1.0 / (rows + 1) * 1.1
+    
+    points = []
+    for r in range(rows):
+        for c in range(cols):
+            # Hexagonal offset
+            x = (c + 1) * dx + (r % 2) * dx / 2
+            y = (r + 1) * dy
+            # Clip to reasonable bounds [0.1, 0.9] initially to avoid walls
+            if 0.05 < x < 0.95 and 0.05 < y < 0.95:
+                points.append([x, y])
+    
+    # If we have enough points, pick 26. If not, fill randomly.
+    if len(points) >= n:
+        # Pick points that are well distributed? 
+        # Just pick first n. The optimizer will fix it.
+        initial_centers = np.array(points[:n])
+    else:
+        # Fallback to random
+        initial_centers = np.random.uniform(0.2, 0.8, (n, 2))
+        
+    # 2. Initial Radii Calculation
+    # Compute max feasible radius for each circle based on current positions
+    # to ensure a valid starting point for the optimizer.
+    radii = np.zeros(n)
+    for i in range(n):
+        x, y = initial_centers[i]
+        # Distance to walls
+        r_wall = min(x, 1-x, y, 1-y)
+        r = r_wall
+        
+        # Distance to other centers
+        for j in range(n):
+            if i == j:
+                continue
+            dist = np.hypot(x - initial_centers[j, 0], y - initial_centers[j, 1])
+            # The radius can be at most half the distance to center j
+            # (assuming circle j has 0 radius initially, but we want a safe lower bound)
+            # Actually, for initialization, we just need a small valid radius.
+            # Let's set radii very small initially to be strictly feasible.
+            pass 
+        
+        # Set a small safe radius
+        radii[i] = min(r_wall, 0.01)
+
+    # 3. Optimization Setup
+    # Variables: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = initial_centers[i, 0]
+        x0[3 * i + 1] = initial_centers[i, 1]
+        x0[3 * i + 2] = radii[i]
+
+    # Bounds
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1))   # x
+        bounds.append((0, 1))   # y
+        bounds.append((0, 0.5)) # r
+
+    # Objective Function
+    def objective(p):
+        # Sum of radii is at indices 2, 5, 8, ...
+        return -np.sum(p[2::3])
+
+    # Constraint Function (Vectorized)
+    # Returns an array of values, all must be >= 0
+    def constraints_func(p):
+        # Extract coordinates
+        # p is shape (3*n,)
+        # Reshape to (n, 3) for easier indexing? No, slice is faster.
+        xs = p[0::3]
+        ys = p[1::3]
+        rs = p[2::3]
+        
+        cons = []
+        
+        # Boundary constraints
+        # x >= r  => x - r >= 0
+        cons.append(xs - rs)
+        # x <= 1 - r => 1 - x - r >= 0
+        cons.append(1.0 - xs - rs)
+        # y >= r => y - r >= 0
+        cons.append(ys - rs)
+        # y <= 1 - r => 1 - y - r >= 0
+        cons.append(1.0 - ys - rs)
+        
+        # Pairwise distance constraints
+        # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+        # Compute pairwise squared distances efficiently
+        # xs is (n,), need (n, n)
+        # Use broadcasting
+        # dx_ij = xs[:, None] - xs[None, :]
+        # This creates full matrix. We only need upper triangle to avoid redundancy.
+        
+        # Compute full matrices
+        # Note: creating n x n matrices is 26x26 = 676 elements. Cheap.
+        diff_x = xs[:, None] - xs[None, :]
+        diff_y = ys[:, None] - ys[None, :]
+        sum_r = rs[:, None] + rs[None, :]
+        
+        sq_dist = diff_x**2 + diff_y**2
+        sq_sum_r = sum_r**2
+        
+        constraint_vals = sq_dist - sq_sum_r
+        
+        # We need values for i < j.
+        # Create mask for upper triangle
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        vals = constraint_vals[mask]
+        
+        cons.append(vals)
+        
+        return np.concatenate(cons)
+
+    # Define constraint dictionary for SLSQP
+    # Type 'ineq' means fun(x) >= 0
+    constraints = {'type': 'ineq', 'fun': constraints_func}
+
+    # Run Optimization
+    # SLSQP is good for this. We might need to run it a few times or increase iterations.
+    # Initial guess is valid, so it should converge.
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                       options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+        
+        if res.success:
+            final_p = res.x
+        else:
+            # If optimization didn't fully succeed, use the best found so far
+            final_p = res.x
+    except Exception:
+        # Fallback if optimization crashes (rare)
+        final_p = x0
+
+    # 4. Post-processing
+    # Extract results
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    for i in range(n):
+        centers[i, 0] = final_p[3 * i]
+        centers[i, 1] = final_p[3 * i + 1]
+        radii[i] = final_p[3 * i + 2]
+        
+    # Ensure strict validity by shrinking radii slightly if needed (numerical safety)
+    # The optimizer pushes constraints to boundary, might have tiny violations.
+    # We can check and adjust.
+    
+    # Check overlaps and adjust
+    valid = True
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        
+        # Check walls
+        if x < r: r = x
+        if x > 1 - r: r = 1 - x
+        if y < r: r = y
+        if y > 1 - r: r = 1 - y
+        
+        # Check neighbors
+        for j in range(i + 1, n):
+            dx = x - centers[j, 0]
+            dy = y - centers[j, 1]
+            dist = np.hypot(dx, dy)
+            required_dist = r + radii[j]
+            
+            if dist < required_dist:
+                # Overlap! Reduce radii to touch
+                # Simple fix: scale down both or just current?
+                # Better: distribute the shrinkage.
+                overlap = required_dist - dist
+                # Reduce r and radii[j] equally?
+                # Or just reduce r to satisfy dist >= r + radii[j] => r <= dist - radii[j]
+                max_r_i = dist - radii[j]
+                max_r_j = dist - r
+                
+                if max_r_i < r:
+                    r = max_r_i
+                if max_r_j < radii[j]:
+                    radii[j] = max_r_j
+                    
+        # Ensure radius non-negative
+        radii[i] = max(0, r)
+
+    # Final Sum
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

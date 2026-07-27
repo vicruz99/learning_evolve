@@ -1,0 +1,322 @@
+# sol_000129 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 92361807) state=0aa17fd5 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def get_initial_positions(n_circles):
+    """Generates candidate points on a hex grid and selects n_circles points."""
+    # Create a dense hexagonal grid
+    # Spacing s
+    s = 0.05 
+    points = []
+    
+    # Grid generation parameters
+    row_step = s * np.sqrt(3) / 2
+    
+    y = s # Start slightly inside
+    while y <= 1 - s:
+        x = s
+        offset = (0.5 * s) if (len(points) % 2 != 0) else 0 # Simple staggering heuristic
+        # Actually, standard hex: even rows x=0,2,4... odd rows x=1,3,5...
+        # Let's just iterate
+        row_idx = int(round((y - s) / row_step))
+        
+        if row_idx % 2 == 0:
+            x_start = s
+        else:
+            x_start = s + s/2
+            
+        x = x_start
+        while x <= 1 - s:
+            points.append((x, y))
+            x += s
+        y += row_step
+        
+    # Convert to array
+    points = np.array(points)
+    
+    if len(points) >= n_circles:
+        # Greedy selection to maximize min-distance
+        selected = [points[0]]
+        remaining = points[1:]
+        
+        for _ in range(n_circles - 1):
+            best_idx = -1
+            best_min_dist = -1
+            
+            for idx in range(len(remaining)):
+                p = remaining[idx]
+                min_d = float('inf')
+                for s_p in selected:
+                    d = np.linalg.norm(p - s_p)
+                    if d < min_d:
+                        min_d = d
+                
+                if min_d > best_min_dist:
+                    best_min_dist = min_d
+                    best_idx = idx
+            
+            if best_idx != -1:
+                selected.append(remaining[best_idx])
+                remaining = np.delete(remaining, best_idx, axis=0)
+                
+        return np.array(selected)
+    else:
+        # Fallback to random if grid was too sparse (unlikely with s=0.05)
+        return np.random.uniform(0.1, 0.9, size=(n_circles, 2))
+
+def optimize_packing(centers_init, n_circles):
+    """Runs the growth simulation optimization."""
+    centers = centers_init.copy()
+    radii = np.ones(n_circles) * 0.01
+    
+    # Optimization parameters
+    growth_rate = 0.0005
+    repulsion_strength = 5.0
+    boundary_strength = 10.0
+    damping = 0.9
+    
+    velocities = np.zeros_like(centers)
+    
+    # Total iterations
+    max_iter = 5000
+    
+    for step in range(max_iter):
+        # Decay growth rate to settle
+        current_growth = growth_rate * (1.0 - step / max_iter)
+        if current_growth < 1e-5:
+            current_growth = 1e-5
+
+        radii += current_growth
+        
+        # Compute forces
+        forces = np.zeros_like(centers)
+        
+        # Pairwise repulsion
+        # Using broadcasting for efficiency
+        # dist_matrix[i, j] = distance between i and j
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.linalg.norm(diff, axis=2)
+        
+        # Avoid division by zero
+        dists_safe = np.where(dists < 1e-9, 1e-9, dists)
+        
+        # Calculate overlap amount
+        sum_radii = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlaps = sum_radii - dists
+        
+        # Only consider positive overlaps (collisions)
+        is_colliding = overlaps > 0
+        
+        # Normalize direction vectors
+        # dir[i, j] = unit vector from j to i
+        # diff is i - j
+        directions = diff / dists_safe[:, :, np.newaxis]
+        
+        # Force magnitude
+        force_mag = overlaps * repulsion_strength
+        
+        # Accumulate forces (symmetric)
+        # For circle i, force from j is along direction i->j (pushing i away from j)
+        # Wait, diff is i - j. direction is away from j.
+        # If i and j overlap, we want to push i in direction (i-j).
+        
+        # Mask out self-interactions and non-collisions
+        force_mag = np.where(is_colliding, force_mag, 0)
+        
+        # Apply forces
+        # Sum over j for each i
+        # directions is shape (N, N, 2)
+        # force_mag is shape (N, N)
+        force_vec = directions * force_mag[:, :, np.newaxis]
+        
+        # Sum forces on each circle
+        # force_vec[i, j] is force on i due to j
+        forces += np.sum(force_vec, axis=1)
+        
+        # Boundary forces
+        # Left wall
+        mask_left = centers[:, 0] < radii
+        forces[mask_left, 0] += boundary_strength * (radii[mask_left] - centers[mask_left, 0])
+        
+        # Right wall
+        mask_right = centers[:, 0] > 1 - radii
+        forces[mask_right, 0] -= boundary_strength * (centers[mask_right, 0] - (1 - radii[mask_right]))
+        
+        # Bottom wall
+        mask_bottom = centers[:, 1] < radii
+        forces[mask_bottom, 1] += boundary_strength * (radii[mask_bottom] - centers[mask_bottom, 1])
+        
+        # Top wall
+        mask_top = centers[:, 1] > 1 - radii
+        forces[mask_top, 1] -= boundary_strength * (centers[mask_top, 1] - (1 - radii[mask_top]))
+        
+        # Update velocities and positions
+        velocities += forces * (1e-4) # small time step
+        velocities *= damping
+        centers += velocities
+
+        # Clamp centers to valid range [0, 1] to prevent explosion
+        centers = np.clip(centers, 0, 1)
+        
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n_circles = 26
+    
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    # Run multiple times with different initializations to find global optimum
+    for seed in range(10): # 10 restarts
+        np.random.seed(seed * 42 + 1)
+        
+        # 1. Initialize
+        centers_init = get_initial_positions(n_circles)
+        
+        # Add small random jitter to break symmetry
+        jitter = np.random.uniform(-0.02, 0.02, size=centers_init.shape)
+        centers_init = np.clip(centers_init + jitter, 0.1, 0.9)
+        
+        # 2. Optimize
+        centers, radii = optimize_packing(centers_init, n_circles)
+        
+        # 3. Validate and check sum
+        # The simulation might leave tiny overlaps due to discretization, 
+        # but radii might be slightly too optimistic if we just expanded.
+        # We should strictly enforce validity by shrinking radii if necessary.
+        
+        # Adjust radii to ensure no overlap
+        # Calculate min distance to any neighbor or boundary
+        min_r = np.inf
+        
+        # Boundary constraints
+        dists_to_boundary = np.minimum(
+            np.minimum(centers[:, 0], 1 - centers[:, 0]),
+            np.minimum(centers[:, 1], 1 - centers[:, 1])
+        )
+        
+        # Inter-circle constraints
+        # For each circle, max radius is limited by distance to others / 2
+        # But this is a system. 
+        # Simple heuristic: cap radius by half min distance to nearest neighbor
+        dists_matrix = np.linalg.norm(centers[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+        np.fill_diagonal(dists_matrix, np.inf)
+        min_neighbor_dists = np.min(dists_matrix, axis=1)
+        
+        # The valid radius for circle i is bounded by dists_to_boundary[i] and min_neighbor_dists[i]/2
+        # However, r_i + r_j <= dist_ij.
+        # A safe upper bound for all equal radii is min(min_neighbor_dists)/2.
+        # But we have variable radii.
+        # Let's just take the theoretical max allowed by geometry for current centers:
+        # r_i <= min(dists_to_boundary[i], min_j (dist_ij - r_j))
+        # This is implicit. 
+        # Instead, let's just scale down radii globally to satisfy constraints strictly.
+        # Find the scaling factor alpha such that alpha * radii is valid.
+        
+        # Check overlap constraint: alpha*(r_i + r_j) <= dist_ij => alpha <= dist_ij / (r_i + r_j)
+        # Check boundary: alpha*r_i <= dist_to_boundary => alpha <= dist_to_boundary / r_i
+        
+        min_alpha = 1.0
+        
+        # Boundary
+        ratios_b = dists_to_boundary / (radii + 1e-9)
+        min_alpha = min(min_alpha, np.min(ratios_b))
+        
+        # Pairs
+        # dists_matrix[i, j] >= alpha * (r_i + r_r)
+        # alpha <= dist / (r_i + r_j)
+        # We need alpha <= min_{i<j} dist_ij / (r_i + r_j)
+        
+        # Vectorized computation for pairs
+        r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        # Avoid division by zero
+        r_sum_safe = np.where(r_sum < 1e-9, 1e-9, r_sum)
+        ratios_p = dists_matrix / r_sum_safe
+        np.fill_diagonal(ratios_p, np.inf)
+        min_alpha = min(min_alpha, np.min(ratios_p))
+        
+        if min_alpha < 1.0:
+            radii = radii * min_alpha
+            # Re-center? No, centers are fine, just radii shrunk.
+            # Actually, shrinking radii doesn't change centers.
+            # But we might be able to move centers to allow larger radii?
+            # The simulation should have done that. 
+            # The min_alpha check is a safety net.
+            
+        # Re-validate strictly
+        if validate_packing(centers, radii):
+            current_sum = np.sum(radii)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+        else:
+            # If validation fails, try to fix by aggressive shrinking
+            # This implies simulation didn't converge well or precision issue
+            # Reduce radii significantly
+            radii *= 0.9 
+            centers = np.clip(centers, radii[:, np.newaxis], 1 - radii[:, np.newaxis])
+            if validate_packing(centers, radii):
+                 current_sum = np.sum(radii)
+                 if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = centers.copy()
+                    best_radii = radii.copy()
+
+    return best_centers, best_radii, best_sum

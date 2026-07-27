@@ -1,0 +1,333 @@
+# sol_000200 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4a6b07ba) state=289a526c sum of radii=2.617633 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_initial_guess(n_circles):
+    """
+    Generates an initial feasible configuration for n_circles.
+    Uses a hexagonal-like grid pattern to ensure circles are spread out.
+    """
+    # We want to pack 26 circles. A 5x6 grid (30 points) gives plenty of space.
+    # We can just pick the first 26 points of a grid.
+    
+    # Create a grid of points
+    # Let's use 5 columns and enough rows to hold 26 points
+    # 5 * 5 = 25, 5 * 6 = 30. Let's use 6 rows.
+    rows = 6
+    cols = 5
+    
+    # Grid coordinates with some padding
+    x_vals = np.linspace(0.15, 0.85, cols)
+    y_vals = np.linspace(0.15, 0.85, rows)
+    
+    centers = []
+    for y in y_vals:
+        for x in x_vals:
+            if len(centers) < n_circles:
+                centers.append([x, y])
+            else:
+                break
+        if len(centers) >= n_circles:
+            break
+            
+    centers = np.array(centers[:n_circles])
+    
+    # Assign a small initial radius that guarantees no overlap
+    # Distance between grid points is approx 0.2. Radius 0.05 is safe.
+    radii = np.full(n_circles, 0.06)
+    
+    # Reshape into the state vector: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(n_circles * 3)
+    for i in range(n_circles):
+        x0[3*i] = centers[i, 0]
+        x0[3*i + 1] = centers[i, 1]
+        x0[3*i + 2] = radii[i]
+        
+    return x0
+
+def objective(x, n_circles):
+    """
+    Objective function: Minimize negative sum of radii.
+    x contains [x0, y0, r0, x1, y1, r1, ...]
+    """
+    radii = x[2::3]
+    return -np.sum(radii)
+
+def constraints_func(x, n_circles):
+    """
+    Computes the values of all inequality constraints.
+    Constraints must be >= 0.
+    Returns a 1D array of constraint values.
+    """
+    # Extract centers and radii
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        centers[i, 0] = x[3*i]
+        centers[i, 1] = x[3*i + 1]
+        radii[i] = x[3*i + 2]
+        
+    constraint_values = []
+    
+    # 1. Boundary Constraints
+    # For each circle i:
+    # x_i - r_i >= 0
+    # 1 - x_i - r_i >= 0
+    # y_i - r_i >= 0
+    # 1 - y_i - r_i >= 0
+    
+    # x - r >= 0
+    for i in range(n_circles):
+        constraint_values.append(centers[i, 0] - radii[i])
+    # 1 - x - r >= 0
+    for i in range(n_circles):
+        constraint_values.append(1.0 - centers[i, 0] - radii[i])
+    # y - r >= 0
+    for i in range(n_circles):
+        constraint_values.append(centers[i, 1] - radii[i])
+    # 1 - y - r >= 0
+    for i in range(n_circles):
+        constraint_values.append(1.0 - centers[i, 1] - radii[i])
+        
+    # 2. Non-overlap Constraints
+    # dist^2 >= (r_i + r_j)^2  =>  dist^2 - (r_i + r_j)^2 >= 0
+    # We iterate over unique pairs i < j
+    
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist_sq = dx*dx + dy*dy
+            r_sum = radii[i] + radii[j]
+            constraint_values.append(dist_sq - r_sum*r_sum)
+            
+    return np.array(constraint_values)
+
+def constraints_jac(x, n_circles):
+    """
+    Computes the Jacobian matrix of the constraints.
+    Shape: (num_constraints, num_variables)
+    """
+    # Extract variables
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    for i in range(n_circles):
+        centers[i, 0] = x[3*i]
+        centers[i, 1] = x[3*i + 1]
+        radii[i] = x[3*i + 2]
+        
+    # Number of constraints
+    # 4 * n_circles (boundary) + n_circles * (n_circles - 1) / 2 (pairs)
+    n_pairs = n_circles * (n_circles - 1) // 2
+    n_constraints = 4 * n_circles + n_pairs
+    n_vars = 3 * n_circles
+    
+    jac = np.zeros((n_constraints, n_vars))
+    
+    # 1. Boundary Constraints Jacobian
+    # Index mapping for constraints:
+    # 0..n-1: x - r >= 0
+    # n..2n-1: 1 - x - r >= 0
+    # 2n..3n-1: y - r >= 0
+    # 3n..4n-1: 1 - y - r >= 0
+    
+    # x_i - r_i >= 0
+    # Deriv w.r.t x_i (index 3*i) is 1
+    # Deriv w.r.t r_i (index 3*i+2) is -1
+    for i in range(n_circles):
+        jac[i, 3*i] = 1.0
+        jac[i, 3*i + 2] = -1.0
+        
+    # 1 - x_i - r_i >= 0
+    # Deriv w.r.t x_i is -1
+    # Deriv w.r.t r_i is -1
+    for i in range(n_circles):
+        jac[n_circles + i, 3*i] = -1.0
+        jac[n_circles + i, 3*i + 2] = -1.0
+        
+    # y_i - r_i >= 0
+    # Deriv w.r.t y_i (index 3*i+1) is 1
+    # Deriv w.r.t r_i is -1
+    for i in range(n_circles):
+        jac[2*n_circles + i, 3*i + 1] = 1.0
+        jac[2*n_circles + i, 3*i + 2] = -1.0
+        
+    # 1 - y_i - r_i >= 0
+    # Deriv w.r.t y_i is -1
+    # Deriv w.r.t r_i is -1
+    for i in range(n_circles):
+        jac[3*n_circles + i, 3*i + 1] = -1.0
+        jac[3*n_circles + i, 3*i + 2] = -1.0
+        
+    # 2. Non-overlap Constraints Jacobian
+    # Constraint k (where k starts from 4*n_circles) corresponds to pair (i, j)
+    # g = (xi-xj)^2 + (yi-yj)^2 - (ri+rj)^2
+    # dg/dxi = 2(xi-xj)
+    # dg/dxj = -2(xi-xj)
+    # dg/dyi = 2(yi-yj)
+    # dg/dyj = -2(yi-yj)
+    # dg/dri = -2(ri+rj)
+    # dg/drj = -2(ri+rj)
+    
+    row = 4 * n_circles
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            r_sum = radii[i] + radii[j]
+            
+            # Gradient components
+            val_dx = 2.0 * dx
+            val_dy = 2.0 * dy
+            val_dr = -2.0 * r_sum
+            
+            # Fill Jacobian row
+            # i indices: 3*i, 3*i+1, 3*i+2
+            # j indices: 3*j, 3*j+1, 3*j+2
+            
+            jac[row, 3*i] = val_dx       # d/dxi
+            jac[row, 3*i + 1] = val_dy   # d/dyi
+            jac[row, 3*i + 2] = val_dr   # d/dri
+            
+            jac[row, 3*j] = -val_dx      # d/dxj
+            jac[row, 3*j + 1] = -val_dy  # d/dyj
+            jac[row, 3*j + 2] = val_dr   # d/drj (Wait, derivative of -(ri+rj)^2 w.r.t rj is -2(ri+rj)*1 = -2(ri+rj))
+            # Correction: g = ... - (ri+rj)^2.
+            # dg/drj = -2(ri+rj). 
+            # In code above I wrote val_dr = -2.0 * r_sum. So it is correct.
+            
+            row += 1
+            
+    return jac
+
+def run_packing():
+    """
+    Solves the circle packing problem for 26 circles in a unit square.
+    """
+    n_circles = 26
+    
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    # Actually r can be up to 0.5.
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n_circles
+    
+    # Initial guess
+    x0 = get_initial_guess(n_circles)
+    
+    # Define constraints
+    # SLSQP expects constraints in a specific format if using jac
+    # Here we provide the function and the jacobian separately or use a dict
+    
+    # To make it easier, we can use the 'callback' or just pass func and jac in a dict
+    # However, standard scipy minimize interface for SLSQP with nonlinear constraints:
+    # constraints = {'type': 'ineq', 'fun': constraints_func, 'jac': constraints_jac}
+    
+    # But constraints_func and constraints_jac need n_circles. 
+    # We can use a wrapper or partial function, but rules say "No closures from function nesting" 
+    # and "helper functions top level". 
+    # We can pass n_circles via a global variable or just hardcode it if needed, 
+    # but passing it is cleaner. The rules say "No closures", meaning don't define functions inside functions 
+    # that capture local variables. Passing arguments is fine.
+    
+    # However, scipy's minimize passes only `x` to the constraint functions.
+    # We need to bind `n_circles` to them. 
+    # We can define wrapper functions at top level that call our helper with n_circles=26.
+    
+    def cons_fun(x):
+        return constraints_func(x, 26)
+    
+    def cons_jac(x):
+        return constraints_jac(x, 26)
+    
+    cons = ({'type': 'ineq', 'fun': cons_fun, 'jac': cons_jac})
+    
+    # Optimization options
+    # maxiter might need to be high
+    options = {'maxiter': 1000, 'ftol': 1e-12, 'disp': False}
+    
+    # Run optimization
+    # We might want to run multiple times with different starts to avoid local minima,
+    # but for a single run return, we stick to one robust run.
+    # SLSQP is local.
+    
+    res = minimize(
+        lambda x: objective(x, 26),
+        x0,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=cons,
+        options=options
+    )
+    
+    # Extract solution
+    x_opt = res.x
+    centers = np.zeros((26, 2))
+    radii = np.zeros(26)
+    
+    for i in range(26):
+        centers[i, 0] = x_opt[3*i]
+        centers[i, 1] = x_opt[3*i + 1]
+        radii[i] = x_opt[3*i + 2]
+        
+    sum_radii = np.sum(radii)
+    
+    # Post-processing: Ensure non-negative radii (though bounds should handle it)
+    radii = np.maximum(radii, 0.0)
+    
+    # The optimization maximizes sum of radii, so radii should be positive.
+    # However, if the optimizer gets stuck, some might be 0.
+    # We should ensure valid packing.
+    
+    return centers, radii, sum_radii
+
+# Helper wrappers for scipy callback compatibility
+def _cons_fun(x):
+    return constraints_func(x, 26)
+
+def _cons_jac(x):
+    return constraints_jac(x, 26)
+
+def _objective(x):
+    return objective(x, 26)
+
+# Re-defining run_packing to use the top-level helpers properly without inner defs
+def run_packing():
+    n_circles = 26
+    
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n_circles
+    x0 = get_initial_guess(n_circles)
+    
+    cons = ({'type': 'ineq', 'fun': _cons_fun, 'jac': _cons_jac})
+    
+    options = {'maxiter': 2000, 'ftol': 1e-15, 'disp': False}
+    
+    # We can try a few random perturbations to x0 to improve chances of finding global optimum
+    # But for the solution, we just need one valid high-sum packing.
+    # Let's just run one robust optimization.
+    
+    res = minimize(
+        _objective,
+        x0,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=cons,
+        options=options
+    )
+    
+    x_opt = res.x
+    centers = np.zeros((26, 2))
+    radii = np.zeros(26)
+    
+    for i in range(26):
+        centers[i, 0] = x_opt[3*i]
+        centers[i, 1] = x_opt[3*i + 1]
+        radii[i] = max(0.0, x_opt[3*i + 2]) # Ensure non-negative
+        
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
