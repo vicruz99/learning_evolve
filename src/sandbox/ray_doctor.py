@@ -132,6 +132,51 @@ def check_resources(ray) -> int:
     else:
         ok(f"Ray CPU count ({ray_cpus}) matches this process's affinity ({affinity})")
 
+    # A cgroup CPU QUOTA is invisible to everything above: sched_getaffinity still reports every
+    # core, so the cpu_scheduler happily hands out cores//group_size groups and queue_seconds stays
+    # ~0, while the kernel throttles the cgroup's total CPU time. The only symptom is that each eval
+    # runs several times slower than it should — exactly the shape of "Ray feels broken" that isn't
+    # Ray at all. Check it explicitly.
+    checked_quota = False
+    for path in ("/sys/fs/cgroup/cpu.max",                       # cgroup v2
+                 "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):        # cgroup v1
+        try:
+            with open(path) as fh:
+                raw = fh.read().split()
+        except OSError:
+            continue
+        checked_quota = True
+        try:
+            if path.endswith("cpu.max"):
+                if raw[0] == "max":
+                    ok("no cgroup CPU quota (cpu.max = max)")
+                    break
+                allowed = float(raw[0]) / float(raw[1])
+            else:
+                quota = float(raw[0])
+                if quota < 0:
+                    ok("no cgroup CPU quota (cfs_quota_us = -1)")
+                    break
+                with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
+                    allowed = quota / float(fh.read().strip())
+        except (ValueError, IndexError, OSError):
+            break
+        if allowed < affinity * 0.9:
+            fail(f"cgroup CPU quota allows only {allowed:.1f} cores of CPU TIME, but affinity "
+                 f"exposes {affinity}. The cpu_scheduler will hand out a group per exposed core and "
+                 f"queue_seconds will read ~0, while every eval runs up to ~{affinity / allowed:.1f}x "
+                 "slow because the kernel throttles the whole cgroup. This is the failure that looks "
+                 "like a Ray problem and is not one. Fix: get a real core allocation, or "
+                 f"`ray start --head --num-cpus={max(1, int(allowed))}` so concurrency matches the "
+                 "CPU time you actually have.")
+        else:
+            ok(f"cgroup CPU quota ({allowed:.1f} cores) is consistent with affinity ({affinity})")
+        break
+    if not checked_quota:
+        info("no readable cgroup cpu.max / cfs_quota_us — could not rule out CPU-time throttling "
+             "this way. If evals are slow with queue_seconds ~0, check section 5 and `cat "
+             "/proc/pressure/cpu`.")
+
     if len([n for n in ray.nodes() if n["Alive"]]) > 1:
         warn("more than one live node — the cpu_scheduler keys groups by node IP and partitions "
              "each host separately, which is correct, but nothing pins a task to the node whose "
@@ -294,7 +339,33 @@ def check_exec(ray, n: int, ray_cpus: int, num_cpus_per_task: int) -> None:
     ray.get(fn.remote(group_size))
     rt = time.perf_counter() - t0
     info(f"single warm task round trip: {rt:.2f}s = 0.30s of work + {rt - 0.3:.2f}s of Ray "
-         "dispatch/pickle/actor RPCs (INESC reference: ~0.06s. Seconds here = unhealthy Ray)")
+         "dispatch/pickle/actor RPCs (INESC reference: 0.06s idle, 0.85s with a sweep loading the "
+         "box — so read this against how busy the machine is, not as an absolute)")
+
+    # THE HARNESS FLOOR. Every eval pays a fresh interpreter + `import numpy` before running a single
+    # line of the candidate's algorithm, and it pays it from wherever the venv lives. This is the
+    # number that explains a slow box when Ray itself is healthy: on the INESC box the CHEAPEST
+    # measured eval of 3,198 candidates was 0.34s end to end, so the floor there is ~0.3s. A floor of
+    # seconds means an NFS-mounted venv, and it is charged to eval_seconds — i.e. it eats the
+    # eval-timeout budget and inflates every percentile you would use to tune it.
+    section("5. Harness floor (interpreter + numpy import, serial)")
+    t0 = time.perf_counter()
+    subprocess.run([sys.executable, "-c", "import numpy"], capture_output=True, timeout=300)
+    warm = time.perf_counter() - t0
+    info(f"`{sys.executable} -c 'import numpy'` = {warm:.2f}s serial and warm")
+    info(f"venv lives on: {sys.prefix}")
+    # Reference: 0.50s on the INESC box, whose venv is ITSELF on an NFS home. So anything much above
+    # that is worse than "NFS", not merely "not local disk".
+    if warm > 2.0:
+        fail(f"{warm:.2f}s to start Python and import numpy, before ANY candidate code runs. "
+             "INESC reference: 0.50s — and that venv is on NFS too, so this is worse than NFS. "
+             "Every eval pays this, it counts against --eval-timeout, and it multiplies under "
+             "concurrency. Fix: put the venv AND --sweep-dir on local disk.")
+    elif warm > 1.0:
+        warn(f"{warm:.2f}s to start Python and import numpy — 2x+ the 0.50s INESC reference, and it "
+             "multiplies under concurrency. Local disk would remove it.")
+    else:
+        ok(f"{warm:.2f}s interpreter+numpy startup — negligible against real evals")
 
 
 def main() -> int:
