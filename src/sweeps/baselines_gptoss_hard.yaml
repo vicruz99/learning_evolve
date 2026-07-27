@@ -1,0 +1,163 @@
+# =================================================================================================
+# EXPERIMENT 0 (part 2 of 2) — no-past-experience baselines, ERDOS + AC1 + AC2, gpt-oss-120b
+# INESC-ID, 2x A100 80GB.  Companion file: baselines_gptoss_cp.yaml (circle packing).
+#
+# >>> RUN THIS FILE ONLY AFTER RESTARTING THE RAY HEAD <<<
+#       ray stop && ray start --head
+#     `num-cpus-per-task` is baked into a DETACHED `cpu_scheduler` actor created by the first run to
+#     touch the head, and `get_if_exists=True` means a stale actor is silently REUSED with the old
+#     group size. Both files happen to use 1 here, but restart anyway so the actor's group_size is
+#     unambiguous — a mismatch between the actor's pinning and Ray's reservation is exactly the bug
+#     that wasted half the box in the first campaign (see baselines_gptoss_cp.yaml, note 3(a)).
+#
+# ---------------------------------------------------------------------------------------------
+# WHY THESE THREE PROBLEMS ARE THEIR OWN SWEEP: they are CPU-bound, circle packing is GPU-bound.
+# Measured 2026-07-27, same server, same search shape, same ~370-410k decode tokens/generation:
+#
+#            wall/generation   aggregate decode   grading share   GPU utilisation
+#   cp_26/32     ~349 s *        ~1220 tok/s          small        busy
+#   erdos       ~2273 s           161 tok/s          ~85-90 %      0 % (sampled 10x over 20 s)
+#   ac1         ~3452 s           118 tok/s          ~90-93 %      0 %
+#   (* generations with no eval_timeout straggler)
+#
+# Identical GPU work, 4-6x the wall clock. The A100s sat at literal zero while these graded.
+# ---------------------------------------------------------------------------------------------
+# DOES MORE PARALLELISM FIX THAT? Mostly NO, and this is the important subtlety:
+#
+#   The idle GPU is NOT recoverable by adding more runs OF THESE PROBLEMS. Total grading work is
+#   fixed, so campaign time for a CPU-bound family = (total eval core-seconds) / (96 cores) no matter
+#   how many runs are in flight. Extra runs just share the same throughput and each goes slower.
+#   The only genuine gain is filling the CPU during the generation phases (~200 s of each ~1030 s
+#   post-fix generation), i.e. a ceiling of roughly 1.2x — hence max_parallel 3, not 8.
+#
+#   What DOES use the idle GPU is co-scheduling the *other* family: circle_packing needs ~630
+#   core-seconds of grading per generation against these problems' ~40,000, so circle packing runs
+#   are nearly free on CPU while consuming the GPU these leave idle. That is a deliberate option,
+#   NOT the default, because it requires one Ray head shared by both files and therefore one
+#   num-cpus-per-task for both (=1, which is correct for every problem here — see below). If you want
+#   it: run both sweeps against the same head with `--sweep-dir` pointing at different directories,
+#   and keep this file's max_parallel at 2 so the CPU stays available to it.
+#
+#   The real fix for this family is not parallelism, it is cheaper grading:
+#     * num-cpus-per-task 1 doubles usable slots 48 -> 96  (~2x, applied below)
+#     * eval-timeout, once we know the real distribution (instrumented now, see below)
+#     * grade-chunk-size, worth ~20 % (see the note on that flag)
+#
+# ---------------------------------------------------------------------------------------------
+# EVAL TIMEOUT: LEFT AT THE REGISTRY DEFAULT (1100 s) ON PURPOSE, FOR NOW
+# ---------------------------------------------------------------------------------------------
+# We do NOT yet know the maximum time a *valid* erdos/ac1 solution takes — it was never recorded, and
+# the honest answer is that the number does not exist in any of the runs done so far. What we do know
+# argues against cutting it blind:
+#   * eval_timeout failures are RARE here (erdos 6/800 candidates, ac1 6/500) and were the
+#     generation's straggler in only 1 of 5 and 1 of 4 of the generations containing one — unlike
+#     circle_packing, where the timeout was the straggler 31/31 times. So the payoff is small.
+#   * these evals are genuinely slow (in-flight eval processes were observed at 929 s of runtime), so
+#     the tail sits much closer to 1100 s than circle_packing's did to 530 s. Cutting it would risk
+#     reclassifying slow-but-valid solutions as failures, which corrupts the science, not just speed.
+#
+# So this is now MEASURED INSTEAD OF GUESSED. Every run records, per candidate:
+#     events.jsonl : eval_seconds (the program's own runtime — the only thing --eval-timeout bounds)
+#                    queue_seconds (waiting for a free CPU group)
+#                    grade_seconds (end-to-end)
+#     progress.csv : eval_p50, eval_p90, eval_p99, eval_max, queue_p50, queue_max,
+#                    grade_p50, grade_max
+#     icl.log      : "gen N eval/candidate | p50 .. p99 .. max .. | eval_timeout=1100s (X% used by
+#                    the slowest) | grade p50 .. max .."
+# AFTER THE FIRST FEW GENERATIONS, read eval_max/eval_p99 over the VALID candidates and set the
+# timeout from that. Note grade_seconds exceeds eval_seconds by queueing PLUS a fixed ~2 s/candidate
+# of Ray dispatch + pickle + NFS writes (measured on an idle box), so compare eval_* to the timeout
+# and use queue_* to judge contention.
+#
+# ---------------------------------------------------------------------------------------------
+# SERVER: identical to the circle-packing file (see it for the full command + rationale). It was
+# never the limiter — zero preemptions, KV 10-23 %, num_requests_waiting 0 all campaign.
+#
+#   CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/scratch/vicstorage \
+#   vllm serve openai/gpt-oss-120b --tensor-parallel-size 2 --async-scheduling \
+#       --gpu-memory-utilization 0.95 --max-model-len 128000 --max-num-seqs 320 \
+#       --max-num-batched-tokens 16384 --enable-prefix-caching \
+#       --reasoning-parser openai_gptoss --port 8001
+#
+# LAUNCH
+#   ray stop && ray start --head
+#   cd src && tmux new -s bl_hard
+#   python run_sweep.py sweeps/baselines_gptoss_hard.yaml --print-cmds
+#   python run_sweep.py sweeps/baselines_gptoss_hard.yaml --sweep-dir runs/baselines_gptoss_hard
+#   python run_sweep.py --status runs/baselines_gptoss_hard
+#   To halt: kill the run_sweep.py pid FIRST (--stop leaves the supervisor alive and it relaunches),
+#   then `python run_sweep.py --stop runs/baselines_gptoss_hard`.
+#
+# COST — THIS FILE IS THE EXPENSIVE HALF; READ BEFORE LAUNCHING ALL 30 RUNS
+#   Pre-fix measurement: erdos ~2273 s/generation, ac1 ~3452 s (ac2 unmeasured, assume ac1-like).
+#   With num-cpus-per-task 1 doubling the grading slots, expect roughly ~1030-1700 s/generation, i.e.
+#   ~9-14 h per 30-generation run. 30 runs at max_parallel 3 is therefore of order 4-6 DAYS, and that
+#   is the optimistic end. Strongly consider running ONE run per problem first, reading the new
+#   eval_* columns, and only then committing to the full grid — the scaled-down alternative at the
+#   bottom exists for exactly this.
+# =================================================================================================
+
+sweep:
+  name: baselines_gptoss_hard
+  max_parallel: 3                # NOT higher: CPU-bound, so extra runs share fixed throughput
+                                 # rather than adding any (see the parallelism note above). 3 rather
+                                 # than 2 only to keep the CPU busy through the generation phases.
+                                 # Drop to 2 if you also run the circle-packing sweep on this head.
+  stagger: 240                   # longer than the cp file: these generations are much longer, and
+                                 # staggering is what keeps two runs' grading bursts from colliding
+  server_max_num_seqs: 320
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: openai/gpt-oss-120b
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: medium
+
+  # --- token budgets (fixed across every experiment in this project) --------------------------
+  max-tokens: 34000              # max decode observed on these problems was only ~9,200 (27 %) with
+                                 # zero truncations, so this is generous; left identical to the other
+                                 # file so token budgets never differ between experiments
+  max-context-tokens: 94000
+  temperature: 1.0
+
+  # --- search shape --------------------------------------------------------------------------
+  n-context: 0
+  groups-per-batch: 5
+  group-size: 20                 # 100 candidates/generation
+  num-generations: 30
+
+  # --- execution -----------------------------------------------------------------------------
+  save-reasoning: false
+  max-gen-concurrency: 5
+  num-cpus-per-task: 1           # every eval child measured single-threaded and pinned to one core
+                                 # on ALL problems (including ac1, whose registry default is 2), so
+                                 # this reserves what is actually used instead of stranding a core.
+                                 # Uniform across problems on purpose: one value keeps a single
+                                 # cpu_scheduler valid for the whole queue.
+  # eval-timeout: intentionally NOT set -> registry defaults (erdos 1100 s, ac1/ac2 1100 s).
+  #   See the long note above: the valid-solution tail here is unknown and close to the limit, so
+  #   cutting it blind would corrupt results rather than just save time. The new eval_* columns in
+  #   progress.csv are there to settle it from data after the first runs.
+  # grade-chunk-size: not set. Worth ~20 % HERE (unlike circle packing, where it measured as no
+  #   gain): unchunked, a parent generates all 20 children and only then grades them, so the GPU
+  #   idles through the entire grading phase and all 5 parents dump 100 evals at once. Chunking
+  #   overlaps chunk A's grading with chunk B's generation and smooths the burst. Left off for now so
+  #   this campaign stays comparable to the circle-packing one; enable it as a deliberate A/B.
+
+grid:
+  seed: [1, 2, 3, 4, 5]
+  parent-source: [initial, puct]
+  problem: [erdos, ac1, ac2]
+  # -> 30 runs named e.g. erdos_s-1_ps-puct
+
+# =================================================================================================
+# SCALED-DOWN ALTERNATIVE — very likely the right starting point for this file (see COST).
+# 3 seeds and 20 generations: 18 runs x 2,000 candidates = 36,000 (vs 90,000), ~2.5x cheaper.
+#
+# common:  (change one key)
+#   num-generations: 20
+# grid:
+#   seed: [1, 2, 3]
+#   parent-source: [initial, puct]
+#   problem: [erdos, ac1, ac2]
+# =================================================================================================

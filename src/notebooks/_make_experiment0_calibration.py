@@ -1,0 +1,549 @@
+"""Generate notebooks/experiment0_calibration.ipynb from a cell list (safer than hand-writing JSON)."""
+import json, sys
+
+C = []
+def md(s): C.append({"cell_type": "markdown", "metadata": {}, "source": s.strip("\n").splitlines(True)})
+def code(s): C.append({"cell_type": "code", "execution_count": None, "metadata": {},
+                       "outputs": [], "source": s.strip("\n").splitlines(True)})
+
+md(r"""
+# Experiment 0 — calibration findings
+
+**What this notebook is for.** Every configuration value in `sweeps/baselines_*.yaml` and
+`sweeps/ctx_strategies_*.yaml` is either measured here or explicitly flagged as unmeasured. It exists
+so a configuration choice can be defended with a number instead of an intuition, and so that a choice
+that turns out to be wrong can be found and corrected.
+
+**Provenance.** Two gpt-oss-120b campaigns on the INESC-ID box (2x A100 80GB, 96 cores):
+
+| campaign | runs | config | eval timing recorded? |
+|---|---|---|---|
+| `runs/baselines_gptoss` | cp26, cp32 (30 gens, complete); erdos (9), ac1 (5), stopped | `num-cpus-per-task 2`, `eval-timeout` registry default (cp 530 s) | no |
+| `runs/baselines_gptoss_cp` | cp26 / cp32 x {initial, puct}, seed 1 | `num-cpus-per-task 1`, `eval-timeout 220` | **yes** |
+
+Both at `reasoning-effort medium`, `n-context 0`, 5 parents x 20 children = 100 candidates/generation,
+temperature 1.0, unseeded vLLM sampling.
+
+**Reading order.** Sections 1-3 are cost/infrastructure. **Section 4 is the one that changes the
+experiment design** and is the reason short-and-many-seeds beats long-and-few.
+""")
+
+code(r"""
+import json, os, csv, math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+RUNS = "../runs" if os.path.basename(os.getcwd()) == "notebooks" else "runs"
+try:                      # so the cells also run as a plain script (CI / quick re-check)
+    display
+except NameError:
+    display = print
+pd.set_option("display.width", 200, "display.max_columns", 50)
+plt.rcParams.update({"figure.dpi": 110, "axes.grid": True, "grid.alpha": .3, "font.size": 9})
+
+def load_runs(*campaigns):
+    # One row per generation, across every run of the given campaigns, with config attached.
+    rows = []
+    for camp in campaigns:
+        root = os.path.join(RUNS, camp)
+        if not os.path.isdir(root):
+            print(f"  (missing campaign: {root})"); continue
+        for run in sorted(os.listdir(root)):
+            p = os.path.join(root, run, "progress.csv")
+            if not os.path.isfile(p):
+                continue
+            df = pd.read_csv(p)
+            if df.empty:
+                continue
+            cfg = json.load(open(os.path.join(root, run, "config.json")))
+            summ_p = os.path.join(root, run, "summary.json")
+            summ = json.load(open(summ_p)) if os.path.isfile(summ_p) else {}
+            df["campaign"], df["run"] = camp, run
+            df["problem"] = cfg.get("problem")
+            df["parent_source"] = cfg.get("parent_source")
+            df["n_context"] = cfg.get("n_context")
+            df["strategy"] = cfg.get("context_strategy")
+            df["seed"] = cfg.get("seed")
+            df["eval_timeout_cfg"] = cfg.get("eval_timeout")
+            df["num_cpus_per_task"] = cfg.get("num_cpus_per_task")
+            df["maximize"] = summ.get("maximize")
+            df["metric_name"] = summ.get("metric_name")
+            rows.append(df)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+def load_events(campaign, run):
+    p = os.path.join(RUNS, campaign, run, "events.jsonl")
+    if not os.path.isfile(p):
+        return pd.DataFrame()
+    recs = []
+    for line in open(p):
+        try: recs.append(json.loads(line))
+        except Exception: pass
+    return pd.DataFrame(recs)
+
+G = load_runs("baselines_gptoss", "baselines_gptoss_cp")
+print(f"{len(G)} generation-rows across {G['run'].nunique()} runs, {G['problem'].nunique()} problems")
+G.groupby(["campaign", "run"]).agg(gens=("generation", "count"), cpus=("num_cpus_per_task", "first"),
+                                   timeout=("eval_timeout_cfg", "first"))
+""")
+
+# ---------------------------------------------------------------- 1
+md(r"""
+---
+## 1. Where the wall-clock actually goes
+
+The four problems do **almost identical GPU work** per generation — same search shape, same token
+budgets, ~370-425k decode tokens each. If wall-clock differs 4-6x between them, that difference is
+*not* the model.
+""")
+
+code(r"""
+fam = (G[G.campaign == "baselines_gptoss"]
+       .groupby("problem")
+       .agg(gens=("generation", "count"),
+            wall_s=("wall_seconds", "mean"),
+            decode_tok=("completion_tokens", "mean"),
+            tok_per_cand=("tokens_per_completion", "mean"),
+            success=("success_rate", "mean"))
+       .assign(agg_tok_s=lambda d: d.decode_tok / d.wall_s))
+
+# Best observed aggregate decode rate across ALL generations = the closest thing we have to the
+# server's ceiling, so decode_tok / that rate is a floor on the GPU time a generation needs.
+peak = (G.completion_tokens / G.wall_seconds).max()
+fam["decode_floor_s"] = fam.decode_tok / peak
+fam["grading_share"] = 1 - fam.decode_floor_s / fam.wall_s
+print(f"peak aggregate decode observed: {peak:,.0f} tok/s\n")
+display(fam.round({"wall_s": 0, "decode_tok": 0, "tok_per_cand": 0, "agg_tok_s": 0,
+                   "decode_floor_s": 0, "grading_share": 2, "success": 2}))
+
+fig, ax = plt.subplots(figsize=(7, 3))
+o = fam.sort_values("wall_s")
+ax.barh(o.index, o.decode_floor_s, label="decode floor (GPU)", color="#3b7dd8")
+ax.barh(o.index, o.wall_s - o.decode_floor_s, left=o.decode_floor_s,
+        label="everything else (grading)", color="#d8843b")
+ax.set_xlabel("mean seconds per generation"); ax.legend(); ax.set_title(
+    "Identical GPU work, 4-6x the wall clock: the difference is grading")
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Finding 1.** circle_packing is **GPU-bound**; erdos and ac1 are **CPU-bound**, spending ~85-93 % of
+each generation grading. Sampling `nvidia-smi` 10x over 20 s during an erdos/ac1 grading phase showed
+both A100s at **0 %**.
+
+Two consequences, and the second is the counter-intuitive one:
+
+1. The families belong in **separate sweep files** — different `max_parallel`, different bottleneck.
+2. Adding more *parallel runs of the same CPU-bound problem does not help*: total grading work is
+   fixed, so campaign time = (total eval core-seconds) / (cores), regardless of how many runs are in
+   flight. Extra runs just share the same throughput. What *does* use the idle GPU is co-scheduling
+   the GPU-bound family alongside.
+""")
+
+# ---------------------------------------------------------------- 2
+md(r"""
+---
+## 2. Eval time and the `--eval-timeout` decision
+
+This is the section that already caught a wrong configuration. Per-candidate grading cost is now
+recorded (`eval_seconds` = the program's own runtime, the only thing `--eval-timeout` bounds;
+`queue_seconds` = waiting for a CPU group; `grade_seconds` = end-to-end).
+
+An earlier version of the sweep set `eval-timeout: 120` for circle_packing, justified by 45
+hand-timed solutions (p50 0.36 s, max 69.6 s). **Both the sample size and the sample were wrong.**
+""")
+
+code(r"""
+ev = []
+for camp, run in G[G.eval_timeout_cfg.notna()][["campaign", "run"]].drop_duplicates().itertuples(index=False):
+    e = load_events(camp, run)
+    if e.empty or "eval_seconds" not in e:
+        continue
+    e["run"], e["campaign"] = run, camp
+    ev.append(e)
+ev = pd.concat(ev, ignore_index=True)
+ev["arm"] = np.where(ev.run.str.contains("ps-puct"), "puct", "initial")
+ev["prob"] = np.where(ev.run.str.contains("_26_"), "cp26", "cp32")
+ev["valid"] = ev.correctness > 0
+
+tab = (ev[ev.valid & ev.eval_seconds.notna()]
+       .groupby(["prob", "arm"]).eval_seconds
+       .agg(n="count", p50=lambda s: s.quantile(.50), p90=lambda s: s.quantile(.90),
+            p99=lambda s: s.quantile(.99), max="max").round(1))
+print("eval_seconds of VALID candidates only (the population a timeout must not truncate):")
+display(tab)
+
+kills = (ev.groupby(["prob", "arm"])
+           .agg(candidates=("valid", "size"),
+                eval_timeouts=("failure_type", lambda s: (s == "eval_timeout").sum()),
+                success_rate=("valid", "mean")).round(3))
+kills["pct_killed"] = (100 * kills.eval_timeouts / kills.candidates).round(1)
+display(kills)
+""")
+
+code(r"""
+# The decisive plot: eval-time percentiles per generation, by arm.
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.6), sharey=True)
+for ax, prob in zip(axes, ["cp26", "cp32"]):
+    for arm, style in [("initial", "-o"), ("puct", "-s")]:
+        d = ev[(ev.prob == prob) & (ev.arm == arm) & ev.valid & ev.eval_seconds.notna()]
+        if d.empty: continue
+        g = d.groupby("generation").eval_seconds
+        ax.plot(g.median().index, g.median().values, style, label=f"{arm} p50", alpha=.9)
+        ax.plot(g.quantile(.9).index, g.quantile(.9).values, style, ls="--",
+                label=f"{arm} p90", alpha=.5)
+    ax.axhline(220, color="crimson", lw=1.4, label="eval-timeout 220 (used)")
+    ax.axhline(120, color="darkorange", lw=1.2, ls=":", label="eval-timeout 120 (proposed, wrong)")
+    ax.set_yscale("log"); ax.set_title(prob); ax.set_xlabel("generation")
+axes[0].set_ylabel("eval_seconds of valid candidates"); axes[0].legend(fontsize=7, ncol=2)
+plt.suptitle("PUCT drives eval cost UP across generations until the timeout truncates it", y=1.02)
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Finding 2.** Valid circle_packing solutions run to **220 s** — exactly the cap that was set, so the
+true tail is censored and unknown. The two mistakes behind the `120 s` proposal:
+
+* **Sample too small**: 45 draws from ~2,100 solutions cannot see a p99.
+* **Wrong population**: all 45 came from a `parent-source: initial` run, the cheapest cell. PUCT is
+  qualitatively different — it selects good parents, the model elaborates them, and **eval cost grows
+  with generation**, until the cap truncates it.
+
+The damage is severe and asymmetric — see the `pct_killed` column above:
+
+| arm | candidates killed by `eval_timeout` | success rate |
+|---|---|---|
+| cp26 `initial` | 1.3 % | 0.68 |
+| cp26 **`puct`** | **45.3 %** | **0.35** |
+| cp32 `initial` | 0.7 % | 0.77 |
+| cp32 **`puct`** | **30.9 %** | **0.46** |
+
+Nearly half the PUCT arm is being discarded for being slow rather than for being wrong, while the
+Best-of-N arm is essentially untouched. Any comparison between those two arms under this setting
+measures the timeout, not the search.
+
+A tight timeout here is not a speed knob, it is a **selection pressure toward cheap programs**, and it
+silently guts the arm we most want to measure. `--eval-timeout` therefore goes back to the registry
+default (530 s for circle_packing) and stays there until the *uncensored* tail is known.
+
+**Corollary for the notebook's own credibility:** the earlier claim that circle_packing grading costs
+"~630 core-seconds per generation" came from that same bad sample. With a p90 of 80-113 s on the PUCT
+arm the real figure is several times higher — circle_packing is still GPU-bound, but not by the
+margin first stated.
+""")
+
+# ---------------------------------------------------------------- 3
+md(r"""
+---
+## 3. Token budgets: `--max-tokens`, reasoning share, truncation
+""")
+
+code(r"""
+tok = (G.groupby(["problem", "parent_source"])
+        .agg(tok_per_cand=("tokens_per_completion", "mean"),
+             reasoning=("reasoning_tokens", "sum"), decode=("completion_tokens", "sum"),
+             p99=("decode_p99", "mean"), dmax=("decode_max", "max"),
+             truncated=("truncated", "sum"), cache=("cache_hit_rate", "mean")))
+tok["reasoning_share"] = (tok.reasoning / tok.decode).round(2)
+tok["pct_of_max_tokens"] = (100 * tok.dmax / 34000).round(0)
+display(tok[["tok_per_cand", "reasoning_share", "p99", "dmax", "pct_of_max_tokens",
+             "truncated", "cache"]].round(2))
+
+fig, ax = plt.subplots(figsize=(7, 3))
+for (prob, ps), d in G.groupby(["problem", "parent_source"]):
+    ax.plot(d.generation, d.tokens_per_completion, "-o", ms=3, label=f"{prob} / {ps}", alpha=.8)
+ax.axhline(34000, color="crimson", ls="--", lw=1, label="--max-tokens 34000")
+ax.set_xlabel("generation"); ax.set_ylabel("mean decode tokens / candidate")
+ax.set_yscale("log"); ax.legend(fontsize=7); ax.set_title("Decode cost per candidate vs the budget")
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Finding 3.** At `reasoning-effort medium`, candidates use **~4,000 decode tokens** with a
+**60-76 % reasoning share** and **zero truncations anywhere**. The largest single completion observed
+was 21,241 tokens = 62 % of `--max-tokens 34000`; on erdos/ac1 the max was ~9,200 = 27 %.
+
+*Decisions justified:* `--max-tokens 34000` stays. It is generous, but shrinking it would save
+nothing — vLLM does not pre-reserve KV for it, there were **zero preemptions** all campaign and KV
+usage peaked at 10-23 %. For Qwen, a `thinking-token-budget` of 10,000 sits just above the *observed*
+ceiling on erdos/ac (9.2k) and will bind only on the circle_packing tail — worth watching `truncated`.
+
+`reasoning-effort medium` (not `high`) is justified separately: the one high-effort observation had
+~70 % of completions spend the whole budget on hidden reasoning and return no code.
+""")
+
+# ---------------------------------------------------------------- 4
+md(r"""
+---
+## 4. ** The design finding: these problems saturate in ~3 generations**
+
+This is the section that should drive the next experiment. The question "how many generations do I
+need?" has a measurable answer, and it is much smaller than expected.
+""")
+
+code(r"""
+def gain(v, maximize):
+    # Improvement is direction-aware: several problems minimise.
+    v = np.asarray(v, float)
+    return (v - v[0]) if maximize else (v[0] - v)
+
+rows = []
+for (camp, run), d in G.groupby(["campaign", "run"]):
+    d = d.sort_values("generation")
+    v = d.best_so_far_score.astype(float).values
+    if len(v) < 4 or np.isnan(v).all(): continue
+    mx = bool(d.maximize.iloc[0])
+    g = gain(v, mx)
+    total = g[-1]
+    rows.append(dict(campaign=camp, run=run, problem=d.problem.iloc[0],
+                     arm=d.parent_source.iloc[0], gens=len(v),
+                     gen0=v[0], final=v[-1], total_gain=total,
+                     gain_by_gen3=g[min(3, len(g) - 1)],
+                     frac_in_first_3=(g[min(3, len(g) - 1)] / total) if total > 1e-4 else np.nan))
+S = pd.DataFrame(rows)
+# A run whose total gain is ~0 has no improvement to apportion -- the ratio is undefined, and that
+# is itself the strongest form of saturation: it was already at its final value in generation 0.
+S["saturated_at_gen0"] = S.total_gain <= 1e-4
+display(S.round(4))
+
+meaningful = S[~S.saturated_at_gen0]
+print(f"\n{len(meaningful)} of {len(S)} runs made any measurable progress at all.")
+print("For those, share of the run's total improvement already achieved by generation 3:")
+print(meaningful.frac_in_first_3.describe().round(3))
+print(f"\n{S.saturated_at_gen0.sum()} run(s) reached their final score in generation 0 and never "
+      f"improved again: {list(S.loc[S.saturated_at_gen0, 'run'])}")
+""")
+
+code(r"""
+comp = G[(G.campaign == "baselines_gptoss") & (G.problem.str.startswith("circle"))]
+fig, ax = plt.subplots(figsize=(7.5, 3.2))
+for run, d in comp.groupby("run"):
+    d = d.sort_values("generation")
+    ax.plot(d.generation, d.best_so_far_score.astype(float), "-o", ms=3, label=run.split("_s-")[0])
+ax.axvspan(0, 3, color="green", alpha=.08)
+ax.text(1.5, ax.get_ylim()[0], " 90-100 % of all gain\n happens here", fontsize=8, va="bottom")
+ax.set_xlabel("generation"); ax.set_ylabel("best so far"); ax.legend(fontsize=8)
+ax.set_title("Two COMPLETE 30-generation runs: flat after generation ~3")
+plt.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Finding 4.** Of the 8 runs, **1 reached its final score in generation 0** and never improved again
+(`circle_packing_32` campaign A: 2.9295 at gen 0, unchanged for 29 more generations). Of the runs that
+did make measurable progress, the median share of it completed by generation 3 is **100 %**, and
+`circle_packing_26` — the only run with a substantial curve to look at — put **91 %** of its 0.0894
+total gain into the first three generations and 0.0078 into the remaining 27.
+
+Two runs sit outside that summary and both deserve naming rather than hiding: `circle_packing_32`
+above (no gain to apportion — saturation in its purest form) and `erdos`, whose total gain of 0.0003
+is small enough that the ratio is noise, not signal.
+
+**This inverts the usual instinct.** Spending the budget on *more generations* buys almost nothing
+here, because the best-so-far curve is flat where the extra generations land. Spending it on **more
+seeds** buys real statistical power, because the interesting variation is between replicates.
+
+Practical consequence for a short deadline: **10 generations x 5 seeds is strictly more informative
+than 30 generations x 1 seed for the same compute**, and costs 3x less than 30 x 5.
+
+*Caveat, stated because it matters:* saturation of `best_so_far` does not mean nothing is happening
+after generation 3 — `eval_seconds` and `success_rate` keep changing (Section 2), and the *population*
+of solutions keeps moving. It does mean that **best-so-far is a low-power metric here** and a
+context-strategy comparison should not rest on it alone. Section 5 quantifies how low.
+""")
+
+# ---------------------------------------------------------------- 5
+md(r"""
+---
+## 5. How big is the noise floor? (how many seeds are needed)
+
+vLLM sampling is unseeded at temperature 1.0, so two runs with the *same* `--seed` and config still
+diverge. That divergence is the noise floor any claimed strategy effect must clear. We happen to have
+the same run repeated in two campaigns, which measures it directly.
+""")
+
+code(r"""
+pairs = [("circle_packing_26_s-1_ps-initial", "cp26 / initial / seed 1"),
+         ("circle_packing_32_s-1_ps-initial", "cp32 / initial / seed 1")]
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.2))
+noise = []
+for ax, (run, title) in zip(axes, pairs):
+    for camp, lab in [("baselines_gptoss", "campaign A"), ("baselines_gptoss_cp", "campaign B")]:
+        d = G[(G.campaign == camp) & (G.run == run)].sort_values("generation")
+        if d.empty: continue
+        ax.plot(d.generation, d.best_so_far_score.astype(float), "-o", ms=4, label=lab)
+    a = G[(G.campaign == "baselines_gptoss") & (G.run == run)].sort_values("generation")
+    b = G[(G.campaign == "baselines_gptoss_cp") & (G.run == run)].sort_values("generation")
+    n = min(len(a), len(b))
+    if n:
+        diff = np.abs(a.best_so_far_score.values[:n].astype(float)
+                      - b.best_so_far_score.values[:n].astype(float))
+        noise.append(pd.Series(diff, name=title))
+        ax.set_title(f"{title}\n|A-B| max {diff.max():.4f}, at gen {n-1}: {diff[-1]:.4f}", fontsize=9)
+    ax.set_xlabel("generation"); ax.legend(fontsize=8)
+axes[0].set_ylabel("best so far")
+plt.suptitle("Same seed, same config, different sampling -> this is the noise floor", y=1.04)
+plt.tight_layout(); plt.show()
+
+print("Historical single-seed strategy comparison on cp26 (30 gens, from runs/index.csv):")
+print("   no-ICL 2.6360 | contrastive 2.6231 | random 2.6132   ->  spread 0.0228")
+for s in noise:
+    print(f"   noise floor {s.name}: max |A-B| = {s.max():.4f}, mean = {s.mean():.4f}")
+""")
+
+md(r"""
+**Finding 5.** The run-to-run noise from sampling alone reaches **0.075** on cp26 early on and settles
+to the same order of magnitude as the *entire* spread between three different context strategies
+(**0.0228**) in the historical single-seed comparison.
+
+So the historical result — "no-ICL beat both strategies" — **is not evidence of anything**. One
+replicate per arm cannot distinguish a strategy effect from sampling noise at this effect size.
+
+*Decision justified:* **>= 5 seeds per arm**, and report the distribution (per-seed points, not just a
+mean), for any claim about context strategies. With 5 seeds a difference of ~0.02 is at the edge of
+detectability; do not expect to resolve less than that.
+""")
+
+# ---------------------------------------------------------------- 6
+md(r"""
+---
+## 6. Infrastructure findings (measured outside the CSVs)
+
+Recorded here because they justify configuration values and are otherwise undocumented. These come
+from live inspection of the running campaign, not from the run artefacts.
+
+| finding | measurement | config it justifies |
+|---|---|---|
+| **Half the CPUs were idle but reserved** | Every eval child single-threaded (`nlwp=1`, 99.9 % of one core) and pinned to exactly **1** core, while Ray reserved **2** — so 48 of 96 cores worked while `ray status` showed `96.0/96.0 CPU` with `10+ pending tasks`. Pinning comes from the `cpu_scheduler` actor's `group_size`, the reservation from the flag: two paths that disagreed. | `num-cpus-per-task: 1` (~2x grading throughput) |
+| **Stale detached Ray actor** | `cpu_scheduler` is created by the *first* run to touch the head with `get_if_exists=True`, so a stale actor is silently reused with the old group size. | `ray stop && ray start --head` between sweeps that differ in `num-cpus-per-task` |
+| **Server was never the limiter** | Zero preemptions all campaign; KV usage peaked 10-23 %; `num_requests_waiting` 0 throughout; prefix-cache hit rate 98.1 %. Peak aggregate decode ~1,907 tok/s vs a campaign average of 663. | leaving `--max-num-seqs`, `--max-num-batched-tokens`, `--max-model-len` alone; the idle time was client-side |
+| **NFS penalties** | Run dir + venv on NFS: per-candidate file I/O 80 ms (vs 0.3 ms local); `import numpy` in a fresh interpreter costs 1.09 s under a 40-way concurrent burst vs 0.18 s serial-warm. | put `--sweep-dir` **and** the venv on local disk |
+| **Harness overhead** | `grade_seconds - eval_seconds - queue_seconds` ~= 2 s/candidate (Ray dispatch + pickle + NFS). Paid in parallel, so ~1 wave/generation: ~1.5 % of a circle_packing generation, ~0.2 % of an erdos one. | **not** worth replacing Ray with subprocess dispatch (see below) |
+
+**On replacing Ray with ShinkaEvolve-style `subprocess.Popen` dispatch:** it would remove the ~1-2 s
+Ray dispatch but keep the dominant cost (a fresh interpreter per eval, which Shinka also pays), on an
+overhead that is already ~1.5 % of a generation. It would also give up cross-run CPU arbitration — one
+Ray head caps *total* grading across concurrent runs, whereas an in-process scheduler cannot see
+sibling runs — and the deterministic 1-core pinning. Not worth it for speed; the honest argument in
+its favour is simplicity and no stale-actor footgun.
+""")
+
+code(r"""
+cores = 96
+print(f"Grading slots = cores // num_cpus_per_task")
+for c in (1, 2):
+    print(f"   num-cpus-per-task {c}: {cores // c} concurrent evals"
+          f"{'   <- what the first campaign actually used, with 1-core evals' if c == 2 else '  <- corrected'}")
+print(f"\nPer-generation grading demand: 100 candidates/run")
+for par in (2, 3, 4):
+    print(f"   max_parallel {par}: {100*par} evals into {cores} slots = {100*par/cores:.1f} waves")
+""")
+
+# ---------------------------------------------------------------- 7
+md(r"""
+---
+## 7. Configuration decisions and the evidence for each
+
+| setting | value | evidence |
+|---|---|---|
+| `num-cpus-per-task` | **1** | S6: evals are single-threaded and 1-core-pinned; 2 stranded half the box |
+| `eval-timeout` (circle_packing) | **registry default 530** | S2: valid solutions reach the 220 s cap; PUCT's eval cost rises with generation; 120 would have gutted the PUCT arm |
+| `eval-timeout` (erdos / ac) | **registry default 1100** | S2 logic + timeouts rare there (6/800, 6/500) and rarely the straggler; tail unknown and close to the limit |
+| `max-tokens` | **34000** | S3: max observed 21,241 (62 %), zero truncations; KV never binding so shrinking saves nothing |
+| `reasoning-effort` | **medium** | S3: ~4,000 tok/candidate, 0 truncations; `high` produced ~70 % no-code completions |
+| `thinking-token-budget` (Qwen) | **10000** | S3: just above the observed 9.2k ceiling on erdos/ac; binds only on the circle_packing tail |
+| `max_parallel` (circle_packing) | **4** on 96 cores / **3** on 64 | S1 GPU-bound + S2 fatter grading tail than first thought; `queue_p50` ~0.01 s confirms 4 is safe at 96 cores |
+| `max_parallel` (erdos / ac) | **3** on 96 cores / **2** on 64 | S1: CPU-bound, so extra runs share fixed throughput; only the generation-phase idle window is recoverable (~1.2x ceiling) |
+| separate sweep files per family | — | S1: opposite bottlenecks, and `num-cpus-per-task` is frozen per Ray head |
+| **generations** | **10 is enough** | S4: 91-100 % of gain by generation 3 |
+| **seeds** | **>= 5** | S5: noise floor is the same order as the entire between-strategy spread |
+| server flags | unchanged | S6: zero preemptions, KV 10-23 %, waiting 0 |
+""")
+
+md(r"""
+---
+## 8. The experiment this justifies (2-day deadline)
+
+**Question:** does *selecting* which past solutions enter the prompt beat having none
+(TTT-Discover without RL), and does the *strategy* matter beyond merely having examples?
+
+Everything below follows from Sections 4 and 5: **generations are cheap to cut, seeds are not.**
+
+### The three files per model — 1,200 candidates per run everywhere
+
+Shape: 5 parents x 16 children x 15 generations = **1,200 candidates/run**, so every arm is compared at
+matched sample count.
+
+| # | file | problem | arms | runs | est. |
+|---|---|---|---|---|---|
+| 1 | `bon_<m>.yaml` | cp26 | Best-of-N, 5 seeds | 5 | ~3.5 h |
+| 2 | `puct_<m>.yaml` | cp26 | PUCT `n-context 0`, 5 seeds — **baseline to beat** | 5 | ~6.5 h |
+| 3 | `ctx_<m>.yaml` | cp26 | random/best/contrastive @ n10, 4 seeds | 12 | ~12 h |
+| 4 | `ac1_<m>.yaml` | ac1 | all four arms, incl. n-context 5 vs 10 | 28 | ~39 h ⚠ |
+
+**Run them in that order.** Files 1-3 are the cp26 deliverable (~22 h). File 4 is ac1, kept separate
+precisely so it can be dropped, deferred or resized without touching the cp26 comparison — launch it
+last, and only after one run reaches generation 2 so you can read its `eval_p90`/`eval_max`.
+The Qwen files run on a different machine, so they are fully parallel with the gpt-oss ones.
+
+`random` is the control separating "choosing well" from "merely having examples" — do not drop it. ac1
+additionally runs at `n-context 5` for a context-size comparison.
+
+### Best-of-N runs as ONE generation of 75 groups — no barrier at all
+
+Best-of-N has **no** inter-generation dependency, and this is checkable rather than assumed: parents
+come from `sample_initial_states()` (buffer ignored) and the context block is empty, so the buffer and
+context pool are written but never read. Measured cost of the barrier it was paying: **19-45 % of
+slot-time idle**, waiting for the slowest parent — on cp32, 4.67 h of wall for 2.55 h of work.
+
+So that file uses `num-generations: 1`, `groups-per-batch: 75`, `group-size: 16` (= the same 1,200
+candidates) with `max-gen-concurrency: 5`. That flag is a semaphore on in-flight *requests*
+(`icl/loop.py:152`), released when `generate()` returns — so 5 x 16 = 80 sequences stay in flight (the
+same footprint as every other arm) as a **sliding window**: a group grades while the next generates.
+Verified on a 12-group smoke run: groups completed staggered at 12.3s, 13.4s, 14.3s, 17.9s, ... rather
+than in lockstep, and all artifacts were intact.
+
+**Analysis consequence — do not skip.** `progress.csv` has exactly one row for that arm, so there is no
+per-generation curve. That is correct rather than a loss: for i.i.d. sampling the right x-axis is
+*candidate count*. Reconstruct best-so-far from `events.jsonl` / `solutions/manifest.jsonl` (written in
+completion order) and compare against the other arms at k = 80, 160, ..., 1200, since generation g of
+the other arms corresponds to k = 80(g+1).
+
+### `n-context` is 10 and 5, never 30 — a correctness issue
+
+`build_context_block` **silently trims** the block tail to fit `max-context-tokens`. A PUCT-lineage
+solution has a median size of 11,270 chars against 2,081 for a Best-of-N one (5.4x — PUCT elaborates
+good parents), so 30 of them is ~85k tokens against a 94k budget. Trimming would fire nearly every
+generation *and differently per arm* (`best` picks the large elaborate solutions, `contrastive` includes
+shorter low scorers), so the arms would differ in how many examples they actually show. **Verify via
+`context=k/N` in `icl.log`; if `k < N`, the comparison is broken.**
+
+### The ac1 half does not fit in two days — and that is the honest headline
+
+Grading is the binding resource. Per model, 50 runs x 1,200 = 60,000 candidates:
+
+| | candidates | grading | on 96 cores |
+|---|---|---|---|
+| cp26 | 26,400 | ~5.8M core-s | **~17 h** |
+| ac1 | 33,600 | ~13.4M core-s | **~39 h** |
+| total | 60,000 | ~19.2M core-s | **~56 h** vs ~40 h available |
+
+cp26 fits comfortably; ac1 does not. Worse, the ac1 figure rests on the one number nobody has measured
+— its per-eval runtime. The ~400 s is *derived* from old generation timings, not observed, because the
+eval instrumentation did not exist when those runs were stopped.
+
+**So:** every file orders cp26 runs first. Let cp26 finish (it is the deliverable, and the only problem
+shown to have a real improvement curve), read the first ac1 run's `eval_p50`/`eval_p90`/`eval_max`,
+and only then size the ac1 grid. If ac1 lands near 400 s/eval the options are: drop the `n-context 5`
+arm (9 runs, ~12 h), cut ac1 to 8 generations, or defer ac1 to next week. Stopping early costs only ac1
+seeds, never the cp26 comparison.
+
+""")
+
+json.dump({"cells": C,
+           "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                       "name": "python3"},
+                        "language_info": {"name": "python"}},
+           "nbformat": 4, "nbformat_minor": 5},
+          open(sys.argv[1], "w"), indent=1)
+print(f"wrote {sys.argv[1]} with {len(C)} cells")
