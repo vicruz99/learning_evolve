@@ -2,18 +2,43 @@
 
 
 # ============ Start the model (vLLM server) ============
+
+ATTENTION: max-model-len can be adjusted depending on n-context. Rough rule: 
+
+
+INESC ID machines:
+
 cd projects/phd/R2/LLMs/local/vllm_provider/
 source .venv/bin/activate
 
-CUDA_VISIBLE_DEVICES=0 \
-HF_HOME=/scratch/vicstorage \
+CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/scratch/vicstorage \
 vllm serve openai/gpt-oss-120b \
+    --tensor-parallel-size 2 \
     --async-scheduling \
-    --tensor-parallel-size 1 \
     --gpu-memory-utilization 0.95 \
-    --max-model-len 131000 \
+    --max-model-len 130000 \
     --max-num-seqs 256 \
+    --max-num-batched-tokens 16384 \
+    --kv-cache-dtype fp8
+    --reasoning-parser openai_gptoss \
     --port 8001
+
+
+---------------------
+
+Bosch machines:
+
+source ~/envs/bin/activate
+vllm serve Qwen/Qwen3.6-27B-FP8 \
+    --async-scheduling \
+    --gpu-memory-utilization 0.95 \
+    --max-model-len 130000 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 16384 \
+    --reasoning-parser openai_gptoss \
+    --kv-cache-dtype fp8
+    --port 8001
+    
 
 
 # ============ ICL runs ============
