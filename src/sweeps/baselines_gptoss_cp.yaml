@@ -1,0 +1,156 @@
+# =================================================================================================
+# EXPERIMENT 0 (part 1 of 2) — no-past-experience baselines, CIRCLE PACKING only, gpt-oss-120b
+# INESC-ID, 2x A100 80GB.  Companion file: baselines_gptoss_hard.yaml (erdos + ac1 + ac2).
+#
+# WHY THIS FILE IS SPLIT OFF from the erdos/ac problems:
+#   The two families have opposite bottlenecks, measured on the first campaign (2026-07-27):
+#     circle_packing : GPU-bound.  ~630 CPU-core-seconds of grading per generation.
+#     erdos / ac     : CPU-bound.  ~40,000 core-seconds per generation (~60x more).
+#   They also want different `num-cpus-per-task`, and that flag is baked into a DETACHED Ray actor
+#   (`cpu_scheduler`) created by the FIRST run to touch the head — it cannot change mid-head. So the
+#   two files must not share a Ray head:
+#
+#       ray stop && ray start --head       # BEFORE switching between this file and the other one
+#
+# Two baselines, both with NO past solutions in the prompt (`n-context: 0`):
+#   * parent-source: initial  -> BEST-OF-N. Every generation restarts from the problem's seed.
+#   * parent-source: puct     -> TTT-DISCOVER WITHOUT RL. Past experience reaches the model only
+#     through *which* solution it is asked to improve.
+#
+# ---------------------------------------------------------------------------------------------
+# 1. SERVER (once, own tmux window). Unchanged from the first campaign — it was never the limiter:
+#    zero preemptions all campaign, KV usage peaked at 10-23 %, num_requests_waiting stayed 0.
+# ---------------------------------------------------------------------------------------------
+#   cd projects/phd/R2/LLMs/local/vllm_provider/ && source .venv/bin/activate
+#
+#   CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/scratch/vicstorage \
+#   vllm serve openai/gpt-oss-120b \
+#       --tensor-parallel-size 2 \
+#       --async-scheduling \
+#       --gpu-memory-utilization 0.95 \
+#       --max-model-len 128000 \
+#       --max-num-seqs 320 \
+#       --max-num-batched-tokens 16384 \
+#       --enable-prefix-caching \
+#       --reasoning-parser openai_gptoss \
+#       --port 8001
+#
+#   --enable-prefix-caching: measured 98.1 % hit rate. Cheap here (prompts are only ~830 tokens at
+#       n-context 0) but free, and it matters once the ICL experiments raise n-context.
+#   --max-num-seqs 320: NOT a limiter at max_parallel 4 (4 x 5 parents x 20 children = 400 wanted,
+#       but the client never has that many truly in flight and KV has 4x headroom). Leave it.
+#   --reasoning-parser openai_gptoss: REQUIRED, and not only for --save-reasoning. Without it the
+#       chain of thought stays inside `content` and code extraction can pick a ```python fence out
+#       of the reasoning instead of the answer.
+#
+# ---------------------------------------------------------------------------------------------
+# 2. LAUNCH
+# ---------------------------------------------------------------------------------------------
+#   ray stop; ray start --head        # fresh head so cpu_scheduler picks up num-cpus-per-task: 1
+#   cd src && tmux new -s bl_cp
+#   python run_sweep.py sweeps/baselines_gptoss_cp.yaml --print-cmds     # inspect first
+#   python run_sweep.py sweeps/baselines_gptoss_cp.yaml --sweep-dir runs/baselines_gptoss_cp
+#   python run_sweep.py --status runs/baselines_gptoss_cp                # any time, any shell
+#
+#   NOTE `--stop` does NOT stop the supervisor, only the live runs — it will immediately launch the
+#   next queued run. To halt a sweep for real: kill the run_sweep.py pid FIRST, then --stop.
+#
+# ---------------------------------------------------------------------------------------------
+# 3. WHAT CHANGED vs the first campaign, and why (all measured, not guessed)
+# ---------------------------------------------------------------------------------------------
+# (a) num-cpus-per-task: 2 -> 1.  The first campaign wasted half the box. Every eval child was
+#     single-threaded (nlwp=1, 99.9 % of one core) and pinned to exactly ONE core, yet Ray reserved
+#     2 CPUs for it, so only 48 of 96 cores ever worked while Ray reported 96/96 with a task backlog.
+#     (The pinning comes from the cpu_scheduler actor's group_size, the reservation from this flag —
+#     two independent paths that disagreed.) Expect ~2x grading throughput.
+# (b) eval-timeout: BACK TO THE REGISTRY DEFAULT (530 s), after two wrong answers. The history is
+#     worth keeping, because it is the clearest example in this project of a plausible measurement
+#     leading to a harmful config — see notebooks/experiment0_calibration.ipynb section 2.
+#       * First attempt 120 s, from 45 hand-timed solutions (p50 0.36 s, MAX 69.6 s). Both the sample
+#         size (45 of ~2,100) and the sample were wrong: all 45 came from a `parent-source: initial`
+#         run, the cheapest cell.
+#       * Then 220 s, and the new per-candidate instrumentation immediately showed it still binding:
+#             arm            candidates killed by eval_timeout    success_rate
+#             cp26 initial                 1.3 %                      0.68
+#             cp26 PUCT                   45.3 %                      0.35
+#             cp32 initial                 0.7 %                      0.77
+#             cp32 PUCT                   30.9 %                      0.46
+#         VALID solutions ran to 220 s exactly — i.e. the true tail was censored, not measured.
+#     PUCT selects good parents, the model elaborates them, and eval cost RISES with generation. So a
+#     tight timeout is not a speed knob here, it is a selection pressure toward cheap programs that
+#     removes ~half the PUCT arm while barely touching Best-of-N. Comparing those two arms under a
+#     tight cap measures the timeout, not the search.
+#     >>> SELF-CHECKING from now on: progress.csv carries eval_p50/p90/p99/eval_max per generation and
+#         icl.log prints "eval/candidate ... (N% used by the slowest)". Only tighten this once the tail
+#         is UNCENSORED (eval_max comfortably below the limit) for BOTH parent-sources.
+# (c) max_parallel: 2 -> 4.  Safe *for this family only*: circle_packing is the GPU-bound family (an
+#     erdos/ac generation spends 85-93 % of its wall grading, with the A100s sampled at 0 %). Measured
+#     confirmation at 4: `queue_p50` stayed ~0.01 s, so the CPU-group queue is not backing up. Note the
+#     grading load here is HIGHER than first estimated — the PUCT arm's eval p90 is 80-113 s, not the
+#     few seconds the bad sample in (b) suggested — so re-check queue_p50 rather than assuming.
+#
+# NOT changed, deliberately: max-tokens stays 34000. Max decode observed was 21,241 (62 %) with zero
+# truncations, and shrinking it would save nothing — KV was never the constraint.
+#
+# CAVEAT ON MIXING WITH EXISTING RESULTS: runs/baselines_gptoss already holds two COMPLETE runs
+# (circle_packing_26 / _32, seed 1, parent-source initial) produced at eval-timeout 530 and
+# num-cpus-per-task 2. Timeout is not purely a speed knob — it can reclassify a slow-but-valid
+# candidate as failed — so those two runs are not strictly config-identical to the ones below.
+# They are the seed-1 `initial` cells of the grid, so the cheapest fix is to let this sweep re-run
+# them (it will, they are in the grid) and keep the old pair only as a cross-check.
+#
+# ---------------------------------------------------------------------------------------------
+# 4. COST
+# ---------------------------------------------------------------------------------------------
+# Measured at reasoning-effort medium: ~4,100 tokens/candidate, 0 truncations, aggregate decode
+# peaking at ~1907 tok/s (campaign average was only 663 tok/s — the gap was all client-side idle,
+# which (a)+(b)+(c) attack). 20 runs x 30 generations x 100 candidates = 60,000 candidates.
+# At the two completed runs' post-fix projection (~3.2-4.0 h/run) and max_parallel 4: roughly
+# 16-20 h wall for this whole file. Re-derive from the first finished run rather than trusting this.
+# =================================================================================================
+
+sweep:
+  name: baselines_gptoss_cp
+  max_parallel: 4                # see 3(c). CPU-cheap family, so this is bounded by the GPU.
+  stagger: 120                   # keep generation phases from landing on the same grading barrier
+  server_max_num_seqs: 320
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: openai/gpt-oss-120b
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: medium       # measured ~4,100 tok/candidate. `high` is unmeasured here and the
+                                 # one high-effort observation was bad (~70 % of completions spent
+                                 # the whole budget on hidden reasoning and returned no code).
+
+  # --- token budgets (fixed across every experiment in this project) --------------------------
+  max-tokens: 34000              # reasoning + answer per candidate; mirrors TTT-Discover's window
+  max-context-tokens: 94000      # inert at n-context 0; kept identical for the later ICL runs
+  temperature: 1.0               # TTT-Discover's value
+
+  # --- search shape --------------------------------------------------------------------------
+  n-context: 0                   # THE baseline property: no past solutions in the prompt
+  groups-per-batch: 5            # parents per generation
+  group-size: 20                 # children per parent -> 100 candidates/generation
+  num-generations: 30            # 3,000 candidates/run
+
+  # --- execution -----------------------------------------------------------------------------
+  save-reasoning: false          # traces off. Only the FILES go away: the reasoning/answer token
+                                 # split, decode percentiles and truncation counts are still
+                                 # measured and land in progress.csv. The SFT/RL experiments in the
+                                 # plan train on traces, so reusing these runs as training data
+                                 # would mean re-running them.
+  max-gen-concurrency: 5         # = groups-per-batch: all 5 parents' requests in flight at once
+  num-cpus-per-task: 1           # see 3(a). MUST match the Ray head's cpu_scheduler group_size,
+                                 # which is fixed by whichever run creates the actor -> restart the
+                                 # head when switching between this file and baselines_gptoss_hard.
+  # eval-timeout: intentionally NOT set -> registry default (circle_packing 530 s). See 3(b): 120 and
+  #   then 220 both truncated VALID solutions and removed ~a third to a half of the PUCT arm.
+
+grid:
+  # Key order = launch order. `seed` first finishes a whole replicate (both baselines, both
+  # problems) before starting the next, so partial results are already analysable.
+  seed: [1, 2, 3, 4]
+  parent-source: [initial, puct]
+  problem: [circle_packing_26, circle_packing_32]
+  # -> 20 runs named e.g. circle_packing_26_s-1_ps-initial

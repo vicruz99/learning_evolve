@@ -495,6 +495,15 @@ class ICLRunner:
                         f"{decode_pct['p90']:,} p99 {decode_pct['p99']:,} max {decode_pct['max']:,} "
                         f"| max_tokens={cfg.max_tokens:,} ({headroom:.0f}% used by the longest) "
                         f"— size --max-tokens off p99, the tail gates each request")
+                ev = self.tracker._per_gen[-1].get("eval_percentiles") or {}
+                gr = self.tracker._per_gen[-1].get("grade_percentiles") or {}
+                if ev:
+                    logger.info(
+                        f"gen {gen} eval/candidate | p50 {ev['p50']:.1f}s p90 {ev['p90']:.1f}s "
+                        f"p99 {ev['p99']:.1f}s max {ev['max']:.1f}s | eval_timeout="
+                        f"{self.eval_timeout}s ({100.0 * ev['max'] / self.eval_timeout:.0f}% used by "
+                        f"the slowest) | grade p50 {gr.get('p50', 0):.1f}s max {gr.get('max', 0):.1f}s "
+                        f"(grade-eval gap = CPU-group queueing + ~2s/candidate Ray+pickle overhead)")
                 self._warn_if_no_reasoning(usage)
                 if usage["truncated"]:
                     logger.warning(

@@ -89,6 +89,20 @@ def _strip_fences(code: str) -> str:
     return c
 
 
+def _pctl(values: list[float]) -> dict[str, float]:
+    """Nearest-rank percentiles of a per-candidate cost, in seconds. Same convention as
+    ``icl.loop._percentiles``: the tail is the actionable statistic, because one slow candidate
+    holds its whole parent group (and therefore the generation barrier)."""
+    if not values:
+        return {}
+    ordered = sorted(values)
+
+    def at(p: float) -> float:
+        return round(ordered[min(len(ordered) - 1, int(p * len(ordered)))], 2)
+
+    return {"p50": at(0.50), "p90": at(0.90), "p99": at(0.99), "max": round(ordered[-1], 2)}
+
+
 def _native(value: float | None, maximize: bool) -> float | None:
     """Native (human) metric from the stored higher-is-better value."""
     if value is None:
@@ -145,6 +159,13 @@ class ExperimentTracker:
             "reasoning_tokens", "tokens_per_completion", "truncated",
             # per-candidate decode distribution — the tail is what sizes --max-tokens
             "decode_p50", "decode_p90", "decode_p99", "decode_max",
+            # per-candidate GRADING cost. eval_* is the sandbox program's own runtime and is the only
+            # thing --eval-timeout bounds, so size that flag off eval_max/eval_p99 (a timed-out
+            # candidate contributes ~the limit itself). grade_* is end-to-end and exceeds eval_* by
+            # CPU-group queueing PLUS a fixed ~2 s/candidate of Ray dispatch + pickle + NFS writes
+            # (measured on an idle box), so read queue_* to tell contention from that floor.
+            "eval_p50", "eval_p90", "eval_p99", "eval_max",
+            "queue_p50", "queue_max", "grade_p50", "grade_max",
         ]
         if not os.path.exists(self._progress_path):
             with open(self._progress_path, "w", newline="") as f:
@@ -189,6 +210,8 @@ class ExperimentTracker:
             "failure_types": {},        # per-generation counts by failure_type (failed only)
             "usage": dict.fromkeys(USAGE_KEYS, 0),
             "parents": {},
+            # grading cost of every candidate this generation, valid or not (see _progress_cols)
+            "eval_times": [], "queue_times": [], "grade_times": [],
         }
         for slot, p in enumerate(parents):
             self._cur["parents"][slot] = {
@@ -270,6 +293,11 @@ class ExperimentTracker:
                 self._failure_types[ft] = self._failure_types.get(ft, 0) + 1
 
             failure_type = "" if res.correctness > 0 else (res.failure_type or "unknown")
+            for key, attr in (("eval_times", "eval_seconds"), ("queue_times", "queue_seconds"),
+                              ("grade_times", "grade_seconds")):
+                val = getattr(res, attr, None)
+                if val is not None:
+                    self._cur[key].append(val)
             child_rec = {
                 "child": child_idx,
                 "correctness": res.correctness,
@@ -305,6 +333,10 @@ class ExperimentTracker:
                 "reasoning_tokens": r_tokens,
                 "answer_tokens": a_tokens,
                 "decode_tokens": d_tokens,
+                # grading cost of THIS candidate; eval_seconds is what --eval-timeout bounds
+                "eval_seconds": getattr(res, "eval_seconds", None),
+                "queue_seconds": getattr(res, "queue_seconds", None),
+                "grade_seconds": getattr(res, "grade_seconds", None),
                 "completion_file": self._rel(completion_file) if completion_file else None,
                 "prompt_file": pinfo["prompt_file"],
             }) + "\n")
@@ -381,6 +413,10 @@ class ExperimentTracker:
             # Kept OUT of `usage` on purpose: usage fields are summed into run totals, and summing
             # percentiles is meaningless. Per-candidate decode tokens; see icl.loop._percentiles.
             "decode_percentiles": dict(decode_percentiles or {}),
+            # Same reasoning, for grading cost. Read eval_percentiles to decide --eval-timeout.
+            "eval_percentiles": _pctl(cur.get("eval_times", [])),
+            "queue_percentiles": _pctl(cur.get("queue_times", [])),
+            "grade_percentiles": _pctl(cur.get("grade_times", [])),
         }
         meta = {
             "generation": gen,
@@ -400,6 +436,9 @@ class ExperimentTracker:
                 gen_usage["reasoning_tokens"], gen_usage["tokens_per_completion"],
                 gen_usage["truncated"],
                 *(gen_stats["decode_percentiles"].get(k) for k in ("p50", "p90", "p99", "max")),
+                *(gen_stats["eval_percentiles"].get(k) for k in ("p50", "p90", "p99", "max")),
+                *(gen_stats["queue_percentiles"].get(k) for k in ("p50", "max")),
+                *(gen_stats["grade_percentiles"].get(k) for k in ("p50", "max")),
             ])
 
         self._per_gen.append(gen_stats)
