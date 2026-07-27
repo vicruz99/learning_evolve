@@ -71,6 +71,10 @@ class RolloutResult:
     correct_format: bool
     next_state: State | None          # the buffered child if the candidate was valid, else None
     failure_type: str = ""            # "" when valid; else infra-vs-genuine category (see sandbox.classify_failure)
+    # --- grading cost, per candidate (None when the candidate never reached the sandbox) ---
+    eval_seconds: float | None = None    # the program's own runtime -> the ONLY number --eval-timeout bounds
+    queue_seconds: float | None = None   # waiting for a free CPU group; contention, not evaluation
+    grade_seconds: float | None = None   # end-to-end (queue + eval + Ray/pickle overhead)
 
 
 # Shared ThreadPoolExecutor for all environments (grading runs off the event loop).
@@ -181,6 +185,10 @@ class Environment(ABC):
             num_cpus_per_task=self.num_cpus_per_task,
         )
         out = task.get_reward(generation, state=state)
+        # Merged here rather than in each problem's get_reward: the evaluator stashes the sandbox
+        # timings on itself, so one hook covers all problems (eval_seconds / queue_seconds / cpus).
+        metrics = dict(out.get("metrics", {}))
+        metrics.update(getattr(task, "_last_timing", {}) or {})
         return VerifyResult(
             reward=out["reward"],
             msg=out["msg"],
@@ -188,7 +196,7 @@ class Environment(ABC):
             raw_score=out["raw_score"],
             result_construction=out.get("result_construction", None),
             stdout=out.get("stdout", ""),
-            metrics=out.get("metrics", {}),
+            metrics=metrics,
             failure_type=out.get("failure_type", ""),
         )
 
@@ -210,6 +218,7 @@ class Environment(ABC):
                 ),
                 timeout=self.timeout,
             )
+            out.metrics.setdefault("grade_seconds", round(time.time() - start_time, 3))
             return out
         except asyncio.TimeoutError:
             elapsed = time.time() - start_time
@@ -259,6 +268,7 @@ class Environment(ABC):
         elif hasattr(self.sampler, "record_failed_rollout"):
             self.sampler.record_failed_rollout(self.initial_state)
 
+        m = outs.metrics or {}
         return RolloutResult(
             reward=outs.reward,
             correctness=outs.correctness,
@@ -268,4 +278,7 @@ class Environment(ABC):
             correct_format=correct_format,
             next_state=next_state,
             failure_type=failure_type,
+            eval_seconds=m.get("eval_seconds"),
+            queue_seconds=m.get("queue_seconds"),
+            grade_seconds=m.get("grade_seconds"),
         )

@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import json
 import pickle
 import tempfile, os
 import time
@@ -424,14 +425,31 @@ def run_program(program_code_path, function_name, max_cpus, eval_timeout_seconds
         tf.write(program_code)
         program_path = tf.name
 
+    # Waiting for a free CPU group is queueing, not evaluation: separating the two is the whole
+    # point of this timing, because only the *execution* half is what --eval-timeout bounds.
+    _t_queue = time.perf_counter()
     group = get_cpu_group(
         ray.get_actor("cpu_scheduler"),
         timeout_s=eval_timeout_seconds + 10,
     )
+    queue_seconds = time.perf_counter() - _t_queue
 
     results_path = program_code_path.with_suffix(".pkl")
     stdout_src = program_path + ".stdout"
     stdout_dst = str(results_path) + ".stdout"
+    # Derived from program_code_path (which the caller also knows) rather than from the return value,
+    # so the caller can still find the timings when this task raises (timeout / crash).
+    timing_path = str(results_path) + ".timing.json"
+    _t_exec = time.perf_counter()
+
+    def _write_timing():
+        try:
+            with open(timing_path, "w") as tf_:
+                json.dump({"queue_seconds": round(queue_seconds, 3),
+                           "eval_seconds": round(time.perf_counter() - _t_exec, 3),
+                           "cpus": len(group)}, tf_)
+        except Exception:
+            pass
 
     try:
         result = run_with_timeout(
@@ -468,6 +486,9 @@ def run_program(program_code_path, function_name, max_cpus, eval_timeout_seconds
         raise
 
     finally:
+        # Written in `finally` so a timed-out / crashed candidate still reports how long it ran —
+        # those are exactly the candidates that tell us whether --eval-timeout is set sanely.
+        _write_timing()
         # Cleanup
         release_cpu_group(ray.get_actor("cpu_scheduler"), group)
 
@@ -603,6 +624,15 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
 
         # Compute expected stdout path (matches run_program's logic)
         expected_stdout_path = Path(code_path).with_suffix(".pkl.stdout")
+        expected_timing_path = str(Path(code_path).with_suffix(".pkl")) + ".timing.json"
+        self._last_timing = {}
+
+        def _load_timing():
+            try:
+                with open(expected_timing_path) as tf_:
+                    self._last_timing = json.load(tf_)
+            except Exception:
+                self._last_timing = {}
 
         try:
             result_path_future = (
@@ -649,6 +679,7 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
             except Exception:
                 self._last_stdout = ""
 
+            _load_timing()
             return results
 
         except Exception:
@@ -659,6 +690,7 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
                         self._last_stdout = sf.read()
             except Exception:
                 pass
+            _load_timing()   # a timed-out candidate's runtime is the most informative one we have
             raise
 
         finally:
@@ -680,6 +712,11 @@ class SandboxRewardEvaluator(BaseRewardEvaluator):
             # Clean up stdout file (use expected path which is always computable)
             try:
                 os.unlink(expected_stdout_path)
+            except (FileNotFoundError, OSError):
+                pass
+
+            try:
+                os.unlink(expected_timing_path)
             except (FileNotFoundError, OSError):
                 pass
 
