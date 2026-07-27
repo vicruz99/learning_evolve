@@ -19,6 +19,7 @@ Exit status is 0 if every check passed, 1 if any FAIL was printed.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -229,6 +230,20 @@ def check_scheduler(ray, ray_cpus: int, expect_group_size: int | None) -> "tuple
                  f"({expected_total}) — release_workers_atomic appends unconditionally, so a "
                  "double release inflates the queue and lets evals oversubscribe cores.")
 
+        # The opposite leak, and the more common one: a worker SIGKILLed mid-eval never runs its
+        # release, so its group is lost from the deque for the head's lifetime. Ray's own accounting
+        # recovers (it frees the reservation when the task dies) while the actor's does not, so the
+        # signature is "Ray says the CPUs are free, the actor says the groups are gone" — and every
+        # future run silently grades at reduced parallelism. Only meaningful on an idle cluster.
+        idle = ray.available_resources().get("CPU", 0) >= 0.95 * ray_cpus
+        if idle and 0 <= s["available_groups"] < expected_total:
+            leaked = expected_total - s["available_groups"]
+            fail(f"{leaked} of {expected_total} CPU groups are LEAKED: the cluster is idle "
+                 f"(Ray reports all {ray_cpus} CPUs free) but only {s['available_groups']} groups are "
+                 "available. Killed evals never returned them, and a detached actor keeps that state "
+                 f"for the head's lifetime — so the next run will grade {s['available_groups']}-way "
+                 f"instead of {expected_total}-way. Fix: `ray stop && ray start --head`.")
+
     # THE stale-actor trap: num_cpus_per_task is frozen at creation, and init_ray uses
     # get_if_exists=True, so a sweep asking for a different value is silently given the old one.
     # Ray then RESERVES what the sweep asked for while the actor PINS the old group size — the exact
@@ -389,6 +404,109 @@ def check_exec(ray, n: int, ray_cpus: int, num_cpus_per_task: int) -> None:
         ok(f"{warm:.2f}s interpreter+numpy startup — negligible against real evals")
 
 
+# Reference timings, INESC box (Xeon Gold 6330 @ 2.00GHz, numpy 2.5.1 / scipy 1.18.0 /
+# scipy-openblas), pinned to ONE core exactly as the sandbox pins an eval child.
+CORE_REF = {"pyloop": 0.40, "blas": 0.49, "slsqp": 2.01}
+
+
+def check_core_speed() -> None:
+    """Per-core compute speed. This is what explains a slow box once Ray and the floor are clean.
+
+    Three fixed workloads, because they separate the causes that a single number cannot:
+      pyloop -> raw integer/branch speed, no libraries involved  => the CPU itself
+      blas   -> BLAS build and its thread behaviour              => numeric stack
+      slsqp  -> the actual circle-packing workload               => what evals really pay
+    Measured on Bosch vs INESC: identical programs ran 5.5x slower (paired, n=19, median ratio 0.18),
+    with Ray healthy and the harness floor equal — i.e. neither Ray nor the venv explained it.
+    """
+    section("6. Per-core compute speed (pinned to 1 core, like an eval child)")
+
+    # The trap: sandbox_reward_evaluator uses env.setdefault() for the thread caps, so a value already
+    # exported by the shell, a module system, or venv activation WINS. >1 on a 1-core-pinned eval means
+    # BLAS oversubscribes that single core and thrashes — a 5x-class slowdown with no Ray or NFS
+    # signature, which is exactly the shape of an unexplained slow box.
+    names = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS")
+    inherited = {k: os.environ[k] for k in names if k in os.environ}
+    bad = {k: v for k, v in inherited.items() if v.strip() not in ("1", "")}
+    if bad:
+        fail("these thread caps are ALREADY set in the environment: "
+             + ", ".join(f"{k}={v}" for k, v in bad.items())
+             + ". sandbox_reward_evaluator.py uses env.setdefault(), so these PRE-SET values win over "
+               "its own cap of --num-cpus-per-task. Every eval pinned to one core will spawn that many "
+               "BLAS threads onto it and thrash. Unset them (or export them as 1) before launching.")
+    elif inherited:
+        ok("inherited thread caps are all 1 — no BLAS oversubscription")
+    else:
+        info("no thread caps inherited — the sandbox will set them to --num-cpus-per-task itself")
+
+    pinned = sorted(os.sched_getaffinity(0))[:1] if hasattr(os, "sched_setaffinity") else []
+    code = r'''
+import os, sys, time
+if %(pin)r and hasattr(os, "sched_setaffinity"):
+    os.sched_setaffinity(0, set(%(pin)r))          # pin BEFORE importing numpy, like the preamble
+import numpy as np
+from scipy.optimize import minimize, NonlinearConstraint
+N = 26
+def pyloop():
+    t = time.perf_counter(); s = 0
+    for i in range(3_000_000): s += i %% 7
+    return time.perf_counter() - t
+def blas():
+    a = np.random.default_rng(0).random((900, 900)); b = np.random.default_rng(1).random((900, 900))
+    t = time.perf_counter()
+    for _ in range(12): a @ b
+    return time.perf_counter() - t
+def _obj(p): return -np.sum(p[2::3])
+def _cons(p):
+    c = np.column_stack((p[0::3], p[1::3])); r = p[2::3]
+    out = [c[:, 0] - r, 1 - c[:, 0] - r, c[:, 1] - r, 1 - c[:, 1] - r]
+    i, j = np.triu_indices(N, 1)
+    out.append(np.sqrt(np.sum((c[i] - c[j]) ** 2, axis=1)) - r[i] - r[j])
+    return np.concatenate(out)
+def slsqp():
+    rng = np.random.default_rng(0); t = time.perf_counter()
+    for _ in range(3):
+        p0 = np.empty(3 * N)
+        p0[0::3] = rng.random(N) * .6 + .2; p0[1::3] = rng.random(N) * .6 + .2; p0[2::3] = .08
+        minimize(_obj, p0, method="SLSQP", bounds=[(0, 1), (0, 1), (0, .5)] * N,
+                 constraints=[NonlinearConstraint(_cons, 0, np.inf)],
+                 options={"ftol": 1e-10, "maxiter": 300})
+    return time.perf_counter() - t
+import json
+print(json.dumps({"pyloop": pyloop(), "blas": blas(), "slsqp": slsqp(),
+                  "numpy": np.__version__}))
+''' % {"pin": pinned}
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=900)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception as e:                       # scipy missing, timeout, crash — all non-fatal here
+        warn(f"could not run the compute benchmark ({type(e).__name__}: {e}); skipping section 6")
+        return
+
+    info(f"numpy {got['numpy']}   pinned to core {pinned}")
+    worst = 1.0
+    for k in ("pyloop", "blas", "slsqp"):
+        ratio = got[k] / CORE_REF[k]
+        worst = max(worst, ratio)
+        info(f"  {k:<7}{got[k]:7.2f}s   INESC {CORE_REF[k]:.2f}s   {ratio:5.2f}x")
+
+    if got["pyloop"] / CORE_REF["pyloop"] > 2.0:
+        fail(f"raw CPython speed is {got['pyloop'] / CORE_REF['pyloop']:.1f}x slower than the INESC "
+             "reference, with no libraries involved — this is the CPU (or a shared/throttled core), "
+             "not a misconfiguration. Nothing to fix: re-budget the grid, because every eval second "
+             "scales by this factor and eval-timeout means something different on this box.")
+    elif worst > 2.0:
+        fail(f"CPython speed is fine but numeric work is up to {worst:.1f}x slower than INESC — that "
+             "is the numeric stack, not the CPU: wrong/slow BLAS, or thread oversubscription (see the "
+             "thread-cap check above). This one IS fixable and is worth the whole factor.")
+    elif worst > 1.3:
+        warn(f"up to {worst:.1f}x slower than the INESC reference — modest, but eval percentiles and "
+             "any --eval-timeout tuned on the other box do not transfer.")
+    else:
+        ok("per-core speed comparable to the INESC reference — eval timings are portable")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -398,6 +516,8 @@ def main() -> int:
     ap.add_argument("--num-cpus-per-task", type=int, default=1,
                     help="the value your sweep sets; the actor's group_size is checked against it "
                          "(default: 1, what every current sweep file uses)")
+    ap.add_argument("--no-bench", action="store_true",
+                    help="skip section 6 (the ~3s single-core compute benchmark)")
     args = ap.parse_args()
 
     ray = check_head()
@@ -412,6 +532,9 @@ def main() -> int:
         n = args.exec if args.exec > 0 else max(1, ray_cpus // max(1, args.num_cpus_per_task))
         gs = sched[1] if sched and sched[1] > 0 else args.num_cpus_per_task
         check_exec(ray, n, ray_cpus, gs)
+
+    if not args.no_bench:
+        check_core_speed()
 
     print(f"\n{'=' * 60}\n{_fails} FAIL, {_warns} WARN\n")
     if _fails:
