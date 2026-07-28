@@ -448,10 +448,15 @@ if %(pin)r and hasattr(os, "sched_setaffinity"):
 import numpy as np
 from scipy.optimize import minimize, NonlinearConstraint
 N = 26
+_cpu_frac = 1.0
 def pyloop():
-    t = time.perf_counter(); s = 0
+    global _cpu_frac
+    t, c = time.perf_counter(), time.process_time()
+    s = 0
     for i in range(3_000_000): s += i %% 7
-    return time.perf_counter() - t
+    w = time.perf_counter() - t
+    _cpu_frac = (time.process_time() - c) / w if w else 1.0   # <1 => descheduled, not slow silicon
+    return w
 def blas():
     a = np.random.default_rng(0).random((900, 900)); b = np.random.default_rng(1).random((900, 900))
     t = time.perf_counter()
@@ -473,9 +478,10 @@ def slsqp():
                  constraints=[NonlinearConstraint(_cons, 0, np.inf)],
                  options={"ftol": 1e-10, "maxiter": 300})
     return time.perf_counter() - t
-import json
+import json, scipy
 print(json.dumps({"pyloop": pyloop(), "blas": blas(), "slsqp": slsqp(),
-                  "numpy": np.__version__}))
+                  "numpy": np.__version__, "scipy": scipy.__version__,
+                  "cpu_frac": _cpu_frac}))
 ''' % {"pin": pinned}
     try:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=900)
@@ -484,27 +490,43 @@ print(json.dumps({"pyloop": pyloop(), "blas": blas(), "slsqp": slsqp(),
         warn(f"could not run the compute benchmark ({type(e).__name__}: {e}); skipping section 6")
         return
 
-    info(f"numpy {got['numpy']}   pinned to core {pinned}")
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        load1 = float("nan")
+    ncpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    info(f"numpy {got['numpy']}  scipy {got['scipy']}   pinned to core {pinned}")
+    info(f"load average {load1:.1f} on {ncpu} cores; this process got "
+         f"{got['cpu_frac']:.0%} of its core's wall time")
+
     worst = 1.0
     for k in ("pyloop", "blas", "slsqp"):
         ratio = got[k] / CORE_REF[k]
         worst = max(worst, ratio)
-        info(f"  {k:<7}{got[k]:7.2f}s   INESC {CORE_REF[k]:.2f}s   {ratio:5.2f}x")
+        info(f"  {k:<7}{got[k]:7.2f}s   ref {CORE_REF[k]:.2f}s   {ratio:5.2f}x")
 
-    if got["pyloop"] / CORE_REF["pyloop"] > 2.0:
-        fail(f"raw CPython speed is {got['pyloop'] / CORE_REF['pyloop']:.1f}x slower than the INESC "
-             "reference, with no libraries involved — this is the CPU (or a shared/throttled core), "
-             "not a misconfiguration. Nothing to fix: re-budget the grid, because every eval second "
-             "scales by this factor and eval-timeout means something different on this box.")
-    elif worst > 2.0:
-        fail(f"CPython speed is fine but numeric work is up to {worst:.1f}x slower than INESC — that "
-             "is the numeric stack, not the CPU: wrong/slow BLAS, or thread oversubscription (see the "
-             "thread-cap check above). This one IS fixable and is worth the whole factor.")
-    elif worst > 1.3:
-        warn(f"up to {worst:.1f}x slower than the INESC reference — modest, but eval percentiles and "
-             "any --eval-timeout tuned on the other box do not transfer.")
+    # CORE_REF was measured on a BUSY box, so it is a weak yardstick: the same loop on that same box
+    # ranged 0.40-0.72s at identical load. Treat cross-machine ratios inside ~2x as noise, and never
+    # conclude "the CPU is the problem" from this section alone — compare eval_seconds on the SAME
+    # candidate program instead (that is a paired measurement; this is not).
+    if got["cpu_frac"] < 0.85:
+        warn(f"this process only got {got['cpu_frac']:.0%} of a core — it was descheduled, so these "
+             "timings measure contention, not the hardware. Re-run on an idle box.")
+    elif worst > 3.0:
+        fail(f"up to {worst:.1f}x slower than the reference. If pyloop is the slow one it is the CPU "
+             "or a throttled/shared core; if only blas/slsqp are slow it is the numeric stack "
+             "(BLAS build, or the thread caps above). Confirm with a paired re-grade of one real "
+             "candidate before acting — this benchmark is not that.")
+    elif worst > 1.5:
+        warn(f"up to {worst:.1f}x off the reference — but that reference was itself taken on a loaded "
+             "box (0.40-0.72s spread for pyloop), so treat this as inconclusive rather than a finding.")
     else:
-        ok("per-core speed comparable to the INESC reference — eval timings are portable")
+        ok("per-core speed within noise of the reference")
+
+    if min(got[k] / CORE_REF[k] for k in CORE_REF) < 0.6:
+        info("this box is FASTER per core than the reference. If its evals are nevertheless slower, "
+             "the cause is in the software path, not the silicon — compare scipy versions first "
+             "(a solver that runs to maxiter instead of converging costs 10-40x at the same answer).")
 
 
 def main() -> int:
