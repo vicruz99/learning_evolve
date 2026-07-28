@@ -105,6 +105,84 @@ def check_head() -> "object | None":
 # -------------------------------------------------------------------------------------------------
 # 2. does Ray see the cores the machine actually has?
 # -------------------------------------------------------------------------------------------------
+def _cgroup_cpu_limits() -> "tuple[float | None, str, tuple[str, int, int] | None]":
+    """Most restrictive CPU quota affecting THIS process, plus any throttling actually recorded.
+
+    The quota is almost never on the root cgroup — it lives on the process's own cgroup or an
+    ancestor (on a shared login node, typically a systemd user slice). Reading
+    /sys/fs/cgroup/cpu.max therefore finds nothing and proves nothing, so walk the real hierarchy
+    from /proc/self/cgroup upwards. Returns (cores_allowed_or_None, where_we_looked, throttling).
+    """
+    try:
+        with open("/proc/self/cgroup") as fh:
+            entries = [l.strip() for l in fh if l.strip()]
+    except OSError:
+        return None, "/proc/self/cgroup unreadable", None
+
+    # cgroup v2 is a single "0::<path>" line; v1 lists one line per controller.
+    rel = None
+    for e in entries:
+        parts = e.split(":", 2)
+        if len(parts) == 3 and (parts[0] == "0" or "cpu" in parts[1].split(",")):
+            rel = parts[2]
+            break
+    if rel is None:
+        return None, "no cpu controller in /proc/self/cgroup", None
+
+    roots = ["/sys/fs/cgroup", "/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"]
+    segments, cur = [], rel.rstrip("/")
+    while True:                                    # leaf first, then each ancestor, then root
+        segments.append(cur or "/")
+        if not cur:
+            break
+        cur = cur.rsplit("/", 1)[0]
+
+    best, best_at, throttled, looked = None, "", None, 0
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for seg in segments:
+            base = os.path.join(root, seg.lstrip("/"))
+            if not os.path.isdir(base):
+                continue
+            looked += 1
+            try:                                   # v2
+                with open(os.path.join(base, "cpu.max")) as fh:
+                    raw = fh.read().split()
+                if raw and raw[0] != "max":
+                    cores = float(raw[0]) / float(raw[1])
+                    if best is None or cores < best:
+                        best, best_at = cores, os.path.join(base, "cpu.max")
+            except (OSError, ValueError, IndexError):
+                pass
+            try:                                   # v1
+                with open(os.path.join(base, "cpu.cfs_quota_us")) as fh:
+                    q = float(fh.read().strip())
+                with open(os.path.join(base, "cpu.cfs_period_us")) as fh:
+                    p = float(fh.read().strip())
+                if q > 0 and p > 0:
+                    cores = q / p
+                    if best is None or cores < best:
+                        best, best_at = cores, os.path.join(base, "cpu.cfs_quota_us")
+            except (OSError, ValueError):
+                pass
+            try:                                   # proof of actual throttling (v1 and v2)
+                stat = {}
+                with open(os.path.join(base, "cpu.stat")) as fh:
+                    for line in fh:
+                        k, _, v = line.partition(" ")
+                        stat[k.strip()] = v.strip()
+                nr = int(stat.get("nr_throttled", 0))
+                usec = int(stat.get("throttled_usec", 0) or
+                           int(stat.get("throttled_time", 0) or 0) // 1000)
+                if nr > 0 and throttled is None:
+                    throttled = (os.path.join(base, "cpu.stat"), nr, usec)
+            except (OSError, ValueError):
+                pass
+
+    return best, (best_at or f"{looked} cgroup level(s) from {rel}"), throttled
+
+
 def check_resources(ray) -> int:
     section("2. Cluster resources")
 
@@ -141,45 +219,40 @@ def check_resources(ray) -> int:
     # ~0, while the kernel throttles the cgroup's total CPU time. The only symptom is that each eval
     # runs several times slower than it should — exactly the shape of "Ray feels broken" that isn't
     # Ray at all. Check it explicitly.
-    checked_quota = False
-    for path in ("/sys/fs/cgroup/cpu.max",                       # cgroup v2
-                 "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"):        # cgroup v1
-        try:
-            with open(path) as fh:
-                raw = fh.read().split()
-        except OSError:
-            continue
-        checked_quota = True
-        try:
-            if path.endswith("cpu.max"):
-                if raw[0] == "max":
-                    ok("no cgroup CPU quota (cpu.max = max)")
-                    break
-                allowed = float(raw[0]) / float(raw[1])
-            else:
-                quota = float(raw[0])
-                if quota < 0:
-                    ok("no cgroup CPU quota (cfs_quota_us = -1)")
-                    break
-                with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
-                    allowed = quota / float(fh.read().strip())
-        except (ValueError, IndexError, OSError):
-            break
-        if allowed < affinity * 0.9:
-            fail(f"cgroup CPU quota allows only {allowed:.1f} cores of CPU TIME, but affinity "
-                 f"exposes {affinity}. The cpu_scheduler will hand out a group per exposed core and "
-                 f"queue_seconds will read ~0, while every eval runs up to ~{affinity / allowed:.1f}x "
-                 "slow because the kernel throttles the whole cgroup. This is the failure that looks "
-                 "like a Ray problem and is not one. Fix: get a real core allocation, or "
-                 f"`ray start --head --num-cpus={max(1, int(allowed))}` so concurrency matches the "
-                 "CPU time you actually have.")
+    quota, where, throttled = _cgroup_cpu_limits()
+
+    # throttling COUNTERS beat inferring from the quota: they are proof the kernel actually stopped
+    # this cgroup, and they accumulate only when concurrency exceeds the quota. A single benchmark
+    # process stays under any sane quota and looks fast, which is why a slow campaign on a fast-
+    # benchmarking box is the signature to look for here.
+    if throttled:
+        path, nr, usec = throttled
+        fail(f"this cgroup HAS BEEN CPU-THROTTLED: nr_throttled={nr}, throttled for {usec / 1e6:.1f}s "
+             f"({path}). The kernel is capping total CPU TIME, which is invisible to "
+             "sched_getaffinity, to the cpu_scheduler, and to queue_seconds — so Ray looks healthy "
+             "and every eval simply runs slow. One process at a time stays under the cap and "
+             "benchmarks fast; a full-concurrency campaign does not. Fix: get a real allocation "
+             "(a compute node, not a login node), or lower concurrency to match the quota.")
+    if quota is not None:
+        if quota < affinity * 0.9:
+            fail(f"cgroup CPU quota allows {quota:.1f} cores of CPU TIME but affinity exposes "
+                 f"{affinity} ({where}). The cpu_scheduler will hand out a group per exposed core "
+                 f"and queue_seconds will read ~0, while {affinity} concurrent evals each run up to "
+                 f"~{affinity / quota:.1f}x slow. Fix: `ray start --head "
+                 f"--num-cpus={max(1, int(quota))}` so concurrency matches the CPU time you have.")
         else:
-            ok(f"cgroup CPU quota ({allowed:.1f} cores) is consistent with affinity ({affinity})")
-        break
-    if not checked_quota:
-        info("no readable cgroup cpu.max / cfs_quota_us — could not rule out CPU-time throttling "
-             "this way. If evals are slow with queue_seconds ~0, check section 5 and `cat "
-             "/proc/pressure/cpu`.")
+            ok(f"cgroup CPU quota ({quota:.1f} cores) is consistent with affinity ({affinity})")
+    elif not throttled:
+        info(f"no cgroup CPU quota found (checked {where}) — CPU time is not capped")
+
+    # PSI: how long runnable tasks spent waiting for a CPU, cgroup-wide. Non-zero under a campaign is
+    # normal; sustained high values mean oversubscription regardless of any quota.
+    try:
+        with open("/proc/pressure/cpu") as fh:
+            some = fh.read().split("\n")[0]
+        info(f"/proc/pressure/cpu: {some.strip()}")
+    except OSError:
+        pass
 
     if len([n for n in ray.nodes() if n["Alive"]]) > 1:
         warn("more than one live node — the cpu_scheduler keys groups by node IP and partitions "
