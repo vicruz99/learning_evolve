@@ -1,0 +1,188 @@
+
+
+<strategy>
+To close the gap from 2.630 to ~2.636, we need to achieve a packing density corresponding to equal radii of approximately $r \approx 0.1014$. The optimal packing for 26 circles in a square is known to be nearly uniform in radius, arranged in a perturbed hexagonal lattice (typically 5-6-5-6-4 row structure). 
+
+Strategy:
+1. **Two-Phase Optimization**: 
+   - *Phase 1*: Optimize for **equal radii** first. Maximizing a single scalar $R$ subject to boundary and separation constraints is numerically more stable and guides the centers into a globally dense configuration.
+   - *Phase 2*: Use the high-quality equal-radius configuration as an initialization for **variable radii optimization**. This allows the solver to fine-tune individual circle sizes if asymmetry yields a marginally higher sum, while starting from a proven dense basin.
+2. **Robust Initialization**: Generate multiple hexagonal lattice configurations with controlled random perturbations. This ensures exploration of different local minima symmetries and boundary alignments.
+3. **Constraint Handling**: Use squared distances for non-overlap constraints to avoid `sqrt` singularities and improve Hessian conditioning. Vectorize constraint evaluation for performance.
+4. **Strict Validation & Safety Scaling**: Post-optimization, iteratively scale down radii only if necessary to satisfy the validator's `1e-12` tolerance, preserving maximum sum.
+5. **Compliance**: All helpers are top-level, no lambdas, explicit bounds, and deterministic seed usage for reproducibility.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_equal(vars_array, n):
+    """Maximize single radius R -> minimize -R"""
+    return -vars_array[2 * n]
+
+def constraints_equal(vars_array, n, triu_idx):
+    """Constraints for equal radii packing: boundary and separation >= 0"""
+    x = vars_array[:n]
+    y = vars_array[n:2 * n]
+    R = vars_array[2 * n]
+    
+    # Boundary: x >= R, 1-x >= R, y >= R, 1-y >= R
+    b_cons = np.concatenate([x - R, 1.0 - x - R, y - R, 1.0 - y - R])
+    
+    # Separation: ||c_i - c_j||^2 >= (2R)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    sep_cons = dist_sq[triu_idx] - 4.0 * (R ** 2)
+    
+    return np.concatenate([b_cons, sep_cons])
+
+def objective_variable(vars_array, n):
+    """Maximize sum of radii -> minimize -sum(r)"""
+    return -np.sum(vars_array[2 * n:3 * n])
+
+def constraints_variable(vars_array, n, triu_idx):
+    """Constraints for variable radii packing: boundary and separation >= 0"""
+    x = vars_array[:n]
+    y = vars_array[n:2 * n]
+    r = vars_array[2 * n:3 * n]
+    
+    # Boundary
+    b_cons = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Separation: ||c_i - c_j||^2 >= (r_i + r_j)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    sep_cons = dist_sq[triu_idx] - (r_sum[triu_idx] ** 2)
+    
+    return np.concatenate([b_cons, sep_cons])
+
+def generate_hex_initial(n, r0, seed=None):
+    """Generate hexagonal lattice initial configuration with optional perturbation"""
+    rng = np.random.default_rng(seed)
+    pts = []
+    y = r0
+    row = 0
+    counts = [5, 6, 5, 6, 4]  # Sums to 26, matches dense packing topology
+    
+    while len(pts) < n:
+        cnt = counts[row % len(counts)]
+        shift = r0 if row % 2 == 1 else 0.0
+        width = (cnt - 1) * 2.0 * r0
+        x_start = (1.0 - width) / 2.0 + shift
+        
+        for k in range(cnt):
+            if len(pts) >= n:
+                break
+            pts.append([x_start + k * 2.0 * r0, y])
+            
+        y += r0 * np.sqrt(3.0)
+        row += 1
+        
+    pts = np.array(pts[:n])
+    if seed is not None:
+        noise = rng.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts + noise, 0.05, 0.95)
+    return pts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    triu_idx = np.triu_indices(n, k=1)
+    
+    # Bounds for equal radii: x,y in [0,1], R in [0.08, 0.5]
+    bounds_eq = [(0.0, 1.0)] * (2 * n) + [(0.08, 0.5)]
+    # Bounds for variable radii: x,y in [0,1], r in [0.0, 0.5]
+    bounds_var = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    
+    best_sum = -np.inf
+    best_centers = None
+    best_radii = None
+    
+    # Create multiple initial configurations to explore basin of attraction
+    inits = [generate_hex_initial(n, 0.1, seed=i) for i in range(12)]
+    
+    cons_eq = {'type': 'ineq', 'fun': constraints_equal, 'args': (n, triu_idx)}
+    cons_var = {'type': 'ineq', 'fun': constraints_variable, 'args': (n, triu_idx)}
+    
+    # Phase 1: Optimize for equal radii to find a globally dense configuration
+    equal_results = []
+    for cfg in inits:
+        x0 = np.concatenate([cfg.flatten(), [0.1]])
+        try:
+            res = minimize(objective_equal, x0, method='SLSQP', bounds=bounds_eq,
+                          constraints=cons_eq, args=(n,),
+                          options={'maxiter': 15000, 'ftol': 1e-14})
+            if np.isfinite(res.fun) and res.x[2 * n] > 0.095:
+                equal_results.append(res.x)
+        except Exception:
+            continue
+            
+    # Fallback if Phase 1 struggles
+    if not equal_results:
+        x0_fb = np.concatenate([inits[0].flatten(), [0.1]])
+        res_fb = minimize(objective_equal, x0_fb, method='SLSQP', bounds=bounds_eq,
+                          constraints=cons_eq, args=(n,),
+                          options={'maxiter': 10000, 'ftol': 1e-12})
+        equal_results.append(res_fb.x)
+        
+    # Phase 2: Optimize variable radii starting from best equal-radius configurations
+    for eq_vars in equal_results:
+        c_eq = eq_vars[:2 * n].reshape(n, 2)
+        R_eq = eq_vars[2 * n]
+        r_eq = np.full(n, R_eq)
+        
+        x0_var = np.concatenate([c_eq.flatten(), r_eq])
+        try:
+            res = minimize(objective_variable, x0_var, method='SLSQP', bounds=bounds_var,
+                          constraints=cons_var, args=(n,),
+                          options={'maxiter': 20000, 'ftol': 1e-14})
+            
+            if np.isfinite(res.fun):
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = res.x[:2 * n].reshape(n, 2).copy()
+                    best_radii = res.x[2 * n:3 * n].copy()
+        except Exception:
+            continue
+            
+    # Strict validity safeguard against floating-point noise
+    if best_centers is not None:
+        scale = 1.0
+        for _ in range(100):
+            valid = True
+            # Check boundaries
+            for i in range(n):
+                x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+                if x - r < -1e-9 or x + r > 1.0 + 1e-9 or y - r < -1e-9 or y + r > 1.0 + 1e-9:
+                    valid = False
+                    break
+            if valid:
+                # Check overlaps
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        dist = np.hypot(best_centers[i, 0] - best_centers[j, 0],
+                                        best_centers[i, 1] - best_centers[j, 1])
+                        if dist < best_radii[i] + best_radii[j] - 1e-9:
+                            valid = False
+                            break
+                    if not valid:
+                        break
+            if valid:
+                break
+            scale *= 0.99995
+            best_radii *= scale
+            
+        best_sum = float(np.sum(best_radii))
+        
+    # Final fallback if optimization yields no valid result
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii = np.full(n, 0.09)
+        best_sum = float(np.sum(best_radii))
+        
+    return best_centers, best_radii, best_sum
+```

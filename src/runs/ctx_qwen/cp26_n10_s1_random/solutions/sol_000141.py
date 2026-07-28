@@ -1,0 +1,195 @@
+# sol_000141 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000067 (state 3fcdd2a7) state=fe843c8a sum of radii=2.616759 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def compute_objective(vars_array, n):
+    """Objective: minimize negative sum of radii"""
+    return -np.sum(vars_array[:n])
+
+def compute_constraints(vars_array, n, triu_idx):
+    """Constraints: pairwise non-overlap dist_sq >= (r_i + r_j)^2"""
+    r = vars_array[:n]
+    u = vars_array[n:2*n]
+    v = vars_array[2*n:3*n]
+    
+    # Parameterization guarantees boundary satisfaction: x = r + (1-2r)u => x in [r, 1-r]
+    denom = 1.0 - 2.0 * r
+    x = r + denom * u
+    y = r + denom * v
+    
+    diff_x = x[:, np.newaxis] - x[np.newaxis, :]
+    diff_y = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = diff_x**2 + diff_y**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    return dist_sq[triu_idx] - r_sum_sq[triu_idx]
+
+def solve_radii_lp(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    limits = np.maximum(limits, 0.0)
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Constraint matrix: r_i + r_j <= dist(i, j)
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    bounds = [(0.0, lim) for lim in limits]
+    c = np.ones(n) * -1.0
+    
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    if res.success and np.isfinite(res.fun):
+        return res.x, -res.fun
+    return None, 0.0
+
+def run_slsqp(x0, n, triu_idx):
+    """Runs SLSQP optimizer from a given start configuration."""
+    bounds = [(1e-5, 0.5)] * n + [(0.0, 1.0)] * n + [(0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': compute_constraints, 'args': (n, triu_idx)}
+    try:
+        res = minimize(
+            compute_objective, x0, args=(n,),
+            method='SLSQP', bounds=bounds, constraints=cons,
+            options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False}
+        )
+        return res
+    except Exception:
+        return None
+
+def run_packing():
+    n = 26
+    triu_idx = np.triu_indices(n, k=1)
+    rng = np.random.default_rng(42)
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    def make_init(r0, seed=None):
+        pts = []
+        dy = r0 * np.sqrt(3.0)
+        dx = 2.0 * r0
+        y = r0
+        row = 0
+        while len(pts) < n:
+            shift = r0 if row % 2 == 1 else 0.0
+            x = r0 + shift
+            while x + r0 <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += dx
+            y += dy
+            row += 1
+        pts = np.array(pts[:n])
+        
+        denom = 1.0 - 2.0 * r0
+        if denom <= 0.0:
+            denom = 0.001
+        u = (pts[:, 0] - r0) / denom
+        v = (pts[:, 1] - r0) / denom
+        
+        if seed is not None:
+            r_temp = np.random.default_rng(seed)
+            u = np.clip(u + r_temp.uniform(-0.15, 0.15, n), 0.0, 1.0)
+            v = np.clip(v + r_temp.uniform(-0.15, 0.15, n), 0.0, 1.0)
+            
+        return np.concatenate([np.full(n, r0), u, v])
+
+    # Phase 1: Generate diverse initial configurations and run SLSQP
+    configs = []
+    for s in range(12):
+        configs.append(make_init(0.09, seed=s))
+    configs.append(make_init(0.085, seed=None))
+    configs.append(make_init(0.095, seed=None))
+    
+    for x0 in configs:
+        res = run_slsqp(x0, n, triu_idx)
+        if res is not None and np.isfinite(res.fun):
+            s_val = -res.fun
+            c_vals = compute_constraints(res.x, n, triu_idx)
+            if np.min(c_vals) >= -1e-7:
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_vars = res.x.copy()
+                    
+    # Phase 2: Basin Hopping to escape local minima
+    if best_vars is not None:
+        curr_vars = best_vars.copy()
+        temp = 0.025
+        for k in range(50):
+            pert = rng.normal(0, temp, size=curr_vars.shape)
+            pert[n:2*n] = np.clip(pert[n:2*n], -0.12, 0.12)
+            pert[2*n:3*n] = np.clip(pert[2*n:3*n], -0.12, 0.12)
+            x_pert = curr_vars + pert
+            
+            x_pert[:n] = np.clip(x_pert[:n], 1e-5, 0.5)
+            x_pert[n:2*n] = np.clip(x_pert[n:2*n], 0.0, 1.0)
+            x_pert[2*n:3*n] = np.clip(x_pert[2*n:3*n], 0.0, 1.0)
+            
+            res = run_slsqp(x_pert, n, triu_idx)
+            if res is not None and np.isfinite(res.fun):
+                s_val = -res.fun
+                c_vals = compute_constraints(res.x, n, triu_idx)
+                if np.min(c_vals) >= -1e-7 and s_val > best_sum:
+                    best_sum = s_val
+                    best_vars = res.x.copy()
+                    curr_vars = best_vars.copy()
+            temp *= 0.94
+            
+    # Decode final centers from parameterization
+    r = best_vars[:n]
+    u = best_vars[n:2*n]
+    v = best_vars[2*n:3*n]
+    denom = 1.0 - 2.0 * r
+    centers = np.column_stack((r + denom * u, r + denom * v))
+    
+    # Phase 3: LP Refinement to maximize radii for the optimized centers
+    radii_lp, sum_lp = solve_radii_lp(centers)
+    if radii_lp is not None and sum_lp > best_sum:
+        best_radii = radii_lp
+        best_sum = sum_lp
+    else:
+        best_radii = r.copy()
+        
+    # Safety scaling to guarantee strict numerical validity
+    def check_valid(c, rad):
+        nc = c.shape[0]
+        for i in range(nc):
+            if rad[i] < 0.0: return False
+            if c[i,0] - rad[i] < -1e-12 or c[i,0] + rad[i] > 1.0 + 1e-12: return False
+            if c[i,1] - rad[i] < -1e-12 or c[i,1] + rad[i] > 1.0 + 1e-12: return False
+        for i in range(nc):
+            for j in range(i+1, nc):
+                d = np.sqrt((c[i,0]-c[j,0])**2 + (c[i,1]-c[j,1])**2)
+                if d < rad[i] + rad[j] - 1e-12: return False
+        return True
+
+    if not check_valid(centers, best_radii):
+        scale = 1.0
+        for _ in range(100):
+            scale -= 0.0005
+            rad_s = best_radii * scale
+            if check_valid(centers, rad_s):
+                best_radii = rad_s
+                best_sum = np.sum(best_radii)
+                break
+                
+    return centers, best_radii, float(best_sum)

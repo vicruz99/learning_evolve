@@ -1,0 +1,179 @@
+# sol_000164 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000133 (state e4602328) state=f78ccef1 sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_radii_lp(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    
+    # Max radius per circle limited by boundaries
+    limits = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    limits = np.maximum(limits, 0.0)
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    # Pairwise Euclidean distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    
+    # Constraint matrix: r_i + r_j <= dist(i, j)
+    idx = np.triu_indices(n, k=1)
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = dists[idx]
+    
+    for k, (i, j) in enumerate(zip(idx[0], idx[1])):
+        A_ub[k, i] = 1.0
+        A_ub[k, j] = 1.0
+        
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def obj_slqp(vars_arr):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(vars_arr[2::3])
+
+def cons_slqp(vars_arr, n):
+    """Inequality constraints for SLSQP: all must be >= 0."""
+    xs = vars_arr[0::3]
+    ys = vars_arr[1::3]
+    rs = vars_arr[2::3]
+    
+    # Boundary constraints
+    c = np.concatenate([xs - rs, 1.0 - xs - rs, ys - rs, 1.0 - ys - rs])
+    
+    # Pairwise non-overlap constraints (squared)
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dr = rs[:, None] + rs[None, :]
+    
+    idx = np.triu_indices(n, k=1)
+    c = np.concatenate([c, (dx[idx]**2 + dy[idx]**2) - dr[idx]**2])
+    
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    np.random.seed(42)
+    
+    # --- Phase 1: Generate Diverse Initial Configurations ---
+    inits = []
+    
+    # 1. Hexagonal lattice patterns
+    for r0 in [0.09, 0.10]:
+        pts = []
+        y = r0
+        row = 0
+        while y + r0 < 1.0 and len(pts) < n + 5:
+            shift = r0 if row % 2 == 1 else 0.0
+            x = r0 + shift
+            while x + r0 < 1.0 and len(pts) < n + 5:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        if len(pts) >= n:
+            inits.append(np.array(pts[:n]))
+            
+    # 2. Regular grid + center
+    grid = np.array([(i*0.2+0.1, j*0.2+0.1) for j in range(5) for i in range(5)])
+    grid = np.vstack([grid, [0.5, 0.5]])
+    inits.append(grid)
+    
+    # 3. Random placements
+    for _ in range(10):
+        inits.append(np.random.uniform(0.1, 0.9, (n, 2)))
+        
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': cons_slqp, 'args': (n,)}
+    
+    # --- Phase 2: Multi-start SLSQP Optimization ---
+    for cfg in inits:
+        # Get a high-quality feasible start via LP
+        radii_lp, sum_lp = solve_radii_lp(cfg)
+        if radii_lp is None:
+            continue
+            
+        v0 = np.zeros(3 * n)
+        v0[0::3] = cfg[:, 0]
+        v0[1::3] = cfg[:, 1]
+        v0[2::3] = radii_lp * 0.97  # Slight shrink to allow gradient ascent room
+        
+        try:
+            res = minimize(obj_slqp, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 15000, 'ftol': 1e-14})
+            
+            if np.isfinite(res.fun):
+                cx = res.x[0::3]
+                cy = res.x[1::3]
+                r = res.x[2::3]
+                centers_opt = np.column_stack((cx, cy))
+                
+                # Re-evaluate radii exactly via LP for these optimized centers
+                radii_lp2, sum_lp2 = solve_radii_lp(centers_opt)
+                if radii_lp2 is not None and sum_lp2 > best_sum:
+                    best_sum = sum_lp2
+                    best_centers = centers_opt
+                    best_radii = radii_lp2
+                    
+        except Exception:
+            continue
+            
+    # --- Phase 3: Local Hill-Climbing Refinement on Best Configuration ---
+    if best_centers is not None:
+        cur_centers = best_centers.copy()
+        cur_radii = best_radii.copy()
+        cur_sum = best_sum
+        step = 0.008
+        
+        # Try multiple perturbation directions to escape local minima
+        for restart in range(5):
+            temp_centers = cur_centers + np.random.uniform(-0.01, 0.01, cur_centers.shape)
+            temp_centers = np.clip(temp_centers, 1e-4, 1.0 - 1e-4)
+            step = 0.006
+            
+            for _ in range(1200):
+                i = np.random.randint(n)
+                old_c = temp_centers[i].copy()
+                temp_centers[i] += np.random.uniform(-step, step, 2)
+                temp_centers[i] = np.clip(temp_centers[i], 1e-4, 1.0 - 1e-4)
+                
+                new_r, new_s = solve_radii_lp(temp_centers)
+                if new_s > cur_sum:
+                    cur_sum = new_s
+                    best_centers = temp_centers.copy()
+                    best_radii = new_r.copy()
+                    step = min(step * 1.005, 0.025)
+                else:
+                    temp_centers[i] = old_c
+                    step *= 0.997
+                    
+    # --- Phase 4: Final Safety Scaling ---
+    if best_centers is not None:
+        best_radii *= 0.9999999
+        best_sum = float(np.sum(best_radii))
+    else:
+        # Strict fallback
+        fallback_pts = np.random.uniform(0.15, 0.85, (n, 2))
+        best_radii, best_sum = solve_radii_lp(fallback_pts)
+        best_centers = fallback_pts
+        
+    return best_centers, best_radii, best_sum

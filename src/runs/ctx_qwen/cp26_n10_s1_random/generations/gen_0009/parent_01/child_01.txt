@@ -1,0 +1,228 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat the problem as finding optimal center coordinates that allow the largest possible radii. For fixed centers, the maximum radii are determined by a linear programming (LP) problem: maximize $\sum r_i$ subject to $r_i \leq \text{dist}(c_i, \text{wall})$ and $r_i + r_j \leq \text{dist}(c_i, c_j)$. 
+
+The strategy is:
+1. **Precompute LP Structure**: The constraint matrix $A_{ub}$ for the LP is constant. Only the right-hand side $b_{ub}$ changes with centers. Precomputing $A_{ub}$ makes each LP evaluation extremely fast.
+2. **Multi-Start Local Search on Centers**: The objective function $f(c) = \text{LP\_max\_sum\_radii}(c)$ is non-smooth but generally well-behaved. We use `scipy.optimize.minimize` with the `Powell` method from diverse initial configurations (hexagonal lattice patterns, random perturbations, grid layouts) to find high-quality local maxima.
+3. **Coordinate-wise Refinement**: After finding a good configuration, we perform a coordinate descent step: iteratively perturb each circle's position while holding others fixed, accepting moves that improve the LP sum. This helps escape flat regions or local minima where simultaneous updates stall.
+4. **Exact LP Extraction & Safety Scaling**: Finally, we solve the LP exactly on the optimized centers to get the radii, then apply a strict numerical safety scaling to guarantee all constraints satisfy the validator's $10^{-12}$ tolerance.
+
+This approach leverages the mathematical exactness of LP for radius calculation while using robust derivative-free optimization for center placement, systematically pushing the sum of radii towards the theoretical optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+# Global constants and structures for LP efficiency
+N_CIRCLES = 26
+A_ub_global = None
+IDX_I_GLOBAL = None
+IDX_J_GLOBAL = None
+M_GLOBAL = None
+C_OBJ_GLOBAL = None
+
+def setup_lp_structure():
+    """Precomputes the constant inequality matrix for the LP radius solver."""
+    global A_ub_global, IDX_I_GLOBAL, IDX_J_GLOBAL, M_GLOBAL, C_OBJ_GLOBAL
+    n = N_CIRCLES
+    triu_idx = np.triu_indices(n, k=1)
+    IDX_I_GLOBAL, IDX_J_GLOBAL = triu_idx
+    n_pairs = len(IDX_I_GLOBAL)
+    M_GLOBAL = 4 * n + n_pairs
+    
+    A_ub_global = np.zeros((M_GLOBAL, n))
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    for i in range(n):
+        A_ub_global[i, i] = 1.0
+        A_ub_global[n + i, i] = 1.0
+        A_ub_global[2*n + i, i] = 1.0
+        A_ub_global[3*n + i, i] = 1.0
+        
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    k = 4 * n
+    for p in range(n_pairs):
+        A_ub_global[k + p, IDX_I_GLOBAL[p]] = 1.0
+        A_ub_global[k + p, IDX_J_GLOBAL[p]] = 1.0
+        
+    C_OBJ_GLOBAL = -np.ones(n)
+
+def evaluate_lp_sum_radii(centers):
+    """Solves LP to get max sum of radii for fixed centers. Returns 0.0 if infeasible."""
+    n = N_CIRCLES
+    x, y = centers[:, 0], centers[:, 1]
+    
+    # Quick feasibility check
+    if np.any(x < 1e-5) or np.any(x > 1.0 - 1e-5) or np.any(y < 1e-5) or np.any(y > 1.0 - 1e-5):
+        return 0.0
+        
+    b_ub = np.zeros(M_GLOBAL)
+    b_ub[:n] = x
+    b_ub[n:2*n] = 1.0 - x
+    b_ub[2*n:3*n] = y
+    b_ub[3*n:4*n] = 1.0 - y
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub[4*n:] = dists[IDX_I_GLOBAL, IDX_J_GLOBAL]
+    
+    wall_lim = np.minimum(np.minimum(x, 1.0-x), np.minimum(y, 1.0-y))
+    bounds = [(0.0, max(lim, 1e-12)) for lim in wall_lim]
+    
+    try:
+        res = linprog(C_OBJ_GLOBAL, A_ub=A_ub_global, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return -res.fun
+    except Exception:
+        pass
+    return 0.0
+
+def solve_exact_radii(centers):
+    """Returns (radii_array, sum_radii) from exact LP solve."""
+    n = N_CIRCLES
+    x, y = centers[:, 0], centers[:, 1]
+    b_ub = np.zeros(M_GLOBAL)
+    b_ub[:n] = x
+    b_ub[n:2*n] = 1.0 - x
+    b_ub[2*n:3*n] = y
+    b_ub[3*n:4*n] = 1.0 - y
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub[4*n:] = dists[IDX_I_GLOBAL, IDX_J_GLOBAL]
+    
+    wall_lim = np.minimum(np.minimum(x, 1.0-x), np.minimum(y, 1.0-y))
+    bounds = [(0.0, max(lim, 1e-12)) for lim in wall_lim]
+    
+    try:
+        res = linprog(C_OBJ_GLOBAL, A_ub=A_ub_global, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.zeros(n), 0.0
+
+def generate_initial_configs(n, rng):
+    """Generates diverse high-quality initial center configurations."""
+    configs = []
+    
+    # Hexagonal row patterns summing to 26
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4],
+        [5, 5, 6, 5, 5], [4, 6, 6, 6, 4], [7, 6, 6, 7], [6, 7, 6, 7],
+        [5, 5, 5, 5, 6], [6, 5, 5, 5, 5], [4, 5, 5, 5, 7]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != n: continue
+        
+        pts = []
+        y_curr = 0.08
+        r0 = 0.08
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx % 2 == 1 else 0.0
+            x_start = r0 + shift
+            for k in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x_start + k * 2.0 * r0, y_curr])
+            y_curr += r0 * np.sqrt(3)
+        pts = np.array(pts[:n])
+        
+        # Normalize to [0.1, 0.9]
+        mn, mx = pts.min(axis=0), pts.max(axis=0)
+        pts = (pts - mn) / (mx - mn) * 0.8 + 0.1
+        configs.append(pts.copy())
+        
+        # Add perturbed variants
+        for _ in range(3):
+            pert = pts + rng.uniform(-0.04, 0.04, (n, 2))
+            configs.append(np.clip(pert, 0.05, 0.95))
+            
+    # Random dense starts
+    for _ in range(15):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    return configs
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    setup_lp_structure()
+    rng = np.random.default_rng(42)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    inits = generate_initial_configs(n, rng)
+    
+    # Phase 1: Multi-start Powell optimization on centers
+    for cfg in inits:
+        try:
+            res = minimize(
+                lambda c: -evaluate_lp_sum_radii(np.clip(c.reshape(n, 2), 1e-4, 1.0-1e-4)),
+                cfg.flatten(),
+                method='Powell',
+                options={'maxiter': 1500, 'xtol': 1e-10, 'ftol': 1e-12}
+            )
+            if np.isfinite(res.fun):
+                c_opt = np.clip(res.x.reshape(n, 2), 1e-4, 1.0-1e-4)
+                s = evaluate_lp_sum_radii(c_opt)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Coordinate-wise local search to escape local minima
+    if best_centers is not None:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(n):
+                old_pos = best_centers[i].copy()
+                # Try local optimization for single circle
+                def single_obj(p2):
+                    tmp = best_centers.copy()
+                    tmp[i] = np.clip(p2, 1e-4, 1.0-1e-4)
+                    return -evaluate_lp_sum_radii(tmp)
+                    
+                try:
+                    sub_res = minimize(single_obj, old_pos, method='Nelder-Mead', 
+                                       options={'maxiter': 500, 'xatol': 1e-9, 'fatol': 1e-11})
+                    if -sub_res.fun > best_sum + 1e-8:
+                        best_centers[i] = np.clip(sub_res.x, 1e-4, 1.0-1e-4)
+                        best_sum = -sub_res.fun
+                        improved = True
+                except Exception:
+                    best_centers[i] = old_pos
+                    
+        # Re-extract exact radii after center refinement
+        best_radii, best_sum = solve_exact_radii(best_centers)
+        
+    # Fallback if optimization unexpectedly fails
+    if best_centers is None:
+        grid = np.array([(0.1 + i*0.18, 0.1 + j*0.18) for j in range(5) for i in range(5)])
+        best_centers = np.vstack([grid, [[0.55, 0.55]]])
+        best_radii, best_sum = solve_exact_radii(best_centers)
+
+    # Phase 3: Strict numerical safety scaling
+    # Ensure all constraints strictly satisfy the 1e-12 validation tolerance
+    scale = 1.0
+    x, y = best_centers[:, 0], best_centers[:, 1]
+    wall_lim = np.minimum(np.minimum(x, 1.0-x), np.minimum(y, 1.0-y))
+    valid_r = np.maximum(best_radii, 1e-12)
+    scale = min(scale, np.min(wall_lim / valid_r))
+    
+    diff = best_centers[:, np.newaxis, :] - best_centers[np.newaxis, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = best_radii[:, np.newaxis] + best_radii[np.newaxis, :]
+    scale = min(scale, np.min(dists[IDX_I_GLOBAL, IDX_J_GLOBAL] / np.maximum(r_pair[IDX_I_GLOBAL, IDX_J_GLOBAL], 1e-12)))
+    
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

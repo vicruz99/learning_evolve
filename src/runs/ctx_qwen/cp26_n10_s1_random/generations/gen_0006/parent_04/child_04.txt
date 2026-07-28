@@ -1,0 +1,151 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we exploit the fact that for fixed centers, the problem of finding optimal radii is a Linear Programming (LP) problem. This decouples the non-linear center placement from the linear radius optimization, making it highly tractable.
+
+**Strategy:**
+1. **LP-based Evaluation:** Define a function that, given any set of 26 centers, solves an LP to maximize the sum of radii subject to boundary and pairwise distance constraints. This gives the exact optimal radii and sum for those centers.
+2. **Multi-Start Local Search:** Use `Nelder-Mead` optimization on the 52 center coordinates. The objective is to minimize the negative LP sum. We seed this with diverse configurations: hexagonal lattices with varied row distributions, perturbed hex grids, random dense placements, and a regular grid. This ensures we explore multiple basins of attraction.
+3. **Coordinate-wise Hill Climbing:** After finding the best configuration via Nelder-Mead, perform a fine-grained stochastic local search. We iteratively perturb individual circle centers, re-evaluate via LP, and accept improvements. The step size decays over time to allow precise convergence.
+4. **Safety Scaling:** Finally, compute a global scaling factor that guarantees strict satisfaction of all boundary and non-overlap constraints within the validator's `1e-12` tolerance, then shrink radii slightly to ensure robustness.
+
+This approach bypasses the instability of joint non-linear constraint solvers (like SLSQP on 78 variables) by leveraging LP's exactness and speed, while using robust derivative-free optimization on the continuous center space.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, k=1)
+A_LP = np.zeros((N * (N - 1) // 2, N))
+A_LP[np.arange(len(TRIU_I)), TRIU_I] = 1.0
+A_LP[np.arange(len(TRIU_I)), TRIU_J] = 1.0
+
+def get_lp_result(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(l, 1e-9)) for l in limits]
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-16)
+    b_ub = dists[TRIU_I, TRIU_J]
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.full(N, 1e-6)
+
+def neg_sum_obj(x):
+    """Objective function for center optimization: negative max sum of radii."""
+    centers = x.reshape(N, 2)
+    centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+    s, _ = get_lp_result(centers)
+    return -s
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse initial configurations
+    starts = []
+    row_configs = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 7, 5, 5, 4],
+        [5, 5, 5, 5, 6], [6, 4, 6, 5, 5]
+    ]
+    
+    for rc in row_configs:
+        pts = []
+        y = 0.09
+        row_idx = 0
+        for count in rc:
+            shift = 0.09 if row_idx % 2 == 1 else 0.0
+            x = 0.09 + shift
+            for _ in range(count):
+                if len(pts) < N:
+                    pts.append([x, y])
+                x += 0.18
+            y += 0.156
+            row_idx += 1
+        if len(pts) == N:
+            starts.append(np.array(pts))
+            # Perturbed variants to break symmetry
+            for _ in range(3):
+                p = np.array(pts) + rng.uniform(-0.02, 0.02, len(pts))
+                starts.append(np.clip(p, 0.05, 0.95))
+                
+    # Random dense configurations
+    for _ in range(8):
+        starts.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    # Grid configuration
+    gx = np.linspace(0.12, 0.88, 5)
+    gy = np.linspace(0.12, 0.88, 5)
+    grid = np.array([[x, y] for y in gy for x in gx])
+    grid = np.vstack([grid, [0.5, 0.5]])
+    starts.append(grid)
+    
+    # Phase 1: Multi-start Nelder-Mead optimization
+    for cfg in starts:
+        try:
+            res = minimize(neg_sum_obj, cfg.flatten(), method='Nelder-Mead',
+                           options={'maxiter': 2000, 'xatol': 1e-7, 'fatol': 1e-9})
+            if np.isfinite(res.fun):
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = res.x.reshape(N, 2)
+                    _, best_radii = get_lp_result(best_centers)
+        except Exception:
+            continue
+            
+    # Phase 2: Stochastic hill climbing refinement
+    if best_centers is not None:
+        curr_c = best_centers.copy()
+        curr_r = best_radii.copy()
+        curr_s = best_sum
+        step = 0.025
+        for _ in range(2000):
+            idx = rng.integers(N)
+            old = curr_c[idx].copy()
+            curr_c[idx] += rng.uniform(-step, step, 2)
+            curr_c[idx] = np.clip(curr_c[idx], 1e-4, 1.0 - 1e-4)
+            ns, nr = get_lp_result(curr_c)
+            if ns > curr_s + 1e-10:
+                curr_s = ns
+                curr_r = nr
+            else:
+                curr_c[idx] = old
+            step *= 0.998
+        best_centers = curr_c
+        best_radii = curr_r
+        best_sum = curr_s
+        
+    # Phase 3: Strict safety scaling to guarantee numerical validity
+    scale = 1.0
+    for i in range(N):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r < 1e-9: continue
+        scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+        
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0],
+                         best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs < 1e-9: continue
+            scale = min(scale, d / rs)
+            
+    best_radii *= scale * 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

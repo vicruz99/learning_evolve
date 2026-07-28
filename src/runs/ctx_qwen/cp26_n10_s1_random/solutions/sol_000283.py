@@ -1,0 +1,257 @@
+# sol_000283 | problem=circle_packing_26 entrypoint=run_packing
+# generation=11 parent=sol_000265 (state 3cd04161) state=0f40c12d sum of radii=2.617834 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_lp(centers):
+    n = centers.shape[0]
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, l) for l in lims]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    
+    m_pairs = n * (n - 1) // 2
+    m_total = m_pairs + 4 * n
+    A_ub = np.zeros((m_total, n))
+    b_ub = np.zeros(m_total)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    for i in range(n):
+        A_ub[m_pairs + i, i] = 1.0
+        b_ub[m_pairs + i] = centers[i, 0]
+        A_ub[m_pairs + n + i, i] = 1.0
+        b_ub[m_pairs + n + i] = 1.0 - centers[i, 0]
+        A_ub[m_pairs + 2*n + i, i] = 1.0
+        b_ub[m_pairs + 2*n + i] = centers[i, 1]
+        A_ub[m_pairs + 3*n + i, i] = 1.0
+        b_ub[m_pairs + 3*n + i] = 1.0 - centers[i, 1]
+        
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun, res
+        return None, 0.0, None
+    except Exception:
+        return None, 0.0, None
+
+def eval_obj_and_grad(v, n):
+    c = v.reshape(n, 2)
+    r, s, res_lp = solve_lp(c)
+    if r is None:
+        return -s, np.zeros_like(v)
+    
+    grad = np.zeros((n, 2))
+    try:
+        marg = res_lp.marginals.ineqlin
+    except AttributeError:
+        try:
+            marg = res_lp.ineqlin.marginals
+        except AttributeError:
+            marg = None
+            
+    if marg is not None:
+        m_pairs = n * (n - 1) // 2
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                lam = marg[idx]
+                if lam > 1e-9:
+                    dx = c[i, 0] - c[j, 0]
+                    dy = c[i, 1] - c[j, 1]
+                    d = np.hypot(dx, dy)
+                    if d > 1e-9:
+                        fx = lam * dx / d
+                        fy = lam * dy / d
+                        grad[i, 0] += fx
+                        grad[i, 1] += fy
+                        grad[j, 0] -= fx
+                        grad[j, 1] -= fy
+                idx += 1
+                
+        for i in range(n):
+            grad[i, 0] += marg[m_pairs + i] - marg[m_pairs + n + i]
+            grad[i, 1] += marg[m_pairs + 2*n + i] - marg[m_pairs + 3*n + i]
+            
+    return -s, -grad.flatten()
+
+def obj_func(v, n):
+    return eval_obj_and_grad(v, n)[0]
+
+def jac_func(v, n):
+    return eval_obj_and_grad(v, n)[1]
+
+def joint_obj(v, n):
+    return -np.sum(v[2*n:])
+
+def joint_cons(v, n):
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    con = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    
+    mask = np.triu_indices(n, k=1)
+    con = np.concatenate([con, d2[mask] - rs[mask]**2])
+    return con
+
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
+    best_s = -1.0
+    best_c = None
+    best_r = None
+    
+    configs = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], 
+        [5, 5, 6, 5, 5], [4, 6, 6, 6, 4], [5, 7, 5, 5, 4],
+        [6, 5, 5, 6, 4], [5, 6, 6, 4, 5], [7, 6, 6, 7], [8, 6, 6, 6],
+        [5, 5, 5, 5, 5, 1], [4, 5, 6, 5, 6], [6, 4, 6, 6, 4],
+        [5, 6, 4, 6, 5], [4, 6, 5, 6, 5], [6, 5, 4, 5, 6]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: 
+            continue
+        r0 = 0.10
+        pts = []
+        y = r0
+        for ri, cnt in enumerate(pat):
+            shift = r0 if ri % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: 
+                    break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+        pts = np.array(pts[:n])
+        configs.append(pts)
+        
+    for _ in range(30):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    bounds_c = [(0.005, 0.995)] * (2 * n)
+    
+    # Phase 1: Gradient ascent on centers using LP duals
+    for cfg in configs:
+        c0 = np.clip(cfg, 0.01, 0.99)
+        try:
+            res = minimize(obj_func, c0.flatten(), args=(n,), 
+                           jac=jac_func, method='L-BFGS-B', bounds=bounds_c, 
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            if np.isfinite(res.fun):
+                c_opt = res.x.reshape(n, 2)
+                r_opt, s_opt, _ = solve_lp(c_opt)
+                if r_opt is not None and s_opt > best_s:
+                    best_s = s_opt
+                    best_c = c_opt.copy()
+                    best_r = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Coordinate Ascent to escape local traps
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_r = best_r.copy()
+        curr_s = best_s
+        
+        for it in range(1000):
+            idx = rng.integers(n)
+            old = curr_c[idx].copy()
+            step = 0.018 * (0.995 ** (it / 80.0))
+            curr_c[idx] += rng.uniform(-step, step, 2)
+            curr_c[idx] = np.clip(curr_c[idx], 0.01, 0.99)
+            
+            r_try, s_try, _ = solve_lp(curr_c)
+            if r_try is not None and s_try > curr_s + 1e-9:
+                curr_s = s_try
+                curr_r = r_try.copy()
+            else:
+                curr_c[idx] = old
+                
+        best_c = curr_c
+        best_r = curr_r
+        best_s = curr_s
+        
+        # Phase 3: Multi-perturbation & Gradient Ascent
+        for _ in range(15):
+            c_pert = best_c + rng.uniform(-0.008, 0.008, (n, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            try:
+                res_p = minimize(obj_func, c_pert.flatten(), args=(n,),
+                                 jac=jac_func, method='L-BFGS-B', bounds=bounds_c,
+                                 options={'maxiter': 2000, 'ftol': 1e-12})
+                if np.isfinite(res_p.fun):
+                    c_p = res_p.x.reshape(n, 2)
+                    r_p, s_p, _ = solve_lp(c_p)
+                    if r_p is not None and s_p > best_s:
+                        best_s = s_p
+                        best_c = c_p.copy()
+                        best_r = r_p.copy()
+            except Exception:
+                continue
+                
+    # Phase 4: Joint SLSQP polish for precise boundary/overlap handling
+    if best_c is not None:
+        v0 = np.concatenate([best_c[:,0], best_c[:,1], best_r * 0.995])
+        bounds_slqp = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+        try:
+            res_j = minimize(joint_obj, v0, args=(n,), method='SLSQP', bounds=bounds_slqp,
+                             constraints={'type': 'ineq', 'fun': joint_cons, 'args': (n,)},
+                             options={'maxiter': 6000, 'ftol': 1e-13})
+            if np.isfinite(res_j.fun):
+                c_j = np.column_stack((res_j.x[:n], res_j.x[n:2*n]))
+                r_j, s_j, _ = solve_lp(c_j)
+                if r_j is not None and s_j > best_s:
+                    best_s = s_j
+                    best_c = c_j.copy()
+                    best_r = r_j.copy()
+        except Exception:
+            pass
+
+    # Final strict safety scaling to guarantee numerical validity
+    if best_c is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+            if r > 1e-12:
+                scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+                
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+                rs = best_r[i] + best_r[j]
+                if rs > 1e-12:
+                    scale = min(scale, d/rs)
+                    
+        best_r *= scale * 0.9999999
+        best_s = float(np.sum(best_r))
+    else:
+        # Fallback
+        grid = np.array([(i * 0.18 + 0.1, j * 0.18 + 0.1) for j in range(5) for i in range(5)] + [[0.5, 0.5]])
+        best_c = grid[:n]
+        best_r, best_s, _ = solve_lp(best_c)
+        
+    return best_c, best_r, best_s

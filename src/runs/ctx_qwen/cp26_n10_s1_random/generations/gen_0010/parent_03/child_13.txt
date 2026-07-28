@@ -1,0 +1,225 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust pipeline that escapes local minima typical in circle packing problems. The strategy combines three complementary techniques:
+
+1. **Diverse Structured & Random Initializations**: Generate hexagonal lattice patterns with various row distributions (e.g., [5,6,5,6,4]), along with random placements. These are normalized and jittered to break symmetry and explore different topological basins.
+2. **Physics-Based Expansion Simulation**: For each initial configuration, run a Verlet-like integration simulation. Radii are slowly expanded while repulsive forces push overlapping circles apart and wall forces keep them inside the square. This effectively finds a locally jammed, high-clearance configuration without relying on gradient information that might vanish at symmetric points.
+3. **Exact LP Refinement & SLSQP Polish**: 
+   - For fixed centers from the simulation, solve a Linear Program to find the mathematically optimal radii respecting all pairwise and boundary constraints. This gives a tight lower/upper bound for that topology.
+   - Use `SLSQP` to jointly optimize centers and radii, starting from the LP-refined feasible point. This smoothens the configuration and squeezes out additional space.
+   - Apply coordinate-wise hill climbing on centers (re-evaluating the LP objective) to escape remaining plateaus, followed by a final SLSQP polish.
+4. **Strict Numerical Safety**: Post-process the best configuration with a uniform scaling factor to guarantee strict validity under the `1e-12` tolerance of the validator.
+
+This hybrid approach leverages the global exploration of physics simulation, the exactness of LP for fixed centers, and the precision of constrained nonlinear optimization.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    limits = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    limits = np.maximum(limits, 1e-9)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    dx = centers[:, 0:1] - centers[:, 0:1].T
+    dy = centers[:, 1:2] - centers[:, 1:2].T
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    b_ub = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def force_sim(c0, n, steps=3000):
+    """Physics simulation to expand circles and find tight packing."""
+    c = c0.copy()
+    r = np.full(n, 0.03)
+    vel = np.zeros_like(c)
+    dt = 0.002
+    damp = 0.94
+    k_rep = 800.0
+    k_wall = 1200.0
+    
+    for _ in range(steps):
+        r *= 1.0004
+        diff = c[:, None, :] - c[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, 1e9)
+        dists_safe = np.maximum(dists, 1e-8)
+        
+        req = r[:, None] + r[None, :]
+        overlap = np.maximum(0.0, req - dists)
+        rep = (overlap * k_rep) / dists_safe
+        
+        fx = np.sum(diff[:, :, 0] * rep, axis=1)
+        fy = np.sum(diff[:, :, 1] * rep, axis=1)
+        forces = np.column_stack((fx, fy))
+        
+        w_rep = np.zeros_like(c)
+        w_rep[:, 0] += np.maximum(0.0, r - c[:, 0]) * k_wall
+        w_rep[:, 0] -= np.maximum(0.0, c[:, 0] - (1.0 - r)) * k_wall
+        w_rep[:, 1] += np.maximum(0.0, r - c[:, 1]) * k_wall
+        w_rep[:, 1] -= np.maximum(0.0, c[:, 1] - (1.0 - r)) * k_wall
+        forces += w_rep
+        
+        vel = damp * vel + forces * dt
+        c += vel
+        c = np.clip(c, 1e-5, 1.0 - 1e-5)
+    return c
+
+def obj_slqp(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def cons_slqp(v, n):
+    """Inequality constraints >= 0 for SLSQP."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    rad = v[2*n:]
+    c = np.concatenate([cx - rad, 1.0 - cx - rad, cy - rad, 1.0 - cy - rad])
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    idx = np.triu_indices(n, k=1)
+    rs = rad[:, None] + rad[None, :]
+    c = np.concatenate([c, d2[idx] - rs[idx]**2])
+    return c
+
+def run_packing():
+    n = 26
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    rng = np.random.default_rng(42)
+    
+    configs = []
+    patterns = [
+        [5,6,5,6,4], [6,5,6,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [6,6,5,5,4], [5,4,6,6,5], [5,6,4,6,5], [6,5,5,6,4],
+        [7,5,5,5,4], [4,5,7,5,5], [5,5,5,5,6], [6,6,6,4,4],
+        [5,5,5,5,5,1], [8,5,5,5,3], [4,6,5,6,5], [5,6,6,5,4],
+        [5,7,5,5,4], [5,5,5,6,5], [6,4,6,6,4], [5,5,7,4,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != n: continue
+        pts = []
+        y = 0.095
+        for idx, cnt in enumerate(pat):
+            shift = 0.095 if idx % 2 == 1 else 0.0
+            x = 0.095 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.19
+            y += 0.095 * np.sqrt(3)
+        cfg = np.array(pts[:n])
+        mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+        span = mx - mn
+        if span[0] > 1e-5: cfg[:, 0] = (cfg[:, 0] - mn[0]) / span[0] * 0.7 + 0.15
+        if span[1] > 1e-5: cfg[:, 1] = (cfg[:, 1] - mn[1]) / span[1] * 0.7 + 0.15
+        configs.append(cfg)
+        for _ in range(2):
+            p = cfg + rng.uniform(-0.02, 0.02, cfg.shape)
+            configs.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(8):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    bounds_slqp = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+    
+    for cfg in configs:
+        c_sim = force_sim(cfg, n, steps=2500)
+        r_lp, s_lp = solve_lp(c_sim, n)
+        if r_lp is None: continue
+        
+        curr_c, curr_r, curr_s = c_sim, r_lp, s_lp
+        
+        v0 = np.concatenate([curr_c.flatten(), curr_r * 0.98])
+        try:
+            res = minimize(obj_slqp, v0, args=(n,), method='SLSQP', bounds=bounds_slqp,
+                           constraints={'type': 'ineq', 'fun': cons_slqp, 'args': (n,)},
+                           options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if np.isfinite(res.fun):
+                c_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+                r_opt, s_opt = solve_lp(c_opt, n)
+                if r_opt is not None and s_opt > curr_s:
+                    curr_c, curr_r, curr_s = c_opt, r_opt, s_opt
+        except Exception:
+            pass
+            
+        if curr_s > best_sum:
+            best_sum = curr_s
+            best_c = curr_c.copy()
+            best_r = curr_r.copy()
+            
+    if best_c is not None:
+        c_hc = best_c.copy()
+        s_hc = best_sum
+        step = 0.03
+        for _ in range(2000):
+            i = rng.integers(n)
+            old = c_hc[i].copy()
+            c_hc[i] += rng.uniform(-step, step, 2)
+            c_hc[i] = np.clip(c_hc[i], 0.01, 0.99)
+            r_try, s_try = solve_lp(c_hc, n)
+            if r_try is not None and s_try > s_hc + 1e-9:
+                s_hc = s_try
+                if s_try > best_sum:
+                    best_sum = s_try
+                    best_c = c_hc.copy()
+                    best_r = r_try.copy()
+            else:
+                c_hc[i] = old
+            step *= 0.996
+            
+        v0_final = np.concatenate([best_c.flatten(), best_r * 0.98])
+        try:
+            res_f = minimize(obj_slqp, v0_final, args=(n,), method='SLSQP', bounds=bounds_slqp,
+                             constraints={'type': 'ineq', 'fun': cons_slqp, 'args': (n,)},
+                             options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if np.isfinite(res_f.fun):
+                c_f = np.column_stack((res_f.x[:n], res_f.x[n:2*n]))
+                r_f, s_f = solve_lp(c_f, n)
+                if r_f is not None and s_f > best_sum:
+                    best_c = c_f
+                    best_r = r_f
+                    best_sum = s_f
+        except Exception:
+            pass
+
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp(best_c, n)
+        if best_r is None: best_r = np.full(n, 0.08)
+        
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+            
+    ii, jj = np.triu_indices(n, k=1)
+    d = np.sqrt(np.sum((best_c[ii] - best_c[jj])**2, axis=1))
+    rs = best_r[ii] + best_r[jj]
+    if np.any(rs > 1e-12):
+        scale = min(scale, np.min(d / np.maximum(rs, 1e-12)))
+        
+    best_r *= scale * 0.9999995
+    return best_c, best_r, float(np.sum(best_r))
+```

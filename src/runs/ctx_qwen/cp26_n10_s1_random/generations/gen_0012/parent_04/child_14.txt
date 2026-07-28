@@ -1,0 +1,247 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a hybrid optimization strategy that leverages Linear Programming (LP) dual information for efficient gradient-based center adjustment, combined with force-directed relaxation to escape local minima.
+
+1. **LP-Based Radius Maximization**: For any fixed set of centers, the maximum radii are found by solving an LP. The dual variables (marginals) from this LP directly give the sensitivity of the objective to boundary and pairwise distance constraints.
+2. **Gradient Ascent on Centers**: Using the LP duals, we compute the analytical gradient of the sum of radii with respect to circle centers. This allows us to perform efficient gradient ascent, pushing circles apart and towards boundaries in directions that most increase the total radius sum.
+3. **Force-Directed Relaxation**: When gradient ascent plateaus (common in tightly packed configurations), a force simulation repels overlapping/nearby circles and walls, slowly growing radii to create a looser configuration that LP can then optimize more effectively.
+4. **Multi-Start & Perturbation**: We initialize from diverse hexagonal lattice patterns and random layouts, perturbing each to break symmetry. Each configuration undergoes gradient ascent, force relaxation, and fine-tuned gradient ascent.
+5. **Strict Safety Scaling**: Before returning, we compute the maximum valid scaling factor for all radii to guarantee strict compliance with the `1e-12` tolerance in the validator.
+
+This approach avoids the bottlenecks of purely constraint-based optimizers (like SLSQP) on non-convex problems by decoupling radius optimization (convex LP) from center optimization (guided by LP gradients), leading to higher final sums.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def build_lp_matrix(n):
+    """Precomputes the constant inequality matrix structure for the LP solver."""
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    k = 0
+    for i in range(n):
+        for _ in range(4):
+            A[k, i] = 1.0
+            k += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            k += 1
+    return A
+
+def solve_lp(centers, A_ub, n):
+    """Solves LP to maximize sum of radii for fixed centers. Returns radii, sum, and result object."""
+    m = A_ub.shape[0]
+    b = np.zeros(m)
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        b[k] = x; k += 1
+        b[k] = 1.0 - x; k += 1
+        b[k] = y; k += 1
+        b[k] = 1.0 - y; k += 1
+    idx = 0
+    dists = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            b[4*n + idx] = d
+            dists[i,j] = d
+            dists[j,i] = d
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b, bounds=(0, None), method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun, res
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0, None
+
+def compute_gradient(res, centers, n):
+    """Computes gradient of sum of radii w.r.t centers using LP dual variables."""
+    if res is None or not hasattr(res, 'ineqlin') or not hasattr(res.ineqlin, 'marginals'):
+        return None
+    duals = np.abs(np.asarray(res.ineqlin.marginals).flatten())
+    grad = np.zeros((n, 2))
+    
+    # Boundary contributions: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    for i in range(n):
+        grad[i, 0] += duals[4*i] - duals[4*i+1]
+        grad[i, 1] += duals[4*i+2] - duals[4*i+3]
+        
+    # Pairwise contributions: r_i + r_j <= d_ij
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            lam = duals[4*n + idx]
+            if lam > 1e-9:
+                dx = centers[i,0] - centers[j,0]
+                dy = centers[i,1] - centers[j,1]
+                d = np.hypot(dx, dy)
+                if d > 1e-12:
+                    factor = lam / d
+                    grad[i,0] += factor * dx
+                    grad[i,1] += factor * dy
+                    grad[j,0] -= factor * dx
+                    grad[j,1] -= factor * dy
+            idx += 1
+    return grad
+
+def run_force_sim(centers, radii, steps=300):
+    """Vectorized force-directed simulation to spread circles and grow radii."""
+    n = len(radii)
+    c = centers.copy()
+    r = radii.copy()
+    dt = 0.003
+    for step in range(steps):
+        forces = np.zeros((n, 2))
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = c[i,0] - c[j,0]
+                dy = c[i,1] - c[j,1]
+                d = np.hypot(dx, dy)
+                if d < 1e-9:
+                    dx, dy = 1e-4, 0.0
+                    d = 1e-4
+                target = r[i] + r[j]
+                if d < target + 0.002:
+                    overlap = target + 0.002 - d
+                    f = overlap * 60.0 / d
+                    forces[i,0] += f * dx
+                    forces[i,1] += f * dy
+                    forces[j,0] -= f * dx
+                    forces[j,1] -= f * dy
+                    
+        for i in range(n):
+            if c[i,0] < r[i] + 0.001: forces[i,0] += (r[i] + 0.001 - c[i,0]) * 120.0
+            if c[i,0] > 1.0 - r[i] - 0.001: forces[i,0] -= (c[i,0] - (1.0 - r[i] - 0.001)) * 120.0
+            if c[i,1] < r[i] + 0.001: forces[i,1] += (r[i] + 0.001 - c[i,1]) * 120.0
+            if c[i,1] > 1.0 - r[i] - 0.001: forces[i,1] -= (c[i,1] - (1.0 - r[i] - 0.001)) * 120.0
+            
+        c += forces * dt
+        c = np.clip(c, 1e-5, 1.0 - 1e-5)
+        r *= 1.00002
+    return c, r
+
+def generate_configs(n, rng):
+    """Generates diverse initial configurations."""
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5],
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,6,4],
+        [5,6,6,4,5], [6,5,5,6,4], [5,5,5,6,5], [6,5,6,4,5]
+    ]
+    for pat in patterns:
+        if sum(pat) >= n:
+            pts = []
+            y = 0.10
+            for ri, cnt in enumerate(pat):
+                shift = 0.10 if ri % 2 == 1 else 0.0
+                x = 0.10 + shift
+                for _ in range(cnt):
+                    if len(pts) >= n: break
+                    pts.append([x, y])
+                    x += 0.20
+                y += 0.10 * np.sqrt(3)
+            configs.append(np.array(pts[:n]))
+            for _ in range(3):
+                cp = np.array(pts[:n]) + rng.uniform(-0.02, 0.02, (n,2))
+                configs.append(np.clip(cp, 0.05, 0.95))
+                
+    for _ in range(10):
+        configs.append(rng.uniform(0.1, 0.9, (n,2)))
+    return configs
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.seterr(all='ignore')
+    n = 26
+    rng = np.random.default_rng(42)
+    A_ub = build_lp_matrix(n)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    configs = generate_configs(n, rng)
+    
+    for cfg in configs:
+        c = cfg.copy()
+        r, s, res = solve_lp(c, A_ub, n)
+        if r is None: continue
+        
+        # Phase 1: Gradient Ascent on Centers
+        step = 0.008
+        for it in range(200):
+            g = compute_gradient(res, c, n)
+            if g is not None:
+                c_new = c + step * g
+                c_new = np.clip(c_new, 1e-4, 1.0 - 1e-4)
+                r_new, s_new, res_new = solve_lp(c_new, A_ub, n)
+                if r_new is not None and s_new > s + 1e-9:
+                    c = c_new
+                    s = s_new
+                    r = r_new
+                    res = res_new
+                    step = min(step * 1.02, 0.02)
+                else:
+                    step *= 0.95
+        
+        # Phase 2: Force Simulation to escape tight clusters/local minima
+        c, r = run_force_sim(c, r, steps=250)
+        r_lp, s_lp, res_lp = solve_lp(c, A_ub, n)
+        if r_lp is not None and s_lp > best_sum:
+            best_sum = s_lp
+            best_centers = c.copy()
+            best_radii = r_lp.copy()
+            
+        # Phase 3: Fine-grained Gradient Ascent
+        step = 0.005
+        for it in range(150):
+            g = compute_gradient(res_lp, c, n)
+            if g is not None:
+                c_new = c + step * g
+                c_new = np.clip(c_new, 1e-4, 1.0 - 1e-4)
+                r_new, s_new, res_new = solve_lp(c_new, A_ub, n)
+                if r_new is not None and s_new > s_lp + 1e-9:
+                    c = c_new
+                    s_lp = s_new
+                    r_lp = r_new
+                    res_lp = res_new
+                    step = min(step * 1.01, 0.015)
+                else:
+                    step *= 0.96
+                    
+        if s_lp > best_sum:
+            best_sum = s_lp
+            best_centers = c.copy()
+            best_radii = r_lp.copy()
+            
+    # Final strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    if best_centers is not None:
+        scale = 1.0
+        c = best_centers
+        r = best_radii
+        for i in range(n):
+            x, y = c[i]
+            ri = r[i]
+            if ri > 1e-12:
+                scale = min(scale, x/ri, (1.0-x)/ri, y/ri, (1.0-y)/ri)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(c[i,0]-c[j,0], c[i,1]-c[j,1])
+                rs = r[i] + r[j]
+                if rs > 1e-12:
+                    scale = min(scale, d/rs)
+        r *= scale * 0.9999999
+        best_sum = float(np.sum(r))
+    else:
+        best_centers = rng.uniform(0.1, 0.9, (n,2))
+        best_radii = np.full(n, 0.08)
+        best_sum = float(np.sum(best_radii) * 0.99)
+        
+    return best_centers, best_radii, best_sum
+```

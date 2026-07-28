@@ -1,0 +1,207 @@
+# sol_000353 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000225 (state c5495767) state=dc6e6bc2 sum of radii=2.620779 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, k=1)
+M_PAIRS = len(TRIU_I)
+
+# Precompute LP constraint matrix structure (r_i + r_j <= dist_ij)
+A_LP = np.zeros((M_PAIRS, N))
+for k, (i, j) in enumerate(zip(TRIU_I, TRIU_J)):
+    A_LP[k, i] = 1.0
+    A_LP[k, j] = 1.0
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    diffs = centers[TRIU_I] - centers[TRIU_J]
+    dists = np.hypot(diffs[:, 0], diffs[:, 1])
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A_LP, b_ub=dists, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return np.maximum(res.x, 0.0), -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def slsqp_constraints(params):
+    """Computes pairwise non-overlap constraints >= 0."""
+    r = params[:N]
+    u = params[N:2*N]
+    v = params[2*N:3*N]
+    # Boundary-safe parameterization
+    x = r + (1.0 - 2.0 * r) * u
+    y = r + (1.0 - 2.0 * r) * v
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    return d2[TRIU_I, TRIU_J] - rs[TRIU_I, TRIU_J]**2
+
+def slsqp_obj(params):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(params[:N])
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+
+    # 1. Generate diverse initial configurations
+    inits = []
+    patterns = [[5,6,5,6,4], [6,5,6,5,4], [4,6,6,6,4], [5,5,6,5,5], [6,6,5,5,4]]
+    for pat in patterns:
+        pts = []
+        y = 0.08
+        for ri, cnt in enumerate(pat):
+            shift = 0.08 if ri % 2 == 1 else 0.0
+            x = 0.08 + shift
+            for _ in range(cnt):
+                if len(pts) < N:
+                    pts.append([x, y])
+                    x += 0.16
+            y += 0.138
+        cfg = np.array(pts[:N])
+        inits.append(cfg)
+        for _ in range(4):
+            p = cfg + rng.uniform(-0.02, 0.02, (N, 2))
+            inits.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(10):
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    bounds_v = [(1e-5, 0.25)] * N + [(0.0, 1.0)] * (2 * N)
+    
+    # 2. Multi-start SLSQP joint optimization
+    for cfg in inits:
+        r_est, _ = solve_lp_radii(cfg)
+        if r_est is None:
+            r_est = np.full(N, 0.08)
+        else:
+            r_est = r_est * 0.95
+            
+        u = np.clip((cfg[:, 0] - r_est) / (1.0 - 2.0 * r_est), 0.0, 1.0)
+        v = np.clip((cfg[:, 1] - r_est) / (1.0 - 2.0 * r_est), 0.0, 1.0)
+        x0 = np.concatenate([r_est, u, v])
+        
+        try:
+            res = minimize(slsqp_obj, x0, method='SLSQP', bounds=bounds_v,
+                           constraints={'type': 'ineq', 'fun': slsqp_constraints},
+                           options={'maxiter': 5000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_vals = slsqp_constraints(res.x)
+                if np.min(c_vals) > -1e-6:
+                    r_opt = res.x[:N]
+                    u_opt = res.x[N:2*N]
+                    v_opt = res.x[2*N:3*N]
+                    x_opt = r_opt + (1.0 - 2.0 * r_opt) * u_opt
+                    y_opt = r_opt + (1.0 - 2.0 * r_opt) * v_opt
+                    c_opt = np.column_stack((x_opt, y_opt))
+                    
+                    r_lp, s_lp = solve_lp_radii(c_opt)
+                    if r_lp is not None and s_lp > best_sum:
+                        best_sum = s_lp
+                        best_centers = c_opt.copy()
+                        best_radii = r_lp.copy()
+        except Exception:
+            continue
+
+    # 3. Simulated Annealing on centers with LP radius evaluation
+    if best_centers is not None:
+        cur_c = best_centers.copy()
+        step = 0.015
+        temp = 0.02
+        for _ in range(2500):
+            i = rng.integers(N)
+            old = cur_c[i].copy()
+            dx = rng.uniform(-step, step)
+            dy = rng.uniform(-step, step)
+            cur_c[i] = np.clip([old[0]+dx, old[1]+dy], 1e-4, 1-1e-4)
+            
+            r_new, s_new = solve_lp_radii(cur_c)
+            if r_new is not None:
+                if s_new > best_sum + 1e-9:
+                    best_sum = s_new
+                    best_centers = cur_c.copy()
+                    best_radii = r_new.copy()
+                    step = min(step * 1.03, 0.05)
+                else:
+                    delta = best_sum - s_new
+                    # Metropolis criterion
+                    if rng.random() < np.exp(-delta / max(temp, 1e-7)):
+                        pass
+                    else:
+                        cur_c[i] = old
+                    if rng.random() < 0.04:
+                        step *= 0.95
+            else:
+                cur_c[i] = old
+            temp *= 0.997
+
+        # 4. Final SLSQP polish from refined centers
+        r_est, _ = solve_lp_radii(best_centers)
+        if r_est is not None:
+            u = np.clip((best_centers[:, 0] - r_est) / (1.0 - 2.0 * r_est), 0.0, 1.0)
+            v = np.clip((best_centers[:, 1] - r_est) / (1.0 - 2.0 * r_est), 0.0, 1.0)
+            x0 = np.concatenate([r_est * 0.98, u, v])
+            try:
+                res = minimize(slsqp_obj, x0, method='SLSQP', bounds=bounds_v,
+                               constraints={'type': 'ineq', 'fun': slsqp_constraints},
+                               options={'maxiter': 5000, 'ftol': 1e-13})
+                if np.isfinite(res.fun) and np.min(slsqp_constraints(res.x)) > -1e-6:
+                    r_opt = res.x[:N]
+                    u_opt = res.x[N:2*N]
+                    v_opt = res.x[2*N:3*N]
+                    x_opt = r_opt + (1.0 - 2.0 * r_opt) * u_opt
+                    y_opt = r_opt + (1.0 - 2.0 * r_opt) * v_opt
+                    c_opt = np.column_stack((x_opt, y_opt))
+                    r_lp, s_lp = solve_lp_radii(c_opt)
+                    if r_lp is not None and s_lp > best_sum:
+                        best_sum = s_lp
+                        best_centers = c_opt.copy()
+                        best_radii = r_lp.copy()
+            except Exception:
+                pass
+
+    # Fallback
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii, best_sum = solve_lp_radii(best_centers)
+        if best_radii is None:
+            best_radii = np.full(N, 0.08)
+            best_sum = 2.08
+            
+    # 5. Strict safety scaling to guarantee validation tolerance
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(N):
+        x, y, ri = c[i, 0], c[i, 1], r[i]
+        if ri > 1e-12:
+            scale = min(scale, x/ri, (1.0-x)/ri, y/ri, (1.0-y)/ri)
+            
+    dx = c[TRIU_I, 0] - c[TRIU_J, 0]
+    dy = c[TRIU_I, 1] - c[TRIU_J, 1]
+    d = np.hypot(dx, dy)
+    rs = r[TRIU_I] + r[TRIU_J]
+    if np.any(rs > 1e-12):
+        scale = min(scale, np.min(d / np.maximum(rs, 1e-12)))
+        
+    r *= scale * 0.999999
+    best_sum = float(np.sum(r))
+    best_radii = r
+    
+    return best_centers, best_radii, best_sum

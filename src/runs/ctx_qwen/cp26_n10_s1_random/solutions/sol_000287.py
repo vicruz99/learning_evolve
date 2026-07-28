@@ -1,0 +1,185 @@
+# sol_000287 | problem=circle_packing_26 entrypoint=run_packing
+# generation=11 parent=sol_000259 (state 338d39d1) state=d3d63855 sum of radii=2.100025 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-9), 0.0
+
+def compute_penalty_and_grad(C_flat, R, n):
+    """Computes penalty and gradient for fixed radii R and centers C."""
+    C = C_flat.reshape(n, 2)
+    penalty = 0.0
+    grad = np.zeros_like(C)
+    
+    # Pairwise overlap penalty
+    diff = C[:, np.newaxis, :] - C[np.newaxis, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2) + 1e-16)
+    r_sum = R[:, np.newaxis] + R[np.newaxis, :]
+    overlap = np.maximum(0, r_sum - dist)
+    penalty += np.sum(overlap**2)
+    
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    for k in range(len(idx_i)):
+        i, j = idx_i[k], idx_j[k]
+        v = overlap[i, j]
+        if v > 0:
+            d = dist[i, j]
+            factor = -2.0 * v / d
+            grad[i] += factor * diff[i, j]
+            grad[j] -= factor * diff[i, j]
+            
+    # Boundary violation penalty
+    v_left = np.maximum(0, R - C[:, 0])
+    penalty += np.sum(v_left**2)
+    grad[:, 0] += 2 * v_left
+    
+    v_right = np.maximum(0, R - (1 - C[:, 0]))
+    penalty += np.sum(v_right**2)
+    grad[:, 0] -= 2 * v_right
+    
+    v_bot = np.maximum(0, R - C[:, 1])
+    penalty += np.sum(v_bot**2)
+    grad[:, 1] += 2 * v_bot
+    
+    v_top = np.maximum(0, R - (1 - C[:, 1]))
+    penalty += np.sum(v_top**2)
+    grad[:, 1] -= 2 * v_top
+    
+    return penalty, grad.flatten()
+
+def obj_func(C_flat, R, n):
+    return compute_penalty_and_grad(C_flat, R, n)[0]
+
+def jac_func(C_flat, R, n):
+    return compute_penalty_and_grad(C_flat, R, n)[1]
+
+def generate_inits(rng):
+    """Generates diverse initial center configurations."""
+    inits = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [6,6,4,6,4], 
+        [5,5,6,5,5], [6,4,6,4,6], [5,6,6,5,4], [6,5,4,6,5],
+        [5,5,5,5,6], [6,6,6,4,4], [4,5,6,5,6], [5,4,6,5,6],
+        [7,6,6,7], [6,7,6,7], [5,6,5,6,5,1], [5,5,5,6,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != N: continue
+        pts = []
+        r0 = 0.098
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx%2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:N])
+        
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        span = mx - mn
+        if span[0] > 1e-4 and span[1] > 1e-4:
+            pts = (pts - mn) / span * 0.75 + 0.125
+        else:
+            pts = np.full((N, 2), 0.5)
+            
+        inits.append(pts)
+        for _ in range(2):
+            p = pts + rng.uniform(-0.015, 0.015, pts.shape)
+            inits.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(5):
+        inits.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    return inits
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    inits = generate_inits(rng)
+    bounds_xy = [(0.0, 1.0)] * (2 * N)
+    
+    for cfg in inits:
+        C = cfg.copy()
+        R, s_lp = solve_lp(C)
+        
+        prev_s = s_lp
+        # Alternating optimization: LP for radii, L-BFGS-B for centers
+        for cycle in range(15):
+            # Optimize centers for fixed radii
+            res = minimize(obj_func, C.flatten(), args=(R, N), jac=jac_func,
+                           method='L-BFGS-B', bounds=bounds_xy,
+                           options={'maxiter': 800, 'ftol': 1e-14, 'gtol': 1e-10})
+            C = res.x.reshape(N, 2)
+            
+            # Update radii via exact LP
+            R_new, s_new = solve_lp(C)
+            if s_new < prev_s * 0.95:
+                break
+            R = R_new
+            prev_s = s_new
+            
+        if prev_s > best_sum:
+            best_sum = prev_s
+            best_centers = C.copy()
+            best_radii = R.copy()
+
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii, best_sum = solve_lp(best_centers)
+        
+    # Strict safety scaling to guarantee numerical validity
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_centers[i,0], best_centers[i,1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_radii *= scale * 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

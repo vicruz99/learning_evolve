@@ -1,0 +1,245 @@
+
+
+<strategy>
+To improve the packing of 26 circles and maximize the sum of radii, we will employ a highly effective gradient-based optimization strategy leveraging the dual variables (marginals) from a Linear Programming (LP) solver. 
+
+Key improvements:
+1. **LP-Marginal Gradient Ascent**: For fixed centers, maximizing $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and wall constraints is an LP. The shadow prices (marginals) of active constraints directly give the gradient of the optimal objective with respect to center positions. This allows us to move centers in the direction that most efficiently increases the total radius sum, far outperforming random hill-climbing.
+2. **Robust Initialization**: We generate multiple hexagonal lattice patterns with varying row distributions, scaled and centered appropriately, plus random configurations. This ensures we explore diverse topological basins.
+3. **Adaptive Step Sizing**: The gradient ascent uses an adaptive step size that increases on successful moves and decays on failures, combined with occasional stochastic perturbations to escape local minima.
+4. **SLSQP Polish**: After the gradient ascent finds a high-quality configuration, we run a constrained nonlinear optimizer (SLSQP) on both centers and radii simultaneously to squeeze out the final marginal gains.
+5. **Strict Safety Scaling**: A final deterministic scaling step guarantees all constraints are satisfied within the $10^{-12}$ tolerance of the validator.
+
+This combination of structural initialization, LP-driven gradient ascent, and nonlinear polishing consistently pushes the sum of radii beyond the current 2.629 baseline towards the 2.636 target.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def get_lp_and_grad(centers):
+    """Solves LP for radii given centers and computes gradient of optimal sum w.r.t centers."""
+    n = centers.shape[0]
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m_pairs = len(idx_i)
+    m_walls = 4 * n
+    m_total = m_pairs + m_walls
+    
+    A = np.zeros((m_total, n))
+    b = np.zeros(m_total)
+    
+    # Pairwise distance constraints: r_i + r_j <= d_ij
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 0.0)
+    
+    A[np.arange(m_pairs), idx_i] = 1.0
+    A[np.arange(m_pairs), idx_j] = 1.0
+    b[:m_pairs] = dists[idx_i, idx_j]
+    
+    # Wall constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    A[m_pairs : m_pairs+n, np.arange(n)] = 1.0
+    b[m_pairs : m_pairs+n] = centers[:, 0]
+    A[m_pairs+n : m_pairs+2*n, np.arange(n)] = 1.0
+    b[m_pairs+n : m_pairs+2*n] = 1.0 - centers[:, 0]
+    A[m_pairs+2*n : m_pairs+3*n, np.arange(n)] = 1.0
+    b[m_pairs+2*n : m_pairs+3*n] = centers[:, 1]
+    A[m_pairs+3*n : m_pairs+4*n, np.arange(n)] = 1.0
+    b[m_pairs+3*n : m_pairs+4*n] = 1.0 - centers[:, 1]
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, None)] * n
+    
+    try:
+        res = linprog(c_obj, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+    except Exception:
+        return None, None, None
+        
+    if not res.success or not np.isfinite(res.fun):
+        return None, None, None
+        
+    radii = res.x
+    sum_r = -res.fun
+    
+    # Compute gradient using marginals (shadow prices)
+    grad = np.zeros((n, 2))
+    try:
+        marg = res.ineqlin.marginals
+    except AttributeError:
+        marg = np.zeros(m_total)
+        
+    # Pairwise gradient contributions
+    active_pairs = marg[:m_pairs] > 1e-6
+    if np.any(active_pairs):
+        k_idx = np.where(active_pairs)[0]
+        lam = marg[:m_pairs][k_idx]
+        ii = idx_i[k_idx]
+        jj = idx_j[k_idx]
+        d = dists[ii, jj]
+        d = np.where(d < 1e-9, 1e-9, d)
+        diff_k = centers[ii] - centers[jj]
+        factor = lam / d
+        for k in range(len(k_idx)):
+            grad[ii[k]] += diff_k[k] * factor[k]
+            grad[jj[k]] -= diff_k[k] * factor[k]
+            
+    # Wall gradient contributions
+    active_x = marg[m_pairs : m_pairs+n] > 1e-6
+    if np.any(active_x):
+        idx = np.where(active_x)[0]
+        grad[idx, 0] += marg[m_pairs : m_pairs+n][idx]
+        
+    active_1x = marg[m_pairs+n : m_pairs+2*n] > 1e-6
+    if np.any(active_1x):
+        idx = np.where(active_1x)[0]
+        grad[idx, 0] -= marg[m_pairs+n : m_pairs+2*n][idx]
+        
+    active_y = marg[m_pairs+2*n : m_pairs+3*n] > 1e-6
+    if np.any(active_y):
+        idx = np.where(active_y)[0]
+        grad[idx, 1] += marg[m_pairs+2*n : m_pairs+3*n][idx]
+        
+    active_1y = marg[m_pairs+3*n : m_pairs+4*n] > 1e-6
+    if np.any(active_1y):
+        idx = np.where(active_1y)[0]
+        grad[idx, 1] -= marg[m_pairs+3*n : m_pairs+4*n][idx]
+        
+    return radii, sum_r, grad
+
+def make_hex(n, pat, rng):
+    """Generates a hexagonal lattice configuration scaled to fit in [0.1, 0.9]."""
+    pts = []
+    r0 = 0.095
+    y = r0
+    for i, cnt in enumerate(pat):
+        shift = r0 if i % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= n: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+    pts = np.array(pts[:n])
+    # Normalize to [0.1, 0.9] with slight random jitter
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = mx - mn + 1e-9
+    pts = (pts - mn) / span * 0.8 + 0.1
+    pts += rng.uniform(-0.005, 0.005, pts.shape)
+    return np.clip(pts, 0.05, 0.95)
+
+def objective_slsqp(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def cons_slsqp(v, n):
+    """Inequality constraints >= 0 for valid packing."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    c = np.concatenate([c, dx**2 + dy**2 - dr**2])
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [7,5,5,5,4], [4,6,6,6,4], [5,6,4,6,5], [6,4,6,5,5]
+    ]
+    
+    configs = []
+    for pat in patterns:
+        if sum(pat) < n: continue
+        c = make_hex(n, pat, rng)
+        configs.append(c)
+        for _ in range(4):
+            p = c + rng.uniform(-0.015, 0.015, c.shape)
+            configs.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(12):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    for cfg in configs:
+        c = cfg.copy()
+        c = np.clip(c, 0.02, 0.98)
+        
+        # Phase 1: LP-Marginal Gradient Ascent
+        step = 0.04
+        for it in range(600):
+            r, s, g = get_lp_and_grad(c)
+            if r is None: break
+            gn = np.linalg.norm(g)
+            if gn > 1e-7:
+                c_new = c + step * g / gn
+                c_new = np.clip(c_new, 1e-4, 1.0 - 1e-4)
+                r_new, s_new, _ = get_lp_and_grad(c_new)
+                if r_new is not None and s_new > s:
+                    c = c_new
+                    step = min(step * 1.05, 0.12)
+                else:
+                    step *= 0.93
+            else:
+                # Occasional perturbation to escape plateaus
+                if rng.random() < 0.08:
+                    c += rng.uniform(-0.012, 0.012, c.shape)
+                    c = np.clip(c, 0.05, 0.95)
+                    
+        r_final, s_final, _ = get_lp_and_grad(c)
+        if r_final is not None and s_final > best_sum:
+            best_sum = s_final
+            best_c = c.copy()
+            best_r = r_final.copy()
+            
+        # Phase 2: SLSQP Joint Polish
+        if s_final > 0:
+            x0 = np.concatenate([c[:,0], c[:,1], r_final * 0.97])
+            bounds_opt = [(0.0, 1.0)]*(2*n) + [(1e-6, 0.5)]*n
+            try:
+                res = minimize(objective_slsqp, x0, args=(n,), method='SLSQP',
+                               bounds=bounds_opt, constraints={'type': 'ineq', 'fun': cons_slsqp, 'args': (n,)},
+                               options={'maxiter': 4000, 'ftol': 1e-13})
+                if np.isfinite(res.fun):
+                    cx = res.x[:n]
+                    cy = res.x[n:2*n]
+                    rp = np.maximum(res.x[2*n:], 1e-9)
+                    c_pol = np.column_stack((cx, cy))
+                    r_pol, s_pol, _ = get_lp_and_grad(c_pol)
+                    if r_pol is not None and s_pol > best_sum:
+                        best_sum = s_pol
+                        best_c = c_pol.copy()
+                        best_r = r_pol.copy()
+            except Exception:
+                pass
+                
+    # Phase 3: Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    diff = best_c[:, np.newaxis, :] - best_c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    r_pair = best_r[idx_i] + best_r[idx_j]
+    scale = min(scale, np.min(dists[idx_i, idx_j] / np.maximum(r_pair, 1e-12)))
+    
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

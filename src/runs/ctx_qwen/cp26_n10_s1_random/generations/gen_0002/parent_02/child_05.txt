@@ -1,0 +1,248 @@
+
+
+<strategy>
+Looking at the current solution with sum of radii = 2.624527 and target of 2.636, I need to find a ~0.44% improvement. The current approach uses SLSQP with hexagonal lattice initializations and random perturbations.
+
+Key observations:
+1. The current solution uses 20 initial configurations (5 hex patterns × 3 perturbations + 5 random)
+2. SLSQP with 5000 maxiter might not converge fully
+3. The constraint formulation could be more efficient
+
+Strategy for improvement:
+1. **More diverse initial configurations**: Generate 80+ configurations including multiple hexagonal patterns with different row distributions, various perturbation scales, and random starts
+2. **Two-phase optimization**: First use L-BFGS-B with penalty method (fast gradient-based local search), then refine with SLSQP (handles constraints explicitly)
+3. **Higher iteration limits**: Use 10000+ iterations to ensure convergence
+4. **Tighter tolerances**: Use ftol=1e-14 for better precision
+5. **Top-level helper functions**: As required by rules, move all helpers to top level and pass parameters explicitly instead of using closures
+
+The penalty method with L-BFGS-B is faster and can escape some local minima that SLSQP might struggle with. The two-phase approach leverages the strengths of both methods.
+</strategy>
+
+```python
+import numpy as np
+import scipy.optimize as opt
+
+
+def objective_func(vars):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+
+def constraint_func(vars, n):
+    """Inequality constraints >= 0 for valid packing."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+
+    c_list = []
+    # Boundary constraints
+    c_list.append(x - r)
+    c_list.append(1.0 - x - r)
+    c_list.append(y - r)
+    c_list.append(1.0 - y - r)
+
+    # Pairwise non-overlap
+    rows, cols = np.triu_indices(n, k=1)
+    x_diff = x[rows] - x[cols]
+    y_diff = y[rows] - y[cols]
+    dists = np.sqrt(x_diff ** 2 + y_diff ** 2)
+    r_sums = r[rows] + r[cols]
+    c_list.append(dists - r_sums)
+
+    return np.concatenate(c_list)
+
+
+def penalty_func(vars, n, mu):
+    """Penalty-based objective for L-BFGS-B."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+
+    obj = -np.sum(r)
+
+    # Boundary penalties
+    penalty = 0.0
+    v1 = x - r
+    v2 = 1.0 - x - r
+    v3 = y - r
+    v4 = 1.0 - y - r
+    penalty += np.sum(np.maximum(0, -v1) ** 2)
+    penalty += np.sum(np.maximum(0, -v2) ** 2)
+    penalty += np.sum(np.maximum(0, -v3) ** 2)
+    penalty += np.sum(np.maximum(0, -v4) ** 2)
+
+    # Overlap penalties
+    x_diff = x[:, np.newaxis] - x[np.newaxis, :]
+    y_diff = y[:, np.newaxis] - y[np.newaxis, :]
+    dists = np.sqrt(x_diff ** 2 + y_diff ** 2)
+    np.fill_diagonal(dists, np.inf)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    viol = r_sum - dists
+    penalty += np.sum(np.maximum(0, viol) ** 2)
+
+    return obj + mu * penalty
+
+
+def generate_hex_config(n, row_dists, r_init):
+    """Generate hexagonal lattice configuration."""
+    y = r_init
+    row_idx = 0
+    pts = []
+    for count in row_dists:
+        shift = r_init if row_idx % 2 == 1 else 0.0
+        x = r_init + shift
+        for _ in range(count):
+            if len(pts) < n:
+                pts.append([x, y])
+            x += 2 * r_init
+        y += np.sqrt(3) * r_init
+        row_idx += 1
+    return np.array(pts[:n])
+
+
+def validate_solution(centers, radii, n):
+    """Strict validation of packing."""
+    x_opt = centers[:, 0]
+    y_opt = centers[:, 1]
+    r_opt = radii
+
+    if np.any(r_opt < 1e-10):
+        return False
+
+    if np.any(x_opt - r_opt < -1e-10) or np.any(x_opt + r_opt > 1 + 1e-10):
+        return False
+    if np.any(y_opt - r_opt < -1e-10) or np.any(y_opt + r_opt > 1 + 1e-10):
+        return False
+
+    dists = np.linalg.norm(centers[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+    r_sums = r_opt[:, np.newaxis] + r_opt[np.newaxis, :]
+    rows, cols = np.triu_indices(n, k=1)
+    if np.any(dists[rows, cols] < r_sums[rows, cols] - 1e-10):
+        return False
+
+    return True
+
+
+def run_packing():
+    n = 26
+
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+
+    np.random.seed(42)
+
+    # Generate diverse initial configurations
+    configs = []
+
+    # Various hexagonal row distributions
+    row_dists_list = [
+        [5, 6, 5, 6, 4],
+        [6, 5, 6, 5, 4],
+        [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4],
+        [5, 5, 5, 5, 6],
+        [6, 6, 5, 5, 4],
+        [5, 6, 6, 5, 4],
+        [4, 5, 6, 6, 5],
+        [5, 5, 5, 6, 5],
+        [6, 5, 5, 5, 5],
+        [5, 6, 4, 6, 5],
+        [4, 5, 5, 6, 6],
+        [6, 4, 6, 6, 4],
+        [5, 5, 5, 5, 6],
+        [4, 6, 5, 6, 5],
+        [6, 6, 4, 5, 5],
+    ]
+
+    for rd in row_dists_list:
+        pts = generate_hex_config(n, rd, 0.10)
+
+        # Multiple perturbation scales
+        for scale in [0.01, 0.02, 0.03]:
+            for _ in range(3):
+                p = pts.copy()
+                noise = np.random.uniform(-scale, scale, p.shape)
+                p = np.clip(p + noise, 0.05, 0.95)
+                v = np.zeros(3 * n)
+                v[0::3] = p[:, 0]
+                v[1::3] = p[:, 1]
+                v[2::3] = 0.095 + np.random.uniform(-0.005, 0.005, n)
+                configs.append(v)
+
+    # Random configurations with various radius starts
+    for _ in range(25):
+        pts = np.random.uniform(0.08, 0.92, (n, 2))
+        v = np.zeros(3 * n)
+        v[0::3] = pts[:, 0]
+        v[1::3] = pts[:, 1]
+        r_start = 0.07 + np.random.uniform(0, 0.04)
+        v[2::3] = r_start + np.random.uniform(-0.01, 0.01, n)
+        v[2::3] = np.clip(v[2::3], 0.02, 0.15)
+        configs.append(v)
+
+    # Bounds for variables
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-9, 0.5)] * n
+
+    # Constraint dictionary for SLSQP
+    constraint_dict = {'type': 'ineq', 'fun': constraint_func, 'args': (n,)}
+
+    # Optimize each configuration
+    for idx, cfg in enumerate(configs):
+        try:
+            # Phase 1: L-BFGS-B with penalty (fast local search)
+            x = cfg.copy()
+            for mu in [1000, 5000, 20000, 50000]:
+                res = opt.minimize(
+                    penalty_func,
+                    x,
+                    args=(n, mu),
+                    method='L-BFGS-B',
+                    bounds=bounds,
+                    options={'maxiter': 3000, 'ftol': 1e-14}
+                )
+                x = res.x
+
+            # Phase 2: SLSQP refinement with explicit constraints
+            res = opt.minimize(
+                objective_func,
+                x,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraint_dict,
+                options={'maxiter': 15000, 'ftol': 1e-14}
+            )
+
+            if not np.isfinite(res.fun):
+                continue
+
+            x_opt = res.x[0::3]
+            y_opt = res.x[1::3]
+            r_opt = res.x[2::3]
+
+            centers = np.column_stack((x_opt, y_opt))
+
+            if validate_solution(centers, r_opt, n):
+                s = np.sum(r_opt)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = centers.copy()
+                    best_radii = r_opt.copy()
+
+        except Exception:
+            continue
+
+    # Fallback if nothing valid found
+    if best_centers is None:
+        rd = [5, 6, 5, 6, 4]
+        pts = generate_hex_config(n, rd, 0.09)
+        best_centers = pts
+        best_radii = np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+
+    # Safety scaling to guarantee strict validity
+    best_radii *= 0.99999
+    best_sum = np.sum(best_radii)
+
+    return best_centers, best_radii, float(best_sum)
+```

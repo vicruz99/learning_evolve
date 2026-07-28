@@ -1,0 +1,164 @@
+# sol_000155 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000140 (state 07ed95ff) state=c35b80e3 sum of radii=2.594554 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_radii_lp(centers, n, idx_i, idx_j):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    # Distance to boundaries
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    limits = np.maximum(limits, 0.0)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    # Pairwise distances
+    diffs = centers[idx_i] - centers[idx_j]
+    dists = np.sqrt(np.sum(diffs**2, axis=1))
+    
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    b_ub = dists
+    
+    c_obj = -np.ones(n)
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.zeros(n), 0.0
+
+def obj_func(x, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(x[2*n:])
+
+def con_func(x, n, idx_i, idx_j):
+    """Inequality constraints for SLSQP: must be >= 0."""
+    c = x[:2*n].reshape(n, 2)
+    r = x[2*n:]
+    
+    # Boundary constraints
+    bc = np.concatenate([c[:, 0] - r, 1.0 - c[:, 0] - r, 
+                         c[:, 1] - r, 1.0 - c[:, 1] - r])
+    
+    # Pairwise non-overlap: dist^2 - (r_i + r_j)^2 >= 0
+    diffs = c[idx_i] - c[idx_j]
+    dist_sq = np.sum(diffs**2, axis=1)
+    r_sum = r[idx_i] + r[idx_j]
+    pc = dist_sq - r_sum**2
+    
+    return np.concatenate([bc, pc])
+
+def run_packing():
+    n = 26
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    rng = np.random.default_rng(42)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. Scaled Hexagonal Lattices
+    for scale in np.linspace(0.90, 1.10, 6):
+        pts = []
+        r0 = 0.1
+        row = 0
+        y = r0
+        while len(pts) < n:
+            x = r0 + (row % 2) * r0
+            while x + r0 <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2.0 * r0
+            if len(pts) < n:
+                y += np.sqrt(3) * r0
+                row += 1
+        cfg = np.array(pts[:n])
+        # Normalize to fit comfortably in [0,1]
+        cfg = (cfg - cfg.min(axis=0)) / (cfg.max(axis=0) - cfg.min(axis=0)) * 0.96 + 0.02
+        configs.append(cfg)
+        
+    # 2. Random dense starts
+    for _ in range(12):
+        configs.append(rng.uniform(0.05, 0.95, (n, 2)))
+        
+    # Bounds for SLSQP: keep centers strictly inside to ensure LP feasibility
+    bounds_vars = [(0.001, 0.999)]*(2*n) + [(1e-6, 0.5)]*n
+    
+    for cfg in configs:
+        # Initial radii estimation
+        r_init, _ = solve_radii_lp(cfg, n, idx_i, idx_j)
+        if np.sum(r_init) < 1.0:
+            r_init = np.full(n, 0.08)
+            
+        x0 = np.concatenate([cfg.flatten(), r_init])
+        
+        # Phase 1: SLSQP local refinement
+        try:
+            res = minimize(obj_func, x0, args=(n,), method='SLSQP', bounds=bounds_vars,
+                          constraints={'type': 'ineq', 'fun': con_func, 'args': (n, idx_i, idx_j)},
+                          options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            if np.isfinite(res.fun):
+                c_opt = res.x[:2*n].reshape(n, 2)
+                r_lp, s_lp = solve_radii_lp(c_opt, n, idx_i, idx_j)
+                if s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = c_opt.copy()
+                    best_radii = r_lp.copy()
+        except Exception:
+            pass
+            
+        # Phase 2: Stochastic Hill-Climbing on centers with LP evaluation
+        step = 0.025
+        for it in range(2500):
+            if step < 1e-6:
+                break
+            pert = best_centers + rng.normal(0, step, (n, 2))
+            pert = np.clip(pert, 0.005, 0.995)
+            
+            r_p, s_p = solve_radii_lp(pert, n, idx_i, idx_j)
+            if s_p > best_sum:
+                best_sum = s_p
+                best_centers = pert.copy()
+                best_radii = r_p.copy()
+                step *= 1.03  # Increase step on success
+            else:
+                step *= 0.97  # Decrease step on failure
+                
+    # Final strict validation and safety scaling
+    if best_centers is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+            if r > 1e-9:
+                scale = min(scale, (x - r + 1e-9) / r, (1.0 - x - r + 1e-9) / r,
+                            (y - r + 1e-9) / r, (1.0 - y - r + 1e-9) / r)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                             best_centers[i, 1] - best_centers[j, 1])
+                rs = best_radii[i] + best_radii[j]
+                if rs > 1e-9:
+                    scale = min(scale, (d - rs + 1e-9) / rs)
+                    
+        scale = max(scale, 0.99)  # Avoid aggressive shrinking unless necessary
+        best_radii *= scale
+        best_sum = float(np.sum(best_radii))
+        
+    # Fallback if optimization fails unexpectedly
+    if best_centers is None:
+        best_centers = np.tile(np.linspace(0.1, 0.9, 5), 5).reshape(25, 1)
+        best_centers = np.hstack([best_centers, np.repeat(np.linspace(0.1, 0.9, 5), 5).reshape(25, 1)])
+        best_centers = np.vstack([best_centers, [[0.5, 0.5]]])
+        best_radii = np.full(n, 0.09)
+        best_sum = float(np.sum(best_radii))
+        
+    return best_centers, best_radii, best_sum

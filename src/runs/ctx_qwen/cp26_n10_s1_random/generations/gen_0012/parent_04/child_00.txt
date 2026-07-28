@@ -1,0 +1,233 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.624 towards the 2.636 target, we need a more sophisticated optimization strategy that efficiently navigates the non-convex landscape of circle packing. The key improvements are:
+
+1. **LP-Guided Gradient Ascent**: Instead of blind hill-climbing, we use the dual variables (Lagrange multipliers) from the linear programming solver. These marginals directly tell us which pairwise distance constraints are binding and how much relaxing them improves the objective. We compute the exact gradient of the sum of radii with respect to center positions and perform directed gradient ascent. This is significantly faster and more accurate than finite-difference approximations.
+
+2. **Diverse Structural Initialization**: We generate a wide variety of hexagonal lattice patterns with different row distributions, heavily perturbing them to break symmetry. Combined with dense random starts, this ensures we explore different topological packings (e.g., staggered rows, boundary-clustering).
+
+3. **Two-Phase Refinement**:
+   - *Phase A (LP Gradient Ascent)*: Iteratively moves centers to increase inter-circle distances where radii are constrained, adaptively adjusting step size. Includes random shaking to escape plateaus.
+   - *Phase B (SLSQP Joint Polish)*: Takes the best center layouts and optimizes centers and radii simultaneously using squared-distance constraints for smooth gradients, squeezing out the last bits of slack.
+
+4. **Robust Compatibility & Safety**: Handles different scipy versions gracefully for marginal extraction, uses squared distances in SLSQP to avoid non-smooth `hypot` gradients, and applies a strict numerical safety scale at the end to guarantee the validator's `1e-12` tolerance is met without shrinking the sum unnecessarily.
+
+This combination of exact LP gradients, multi-start diversity, and constrained nonlinear polishing consistently pushes packings past theoretical equal-radius limits by exploiting boundary expansion opportunities.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def build_lp_matrix(n):
+    """Precomputes the constant inequality matrix structure for the LP solver."""
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    k = 0
+    for i in range(n):
+        for _ in range(4):
+            A[k, i] = 1.0
+            k += 1
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[4*n + idx, i] = 1.0
+            A[4*n + idx, j] = 1.0
+            idx += 1
+    return A
+
+def solve_lp(centers, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    m = A_ub.shape[0]
+    b = np.zeros(m)
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        b[k] = x; k += 1
+        b[k] = 1.0 - x; k += 1
+        b[k] = y; k += 1
+        b[k] = 1.0 - y; k += 1
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            b[4*n + idx] = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            idx += 1
+            
+    res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b, bounds=(0, None), method='highs')
+    if res.success and np.isfinite(res.fun):
+        return res.x, -res.fun, res
+    return None, 0.0, None
+
+def compute_center_gradient(res, centers, n, triu_i, triu_j):
+    """Computes gradient of LP objective w.r.t center positions using dual variables."""
+    grad = np.zeros((n, 2))
+    if res is None:
+        return grad
+        
+    lams = None
+    if hasattr(res, 'ineqlin') and hasattr(res.ineqlin, 'marginals'):
+        lams = res.ineqlin.marginals
+    elif hasattr(res, 'marginals') and hasattr(res.marginals, 'ineqlin'):
+        lams = res.marginals.ineqlin
+        
+    if lams is None:
+        return grad
+
+    # Pairwise constraints start at index 4*n
+    pair_lams = lams[4*n:]
+    active = pair_lams > 1e-6
+    if not np.any(active):
+        return grad
+        
+    ii = triu_i[active]
+    jj = triu_j[active]
+    ll = pair_lams[active]
+    
+    diff = centers[ii] - centers[jj]
+    dists = np.linalg.norm(diff, axis=1)
+    safe_dists = np.where(dists > 1e-9, dists, 1.0)
+    factors = (ll / safe_dists)[:, None]
+    
+    np.add.at(grad, ii, diff * factors)
+    np.add.at(grad, jj, -diff * factors)
+    return grad
+
+def joint_obj(v, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def joint_cons(v, n, triu_i, triu_j):
+    """Inequality constraints >= 0 for valid packing."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    dx = cx[triu_i] - cx[triu_j]
+    dy = cy[triu_i] - cy[triu_j]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[triu_i] + r[triu_j]
+    c = np.concatenate([c, dist_sq - r_sum**2])
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.seterr(all='ignore')
+    n = 26
+    rng = np.random.default_rng(42)
+    A_ub = build_lp_matrix(n)
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5],
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,6,4],
+        [5,6,6,4,5], [6,5,5,6,4], [5,5,5,6,5], [6,5,6,4,5],
+        [5,6,5,5,5], [6,6,4,6,4], [4,5,7,5,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.095
+        for ri, cnt in enumerate(pat):
+            shift = 0.095 if ri % 2 == 1 else 0.0
+            x = 0.095 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 2.0 * 0.095
+            y += np.sqrt(3.0) * 0.095
+        configs.append(np.array(pts[:n]))
+        
+        for _ in range(3):
+            cp = np.array(pts[:n]) + rng.uniform(-0.02, 0.02, (n,2))
+            configs.append(np.clip(cp, 0.05, 0.95))
+            
+    for _ in range(15):
+        configs.append(rng.uniform(0.1, 0.9, (n,2)))
+        
+    bounds_v = [(0.0, 1.0)]*(2*n) + [(1e-6, 0.5)]*n
+    
+    for cfg in configs:
+        curr_c = cfg.copy()
+        
+        # Phase A: LP-guided gradient ascent on centers
+        step = 0.02
+        for it in range(600):
+            r_lp, s_lp, res_lp = solve_lp(curr_c, A_ub)
+            if r_lp is None: break
+            
+            grad = compute_center_gradient(res_lp, curr_c, n, triu_i, triu_j)
+            gn = np.linalg.norm(grad)
+            if gn > 1e-8:
+                new_c = curr_c + step * grad / gn
+                new_c = np.clip(new_c, 0.01, 0.99)
+                r_new, s_new, _ = solve_lp(new_c, A_ub)
+                if r_new is not None and s_new > s_lp + 1e-9:
+                    curr_c = new_c
+                    step = min(step * 1.005, 0.05)
+                else:
+                    step *= 0.96
+            else:
+                if rng.random() < 0.05:
+                    shake = curr_c + rng.uniform(-0.015, 0.015, (n,2))
+                    shake = np.clip(shake, 0.05, 0.95)
+                    r_sh, s_sh, _ = solve_lp(shake, A_ub)
+                    if r_sh is not None and s_sh > s_lp:
+                        curr_c = shake
+                        step = 0.02
+                else:
+                    step *= 0.96
+
+        r_best_lp, s_best_lp, _ = solve_lp(curr_c, A_ub)
+        
+        # Phase B: SLSQP joint polish
+        if s_best_lp > best_sum:
+            v0 = np.concatenate([curr_c[:,0], curr_c[:,1], r_best_lp * 0.98])
+            try:
+                res_slqp = minimize(joint_obj, v0, args=(n,), method='SLSQP',
+                                    bounds=bounds_v,
+                                    constraints={'type': 'ineq', 'fun': joint_cons, 'args': (n, triu_i, triu_j)},
+                                    options={'maxiter': 3000, 'ftol': 1e-13})
+                if np.isfinite(res_slqp.fun):
+                    c_slqp = np.column_stack((res_slqp.x[:n], res_slqp.x[n:2*n]))
+                    r_slqp, s_slqp, _ = solve_lp(c_slqp, A_ub)
+                    if r_slqp is not None and s_slqp > s_best_lp:
+                        curr_c = c_slqp
+                        s_best_lp = s_slqp
+                        r_best_lp = r_slqp
+            except Exception:
+                pass
+                
+        if s_best_lp > best_sum:
+            best_sum = s_best_lp
+            best_centers = curr_c.copy()
+            best_radii = r_best_lp.copy()
+            
+    # Final safety scaling
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(n):
+        x, y = c[i]
+        ri = r[i]
+        if ri > 1e-12:
+            scale = min(scale, x/ri, (1.0-x)/ri, y/ri, (1.0-y)/ri)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(c[i,0]-c[j,0], c[i,1]-c[j,1])
+            rs = r[i] + r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    r *= scale * 0.9999999
+    final_sum = float(np.sum(r))
+    
+    return c, r, final_sum
+```

@@ -1,0 +1,213 @@
+# sol_000002 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4fe936d0) state=5e0f2088 sum of radii=2.462587 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+from scipy.spatial.distance import pdist, squareform
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    """
+    n = 26
+    
+    # Function to solve for optimal radii given fixed centers
+    def solve_radii(centers):
+        """
+        Solves the LP to find max radii for fixed centers.
+        Maximize sum(r_i)
+        s.t. r_i + r_j <= dist(c_i, c_j)
+             r_i <= min(c_ix, 1-c_ix, c_iy, 1-c_iy)
+             r_i >= 0
+        """
+        # Calculate pairwise distances
+        dists = squareform(pdist(centers))
+        
+        # Calculate boundary distances
+        # r <= x, r <= 1-x, r <= y, r <= 1-y
+        # r <= min(x, 1-x, y, 1-y)
+        bounds_x = np.minimum(centers[:, 0], 1 - centers[:, 0])
+        bounds_y = np.minimum(centers[:, 1], 1 - centers[:, 1])
+        b_i = np.minimum(bounds_x, bounds_y)
+        
+        # LP coefficients
+        # Minimize -sum(r_i)
+        c_obj = -np.ones(n)
+        
+        # Constraints: A_ub @ r <= b_ub
+        # We have r_i + r_j <= dists[i,j] for all i < j
+        # And r_i <= b_i for all i
+        
+        n_constraints = (n * (n - 1)) // 2 + n
+        A_ub = np.zeros((n_constraints, n))
+        b_ub = np.zeros(n_constraints)
+        
+        idx = 0
+        # Pairwise constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                A_ub[idx, i] = 1.0
+                A_ub[idx, j] = 1.0
+                b_ub[idx] = dists[i, j]
+                idx += 1
+        
+        # Boundary constraints
+        for i in range(n):
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = b_i[i]
+            idx += 1
+            
+        # Bounds for radii (non-negative)
+        bounds_r = [(0, None) for _ in range(n)]
+        
+        # Solve LP
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        
+        if res.success:
+            return -res.fun, res.x
+        else:
+            # Fallback if LP fails (should not happen usually)
+            return 0.0, np.zeros(n)
+
+    # Objective function for center optimization
+    def objective(centers_flat):
+        centers = centers_flat.reshape((n, 2))
+        # Ensure centers are within [0, 1] to avoid NaNs in LP if outside
+        # Though optimizer should handle bounds, clipping helps stability
+        centers = np.clip(centers, 1e-6, 1 - 1e-6)
+        total_r, _ = solve_radii(centers)
+        return -total_r # Minimize negative sum
+
+    # Initial configuration: Hexagonal packing
+    centers_init = np.zeros((n, 2))
+    r_guess = 0.10
+    dy = np.sqrt(3) * r_guess
+    
+    row_idx = 0
+    col_idx = 0
+    current_row = 0
+    count = 0
+    
+    while count < n:
+        x = r_guess + col_idx * (2 * r_guess)
+        y = r_guess + current_row * dy
+        
+        # Shift odd rows
+        if current_row % 2 == 1:
+            x += r_guess
+        
+        # Check if fits
+        if x <= 1 - r_guess:
+            centers_init[count] = [x, y]
+            count += 1
+            col_idx += 1
+        else:
+            # Next row
+            current_row += 1
+            col_idx = 0
+    
+    # If we didn't fill 26 with strict hex spacing, adjust or just use what we have
+    # (The logic above might leave empty spots if width is tight, but for r=0.1 it works)
+    # Actually, let's just generate a robust grid that fills 26 spots
+    # A 5x5 grid (25) + 1 extra
+    centers_alt = []
+    # 5 rows of 5
+    for r in range(5):
+        for c in range(5):
+            cx = 0.1 + c * 0.2
+            cy = 0.1 + r * 0.2
+            centers_alt.append([cx, cy])
+    # 1 extra at center? Or somewhere else.
+    # Let's try to place the 26th circle in a gap.
+    # With 5x5 grid, centers are at 0.1, 0.3, 0.5, 0.7, 0.9.
+    # Gaps are at 0.2, 0.4, etc.
+    # Let's try (0.2, 0.2) -> dist to (0.1, 0.1) is 0.141 > 0.2? No.
+    # (0.2, 0.2) dist to (0.1, 0.1) is sqrt(0.02) ~ 0.141.
+    # Sum of radii 0.1+0.1 = 0.2. 0.141 < 0.2. Overlap.
+    # So grid is tight.
+    
+    # Let's use the hex packing attempt again but ensure 26 points.
+    # With r=0.09, we can definitely fit 26.
+    # Let's generate 26 points on a hex grid scaled to fit.
+    centers_hex = np.zeros((n, 2))
+    idx = 0
+    # Try to fit 6 rows
+    # Row 0: 5, Row 1: 5, Row 2: 5, Row 3: 5, Row 4: 5, Row 5: 1?
+    # Or alternating 5, 4...
+    # 5+4+5+4+5+4 = 27. We can pick 26.
+    
+    r_start = 0.09
+    dy_hex = np.sqrt(3) * r_start
+    
+    row = 0
+    while idx < n:
+        # Determine number of circles in this row
+        # Even rows (0, 2...): x = r, 3r, 5r... -> 5 circles
+        # Odd rows (1, 3...): x = 2r, 4r, 6r, 8r -> 4 circles
+        # But let's make them all 5 if possible, or adjust spacing.
+        # Let's just place them in a grid-like fashion with slight offset to allow optimization to fix.
+        
+        if row % 2 == 0:
+            ncols = 5
+            offset_x = r_start
+        else:
+            ncols = 5 # Try to fit 5 even in odd rows by compressing x?
+            # If we compress x, we might overlap.
+            # Let's stick to standard hex: 5, 4, 5, 4...
+            ncols = 4
+            offset_x = r_start * 2
+        
+        # Calculate y
+        y_pos = r_start + row * dy_hex
+        
+        # Check if y fits
+        if y_pos + r_start > 1:
+            # Reduce row height if needed, but for initial guess it's ok to be slightly out,
+            # optimizer will fix. But let's keep it inside.
+            pass 
+            
+        for c in range(ncols):
+            if idx >= n: break
+            x_pos = offset_x + c * (2 * r_start)
+            centers_hex[idx] = [x_pos, y_pos]
+            idx += 1
+        row += 1
+        
+    # Use the hex initialization
+    x0 = centers_hex.flatten()
+    
+    # Optimization
+    # Bounds for centers: [0, 1]
+    bounds_opt = [(0, 1) for _ in range(2 * n)]
+    
+    # Run Nelder-Mead
+    # Maxiter needs to be sufficient.
+    res = minimize(objective, x0, method='Nelder-Mead', 
+                   bounds=bounds_opt, 
+                   options={'maxiter': 2000, 'xatol': 1e-6, 'fatol': 1e-9})
+    
+    best_centers = res.x.reshape((n, 2))
+    best_sum, best_radii = solve_radii(best_centers)
+    
+    # Try a few random restarts to avoid local optima
+    best_sum_global = best_sum
+    best_centers_global = best_centers
+    best_radii_global = best_radii
+    
+    for _ in range(5):
+        # Random centers
+        np.random.seed(_)
+        rands = np.random.uniform(r_start, 1-r_start, (n, 2))
+        res_rand = minimize(objective, rands.flatten(), method='Nelder-Mead',
+                            bounds=bounds_opt,
+                            options={'maxiter': 1000, 'xatol': 1e-6, 'fatol': 1e-9})
+        curr_sum, curr_radii = solve_radii(res_rand.x.reshape((n, 2)))
+        if curr_sum > best_sum_global:
+            best_sum_global = curr_sum
+            best_centers_global = res_rand.x.reshape((n, 2))
+            best_radii_global = curr_radii
+            
+    return best_centers_global, best_radii_global, best_sum_global

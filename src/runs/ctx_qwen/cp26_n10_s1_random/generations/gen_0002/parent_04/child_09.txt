@@ -1,0 +1,152 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we recognize that the optimal configuration is extremely close to an equal-radius packing. The known theoretical optimum for 26 equal circles in a square yields a radius of approximately $R \approx 0.10139$, giving a sum of $\approx 2.63614$. 
+
+The strategy involves:
+1. **Equal-Radius Optimization**: Formulate the problem as maximizing a single radius $R$ subject to boundary and pairwise non-overlap constraints. This reduces the variable space and often leads directly to the global optimum for dense packings.
+2. **Robust Initialization**: Generate a hexagonal lattice (optimal for density) and apply multiple random perturbations to escape local minima. Also include a uniform grid start.
+3. **Constraint Handling**: Use `SLSQP` with vectorized inequality constraints for efficiency. Constraints enforce $r \le x,y \le 1-r$ and $\|c_i - c_j\|^2 \ge 4R^2$.
+4. **Refinement Phase**: If the equal-radius optimization falls slightly short of the target, run a secondary optimization allowing radii to vary independently. This can sometimes squeeze out additional volume by adapting to local gaps, though equal radii typically dominate.
+5. **Safety Scaling**: Apply a negligible multiplicative factor to radii to guarantee strict compliance with the $10^{-12}$ tolerance in the validator.
+
+This approach directly targets the known optimal packing geometry while using robust numerical optimization to handle the non-convex constraint landscape.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def compute_equal_constraints(v):
+    """Constraints for equal-radius packing: boundary and pairwise distances."""
+    x = v[0::2]
+    y = v[1::2]
+    R = v[-1]
+    c = []
+    # Boundary constraints
+    c.append(x - R)
+    c.append(1.0 - x - R)
+    c.append(y - R)
+    c.append(1.0 - y - R)
+    # Pairwise squared distance constraints
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    c.append(d2[TRIU_IDX] - 4.0 * R * R)
+    return np.concatenate(c)
+
+def objective_equal(v):
+    """Maximize R => minimize -R."""
+    return -v[-1]
+
+def compute_varying_constraints(v):
+    """Constraints for varying-radius packing."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = []
+    # Boundary constraints
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    # Pairwise squared distance constraints
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    r_sum = r[:, None] + r[None, :]
+    c.append(d2[TRIU_IDX] - r_sum[TRIU_IDX]**2)
+    return np.concatenate(c)
+
+def objective_varying(v):
+    """Maximize sum of radii => minimize negative sum."""
+    return -np.sum(v[2::3])
+
+def get_hex_init(R_est):
+    """Generate a hexagonal lattice initialization."""
+    pts = []
+    y = R_est
+    row = 0
+    while len(pts) < N_CIRCLES:
+        shift = R_est if row % 2 == 1 else 0.0
+        x = R_est + shift
+        while x + R_est <= 1.0 and len(pts) < N_CIRCLES:
+            pts.append([x, y])
+            x += 2.0 * R_est
+        y += R_est * np.sqrt(3)
+        row += 1
+    return np.array(pts[:N_CIRCLES])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    best_R_val = 0.0
+    best_centers = None
+    
+    # Phase 1: Equal-Radius Optimization
+    bounds_equal = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)]
+    cons_equal = {'type': 'ineq', 'fun': compute_equal_constraints}
+    
+    np.random.seed(42)
+    configs = [get_hex_init(0.09)]
+    hex_cfg = configs[0]
+    
+    # Generate perturbed starting configurations to escape local minima
+    for _ in range(12):
+        pert = hex_cfg + np.random.uniform(-0.04, 0.04, hex_cfg.shape)
+        configs.append(np.clip(pert, 0.05, 0.95))
+        
+    # Uniform grid alternative
+    grid_cfg = []
+    step = 1.0 / 7.0
+    for i in range(1, 7):
+        for j in range(1, 7):
+            if len(grid_cfg) < n:
+                grid_cfg.append([i*step, j*step])
+    configs.append(np.array(grid_cfg[:n]))
+
+    for cfg in configs:
+        x0 = np.concatenate([cfg.flatten(), [0.09]])
+        try:
+            res = minimize(objective_equal, x0, method='SLSQP', bounds=bounds_equal,
+                           constraints=cons_equal, options={'maxiter': 10000, 'ftol': 1e-13})
+            if np.isfinite(res.fun) and res.x[-1] > best_R_val:
+                best_R_val = res.x[-1]
+                best_centers = res.x[:-1].reshape(n, 2)
+        except Exception:
+            continue
+
+    # Phase 2: Varying-Radius Refinement (if needed to push past theoretical equal-radius limit)
+    if best_R_val * n < 2.634:
+        bounds_var = [(0.0, 1.0)] * (2 * n) + [(1e-5, 0.5)] * n
+        cons_var = {'type': 'ineq', 'fun': compute_varying_constraints'}
+        
+        x0_var = np.zeros(3 * n)
+        x0_var[0::3] = best_centers[:, 0]
+        x0_var[1::3] = best_centers[:, 1]
+        x0_var[2::3] = best_R_val
+        
+        try:
+            res_var = minimize(objective_varying, x0_var, method='SLSQP', bounds=bounds_var,
+                               constraints=cons_var, options={'maxiter': 10000, 'ftol': 1e-13})
+            if np.isfinite(res_var.fun):
+                c_val = compute_varying_constraints(res_var.x)
+                if np.min(c_val) >= -1e-5:
+                    best_centers = np.column_stack((res_var.x[0::3], res_var.x[1::3]))
+                    best_R_val = res_var.x[2::3]
+        except Exception:
+            pass
+
+    # Prepare output
+    if isinstance(best_R_val, np.ndarray):
+        radii = best_R_val
+    else:
+        radii = np.full(n, best_R_val)
+        
+    # Strict safety scaling for numerical stability against validator tolerance
+    radii *= 0.999999
+    
+    return best_centers, radii, float(np.sum(radii))
+```

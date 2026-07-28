@@ -1,0 +1,204 @@
+
+
+<strategy>
+To improve the packing sum of radii from ~2.620 to ~2.636, we need a more robust optimization pipeline that effectively escapes local minima and tightly exploits boundary constraints. The key insights are:
+1. **LP-Driven Jiggle Search**: The sum of radii for fixed centers is given by a simple LP. Maximizing this LP objective over center positions is highly effective. We will use a stochastic hill-climbing (jiggle) search that perturbs individual circle centers and accepts moves that increase the LP sum. This directly optimizes the target metric.
+2. **Diverse Hexagonal Initializations**: Circle packings in squares typically follow perturbed hexagonal lattices. We generate many row-distribution patterns (e.g., 6-5-6-5-4, 5-6-4-6-5, etc.), normalize them, and add controlled noise to break symmetry.
+3. **Joint SLSQP Polishing**: After the jiggle search finds a strong geometric configuration, we run SLSQP on joint variables (centers + radii) to squeeze out remaining slack by smoothly adjusting boundaries and pairwise contacts.
+4. **Strict Safety Scaling**: Finally, we compute the exact maximum scaling factor that keeps all constraints satisfied within the validator's `1e-12` tolerance, ensuring 100% validity without overly shrinking radii.
+5. **Performance & Stability**: Precomputing pair indices, using `scipy.optimize.linprog` with the 'highs' method, and avoiding closures/lambdas ensures fast execution and deterministic behavior.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+M_PAIRS = len(PAIR_I)
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    diff = centers[PAIR_I] - centers[PAIR_J]
+    dists = np.hypot(diff[:, 0], diff[:, 1])
+    
+    A_ub = np.zeros((M_PAIRS, n))
+    A_ub[np.arange(M_PAIRS), PAIR_I] = 1.0
+    A_ub[np.arange(M_PAIRS), PAIR_J] = 1.0
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=dists, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def obj_joint(v):
+    """Objective for joint SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def cons_joint(v):
+    """Inequality constraints >= 0 for joint SLSQP."""
+    x, y, r = v[:N], v[N:2*N], v[2*N:]
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dr = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    d2 = dx[PAIR_I, PAIR_J]**2 + dy[PAIR_I, PAIR_J]**2
+    rs2 = dr[PAIR_I, PAIR_J]**2
+    c = np.concatenate([c, d2 - rs2])
+    return c
+
+def generate_hex_config(row_counts, r0):
+    """Generates a hexagonal lattice configuration based on row counts."""
+    pts = []
+    y = r0
+    for idx, cnt in enumerate(row_counts):
+        shift = r0 if idx % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N:
+                break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    while len(pts) < N:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    
+    # Diverse hexagonal row distributions for N=26
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 6, 4, 6, 5],
+        [5, 4, 6, 5, 6], [6, 4, 5, 6, 5], [7, 5, 6, 5, 3],
+        [5, 7, 5, 5, 4], [6, 5, 5, 6, 4]
+    ]
+    
+    inits = []
+    for pat in patterns:
+        if sum(pat) < N: continue
+        cfg = generate_hex_config(pat, 0.095)
+        # Normalize to fit comfortably inside [0,1] with margin
+        cfg = (cfg - cfg.min(axis=0)) / (cfg.max(axis=0) - cfg.min(axis=0))
+        cfg = cfg * 0.86 + 0.07
+        inits.append(cfg)
+        for _ in range(3):
+            p = cfg + rng.uniform(-0.02, 0.02, cfg.shape)
+            inits.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(8):
+        inits.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    bounds_j = [(0.0, 1.0)] * (2 * N) + [(1e-6, 0.5)] * N
+    
+    # Phase 1: SLSQP multi-start to find feasible, tight structures
+    for cfg in inits:
+        r_init, _ = solve_lp_radii(cfg)
+        if r_init is None:
+            r_init = np.full(N, 0.06)
+        v0 = np.concatenate([cfg.flatten(), r_init])
+        
+        try:
+            res = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_j,
+                           constraints={'type': 'ineq', 'fun': cons_joint},
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            if np.isfinite(res.fun):
+                cx, cy = res.x[:N], res.x[N:2*N]
+                c_opt = np.column_stack((cx, cy))
+                r_lp, s_lp = solve_lp_radii(c_opt)
+                if r_lp is not None and s_lp > best_sum:
+                    best_sum = s_lp
+                    best_c = c_opt.copy()
+                    best_r = r_lp.copy()
+        except Exception:
+            pass
+            
+    # Fallback if Phase 1 fails
+    if best_c is None:
+        best_c = inits[0]
+        best_r, best_sum = solve_lp_radii(best_c)
+        
+    # Phase 2: LP-driven Jiggle Search (Stochastic Hill-Climbing)
+    # Directly maximizes the LP sum of radii by perturbing centers
+    curr_c = best_c.copy()
+    curr_r = best_r.copy()
+    curr_s = best_sum
+    step = 0.025
+    
+    for it in range(5000):
+        idx = rng.integers(N)
+        old = curr_c[idx].copy()
+        move = rng.uniform(-step, step, 2)
+        new_pos = np.clip(curr_c[idx] + move, 1e-4, 1.0 - 1e-4)
+        curr_c[idx] = new_pos
+        
+        r_try, s_try = solve_lp_radii(curr_c)
+        if r_try is not None and s_try > curr_s + 1e-9:
+            curr_s = s_try
+            curr_r = r_try.copy()
+            if curr_s > best_sum:
+                best_sum = curr_s
+                best_c = curr_c.copy()
+                best_r = curr_r.copy()
+            step *= 1.002  # Slightly increase step on success
+        else:
+            curr_c[idx] = old
+            step *= 0.996  # Slowly decay step on failure
+            
+        # Occasional global perturbation to escape deep local minima
+        if it % 800 == 0 and step < 0.005:
+            step = 0.015
+            
+    # Phase 3: Final SLSQP Joint Polish
+    v0_pol = np.concatenate([best_c.flatten(), best_r])
+    try:
+        res_pol = minimize(obj_joint, v0_pol, method='SLSQP', bounds=bounds_j,
+                           constraints={'type': 'ineq', 'fun': cons_joint},
+                           options={'maxiter': 5000, 'ftol': 1e-14})
+        if np.isfinite(res_pol.fun):
+            cx_p, cy_p = res_pol.x[:N], res_pol.x[N:2*N]
+            c_pol = np.column_stack((cx_p, cy_p))
+            r_pol, s_pol = solve_lp_radii(c_pol)
+            if r_pol is not None and s_pol > best_sum:
+                best_sum = s_pol
+                best_c = c_pol.copy()
+                best_r = r_pol.copy()
+    except Exception:
+        pass
+        
+    # Phase 4: Strict safety scaling to guarantee 1e-12 tolerance validity
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_c[i,0] - best_c[j,0], best_c[i,1] - best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    # Apply conservative margin
+    best_r *= scale * 0.9999999
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

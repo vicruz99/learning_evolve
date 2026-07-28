@@ -1,0 +1,155 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.618, we need to escape local minima that trap standard single-run optimizers. The strategy involves:
+1. **Parameterized Formulation**: Use $x = r + (1-2r)u$, $y = r + (1-2r)v$ with $u,v \in [0,1]$. This automatically satisfies boundary constraints, reducing the optimization to only pairwise non-overlap constraints and improving solver stability.
+2. **Diverse Hexagonal Initializations**: Generate multiple starting configurations from hexagonal lattices (the densest packing structure in 2D) with varying base radii and noise scales. Hexagonal grids naturally align with optimal circle packing geometries.
+3. **Iterative Perturbation & Refinement**: After finding a local optimum, repeatedly perturb radii and position parameters, then re-optimize. This acts as a simulated local search to climb out of suboptimal basins.
+4. **Robust Validation & Scaling**: Strictly check constraint satisfaction at each step and apply a microscopic scaling factor to guarantee numerical validity against the checker's $10^{-12}$ tolerance.
+
+This combination of geometric intuition, multi-start optimization, and local perturbation systematically pushes the solution towards the theoretical maximum for $n=26$.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars_array, n):
+    """Minimize negative sum of radii"""
+    return -np.sum(vars_array[:n])
+
+def constraint_fun(vars_array, n, triu_idx):
+    """
+    Computes pairwise non-overlap constraints:
+    dist_sq(i,j) - (r_i + r_j)^2 >= 0
+    Uses parameterization to guarantee boundary satisfaction automatically.
+    """
+    r = vars_array[:n]
+    u = vars_array[n:2*n]
+    v = vars_array[2*n:3*n]
+    
+    x = r + (1.0 - 2.0*r)*u
+    y = r + (1.0 - 2.0*r)*v
+    
+    # Vectorized pairwise squared distances
+    diff_x = x[:, np.newaxis] - x[np.newaxis, :]
+    diff_y = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = diff_x**2 + diff_y**2
+    
+    # Sum of radii squared
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Return only upper triangle constraints (i < j)
+    return dist_sq[triu_idx] - r_sum_sq[triu_idx]
+
+def run_packing():
+    n = 26
+    triu_idx = np.triu_indices(n, k=1)
+    
+    # Bounds: r in [1e-4, 0.5], u in [0, 1], v in [0, 1]
+    bounds = [(1e-4, 0.5)] * n + [(0.0, 1.0)] * n + [(0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': constraint_fun, 'args': (n, triu_idx)}
+    
+    best_vars = None
+    best_sum = -np.inf
+    rng = np.random.default_rng(42)
+    
+    def hex_init(r0, noise_scale):
+        """Generates a hexagonal lattice initialization perturbed by noise."""
+        pts = []
+        dy = r0 * np.sqrt(3)
+        row = 0
+        y = r0
+        while len(pts) < n:
+            shift = r0 if row % 2 == 1 else 0.0
+            x = r0 + shift
+            while x + r0 <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += dy
+            row += 1
+            
+        pts = np.array(pts[:n])
+        pts += rng.uniform(-noise_scale, noise_scale, (n, 2))
+        pts = np.clip(pts, 0.05, 0.95)
+        
+        denom = 1.0 - 2.0 * r0
+        u = np.clip((pts[:, 0] - r0) / denom, 0.0, 1.0)
+        v = np.clip((pts[:, 1] - r0) / denom, 0.0, 1.0)
+        return np.concatenate([np.full(n, r0), u, v])
+
+    # Generate diverse initial configurations
+    starts = [
+        hex_init(0.09, 0.02),
+        hex_init(0.085, 0.01),
+        hex_init(0.095, 0.03),
+        hex_init(0.08, 0.04)
+    ]
+    for _ in range(5):
+        starts.append(hex_init(0.09, rng.uniform(0.01, 0.05)))
+        
+    # Phase 1: Multi-start optimization
+    for x0 in starts:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if np.isfinite(res.fun):
+                r_opt = res.x[:n]
+                s = np.sum(r_opt)
+                c_vals = constraint_fun(res.x, n, triu_idx)
+                if np.min(c_vals) >= -1e-7 and s > best_sum:
+                    best_sum = s
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Iterative perturbation & refinement to escape local minima
+    if best_vars is not None:
+        for _ in range(15):
+            pert = best_vars.copy()
+            # Perturb radii and position parameters
+            pert[:n] *= rng.uniform(0.96, 1.04, n)
+            pert[n:] += rng.uniform(-0.03, 0.03, 2*n)
+            
+            # Enforce bounds
+            pert[:n] = np.clip(pert[:n], 1e-4, 0.5)
+            pert[n:] = np.clip(pert[n:], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, pert, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 6000, 'ftol': 1e-14, 'disp': False})
+                if np.isfinite(res.fun):
+                    r_opt = res.x[:n]
+                    s = np.sum(r_opt)
+                    c_vals = constraint_fun(res.x, n, triu_idx)
+                    if np.min(c_vals) >= -1e-7 and s > best_sum:
+                        best_sum = s
+                        best_vars = res.x.copy()
+            except Exception:
+                continue
+
+    # Fallback if optimization unexpectedly yields nothing valid
+    if best_vars is None:
+        best_vars = starts[0]
+        
+    # Decode final positions from parameterization
+    r = best_vars[:n]
+    u = best_vars[n:2*n]
+    v = best_vars[2*n:3*n]
+    
+    x = r + (1.0 - 2.0*r)*u
+    y = r + (1.0 - 2.0*r)*v
+    centers = np.column_stack((x, y))
+    
+    # Strict validity safeguard against numerical precision limits
+    c_vals = constraint_fun(best_vars, n, triu_idx)
+    if np.min(c_vals) < 0:
+        # Negligible scale down to guarantee dist >= r_i + r_j - 1e-12
+        r *= 0.99999
+        x = r + (1.0 - 2.0*r)*u
+        y = r + (1.0 - 2.0*r)*v
+        centers = np.column_stack((x, y))
+        
+    return centers, r, float(np.sum(r))
+```

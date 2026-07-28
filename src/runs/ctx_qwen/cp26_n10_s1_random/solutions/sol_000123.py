@@ -1,0 +1,166 @@
+# sol_000123 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000066 (state 7dd8b726) state=90e3970d sum of radii=2.634292 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(vars_array):
+    """Minimize negative sum of radii => Maximize sum of radii"""
+    return -np.sum(vars_array[:N_CIRCLES])
+
+def constraints(vars_array):
+    """Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2"""
+    r = vars_array[:N_CIRCLES]
+    u = vars_array[N_CIRCLES:2*N_CIRCLES]
+    v = vars_array[2*N_CIRCLES:3*N_CIRCLES]
+    
+    # Parameterization automatically satisfies boundary constraints:
+    # x = r + (1-2r)*u  =>  r <= x <= 1-r when u in [0,1]
+    x = r + (1.0 - 2.0 * r) * u
+    y = r + (1.0 - 2.0 * r) * v
+    
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    d2 = dx**2 + dy**2
+    
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    return d2[TRIU_IDX] - rs[TRIU_IDX]**2
+
+def centers_to_vars(centers, r_init):
+    """Convert center coordinates to parameterized variables"""
+    r = np.full(N_CIRCLES, r_init)
+    denom = 1.0 - 2.0 * r
+    u = np.clip((centers[:, 0] - r) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / denom, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def generate_inits(rng):
+    """Generate diverse initial configurations"""
+    inits = []
+    
+    # 1. Hexagonal lattices with various densities and rotations
+    for r0 in [0.08, 0.09, 0.10]:
+        for rot in [0.0, 0.1, 0.2, 0.35, 0.5]:
+            pts = []
+            y = r0
+            row = 0
+            while len(pts) < N_CIRCLES + 10:
+                shift = r0 if row % 2 == 1 else 0.0
+                x = r0 + shift
+                while x + r0 <= 1.0:
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+                row += 1
+            pts = np.array(pts[:N_CIRCLES])
+            if rot != 0.0:
+                cos_t, sin_t = np.cos(rot), np.sin(rot)
+                pts = pts @ np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+                pts -= pts.min(axis=0)
+                pts /= pts.max(axis=0)
+                pts = pts * 0.85 + 0.075
+            inits.append(centers_to_vars(pts, r0))
+            
+    # 2. Grid patterns
+    for r0 in [0.08, 0.095]:
+        gx = np.linspace(r0, 1-r0, 5)
+        gy = np.linspace(r0, 1-r0, 5)
+        pts = np.array([(x, y) for y in gy for x in gx])
+        pts = np.vstack([pts, [0.5, 0.5]])
+        inits.append(centers_to_vars(pts, r0))
+        
+    # 3. Random dense starts
+    for _ in range(6):
+        r0 = 0.085
+        c = np.clip(rng.uniform(0.1, 0.9, (N_CIRCLES, 2)), r0, 1-r0)
+        inits.append(centers_to_vars(c, r0))
+        
+    return inits
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    bounds = [(1e-5, 0.5)] * N_CIRCLES + [(0.0, 1.0)] * N_CIRCLES + [(0.0, 1.0)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    inits = generate_inits(rng)
+    
+    # Phase 1: Initial optimizations from diverse starts
+    for x0 in inits:
+        x0_pert = x0.copy()
+        x0_pert[:N_CIRCLES] *= rng.uniform(0.95, 1.05, N_CIRCLES)
+        x0_pert[N_CIRCLES:] += rng.uniform(-0.015, 0.015, 2*N_CIRCLES)
+        x0_pert = np.clip(x0_pert, [1e-5]*N_CIRCLES + [0.0]*(2*N_CIRCLES), [0.5]*N_CIRCLES + [1.0]*(2*N_CIRCLES))
+        
+        try:
+            res = minimize(objective, x0_pert, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_vals = constraints(res.x)
+                if np.min(c_vals) > -1e-5:
+                    s = -res.fun
+                    if s > best_sum:
+                        best_sum = s
+                        best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Iterative refinement of the best solution found
+    if best_vars is not None:
+        current_vars = best_vars.copy()
+        for _ in range(12):
+            xp = current_vars.copy()
+            xp[:N_CIRCLES] *= rng.uniform(0.97, 1.03, N_CIRCLES)
+            xp[N_CIRCLES:] += rng.uniform(-0.01, 0.01, 2*N_CIRCLES)
+            xp = np.clip(xp, [1e-5]*N_CIRCLES + [0.0]*(2*N_CIRCLES), [0.5]*N_CIRCLES + [1.0]*(2*N_CIRCLES))
+            
+            try:
+                res = minimize(objective, xp, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13})
+                if np.isfinite(res.fun):
+                    c_vals = constraints(res.x)
+                    if np.min(c_vals) > -1e-5:
+                        s = -res.fun
+                        if s > best_sum:
+                            best_sum = s
+                            best_vars = res.x.copy()
+                            current_vars = best_vars.copy()
+            except Exception:
+                pass
+                
+    if best_vars is None:
+        best_vars = inits[0]
+        
+    # Decode parameters to final centers and radii
+    r_out = best_vars[:N_CIRCLES]
+    u_out = best_vars[N_CIRCLES:2*N_CIRCLES]
+    v_out = best_vars[2*N_CIRCLES:3*N_CIRCLES]
+    
+    x_out = r_out + (1.0 - 2.0 * r_out) * u_out
+    y_out = r_out + (1.0 - 2.0 * r_out) * v_out
+    centers_out = np.column_stack((x_out, y_out))
+    
+    # Strict safety scaling to guarantee numerical validity
+    scale = 1.0
+    c_vals = constraints(best_vars)
+    if np.min(c_vals) < -1e-9:
+        for i in range(N_CIRCLES):
+            for j in range(i+1, N_CIRCLES):
+                d = np.linalg.norm(centers_out[i] - centers_out[j])
+                rs = r_out[i] + r_out[j]
+                if d < rs:
+                    scale = min(scale, d / rs)
+        r_out *= scale * 0.999998
+        x_out = r_out + (1.0 - 2.0 * r_out) * u_out
+        y_out = r_out + (1.0 - 2.0 * r_out) * v_out
+        centers_out = np.column_stack((x_out, y_out))
+        
+    return centers_out, r_out, float(np.sum(r_out))

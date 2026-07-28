@@ -1,0 +1,167 @@
+
+
+<strategy>
+To bridge the tiny gap to 2.636, we need a highly robust multi-phase optimization strategy:
+1. **Fast LP Radius Solver**: Given fixed centers, the optimal radii can be found via Linear Programming. We vectorize the constraint matrix construction for maximum speed.
+2. **Phase 1 (Joint SLSQP)**: Initialize from diverse hexagonal lattice patterns and random seeds. Use SLSQP to jointly optimize centers and radii with squared-distance constraints to quickly find a high-quality feasible basin.
+3. **Phase 2 (Center-only L-BFGS-B)**: Fix radii optimization to the LP solver and use L-BFGS-B to perturb and optimize only the center coordinates. This decouples the non-convex center placement from the linear radius sizing, allowing tighter packing. We run many trials with decaying perturbation scales.
+4. **Phase 3 (Coordinate Ascent)**: Iteratively optimize each circle's position one-by-one using Nelder-Mead while evaluating the LP sum. This often escapes shallow local minima that gradient methods miss.
+5. **Safety Scaling**: Apply a strict numerical safety factor to guarantee the packing passes the `1e-12` tolerance check in the validator.
+All helper functions are defined at the top level to avoid closures, complying with the rules.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+TRI_I, TRI_J = np.triu_indices(N_CIRCLES, k=1)
+M_CONST = len(TRI_I)
+A_PAIRWISE = np.zeros((M_CONST, N_CIRCLES))
+A_PAIRWISE[np.arange(M_CONST), TRI_I] = 1.0
+A_PAIRWISE[np.arange(M_CONST), TRI_J] = 1.0
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, l) for l in lims]
+    
+    dx = centers[:, 0, None] - centers[:, 0][None, :]
+    dy = centers[:, 1, None] - centers[:, 1][None, :]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    b_ub = dists[TRI_I, TRI_J]
+    
+    try:
+        res = linprog(-np.ones(N_CIRCLES), A_ub=A_PAIRWISE, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def neg_lp_sum(x, shape):
+    """Objective for L-BFGS-B: negative sum of radii from LP."""
+    c = x.reshape(shape)
+    _, s = solve_lp_radii(c)
+    return -s
+
+def obj_i_wrapper(centers, idx, xi):
+    """Objective for coordinate ascent: negative LP sum after moving circle idx."""
+    c = centers.copy()
+    c[idx] = xi
+    _, s = solve_lp_radii(c)
+    return -s
+
+def joint_obj(v):
+    return -np.sum(v[2 * N_CIRCLES:])
+
+def joint_cons(v):
+    cx, cy, r = v[:N_CIRCLES], v[N_CIRCLES:2 * N_CIRCLES], v[2 * N_CIRCLES:]
+    c = list(cx - r) + list(1.0 - cx - r) + list(cy - r) + list(1.0 - cy - r)
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dr = r[:, None] + r[None, :]
+    c.extend((dx[TRI_I, TRI_J]**2 + dy[TRI_I, TRI_J]**2) - dr[TRI_I, TRI_J]**2)
+    return np.array(c)
+
+def make_hex(rows, r0):
+    """Generates hexagonal lattice initialization."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(rows):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N_CIRCLES: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    while len(pts) < N_CIRCLES:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:N_CIRCLES])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    pats = [[5,6,5,6,4], [6,5,6,5,4], [5,5,6,5,5], [4,6,6,6,4], [5,7,5,5,4], [6,6,5,5,4]]
+    inits = []
+    for p in pats:
+        if sum(p) >= N_CIRCLES:
+            inits.append(make_hex(p, 0.095))
+    for _ in range(15):
+        inits.append(rng.uniform(0.15, 0.85, (N_CIRCLES, 2)))
+        
+    bnd_j = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(1e-5, 0.5)] * N_CIRCLES
+    
+    # Phase 1: Joint SLSQP
+    for cfg in inits:
+        v0 = np.concatenate([cfg[:, 0], cfg[:, 1], np.full(N_CIRCLES, 0.09)])
+        try:
+            res = minimize(joint_obj, v0, method='SLSQP', bounds=bnd_j, 
+                           constraints={'type': 'ineq', 'fun': joint_cons}, 
+                           options={'maxiter': 2000, 'ftol': 1e-12})
+            co = np.column_stack((res.x[:N_CIRCLES], res.x[N_CIRCLES:2 * N_CIRCLES]))
+            rl, sl = solve_lp_radii(co)
+            if rl is not None and sl > best_sum:
+                best_sum = sl
+                best_c = co.copy()
+                best_r = rl.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: L-BFGS-B on centers
+    bnd_c = [(0.02, 0.98)] * (2 * N_CIRCLES)
+    for trial in range(40):
+        if best_c is None: break
+        sc = 0.006 * (0.92 ** trial)
+        cp = best_c + rng.normal(0, sc, best_c.shape)
+        cp = np.clip(cp, 0.02, 0.98)
+        try:
+            res = minimize(neg_lp_sum, cp.flatten(), args=(best_c.shape,), method='L-BFGS-B', 
+                           bounds=bnd_c, options={'maxiter': 300, 'ftol': 1e-14})
+            co = res.x.reshape(N_CIRCLES, 2)
+            rl, sl = solve_lp_radii(co)
+            if rl is not None and sl > best_sum:
+                best_sum = sl
+                best_c = co.copy()
+                best_r = rl.copy()
+        except Exception:
+            pass
+            
+    # Phase 3: Coordinate Ascent
+    if best_c is not None:
+        for _ in range(3):
+            for i in range(N_CIRCLES):
+                res_i = minimize(obj_i_wrapper, best_c[i], args=(best_c, i,), 
+                                 method='Nelder-Mead', options={'maxiter': 150, 'xatol': 1e-6, 'fatol': 1e-9})
+                if -res_i.fun > 0:
+                    best_c[i] = res_i.x
+            rl, sl = solve_lp_radii(best_c)
+            if rl is not None and sl > best_sum:
+                best_sum = sl
+                best_r = rl.copy()
+                
+    # Final Safety Scaling
+    sc = 1.0
+    for i in range(N_CIRCLES):
+        x, y, r = best_c[i]
+        if r > 1e-12:
+            sc = min(sc, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                sc = min(sc, d / rs)
+                
+    best_r *= sc * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

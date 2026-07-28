@@ -1,0 +1,207 @@
+
+
+<strategy>
+To improve the packing sum beyond 2.630 towards the target of 2.636, we recognize that dense circle packings in a square are heavily influenced by hexagonal lattice structures. The current approach uses SLSQP joint optimization followed by LP, which is good but can get trapped in local minima due to the high number of non-convex constraints.
+
+Key improvements implemented:
+1. **Clearance Maximization Pre-optimization**: Instead of jointly optimizing centers and radii directly, we first optimize centers to maximize the *minimum clearance* (distance to walls and half the pairwise distance). This treats the problem as a maximin equal-radius packing, which has a smoother objective landscape and reliably finds dense configurations. Nelder-Mead is used here for robustness.
+2. **Exact LP Refinement**: Once centers are densely packed, we solve a Linear Program to maximize $\sum r_i$ exactly for those fixed centers. This decouples the difficult non-convex geometry problem from the radius assignment, which is linear.
+3. **Diverse Hexagonal Initialization**: We generate multiple row patterns known to be near-optimal for N=26 (e.g., 5-6-5-6-4, 6-5-6-5-4), scale them to tightly fit the unit square, and add controlled noise to break symmetry.
+4. **Adaptive Hill Climbing**: After finding the best configuration, we run a stochastic hill-climbing algorithm that perturbs individual circle centers and re-evaluates the LP objective. The step size decays exponentially to fine-tune positions.
+5. **Strict Numerical Safety**: A final global scaling step ensures all constraints strictly satisfy the `1e-12` tolerance in the validation function.
+
+This strategy leverages the geometric intuition that optimal packings are hexagonal-like, uses robust local search for centers, and exact linear programming for radii, consistently pushing past previous local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_lp(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    A_ub_list = []
+    b_ub_list = []
+    
+    # Boundary constraints: r_i <= x, 1-x, y, 1-y
+    for i in range(n):
+        x, y = centers[i]
+        lims = (x, 1.0 - x, y, 1.0 - y)
+        for lim in lims:
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub_list.append(row)
+            b_ub_list.append(lim)
+            
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub_list.append(row)
+            b_ub_list.append(d)
+            
+    A_ub = np.array(A_ub_list)
+    b_ub = np.array(b_ub_list)
+    bounds = [(0.0, None)] * n
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 1e-6 * n
+
+def compute_clearance(x_flat, n):
+    """Objective for center optimization: maximize minimum clearance."""
+    centers = x_flat.reshape(n, 2)
+    c = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(c**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_pairwise = np.min(dists) / 2.0
+    
+    d_wall = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    min_wall = np.min(d_wall)
+    
+    # Return negative because we are minimizing
+    return -min(min_pairwise, min_wall)
+
+def optimize_clearance(init_centers, n):
+    """Uses Nelder-Mead to find centers that maximize minimum clearance."""
+    res = minimize(compute_clearance, init_centers.flatten(), args=(n,), 
+                   method='Nelder-Mead', options={'maxiter': 12000, 'xatol': 1e-10, 'fatol': 1e-13})
+    return res.x.reshape(n, 2)
+
+def hex_init(pattern, r0=0.1):
+    """Generates points on a hexagonal lattice based on row counts."""
+    pts = []
+    y = r0
+    row_idx = 0
+    for count in pattern:
+        shift = r0 if row_idx % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(count):
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+        row_idx += 1
+    return np.array(pts)
+
+def scale_and_center(pts, margin=0.05):
+    """Scales a set of points to fit within [margin, 1-margin]x[margin, 1-margin]."""
+    if pts.size == 0:
+        return np.zeros((26, 2))
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    spread = mx - mn
+    if spread.max() < 1e-9:
+        return pts
+    scale = (1.0 - 2.0 * margin) / spread.max()
+    pts_scaled = (pts - mn) * scale
+    offset = (1.0 - spread * scale) / 2.0
+    return pts_scaled + offset
+
+def hill_climb_lp(centers, n, rng):
+    """Stochastic refinement: perturb centers and re-evaluate LP sum of radii."""
+    curr_centers = centers.copy()
+    curr_radii, curr_sum = solve_lp(curr_centers)
+    
+    for step in range(3500):
+        i = rng.integers(n)
+        old_pos = curr_centers[i].copy()
+        # Exponentially decaying step size for fine-tuning
+        step_size = 0.025 * np.exp(-step / 900.0)
+        curr_centers[i] += rng.uniform(-step_size, step_size, 2)
+        curr_centers[i] = np.clip(curr_centers[i], 0.02, 0.98)
+        
+        r_new, s_new = solve_lp(curr_centers)
+        if s_new > curr_sum + 1e-10:
+            curr_sum = s_new
+            curr_radii = r_new
+        else:
+            curr_centers[i] = old_pos
+            
+    return curr_centers, curr_radii, curr_sum
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # Row patterns known to produce dense packings for N=26
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 6, 6, 5, 4],
+        [5, 5, 5, 5, 5, 1], [6, 4, 6, 6, 4], [5, 7, 4, 6, 4]
+    ]
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Hex lattice starts -> Clearance Optimization -> LP Refinement
+    for pat in patterns:
+        base = hex_init(pat, 0.1)
+        # Ensure we have at least n points
+        while len(base) < n:
+            base = np.vstack([base, [0.5, 0.5]])
+        base = base[:n]
+        
+        for _ in range(5):
+            pts = scale_and_center(base, margin=0.07)
+            pts = pts + rng.uniform(-0.018, 0.018, pts.shape)
+            pts = np.clip(pts, 0.04, 0.96)
+            
+            opt_pts = optimize_clearance(pts, n)
+            r_lp, s_lp = solve_lp(opt_pts)
+            
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_centers = opt_pts.copy()
+                best_radii = r_lp.copy()
+                
+    # Phase 2: Random dense starts to escape lattice symmetries
+    for _ in range(20):
+        pts = rng.uniform(0.18, 0.82, (n, 2))
+        opt_pts = optimize_clearance(pts, n)
+        r_lp, s_lp = solve_lp(opt_pts)
+        if s_lp > best_sum:
+            best_sum = s_lp
+            best_centers = opt_pts.copy()
+            best_radii = r_lp.copy()
+            
+    # Phase 3: Adaptive Hill Climbing on the best configuration
+    if best_centers is not None:
+        best_centers, best_radii, best_sum = hill_climb_lp(best_centers, n, rng)
+        
+    # Fallback configuration (highly unlikely to be reached)
+    if best_centers is None:
+        best_centers = scale_and_center(hex_init([5, 6, 5, 6, 4], 0.1))
+        best_radii = np.full(n, 0.09)
+        best_sum = np.sum(best_radii)
+        
+    # Phase 4: Strict numerical safety scaling
+    # Ensures dist >= r_i + r_j - 1e-12 and boundaries are respected
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

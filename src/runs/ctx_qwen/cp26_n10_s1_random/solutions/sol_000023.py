@@ -1,0 +1,220 @@
+# sol_000023 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state cd0e5d1c) state=a0bd1c70 sum of radii=2.040044 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import random
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+def get_overlap_penalty(centers, radii):
+    """
+    Calculate a penalty score for overlaps and boundary violations.
+    Higher penalty means worse packing.
+    """
+    n = centers.shape[0]
+    penalty = 0.0
+    
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if r < 0: r = 0
+        # Penalties for being outside [0,1]
+        if x - r < 0: penalty += 100 * (x - r)**2
+        if x + r > 1: penalty += 100 * (x + r - 1)**2
+        if y - r < 0: penalty += 100 * (y - r)**2
+        if y + r > 1: penalty += 100 * (y + r - 1)**2
+        
+        # Negative radius penalty
+        if r < 0: penalty += 1000 * r**2
+
+    # Overlap constraints
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            sum_r = radii[i] + radii[j]
+            if dist < sum_r:
+                # Quadratic penalty for overlap
+                penalty += 100 * (sum_r - dist)**2
+                
+    return penalty
+
+def optimize_packing(seed=0):
+    np.random.seed(seed)
+    n = 26
+    
+    # Initialization: Hexagonal-like grid
+    # 5 rows of 5 or 6 circles? 5x5 is 25. Let's try a perturbed grid.
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.05
+    
+    # Place in a dense pattern
+    idx = 0
+    rows = 6
+    # Distribute 26 circles into rows: 5, 5, 5, 5, 5, 1
+    # Or better, a more hexagonal distribution
+    # Let's just place them in a 5x5 grid and one in the middle of the last row
+    # Actually, a 5x5 grid has radius 0.1. Let's start there.
+    # 5 columns, 5 rows.
+    # Centers: 0.1, 0.3, 0.5, 0.7, 0.9
+    
+    # Create 5x5 grid
+    coords = []
+    for r in range(5):
+        for c in range(5):
+            x = 0.1 + c * 0.2
+            y = 0.1 + r * 0.2
+            coords.append([x, y])
+    
+    # Add 1 more circle. Maybe in a gap or slightly outside grid.
+    # Let's add one at (0.5, 0.5) which is occupied? No, grid has (0.5,0.5).
+    # Let's put the 26th circle at (0.0, 0.5) -> needs radius 0.0? No.
+    # Let's perturb the grid to make space.
+    
+    # Better init: Random dense packing
+    centers = np.random.rand(n, 2)
+    # Scale to be somewhat inside
+    centers = 0.1 + centers * 0.8 
+    radii = np.ones(n) * 0.08
+    
+    # Optimization using a custom loop (Gradient-free or simple descent)
+    # We want to maximize sum(radii) -> minimize -sum(radii)
+    # Subject to constraints. We use a penalty method.
+    
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    # Use Powell or Nelder-Mead? Nelder-Mead is good for non-smooth but slow in high dim.
+    # Let's try a iterative relaxation approach.
+    
+    best_sum = 0
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    # Relaxation loop
+    for _ in range(50): # Iterations
+        # Try to expand radii
+        for i in range(n):
+            # Calculate min distance to boundaries and other circles
+            min_dist = 1.0
+            
+            # Boundaries
+            min_dist = min(min_dist, centers[i][0], 1 - centers[i][0], centers[i][1], 1 - centers[i][1])
+            
+            # Other circles
+            for j in range(n):
+                if i == j: continue
+                dist = np.linalg.norm(centers[i] - centers[j])
+                # Available space for circle i given circle j's radius
+                # dist - radii[j]
+                avail = dist - radii[j]
+                if avail < min_dist:
+                    min_dist = avail
+            
+            # We want to set radii[i] as large as possible.
+            # But changing radii affects others.
+            # Let's just push it slightly towards min_dist
+            target_r = max(0, min_dist)
+            # Smooth update
+            radii[i] = radii[i] * 0.9 + target_r * 0.1
+            
+        # Repulsion step to fix overlaps and allow growth
+        # Simple force-directed repulsion
+        for _ in range(20):
+            forces = np.zeros_like(centers)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    diff = centers[i] - centers[j]
+                    dist = np.linalg.norm(diff)
+                    if dist == 0: dist = 1e-6
+                    required_dist = radii[i] + radii[j]
+                    if dist < required_dist:
+                        # Repulsive force proportional to overlap
+                        overlap = required_dist - dist
+                        force_mag = overlap * 10.0 # Strong repulsion
+                        direction = diff / dist
+                        forces[i] += direction * force_mag
+                        forces[j] -= direction * force_mag
+            
+            centers += forces * 0.01
+            
+            # Clamp centers to [0,1] roughly (allow soft boundary for now)
+            # But strictly, we need to push back if out
+            for i in range(n):
+                r = radii[i]
+                if centers[i][0] < r: centers[i][0] = r
+                if centers[i][0] > 1 - r: centers[i][0] = 1 - r
+                if centers[i][1] < r: centers[i][1] = r
+                if centers[i][1] > 1 - r: centers[i][1] = 1 - r
+
+        curr_sum = np.sum(radii)
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            
+    return best_centers, best_radii, best_sum
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # Run multiple optimizations with different seeds to find the best one
+    final_centers = None
+    final_radii = None
+    max_sum = 0.0
+    
+    for seed in range(5):
+        c, r, s = optimize_packing(seed)
+        if s > max_sum:
+            max_sum = s
+            final_centers = c
+            final_radii = r
+            
+    # Ensure non-negativity and cleanup
+    final_radii = np.maximum(final_radii, 0)
+    
+    # Final validation check
+    if not validate_packing(final_centers, final_radii):
+        # If invalid, fallback to a safe grid packing
+        # 5x5 grid with one small circle?
+        # But we need 26 circles.
+        # Let's create a dense valid packing manually as fallback
+        centers_fb = []
+        radii_fb = []
+        
+        # 5x5 grid of 0.09 radius circles (fits easily)
+        for r in range(5):
+            for c in range(5):
+                centers_fb.append([0.15 + c * 0.175, 0.15 + r * 0.175])
+                radii_fb.append(0.08) # 0.08 fits in 0.175 spacing (0.175 > 0.16)
+                
+        # Add 1 more circle in a gap
+        # Gap between (0.15, 0.15) and (0.325, 0.15)... center at (0.2375, 0.2375)
+        centers_fb.append([0.2375, 0.2375])
+        radii_fb.append(0.03)
+        
+        final_centers = np.array(centers_fb)
+        final_radii = np.array(radii_fb)
+        max_sum = np.sum(final_radii)
+
+    return final_centers, final_radii, max_sum

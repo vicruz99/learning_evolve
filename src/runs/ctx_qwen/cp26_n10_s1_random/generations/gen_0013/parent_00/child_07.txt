@@ -1,0 +1,201 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.627, I will implement a more robust multi-phase optimization pipeline:
+
+1. **Diverse Initialization**: Generate hexagonal lattice patterns with varying row distributions, scale/center them properly, and add random perturbations. This ensures coverage of different topological basins.
+2. **LP-Driven Feasibility**: Before any nonlinear optimization, compute exact maximum radii via Linear Programming (`scipy.optimize.linprog`) for given centers. This guarantees a strictly feasible starting point with high initial sum.
+3. **SLSQP Joint Optimization**: Use `scipy.optimize.minimize` with SLSQP to jointly optimize centers and radii. Squared distance constraints (`dx^2 + dy^2 - (r_i+r_j)^2 >= 0`) provide smooth gradients. Multiple restarts per configuration help escape local minima.
+4. **Adaptive Local Search**: After SLSQP converges, run a coordinate-style local search on centers. Random subsets of circles (1-3 at a time) are perturbed, and the LP is re-evaluated. Step size adapts based on improvement rate. This phase is highly effective at squeezing out extra sum from the LP landscape.
+5. **Shake & Refine Loop**: Perturb the best configuration slightly and re-run local search to probe neighboring basins.
+6. **Strict Safety Scaling**: Finally, compute the exact violation ratio against boundaries and pairwise distances, and scale radii down by a tiny margin to guarantee strict `1e-12` validation compliance.
+
+This approach leverages the speed of LP for radius extraction, the gradient-following strength of SLSQP for joint geometry/radius refinement, and the rugged-landscape traversal of adaptive local search.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+_N = 26
+_TRIU_I, _TRIU_J = np.triu_indices(_N, k=1)
+_NUM_PAIRS = len(_TRIU_I)
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    
+    A = np.zeros((_NUM_PAIRS, _N))
+    A[np.arange(_NUM_PAIRS), _TRIU_I] = 1.0
+    A[np.arange(_NUM_PAIRS), _TRIU_J] = 1.0
+    
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b = dists[_TRIU_I, _TRIU_J]
+    
+    bounds = [(0.0, lims[i]) for i in range(_N)]
+    c_obj = -np.ones(_N)
+    
+    try:
+        res = linprog(c_obj, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+        if res.success and np.all(res.x >= -1e-7):
+            return np.maximum(res.x, 0.0), -res.fun
+    except Exception:
+        pass
+    return np.full(_N, 1e-5), 0.0
+
+def obj_slsqp(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2 * _N:])
+
+def cons_slsqp(v):
+    """Inequality constraints >= 0 using squared distances for smooth gradients."""
+    cx = v[:_N]
+    cy = v[_N:2 * _N]
+    r = v[2 * _N:]
+    
+    bc = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    dx = cx[_TRIU_I] - cx[_TRIU_J]
+    dy = cy[_TRIU_I] - cy[_TRIU_J]
+    dr = r[_TRIU_I] + r[_TRIU_J]
+    pc = dx**2 + dy**2 - dr**2
+    return np.concatenate([bc, pc])
+
+def run_slsqp(c0, r0):
+    """Refine centers and radii simultaneously using SLSQP."""
+    v0 = np.concatenate([c0[:, 0], c0[:, 1], r0])
+    bounds = [(0.0, 1.0)] * (2 * _N) + [(1e-6, 0.5)] * _N
+    cons = {'type': 'ineq', 'fun': cons_slsqp}
+    try:
+        res = minimize(obj_slsqp, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                       options={'maxiter': 6000, 'ftol': 1e-14})
+        if np.isfinite(res.fun) and np.min(cons_slsqp(res.x)) > -1e-6:
+            return res.x[:_N], res.x[_N:2 * _N], res.x[2 * _N:]
+    except Exception:
+        pass
+    return c0[:, 0], c0[:, 1], r0
+
+def local_search(c_init, r_init, n_iters=1500):
+    """Adaptive coordinate search on centers maximizing LP sum of radii."""
+    c = c_init.copy()
+    r = r_init.copy()
+    s_best = np.sum(r)
+    step = 0.012
+    
+    for it in range(n_iters):
+        k = np.random.randint(1, 4)
+        idx = np.random.choice(_N, k, replace=False)
+        old_c = c[idx].copy()
+        
+        c[idx] += np.random.uniform(-step, step, (k, 2))
+        c[idx] = np.clip(c[idx], 1e-4, 0.999)
+        
+        r_new, s_new = solve_lp_radii(c)
+        if s_new > s_best + 1e-8:
+            s_best = s_new
+            r = r_new
+            step = min(step * 1.015, 0.035)
+        else:
+            c[idx] = old_c
+            step *= 0.9985
+            
+    return c, r, s_best
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    pats = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 6, 6, 5, 4],
+        [7, 5, 5, 5, 4], [4, 5, 7, 5, 5], [8, 6, 6, 6],
+        [6, 5, 5, 6, 4], [5, 7, 5, 5, 4]
+    ]
+    
+    for pat in pats:
+        if sum(pat) != _N: continue
+        pts = []
+        y = 0.095
+        for i, cnt in enumerate(pat):
+            shift = 0.095 if i % 2 == 1 else 0.0
+            x = 0.095 + shift
+            for _ in range(cnt):
+                if len(pts) >= _N: break
+                pts.append([x, y])
+                x += 0.19
+            y += 0.095 * np.sqrt(3)
+        cfg = np.array(pts[:_N])
+        cfg = (cfg - cfg.min(axis=0)) / (cfg.max(axis=0) - cfg.min(axis=0)) * 0.88 + 0.06
+        starts.append(cfg)
+        
+    for _ in range(5):
+        starts.append(rng.uniform(0.15, 0.85, (_N, 2)))
+        
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    starts = generate_starts(rng)
+    
+    # Phase 1 & 2: SLSQP optimization from diverse starts
+    for s in starts:
+        for _ in range(3):
+            s_p = s + rng.uniform(-0.02, 0.02, s.shape)
+            s_p = np.clip(s_p, 0.05, 0.95)
+            
+            r_lp, _ = solve_lp_radii(s_p)
+            cx, cy, r_pol = run_slsqp(s_p, r_lp)
+            c_pol = np.column_stack((cx, cy))
+            
+            r_final, s_final = solve_lp_radii(c_pol)
+            if s_final > best_sum:
+                best_sum = s_final
+                best_c = c_pol.copy()
+                best_r = r_final.copy()
+                
+    # Phase 3: Local search refinement
+    if best_c is not None:
+        c_ref, r_ref, s_ref = local_search(best_c, best_r)
+        if s_ref > best_sum:
+            best_sum = s_ref
+            best_c = c_ref
+            best_r = r_ref
+            
+        # Phase 4: Shake and refine to escape shallow local minima
+        for _ in range(5):
+            c_shake = best_c + rng.uniform(-0.008, 0.008, best_c.shape)
+            c_shake = np.clip(c_shake, 0.02, 0.98)
+            c_lr, r_lr, s_lr = local_search(c_shake, best_r * 0.95)
+            if s_lr > best_sum:
+                best_sum = s_lr
+                best_c = c_lr
+                best_r = r_lr
+                
+    # Phase 5: Strict Numerical Safety Scaling
+    scale = 1.0
+    for i in range(_N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    for i in range(_N):
+        for j in range(i + 1, _N):
+            d = dists[i, j]
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

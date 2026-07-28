@@ -1,0 +1,225 @@
+
+
+<strategy>
+To improve the packing sum of radii for 26 circles in a unit square, I will employ a multi-phase optimization strategy that combines:
+1. **Diverse High-Quality Initializations**: Generate multiple hexagonal lattice patterns with varying row counts, shifts, and densities, along with random dense starts. This covers different geometric topologies (corner-packed, center-packed, staggered).
+2. **Parameterized SLSQP Optimization**: Use a clever variable transformation `x = r + (1-2r)u`, `y = r + (1-2r)v` where `u,v ∈ [0,1]`. This automatically satisfies boundary constraints (`r ≤ x,y ≤ 1-r`), reducing the problem to optimizing `r, u, v` subject only to pairwise non-overlap `d_ij² ≥ (r_i + r_j)²`. SLSQP handles this smoothly.
+3. **LP-Driven Local Search (Jiggle)**: For fixed centers, the optimal radii are found exactly via a fast Linear Program (`scipy.optimize.linprog` with `method='highs'`). I will run a robust local search on centers that evaluates this LP objective. The step size adapts dynamically, and occasional larger perturbations help escape shallow local minima.
+4. **Iterative Polishing**: After the local search converges, restart SLSQP from the refined configuration to jointly adjust centers and radii, squeezing out the last bits of slack.
+5. **Strict Safety Scaling**: Finally, compute the exact minimum clearance ratio and apply a microscopic margin (`0.999999`) to guarantee strict numerical validity against the `1e-12` checker tolerance.
+
+This approach leverages the exactness of LP for radii given centers, the smoothness of SLSQP for joint geometry, and stochastic jiggle for global exploration, which consistently pushes past standard local optima in circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+triu_i, triu_j = np.triu_indices(N, k=1)
+n_pairs = len(triu_i)
+
+def get_lp_bounds(centers):
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    return [(0.0, max(l, 1e-9)) for l in limits]
+
+def solve_lp_radii(centers):
+    bounds_lp = get_lp_bounds(centers)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    A = np.zeros((n_pairs, N))
+    A[np.arange(n_pairs), triu_i] = 1.0
+    A[np.arange(n_pairs), triu_j] = 1.0
+    b = dists[triu_i, triu_j]
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A, b_ub=b, bounds=bounds_lp, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def compute_slsqp_constraints(vars_arr):
+    r = vars_arr[:N]
+    u = vars_arr[N:2*N]
+    v = vars_arr[2*N:3*N]
+    # Parameterization automatically satisfies boundary constraints
+    x = r + (1.0 - 2.0 * r) * u
+    y = r + (1.0 - 2.0 * r) * v
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    
+    rs = r[:, None] + r[None, :]
+    return d2[triu_i, triu_j] - rs[triu_i, triu_j]**2
+
+def slsqp_objective(vars_arr):
+    return -np.sum(vars_arr[:N])
+
+def centers_to_params(centers):
+    r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    r = np.maximum(r * 0.98, 1e-5)
+    denom = 1.0 - 2.0 * r
+    u = np.clip((centers[:, 0] - r) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / denom, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def params_to_centers(params):
+    r = params[:N]
+    u = params[N:2*N]
+    v = params[2*N:3*N]
+    x = r + (1.0 - 2.0 * r) * u
+    y = r + (1.0 - 2.0 * r) * v
+    return np.column_stack((x, y))
+
+def generate_hex_config(row_counts, r0, shift_frac=0.5):
+    pts = []
+    y = r0
+    for idx, cnt in enumerate(row_counts):
+        shift = r0 * shift_frac if idx % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N:
+                break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_v = [(1e-6, 0.45)] * N + [(0.0, 1.0)] * (2 * N)
+    cons = {'type': 'ineq', 'fun': compute_slsqp_constraints}
+    
+    # 1. Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [4, 6, 6, 6, 4],
+        [5, 5, 6, 5, 5], [6, 6, 5, 5, 4], [5, 4, 6, 5, 6]
+    ]
+    
+    for pat in patterns:
+        for r0 in [0.085, 0.09, 0.095, 0.10]:
+            for sf in [0.0, 0.33, 0.5, 0.66, 1.0]:
+                cfg = generate_hex_config(pat, r0, sf)
+                mn = cfg.min(axis=0)
+                mx = cfg.max(axis=0)
+                span = mx - mn + 1e-9
+                cfg = (cfg - mn) / span * 0.85 + 0.075
+                configs.append(cfg)
+                
+                p = cfg + rng.uniform(-0.02, 0.02, cfg.shape)
+                configs.append(np.clip(p, 0.02, 0.98))
+                
+    for _ in range(12):
+        configs.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    # 2. Phase 1: SLSQP joint optimization from diverse starts
+    for cfg in configs:
+        x0 = centers_to_params(cfg)
+        try:
+            res = minimize(slsqp_objective, x0, method='SLSQP', bounds=bounds_v,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                cvals = compute_slsqp_constraints(res.x)
+                if np.min(cvals) > -1e-6:
+                    c_opt = params_to_centers(res.x)
+                    r_lp, s_lp = solve_lp_radii(c_opt)
+                    if r_lp is not None and s_lp > best_sum:
+                        best_sum = s_lp
+                        best_centers = c_opt.copy()
+                        best_radii = r_lp.copy()
+        except Exception:
+            pass
+            
+    # 3. Phase 2: LP-Driven Local Search (Jiggle) on centers
+    if best_centers is not None:
+        cur_c = best_centers.copy()
+        cur_r = best_radii.copy()
+        cur_s = best_sum
+        
+        step = 0.02
+        for it in range(2500):
+            i = rng.integers(N)
+            old = cur_c[i].copy()
+            
+            # Occasional larger jump to escape local minima
+            if rng.random() < 0.05:
+                move = rng.uniform(-0.06, 0.06, 2)
+            else:
+                move = rng.uniform(-step, step, 2)
+                
+            new_pos = np.clip(cur_c[i] + move, 1e-4, 0.999)
+            cur_c[i] = new_pos
+            
+            r_new, s_new = solve_lp_radii(cur_c)
+            
+            if r_new is not None:
+                if s_new > cur_s:
+                    cur_c[i] = new_pos
+                    cur_r = r_new.copy()
+                    cur_s = s_new
+                    if cur_s > best_sum:
+                        best_sum = cur_s
+                        best_centers = cur_c.copy()
+                        best_radii = cur_r.copy()
+                    step = min(step * 1.05, 0.05)
+                else:
+                    cur_c[i] = old
+                    step *= 0.98
+            else:
+                cur_c[i] = old
+                
+        # 4. Phase 3: Final SLSQP polish from refined jiggle result
+        x0 = centers_to_params(best_centers)
+        try:
+            res = minimize(slsqp_objective, x0, method='SLSQP', bounds=bounds_v,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+            if np.isfinite(res.fun):
+                if np.min(compute_slsqp_constraints(res.x)) > -1e-6:
+                    c_opt = params_to_centers(res.x)
+                    r_lp, s_lp = solve_lp_radii(c_opt)
+                    if r_lp is not None and s_lp > best_sum:
+                        best_sum = s_lp
+                        best_centers = c_opt.copy()
+                        best_radii = r_lp.copy()
+        except Exception:
+            pass
+
+    # Fallback safety net (should not trigger if optimizations work)
+    if best_centers is None:
+        best_centers = generate_hex_config([5, 6, 5, 6, 4], 0.09, 0.5)
+        best_radii = np.full(N, 0.09)
+        best_sum = float(np.sum(best_radii))
+        
+    # 5. Final strict safety scaling to guarantee validation tolerance
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    dx = best_centers[triu_i, 0] - best_centers[triu_j, 0]
+    dy = best_centers[triu_i, 1] - best_centers[triu_j, 1]
+    d = np.sqrt(dx**2 + dy**2)
+    rs = best_radii[triu_i] + best_radii[triu_j]
+    valid_pairs = rs > 1e-12
+    if np.any(valid_pairs):
+        scale = min(scale, np.min(d[valid_pairs] / rs[valid_pairs]))
+        
+    best_radii *= scale * 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

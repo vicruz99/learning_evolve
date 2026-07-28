@@ -1,0 +1,188 @@
+# sol_000235 | problem=circle_packing_26 entrypoint=run_packing
+# generation=8 parent=sol_000142 (state d65765d5) state=4eb9de93 sum of radii=2.622959 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def slsqp_obj(vars, n):
+    """Objective for SLSQP: maximize sum of radii."""
+    return -np.sum(vars[2::3])
+
+def slsqp_cons(vars, n):
+    """Inequality constraints for SLSQP: must be >= 0."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    c = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    
+    diff_x = x[:, np.newaxis] - x[np.newaxis, :]
+    diff_y = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = diff_x**2 + diff_y**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    c.append(dist_sq[mask] - r_sum_sq[mask])
+    return np.concatenate(c)
+
+def penalty_obj(vars, n, mu):
+    """Penalty-based objective for L-BFGS-B."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    pen = np.sum(np.maximum(0.0, r - x)**2)
+    pen += np.sum(np.maximum(0.0, r - (1.0 - x))**2)
+    pen += np.sum(np.maximum(0.0, r - y)**2)
+    pen += np.sum(np.maximum(0.0, r - (1.0 - y))**2)
+    
+    diff_x = x[:, np.newaxis] - x[np.newaxis, :]
+    diff_y = y[:, np.newaxis] - y[np.newaxis, :]
+    dist = np.sqrt(diff_x**2 + diff_y**2)
+    np.fill_diagonal(dist, np.inf)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    overlap = np.maximum(0.0, r_sum - dist)
+    triu = np.triu(np.ones((n, n), dtype=bool), k=1)
+    pen += np.sum(overlap[triu]**2)
+    
+    return -np.sum(r) + mu * pen
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def force_init(n, seed):
+    """Generates a force-relaxed initial configuration."""
+    np.random.seed(seed)
+    r0 = 0.085
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < n:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x + r0 < 1.0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += r0 * np.sqrt(3)
+        row += 1
+    centers = np.array(pts[:n])
+    centers += np.random.normal(0, 0.01, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    return centers
+
+def run_packing():
+    n = 26
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    for s in range(5):
+        inits.append(force_init(n, s))
+        
+    pats = [[5,6,5,6,4], [6,5,6,5,4], [5,5,6,5,5], [4,6,6,6,4], [6,6,4,6,4], [6,7,6,7]]
+    for pat in pats:
+        if sum(pat) != 26: continue
+        pts = []
+        y = 0.09
+        for idx, cnt in enumerate(pat):
+            shift = 0.09 if idx % 2 == 1 else 0.0
+            x = 0.09 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.18
+            y += 0.09 * np.sqrt(3)
+        if len(pts) == n:
+            inits.append(np.array(pts))
+            
+    bounds_vars = [(0.0, 1.0), (0.0, 1.0), (0.01, 0.5)] * n
+    
+    for cfg in inits:
+        x0 = np.zeros(3 * n)
+        x0[0::3] = cfg[:, 0]
+        x0[1::3] = cfg[:, 1]
+        x0[2::3] = 0.09
+        
+        try:
+            res_pen = minimize(penalty_obj, x0, args=(n, 500.0), method='L-BFGS-B',
+                               bounds=bounds_vars, options={'maxiter': 3000, 'ftol': 1e-14})
+            
+            cons = {'type': 'ineq', 'fun': slsqp_cons, 'args': (n,)}
+            res_slsqp = minimize(slsqp_obj, res_pen.x, args=(n,), method='SLSQP',
+                                 bounds=bounds_vars, constraints=cons,
+                                 options={'maxiter': 8000, 'ftol': 1e-14})
+                                 
+            cx = np.clip(res_slsqp.x[0::3], 0.0, 1.0)
+            cy = np.clip(res_slsqp.x[1::3], 0.0, 1.0)
+            c_mat = np.column_stack((cx, cy))
+            
+            r_lp, s_lp = solve_lp(c_mat)
+            if r_lp is not None and s_lp > best_sum:
+                best_sum = s_lp
+                best_c = c_mat
+                best_r = r_lp
+        except Exception:
+            pass
+            
+    if best_c is not None:
+        rng = np.random.default_rng(42)
+        step = 0.015
+        for _ in range(1500):
+            i = rng.integers(n)
+            old_c = best_c[i].copy()
+            best_c[i] += rng.uniform(-step, step, 2)
+            best_c[i] = np.clip(best_c[i], 0.01, 0.99)
+            
+            r_try, s_try = solve_lp(best_c)
+            if r_try is not None and s_try > best_sum:
+                best_sum = s_try
+                best_r = r_try
+            else:
+                best_c[i] = old_c
+            step *= 0.998
+            
+    scale = 1.0
+    for i in range(n):
+        if best_r[i] > 1e-12:
+            scale = min(scale, best_c[i,0]/best_r[i], (1.0-best_c[i,0])/best_r[i],
+                        best_c[i,1]/best_r[i], (1.0-best_c[i,1])/best_r[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            if best_r[i] + best_r[j] > 1e-12:
+                scale = min(scale, d/(best_r[i]+best_r[j]))
+                
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum

@@ -1,0 +1,239 @@
+
+
+<strategy>
+To improve the packing sum of radii from 2.6308 to the target of 2.636, we need a more robust global search combined with high-precision local refinement. The key bottlenecks in previous attempts are typically:
+1. Getting stuck in local optima due to the non-smooth nature of the LP objective with respect to centers.
+2. Insufficient exploration of boundary-touching configurations.
+3. Numerical conservatism in joint optimization.
+
+Strategy:
+- **Diverse Initialization**: Generate hexagonal lattice patterns with various row distributions, normalize them to fit comfortably inside the square, and add controlled random perturbations.
+- **Derivative-Free Center Optimization**: Use `scipy.optimize.minimize` with the `Powell` method to optimize centers by maximizing the LP-computed sum of radii. Powell handles the discontinuous gradients of the LP objective better than gradient-based methods.
+- **Cyclic Coordinate Ascent**: Iteratively fix 25 circles and optimize the position of the 26th, cycling through all circles. This breaks symmetry and escapes shallow local minima effectively.
+- **Joint SLSQP Polish**: After finding excellent centers, run a constrained non-linear optimizer (`SLSQP`) on both centers and radii simultaneously to fine-tune the configuration to machine precision.
+- **Adaptive Hill-Climbing**: Perform a final random perturbation phase with decaying step size to squeeze out remaining slack.
+- **Strict Safety Scaling**: Apply a precise scaling factor to guarantee strict compliance with the `1e-12` tolerance in the validator.
+
+This multi-stage approach balances global exploration with aggressive local exploitation, targeting the geometric optimum where circles are tightly packed and touching boundaries/neighbors.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            r_opt = np.maximum(res.x, 0.0)
+            return r_opt, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-9), 0.0
+
+def neg_lp_sum(v):
+    """Objective for center optimization: minimize negative LP sum."""
+    c = v.reshape(N, 2)
+    _, s = solve_lp(c)
+    return -s
+
+def obj_slqp(v):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def cons_slqp(v):
+    """Inequality constraints >= 0 for valid joint packing."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c_list = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    idx_i, idx_j = np.triu_indices(N, k=1)
+    dx = x[idx_i] - x[idx_j]
+    dy = y[idx_i] - y[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    c_list.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(c_list)
+
+def generate_inits():
+    """Generates diverse initial center configurations."""
+    inits = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [6,6,4,6,4], 
+        [5,5,6,5,5], [6,4,6,4,6], [5,6,6,5,4], [6,5,4,6,5],
+        [5,5,5,5,6], [6,6,6,4,4], [4,5,6,5,6], [5,4,6,5,6],
+        [7,6,6,7], [6,7,6,7], [5,6,5,6,5,1], [5,5,5,6,5],
+        [8,5,6,7], [7,7,6,6], [9,5,6,6], [8,6,6,6],
+        [5,5,5,5,5,1], [6,5,5,5,5], [4,5,6,5,5,1]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != N: continue
+        pts = []
+        r0 = 0.098
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:N])
+        
+        # Normalize to fit comfortably inside [0.05, 0.95]
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        span = mx - mn
+        if span[0] > 1e-4 and span[1] > 1e-4:
+            pts = (pts - mn) / span * 0.85 + 0.075
+        else:
+            pts = np.full((N, 2), 0.5)
+            
+        inits.append(pts)
+        for _ in range(3):
+            p = pts + np.random.uniform(-0.02, 0.02, pts.shape)
+            inits.append(np.clip(p, 0.02, 0.98))
+            
+    for _ in range(8):
+        inits.append(np.random.uniform(0.1, 0.9, (N, 2)))
+        
+    return inits
+
+def cyclic_optimization(centers):
+    """Cyclic coordinate ascent on centers to escape local optima."""
+    c = centers.copy()
+    _, curr_s = solve_lp(c)
+    for _ in range(6):
+        for i in range(N):
+            best_pos = c[i].copy()
+            best_s = curr_s
+            for _ in range(15):
+                move = np.random.uniform(-0.025, 0.025, 2)
+                c[i] = np.clip(c[i] + move, 1e-4, 1.0 - 1e-4)
+                _, s = solve_lp(c)
+                if s > best_s:
+                    best_s = s
+                    best_pos = c[i].copy()
+            c[i] = best_pos
+            curr_s = best_s
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds_vars = [(0.0, 1.0)] * (2 * N) + [(1e-6, 0.5)] * N
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    inits = generate_inits()
+    
+    # Phase 1: Powell optimization on centers (derivative-free, handles LP discontinuities well)
+    for cfg in inits:
+        try:
+            res = minimize(neg_lp_sum, cfg.flatten(), method='Powell',
+                           options={'maxiter': 2000, 'ftol': 1e-13})
+            c_opt = np.clip(res.x.reshape(N, 2), 1e-4, 1.0 - 1e-4)
+            r_lp, s_lp = solve_lp(c_opt)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_centers = c_opt.copy()
+                best_radii = r_lp.copy()
+        except Exception:
+            pass
+
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii, best_sum = solve_lp(best_centers)
+
+    # Phase 2: Cyclic coordinate ascent to break symmetries
+    best_centers = cyclic_optimization(best_centers)
+    best_radii, best_sum = solve_lp(best_centers)
+
+    # Phase 3: Joint SLSQP Polish for high precision
+    x0 = np.zeros(3 * N)
+    x0[:N] = best_centers[:, 0]
+    x0[N:2*N] = best_centers[:, 1]
+    x0[2*N:] = best_radii * 0.995
+    
+    try:
+        res = minimize(obj_slqp, x0, method='SLSQP', bounds=bounds_vars,
+                       constraints={'type': 'ineq', 'fun': cons_slqp},
+                       options={'maxiter': 20000, 'ftol': 1e-15})
+        if np.isfinite(res.fun):
+            c_mat = np.column_stack((res.x[:N], res.x[N:2*N]))
+            r_lp, s_lp = solve_lp(c_mat)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_centers = c_mat.copy()
+                best_radii = r_lp.copy()
+    except Exception:
+        pass
+
+    # Phase 4: Adaptive random perturbation hill-climbing
+    curr_c = best_centers.copy()
+    curr_r, curr_s = solve_lp(curr_c)
+    step = 0.015
+    for it in range(3000):
+        idx = np.random.randint(N)
+        old = curr_c[idx].copy()
+        improved = False
+        for _ in range(8):
+            move = np.random.uniform(-step, step, 2)
+            curr_c[idx] = np.clip(old + move, 1e-4, 1.0 - 1e-4)
+            r_try, s_try = solve_lp(curr_c)
+            if s_try > curr_s + 1e-10:
+                curr_s = s_try
+                curr_r = r_try.copy()
+                improved = True
+                break
+        if not improved:
+            curr_c[idx] = old
+            
+        step *= 0.9998
+        if curr_s > best_sum:
+            best_sum = curr_s
+            best_centers = curr_c.copy()
+            best_radii = curr_r.copy()
+            
+    # Phase 5: Strict Safety Scaling to guarantee numerical validity
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                         best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

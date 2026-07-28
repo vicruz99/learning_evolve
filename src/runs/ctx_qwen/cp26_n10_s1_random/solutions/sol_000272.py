@@ -1,0 +1,255 @@
+# sol_000272 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000253 (state 86316387) state=abc04293 sum of radii=2.600714 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+M_PAIRS = len(PAIR_I)
+
+def compute_lp_and_grad(centers):
+    """Solves LP for max sum of radii given centers, returns radii, sum, and gradient w.r.t centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    diffs = centers[PAIR_I] - centers[PAIR_J]
+    dists = np.sqrt(np.sum(diffs**2, axis=1))
+    
+    A_ub = np.zeros((M_PAIRS + N, N))
+    b_ub = np.zeros(M_PAIRS + N)
+    
+    A_ub[:M_PAIRS, PAIR_I] = 1.0
+    A_ub[:M_PAIRS, PAIR_J] = 1.0
+    b_ub[:M_PAIRS] = dists
+    
+    A_ub[M_PAIRS:, np.arange(N)] = 1.0
+    b_ub[M_PAIRS:] = lims
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if not res.success or not np.isfinite(res.fun):
+            return None, 0.0, np.zeros((N, 2))
+            
+        r = res.x
+        s = -res.fun
+        
+        grad = np.zeros((N, 2))
+        marg = None
+        try:
+            marg = res.marginals.ineqlin
+        except AttributeError:
+            try:
+                marg = res.ineqlin.marginals
+            except AttributeError:
+                marg = None
+                
+        if marg is not None:
+            active_lam = marg[:M_PAIRS]
+            mask = active_lam > 1e-7
+            if np.any(mask):
+                idx = np.where(mask)[0]
+                lam = active_lam[mask]
+                ii = PAIR_I[idx]
+                jj = PAIR_J[idx]
+                d = dists[idx]
+                d = np.where(d > 1e-9, d, 1.0)
+                vec = lam[:, np.newaxis] * (centers[ii] - centers[jj]) / d[:, np.newaxis]
+                np.add.at(grad, ii, vec)
+                np.add.at(grad, jj, -vec)
+                
+        return r, s, grad
+    except Exception:
+        return None, 0.0, np.zeros((N, 2))
+
+def gradient_ascent(c0):
+    """Performs gradient ascent on centers to maximize LP sum of radii."""
+    c = c0.copy()
+    r_best, s_best, _ = compute_lp_and_grad(c)
+    if r_best is None:
+        return c, s_best
+        
+    step = 0.025
+    vel = np.zeros_like(c)
+    momentum = 0.6
+    
+    for _ in range(300):
+        r, s, g = compute_lp_and_grad(c)
+        if r is None:
+            break
+            
+        g_norm = np.linalg.norm(g)
+        if g_norm < 1e-6:
+            break
+            
+        g_dir = g / g_norm
+        vel = momentum * vel + step * g_dir
+        c_new = c + vel
+        c_new = np.clip(c_new, 1e-4, 1.0 - 1e-4)
+        
+        r_new, s_new, _ = compute_lp_and_grad(c_new)
+        if r_new is not None and s_new > s_best + 1e-7:
+            c = c_new
+            r_best, s_best = r_new, s_new
+            step = min(step * 1.05, 0.08)
+        else:
+            step *= 0.85
+            vel *= 0.5
+            
+        if step < 1e-5:
+            break
+            
+    return c, s_best
+
+def joint_cons(v):
+    """Inequality constraints >= 0 for SLSQP joint optimization."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    dr = r[PAIR_I] + r[PAIR_J]
+    c = np.concatenate([c, dx**2 + dy**2 - dr**2])
+    return c
+
+def joint_obj(v):
+    return -np.sum(v[2*N:])
+
+def generate_configs(rng):
+    """Generates diverse initial center configurations."""
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5], [4,6,6,6,4], 
+        [6,6,5,5,4], [5,4,6,6,5], [5,6,4,6,5], [6,5,5,6,4],
+        [7,5,5,5,4], [4,5,7,5,5], [5,5,5,5,6], [6,6,6,4,4],
+        [8,6,6,6], [9,5,6,6], [10,8,8], [7,6,6,7]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < N:
+            continue
+        for _ in range(2):
+            r0 = rng.uniform(0.092, 0.102)
+            pts = []
+            y = r0
+            for idx, cnt in enumerate(pat):
+                shift = r0 if idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) >= N:
+                        break
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+            cfg = np.array(pts[:N])
+            
+            # Normalize and center in [0.1, 0.9]
+            mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+            span = mx - mn + 1e-9
+            cfg = (cfg - mn) / span * 0.72 + 0.14
+            cfg += rng.uniform(-0.01, 0.01, cfg.shape)
+            cfg = np.clip(cfg, 0.04, 0.96)
+            configs.append(cfg)
+            
+    for _ in range(8):
+        configs.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    return configs
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    configs = generate_configs(rng)
+    
+    # Phase 1: Gradient ascent from diverse starts
+    for cfg in configs:
+        c_opt, s_opt = gradient_ascent(cfg)
+        if s_opt > best_sum:
+            r_lp, best_sum, _ = compute_lp_and_grad(c_opt)
+            best_c = c_opt.copy()
+            best_r = r_lp.copy()
+            
+    # Phase 2: Joint SLSQP polish
+    if best_c is not None:
+        for _ in range(4):
+            # Slight perturbation to find neighboring basins
+            c_pert = np.clip(best_c + rng.uniform(-0.003, 0.003, best_c.shape), 0.02, 0.98)
+            r_pert = best_r.copy()
+            if r_pert is not None:
+                r_pert = r_pert * 0.97
+                
+            v0 = np.concatenate([c_pert[:, 0], c_pert[:, 1], r_pert])
+            bounds = [(0.0, 1.0)] * (2 * N) + [(1e-6, 0.5)] * N
+            
+            try:
+                res = minimize(joint_obj, v0, method='SLSQP', bounds=bounds,
+                               constraints={'type': 'ineq', 'fun': joint_cons},
+                               options={'maxiter': 3000, 'ftol': 1e-14})
+                if np.isfinite(res.fun):
+                    c_slq = np.column_stack((res.x[:N], res.x[N:2*N]))
+                    r_slq = np.maximum(res.x[2*N:], 1e-9)
+                    
+                    # Verify strict feasibility
+                    valid = True
+                    if np.any(c_slq[:, 0] < r_slq - 1e-9) or np.any(c_slq[:, 0] > 1.0 - r_slq + 1e-9): valid = False
+                    if np.any(c_slq[:, 1] < r_slq - 1e-9) or np.any(c_slq[:, 1] > 1.0 - r_slq + 1e-9): valid = False
+                    
+                    dx = c_slq[PAIR_I, 0] - c_slq[PAIR_J, 0]
+                    dy = c_slq[PAIR_I, 1] - c_slq[PAIR_J, 1]
+                    d2 = dx**2 + dy**2
+                    rs2 = (r_slq[PAIR_I] + r_slq[PAIR_J])**2
+                    if np.any(d2 < rs2 - 1e-9): valid = False
+                    
+                    if valid:
+                        s_slq = np.sum(r_slq)
+                        if s_slq > best_sum:
+                            best_sum = s_slq
+                            best_c = c_slq.copy()
+                            best_r = r_slq.copy()
+            except Exception:
+                continue
+                
+    # Fallback if optimizations failed
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum, _ = compute_lp_and_grad(best_c)
+        if best_r is None:
+            best_r = np.full(N, 0.08)
+            best_sum = np.sum(best_r)
+            
+    # Final exact LP squeeze on best centers
+    r_final, s_final, _ = compute_lp_and_grad(best_c)
+    if r_final is not None and s_final > best_sum:
+        best_r = r_final
+        best_sum = s_final
+        
+    # Phase 3: Strict safety scaling
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    dx = best_c[PAIR_I, 0] - best_c[PAIR_J, 0]
+    dy = best_c[PAIR_I, 1] - best_c[PAIR_J, 1]
+    d = np.sqrt(dx**2 + dy**2)
+    rs = best_r[PAIR_I] + best_r[PAIR_J]
+    mask = rs > 1e-12
+    if np.any(mask):
+        scale = min(scale, np.min(d[mask] / rs[mask]))
+        
+    best_r *= scale * 0.9999998
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum

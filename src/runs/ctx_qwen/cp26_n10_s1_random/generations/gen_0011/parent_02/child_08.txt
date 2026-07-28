@@ -1,0 +1,228 @@
+
+
+<strategy>
+To improve the packing sum of radii from ~2.631 to the target ~2.636, we need to escape local optima that trap standard gradient-based or single-coordinate ascent methods. The strategy focuses on:
+
+1. **Robust LP Oracle**: Keep the Linear Programming approach to compute optimal radii for fixed centers. This is exact, fast, and handles the `r_i + r_j <= dist` constraints perfectly.
+2. **Diverse Topological Seeds**: Generate a wide variety of initial configurations, including hexagonal lattices with varied row counts, corner/edge-biased layouts, and rotated/scaled grids. This ensures we explore different global topologies.
+3. **Simulated Annealing + Multi-Circle Perturbation**: Instead of moving one circle at a time, we randomly perturb 1 to 4 circles simultaneously. We use a simulated annealing acceptance criterion to occasionally accept worse moves early on, helping escape shallow local minima. The perturbation step size cools over time.
+4. **Hybrid Optimization Loop**: Combine a fast coordinate-search style local refinement with occasional large random jumps. This balances exploitation (fine-tuning near current best) and exploration (finding new basins).
+5. **Strict Numerical Safety**: Apply a final geometric scaling to guarantee all constraints satisfy the validator's `1e-12` tolerance without losing significant sum.
+
+This approach systematically probes the configuration space more thoroughly than pure SLSQP or single-coordinate ascent, which often stalls around 2.63 for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    m_b = 4 * n
+    m_p = n * (n - 1) // 2
+    A = np.zeros((m_b + m_p, n))
+    b = np.zeros(m_b + m_p)
+    idx = 0
+    
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        x, y = centers[i]
+        lims = (x, 1.0 - x, y, 1.0 - y)
+        for lim in lims:
+            A[idx, i] = 1.0
+            b[idx] = lim
+            idx += 1
+            
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = d
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback to geometrically valid radii if LP unexpectedly fails
+    lims = np.min(np.stack([centers[:,0], 1.0-centers[:,0], centers[:,1], 1.0-centers[:,1]], axis=1), axis=1)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_d = np.min(dists, axis=1) / 2.0
+    r_fall = np.minimum(lims, min_d) * 0.9
+    return r_fall, np.sum(r_fall)
+
+def generate_hex_init(row_counts, r0, n):
+    """Generates a hexagonal lattice initialization with specified row counts."""
+    pts = []
+    y = r0
+    for idx, cnt in enumerate(row_counts):
+        shift = r0 if idx % 2 == 1 else 0.0
+        row_width = (cnt - 1) * 2 * r0
+        x_start = 0.5 - row_width / 2.0 + shift
+        for k in range(cnt):
+            if len(pts) >= n: break
+            pts.append([x_start + k * 2 * r0, y])
+        y += np.sqrt(3) * r0
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:n])
+
+def run_packing():
+    n = 26
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    rng = np.random.default_rng(42)
+    configs = []
+    
+    # 1. Hexagonal lattice patterns with varied row distributions
+    row_dists = [
+        [6,5,6,5,4], [5,6,5,6,4], [7,6,6,7], [8,6,6,6], 
+        [9,5,6,6], [6,6,5,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [6,5,5,5,5], [5,5,5,5,6], [10,8,8], [9,9,8], 
+        [5,5,5,5,5,1], [6,6,6,5,3], [7,7,6,6], [8,8,6,4],
+        [6,5,6,4,5], [5,7,5,6,3], [4,5,6,5,6], [6,4,6,5,5], [5,6,4,6,5]
+    ]
+    
+    for rd in row_dists:
+        if sum(rd) < n: continue
+        for _ in range(2):
+            r0 = rng.uniform(0.085, 0.105)
+            pts = []
+            y = r0
+            for idx, cnt in enumerate(rd):
+                shift = r0 if idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) >= n: break
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+            cfg = np.array(pts[:n])
+            # Normalize to comfortably fit inside [0.05, 0.95]
+            mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+            span = mx - mn
+            if span[0] > 0: cfg[:, 0] = (cfg[:, 0] - mn[0]) / span[0] * 0.8 + 0.1
+            if span[1] > 0: cfg[:, 1] = (cfg[:, 1] - mn[1]) / span[1] * 0.8 + 0.1
+            cfg += rng.uniform(-0.01, 0.01, cfg.shape)
+            cfg = np.clip(cfg, 0.03, 0.97)
+            configs.append(cfg)
+            
+    # 2. Corner & Edge focused layout
+    corners = np.array([[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.88]])
+    edges = []
+    for t in np.linspace(0.25, 0.75, 4):
+        edges.extend([[t, 0.12], [t, 0.88], [0.12, t], [0.88, t]])
+    center_pts = corners.tolist() + edges
+    while len(center_pts) < n:
+        center_pts.append([0.5, 0.5])
+    cfg_corner = np.array(center_pts[:n])
+    cfg_corner += rng.uniform(-0.02, 0.02, cfg_corner.shape)
+    cfg_corner = np.clip(cfg_corner, 0.03, 0.97)
+    configs.append(cfg_corner)
+    
+    # 3. Random starts
+    for _ in range(8):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # Main optimization loop
+    for cfg in configs:
+        curr_c = cfg.copy()
+        r_init, curr_s = solve_lp(curr_c, n)
+        
+        # Simulated Annealing / Coordinate Ascent Hybrid
+        temp = 0.1
+        step = 0.04
+        no_improve = 0
+        
+        for iteration in range(2500):
+            # Decay temperature and step
+            temp = 0.1 * np.exp(-iteration / 800.0)
+            step = 0.04 * np.exp(-iteration / 1000.0) + 0.002
+            
+            # Pick random number of circles to move simultaneously
+            k = rng.integers(1, 4)
+            idxs = rng.choice(n, size=k, replace=False)
+            old_positions = curr_c[idxs].copy()
+            
+            # Perturb selected circles
+            curr_c[idxs] += rng.uniform(-step, step, (k, 2))
+            curr_c[idxs] = np.clip(curr_c[idxs], 0.01, 0.99)
+            
+            r_try, s_try = solve_lp(curr_c, n)
+            
+            # Accept if better, or with SA probability
+            delta = s_try - curr_s
+            if delta > 0 or rng.random() < np.exp(delta / temp):
+                curr_s = s_try
+                if curr_s > best_sum + 1e-9:
+                    best_sum = curr_s
+                    best_c = curr_c.copy()
+                    best_r = r_try.copy()
+                    no_improve = 0
+                else:
+                    no_improve += 1
+            else:
+                # Reject move
+                curr_c[idxs] = old_positions
+                no_improve += 1
+                
+            if no_improve > 400:
+                break
+                
+        # Final local refinement on best found so far
+        if curr_s > best_sum - 0.01:
+            curr_c = best_c.copy() if best_c is not None else curr_c
+            for _ in range(1000):
+                idx = rng.integers(n)
+                old = curr_c[idx].copy()
+                best_move = old
+                best_val = curr_s
+                
+                # Local sampling around current position
+                for _ in range(6):
+                    trial = old + rng.uniform(-step*0.8, step*0.8, 2)
+                    trial = np.clip(trial, 0.01, 0.99)
+                    curr_c[idx] = trial
+                    r_t, s_t = solve_lp(curr_c, n)
+                    if s_t > best_val:
+                        best_val = s_t
+                        best_move = trial.copy()
+                        
+                curr_c[idx] = best_move
+                curr_s = best_val
+                if curr_s > best_sum + 1e-9:
+                    best_sum = curr_s
+                    best_c = curr_c.copy()
+                    best_r = r_try.copy() if 'r_try' in locals() else solve_lp(curr_c, n)[0].copy()
+                    
+    # Fallback safety net
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp(best_c, n)
+        
+    # Phase 4: Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999999
+    return best_c, best_r, float(np.sum(best_r))
+```

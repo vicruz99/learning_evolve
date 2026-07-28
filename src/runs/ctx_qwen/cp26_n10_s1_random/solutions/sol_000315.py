@@ -1,0 +1,190 @@
+# sol_000315 | problem=circle_packing_26 entrypoint=run_packing
+# generation=13 parent=sol_000255 (state 9c9fca7e) state=89b61d37 sum of radii=2.472942 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def solve_lp_and_grad(centers):
+    """Solves LP for radii and computes gradient of sum(radii) w.r.t centers."""
+    n = centers.shape[0]
+    n_pairs = n * (n - 1) // 2
+    n_rows = 4 * n + n_pairs
+    A = np.zeros((n_rows, n))
+    b = np.zeros(n_rows)
+    k = 0
+    for i in range(n):
+        A[k, i] = 1.0; b[k] = centers[i, 0]; k += 1
+        A[k, i] = 1.0; b[k] = 1.0 - centers[i, 0]; k += 1
+        A[k, i] = 1.0; b[k] = centers[i, 1]; k += 1
+        A[k, i] = 1.0; b[k] = 1.0 - centers[i, 1]; k += 1
+        
+    pairs_info = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            d = np.hypot(dx, dy)
+            if d < 1e-9:
+                d = 1e-9
+                dx, dy = 1e-9, 0.0
+            b[k] = d
+            pairs_info.append((i, j, dx, dy, d))
+            k += 1
+            
+    res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=(0, None), method='highs')
+    if not res.success:
+        return None, None, None
+        
+    radii = res.x
+    obj = -res.fun
+    
+    grad = np.zeros((n, 2))
+    try:
+        y = res.marginals.ineqlin
+        if y is not None and len(y) == n_rows:
+            for i in range(n):
+                grad[i, 0] = y[i] - y[n + i]
+                grad[i, 1] = y[2*n + i] - y[3*n + i]
+                
+            idx = 4 * n
+            for (i, j, dx, dy, d) in pairs_info:
+                mu = y[idx]
+                if mu > 1e-14:
+                    f = mu / d
+                    grad[i, 0] += f * dx
+                    grad[i, 1] += f * dy
+                    grad[j, 0] -= f * dx
+                    grad[j, 1] -= f * dy
+                idx += 1
+    except:
+        pass
+        
+    return radii, obj, grad
+
+def obj_grad(c_flat):
+    """Objective and gradient for L-BFGS-B: minimize negative sum of radii."""
+    c = c_flat.reshape(-1, 2)
+    r, s, g = solve_lp_and_grad(c)
+    if r is None:
+        return 1e6, np.zeros_like(c_flat)
+    return -s, -g.flatten()
+
+def get_hex_init(n, r0, shift=0.075):
+    """Generates a hexagonal lattice initialization scaled to fit inside the square."""
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < n:
+        shift_x = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift_x
+        while x <= 1.0 - r0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+    pts = np.array(pts[:n])
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = mx - mn
+    if span[0] > 1e-6 and span[1] > 1e-6:
+        pts = (pts - mn) / span * (1.0 - 2.0 * shift) + shift
+    return pts
+
+def rotate_grid(pts, angle_deg):
+    """Rotates a point cloud and rescales to fit comfortably inside [0,1]^2."""
+    angle = np.radians(angle_deg)
+    c = np.mean(pts, axis=0)
+    pts_c = pts - c
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    pts_r = pts_c @ rot.T
+    mn = pts_r.min(axis=0)
+    mx = pts_r.max(axis=0)
+    span = mx - mn
+    if span[0] > 1e-6 and span[1] > 1e-6:
+        pts_r = (pts_r - mn) / span * 0.85 + 0.075
+    return pts_r
+
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    starts = []
+    # Dense hexagonal starts with varying base radii
+    for r0 in [0.08, 0.085, 0.09, 0.095, 0.10, 0.105]:
+        starts.append(get_hex_init(n, r0))
+    # Rotated hex grids to break symmetry and find better alignments
+    for ang in [5, 10, 15, -5, -10, 20, -20]:
+        base = get_hex_init(n, 0.095)
+        starts.append(rotate_grid(base, ang))
+    # Random dense starts
+    for _ in range(10):
+        starts.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    bounds_c = [(0.02, 0.98)] * (2 * n)
+    
+    # Phase 1: Gradient-based center optimization
+    for cfg in starts:
+        try:
+            res = minimize(obj_grad, cfg.flatten(), method='L-BFGS-B', 
+                           jac=True, bounds=bounds_c, 
+                           options={'maxiter': 8000, 'ftol': 1e-14, 'gtol': 1e-12})
+            c_opt = res.x.reshape(n, 2)
+            r_opt, s_opt, _ = solve_lp_and_grad(c_opt)
+            if r_opt is not None and s_opt > best_sum:
+                best_sum = s_opt
+                best_centers = c_opt.copy()
+                best_radii = r_opt.copy()
+        except:
+            continue
+            
+    # Phase 2: Local perturbation refinement to escape flat regions/local traps
+    if best_centers is not None:
+        step = 0.008
+        for _ in range(1500):
+            idx = rng.integers(n)
+            old = best_centers[idx].copy()
+            trial = best_centers[idx] + rng.uniform(-step, step, 2)
+            trial = np.clip(trial, 0.02, 0.98)
+            best_centers[idx] = trial
+            r_try, s_try, _ = solve_lp_and_grad(best_centers)
+            if r_try is not None and s_try > best_sum:
+                best_sum = s_try
+                best_radii = r_try.copy()
+                step *= 0.998
+            else:
+                best_centers[idx] = old
+                step *= 0.995
+                
+    # Fallback if optimization unexpectedly yields no valid result
+    if best_centers is None:
+        best_centers = get_hex_init(n, 0.09)
+        best_radii = solve_lp_and_grad(best_centers)[0]
+        best_sum = np.sum(best_radii)
+        
+    # Phase 3: Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

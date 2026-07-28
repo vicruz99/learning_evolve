@@ -1,0 +1,196 @@
+# sol_000104 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000075 (state 5b5bfa68) state=0eb63b58 sum of radii=2.624510 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars_array, n):
+    """Objective: minimize negative sum of radii"""
+    return -np.sum(vars_array[2 * n:])
+
+def constraint_func(vars_array, n):
+    """
+    Computes inequality constraints >= 0 for valid packing.
+    Constraints:
+    1. Boundary: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    2. Non-overlap: (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+    """
+    cx = vars_array[:n]
+    cy = vars_array[n:2 * n]
+    r = vars_array[2 * n:]
+    
+    # Boundary constraints
+    b = np.empty(4 * n)
+    b[:n] = cx - r
+    b[n:2 * n] = 1.0 - cx - r
+    b[2 * n:3 * n] = cy - r
+    b[3 * n:4 * n] = 1.0 - cy - r
+    
+    # Pairwise non-overlap constraints (vectorized)
+    cx_m = cx[:, None] - cx[None, :]
+    cy_m = cy[:, None] - cy[None, :]
+    r_m = r[:, None] + r[None, :]
+    
+    d2 = cx_m**2 + cy_m**2
+    rs2 = r_m**2
+    
+    # Extract upper triangular indices to avoid duplicates and self-interaction
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    p = d2[idx_i, idx_j] - rs2[idx_i, idx_j]
+    
+    return np.concatenate([b, p])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Bounds: centers in [0, 1], radii in [small, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+    cons_dict = {'type': 'ineq', 'fun': constraint_func, 'args': (n,)}
+    
+    rng = np.random.default_rng(42)
+    inits = []
+    
+    # Helper to create hex pattern
+    def make_hex(rows_pattern, r0=0.09):
+        pts = []
+        y = r0
+        for ri, cnt in enumerate(rows_pattern):
+            shift = r0 if ri % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+        while len(pts) < n:
+            pts.append([0.5, 0.5])
+        return np.array(pts[:n])
+
+    # Structured hexagonal patterns summing to 26
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], [4, 6, 6, 6, 4],
+        [5, 7, 5, 5, 4], [5, 5, 5, 5, 6], [6, 6, 5, 5, 4], [5, 6, 4, 6, 5]
+    ]
+    for p in patterns:
+        if sum(p) < n: continue
+        pts = make_hex(p)
+        inits.append(pts)
+        inits.append(np.clip(pts + rng.uniform(-0.03, 0.03, pts.shape), 0.05, 0.95))
+
+    # Random starts
+    for _ in range(15):
+        inits.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # Grid start
+    g = np.linspace(0.15, 0.85, 5)
+    grid = np.array([[x, y] for y in g for x in g])
+    grid = np.vstack([grid, [0.5, 0.5]])
+    inits.append(grid)
+    
+    # Precompute indices for fast validation
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    
+    def run_opt(cfg):
+        x0 = np.zeros(3 * n)
+        x0[:n] = cfg[:, 0]
+        x0[n:2 * n] = cfg[:, 1]
+        x0[2 * n:] = 0.08  # Feasible initial radius
+        
+        try:
+            res = minimize(
+                objective, x0, args=(n,),
+                method='SLSQP', bounds=bounds,
+                constraints=cons_dict, 
+                options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False}
+            )
+            
+            cx = res.x[:n]
+            cy = res.x[n:2 * n]
+            r = np.maximum(res.x[2 * n:], 1e-9)
+            centers = np.column_stack((cx, cy))
+            radii = r
+            
+            # Strict validity check
+            valid = True
+            if np.any(centers[:, 0] < radii - 1e-12) or np.any(centers[:, 0] > 1 - radii + 1e-12) or \
+               np.any(centers[:, 1] < radii - 1e-12) or np.any(centers[:, 1] > 1 - radii + 1e-12):
+                valid = False
+                
+            if valid:
+                dx = centers[:, 0][:, None] - centers[:, 0][None, :]
+                dy = centers[:, 1][:, None] - centers[:, 1][None, :]
+                d2 = dx**2 + dy**2
+                rs = radii[:, None] + radii[None, :]
+                if np.any(d2[idx_i, idx_j] < rs[idx_i, idx_j]**2 - 1e-11):
+                    valid = False
+                    
+            if valid:
+                s = np.sum(radii)
+                if s > best_sum:
+                    return centers.copy(), radii.copy(), s
+        except Exception:
+            pass
+        return None, None, 0.0
+
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Broad search
+    for cfg in inits:
+        c, r, s = run_opt(cfg)
+        if c is not None:
+            best_centers, best_radii, best_sum = c, r, s
+            
+    # Phase 2: Local refinement around best found
+    if best_centers is not None:
+        for _ in range(8):
+            pert_centers = np.clip(best_centers + rng.uniform(-0.008, 0.008, best_centers.shape), 0.05, 0.95)
+            pert_radii = best_radii * 0.96
+            c, r, s = run_opt(np.column_stack((pert_centers[:, 0], pert_centers[:, 1])))
+            if c is not None and s > best_sum:
+                best_centers, best_radii, best_sum = c, r, s
+
+    # Fallback configuration if optimization fails unexpectedly
+    if best_centers is None:
+        r_fb = 0.095
+        pts = []
+        y = r_fb
+        row = 0
+        while len(pts) < n:
+            shift = r_fb if row % 2 else 0
+            x = r_fb + shift
+            while x + r_fb <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2 * r_fb
+            y += np.sqrt(3) * r_fb
+            row += 1
+        best_centers = np.array(pts[:n])
+        best_radii = np.full(n, r_fb)
+        best_sum = np.sum(best_radii)
+
+    # Final safety scaling to guarantee strict validity for the checker's tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                         best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.999999
+    best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, float(best_sum)

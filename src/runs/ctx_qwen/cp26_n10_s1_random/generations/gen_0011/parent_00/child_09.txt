@@ -1,0 +1,209 @@
+
+
+<strategy>
+To push the sum of radii past the 2.636 threshold, we need a highly robust and precise optimization pipeline. The current gap is only 0.000020, meaning the configuration is already near-optimal. Small improvements require:
+1. **Alternating Optimization**: Iteratively maximize the constraint slack (distance to boundaries and other circles) for fixed radii, then solve a Linear Program to maximize radii for fixed centers. This decouples the non-convex geometry from the radius expansion.
+2. **Joint SLSQP Polishing**: After alternating optimization reaches a plateau, use SLSQP to jointly optimize centers and radii. This handles the non-linear coupling between positions and sizes more globally.
+3. **Extended Local Search**: Perform a long hill-climbing phase with a decaying step size, simultaneously perturbing 1-2 circles and re-solving the LP. This escapes shallow local minima.
+4. **Numerical Precision**: Tighten tolerances (`ftol=1e-14`), increase iteration limits, and apply a careful final scaling factor that guarantees strict validity under the `1e-12` validator tolerance without unnecessarily shrinking the sum.
+5. **Diverse Initializations**: Generate multiple hexagonal patterns and random starts to ensure the global optimum is explored.
+
+The code is structured with top-level functions, no closures/lambdas, and adheres to all constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+def get_pairwise_indices(n):
+    """Returns indices for upper triangle of distance matrix."""
+    return np.triu_indices(n, k=1)
+
+def solve_lp_radii(centers, idx_i, idx_j):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    wall = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    bounds = [(0.0, max(w, 1e-12)) for w in wall]
+    
+    diff = centers[idx_i] - centers[idx_j]
+    b_ub = np.sqrt(np.sum(diff**2, axis=1))
+    
+    m = len(idx_i)
+    A = np.zeros((m, n))
+    A[np.arange(m), idx_i] = 1.0
+    A[np.arange(m), idx_j] = 1.0
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return np.maximum(res.x, 0.0), -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def compute_slack(centers, radii, idx_i, idx_j):
+    """Computes the minimum constraint slack for given centers and radii."""
+    n = centers.shape[0]
+    s_wall = np.minimum(np.minimum(centers[:,0] - radii, 1.0 - centers[:,0] - radii),
+                        np.minimum(centers[:,1] - radii, 1.0 - centers[:,1] - radii))
+    diff = centers[idx_i] - centers[idx_j]
+    dist = np.sqrt(np.sum(diff**2, axis=1))
+    r_sum = radii[idx_i] + radii[idx_j]
+    s_pair = dist - r_sum
+    return np.min(np.concatenate([s_wall, s_pair]))
+
+def slack_obj_func(x_flat, n, radii, idx_i, idx_j):
+    """Objective for center optimization: maximize minimum slack."""
+    c = x_flat.reshape(n, 2)
+    return -compute_slack(c, radii, idx_i, idx_j)
+
+def joint_cons_func(v, n, idx_i, idx_j):
+    """Inequality constraints >= 0 for SLSQP joint optimization."""
+    cx, cy, r = v[:n], v[n:2*n], v[2*n:]
+    con = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    return np.concatenate([con, dx**2 + dy**2 - dr**2])
+
+def joint_obj_func(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    idx_i, idx_j = get_pairwise_indices(n)
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,5,5],
+        [5,5,5,5,6], [6,5,5,6,4]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.10
+        for i, cnt in enumerate(pat):
+            shift = 0.10 if i % 2 == 1 else 0.0
+            x = 0.10 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.20
+            y += 0.10 * np.sqrt(3)
+        c = np.array(pts[:n])
+        configs.append(c)
+        for _ in range(3):
+            cp = c + rng.uniform(-0.03, 0.03, c.shape)
+            configs.append(np.clip(cp, 0.05, 0.95))
+            
+    for _ in range(8):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    # Main optimization loop
+    for cfg in configs:
+        curr_c = cfg.copy()
+        curr_r = np.full(n, 0.09)
+        curr_s = 0.0
+        
+        # Alternating optimization: optimize centers for fixed radii, then radii for fixed centers
+        for alt in range(15):
+            # Optimize centers to maximize slack
+            try:
+                res_slack = minimize(slack_obj_func, curr_c.flatten(), 
+                                     args=(n, curr_r, idx_i, idx_j),
+                                     method='Nelder-Mead', 
+                                     options={'maxiter': 2000, 'xatol': 1e-10, 'fatol': 1e-12})
+                if res_slack.success:
+                    curr_c = np.clip(res_slack.x.reshape(n, 2), 1e-5, 1.0 - 1e-5)
+            except Exception:
+                pass
+                
+            # Update radii via LP
+            curr_r, curr_s = solve_lp_radii(curr_c, idx_i, idx_j)
+            if curr_s <= best_sum:
+                continue
+                
+            # Joint SLSQP polish
+            bounds_v = [(0.0, 1.0)]*(2*n) + [(1e-5, 0.5)]*n
+            x0 = np.concatenate([curr_c[:,0], curr_c[:,1], curr_r * 0.98])
+            
+            try:
+                res_slqp = minimize(joint_obj_func, x0, args=(n,), method='SLSQP',
+                                    bounds=bounds_v,
+                                    constraints={'type': 'ineq', 'fun': joint_cons_func, 'args': (n, idx_i, idx_j)},
+                                    options={'maxiter': 4000, 'ftol': 1e-14})
+                if np.isfinite(res_slqp.fun):
+                    c_s = np.column_stack((res_slqp.x[:n], res_slqp.x[n:2*n]))
+                    r_s, s_s = solve_lp_radii(c_s, idx_i, idx_j)
+                    if s_s > curr_s:
+                        curr_c = c_s
+                        curr_r = r_s
+                        curr_s = s_s
+            except Exception:
+                pass
+                
+            if curr_s > best_sum:
+                best_sum = curr_s
+                best_c = curr_c.copy()
+                best_r = curr_r.copy()
+                
+        # Local hill-climbing refinement
+        if best_c is not None:
+            lc, lr, ls = best_c.copy(), best_r.copy(), best_sum
+            for it in range(3000):
+                scale = 0.015 * (1.0 - it / 3000.0)**0.5
+                num_pert = rng.choice([1, 2], p=[0.7, 0.3])
+                idx_p = rng.choice(n, size=num_pert, replace=False)
+                old = lc[idx_p].copy()
+                
+                lc[idx_p] += rng.uniform(-scale, scale, (num_pert, 2))
+                lc[idx_p] = np.clip(lc[idx_p], 1e-4, 1.0 - 1e-4)
+                
+                r_new, s_new = solve_lp_radii(lc, idx_i, idx_j)
+                if s_new > ls + 1e-8:
+                    ls = s_new
+                    lr = r_new.copy()
+                else:
+                    lc[idx_p] = old
+                    
+                if ls > best_sum:
+                    best_sum = ls
+                    best_c = lc.copy()
+                    best_r = lr.copy()
+                    
+    # Final safety scaling
+    if best_c is None:
+        best_c = configs[0]
+        best_r = np.full(n, 0.09)
+        best_sum = np.sum(best_r)
+        
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = best_r[:, None] + best_r[None, :]
+    min_ratio = np.min(dists[idx_i, idx_j] / np.maximum(r_pair[idx_i, idx_j], 1e-12))
+    scale = min(scale, min_ratio)
+    
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

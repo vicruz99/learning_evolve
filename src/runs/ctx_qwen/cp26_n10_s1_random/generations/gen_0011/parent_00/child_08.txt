@@ -1,0 +1,207 @@
+
+
+<strategy>
+To push the sum of radii past 2.636, we need to refine the center configurations more aggressively while maintaining exact radius optimization via Linear Programming. The current solution is extremely close (2.635980), indicating we are in a high-quality local optimum. Key improvements:
+1. **Simulated Annealing (SA) Hill Climbing**: Replace simple hill climbing with SA to escape shallow local traps. Perturbing 2 circles simultaneously helps break symmetry faster than single-circle moves.
+2. **Multi-Resolution Fine Search**: After SA, perform a logarithmically decaying coordinate-wise search to squeeze out the remaining ~2e-5 gap.
+3. **Robust Initializations**: Expand the set of hexagonal patterns and random starts to ensure diverse exploration of the configuration space.
+4. **Exact LP Refinement**: Keep the LP solver as the ground truth for radii given centers, but call it more strategically during optimization phases.
+5. **Numerical Safety**: Maintain strict boundary and overlap checks with a final safety scaling to guarantee validator compliance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+def get_pairwise_indices(n):
+    """Returns indices for upper triangle of distance matrix."""
+    return np.triu_indices(n, k=1)
+
+def build_A(n):
+    """Constructs the constraint matrix A for the LP: r_i + r_j <= dist_ij."""
+    idx_i, idx_j = get_pairwise_indices(n)
+    m = len(idx_i)
+    A = np.zeros((m, n))
+    A[np.arange(m), idx_i] = 1.0
+    A[np.arange(m), idx_j] = 1.0
+    return A, idx_i, idx_j
+
+def solve_lp(centers, A, idx_i, idx_j):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    wall = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    bounds = [(0.0, max(w, 1e-12)) for w in wall]
+    
+    # Pairwise constraints: r_i + r_j <= dist(i,j)
+    diff = centers[idx_i] - centers[idx_j]
+    b_ub = np.sqrt(np.sum(diff**2, axis=1))
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            r = np.maximum(res.x, 0.0)
+            return r, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def clearance_obj(x_flat, n):
+    """Objective for Nelder-Mead: maximize minimum clearance (equal-radius packing proxy)."""
+    c = x_flat.reshape(n, 2)
+    # Distance to walls
+    d_wall = np.minimum(np.minimum(c[:,0], 1.0 - c[:,0]), 
+                        np.minimum(c[:,1], 1.0 - c[:,1]))
+    # Distance to other circles
+    diff = c[:, None, :] - c[None, :, :]
+    d_pair = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(d_pair, np.inf)
+    
+    # Minimum clearance is limited by walls and half the pairwise distances
+    min_d = np.min(np.concatenate([d_wall, d_pair.min(axis=1) / 2.0]))
+    return -min_d  # Minimize negative clearance => Maximize clearance
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(123)
+    A, idx_i, idx_j = build_A(n)
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,5,5],
+        [5,5,5,5,6], [6,5,5,5,5], [4,5,6,5,6], [5,6,4,6,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.10
+        for i, cnt in enumerate(pat):
+            shift = 0.10 if i % 2 == 1 else 0.0
+            x = 0.10 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.20
+            y += 0.10 * np.sqrt(3)
+        c = np.array(pts[:n])
+        configs.append(c)
+        
+    # Add purely random starts
+    for _ in range(10):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    # Phase 1: Clearance Maximization + LP
+    for cfg in configs:
+        try:
+            res_nm = minimize(clearance_obj, cfg.flatten(), args=(n,), method='Nelder-Mead', 
+                              options={'maxiter': 5000, 'xatol': 1e-9, 'fatol': 1e-10})
+            c_opt = np.clip(res_nm.x.reshape(n, 2), 0.01, 0.99)
+            r_lp, s_lp = solve_lp(c_opt, A, idx_i, idx_j)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_c = c_opt.copy()
+                best_r = r_lp.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Simulated Annealing Hill Climbing
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_r = best_r.copy()
+        curr_s = best_sum
+        T = 0.05
+        T_min = 1e-6
+        alpha = 0.995
+        
+        for it in range(4000):
+            T = max(T_min, T * alpha)
+            scale = 0.015 * (0.5 + 0.5 * (T / T_min))
+            
+            # Perturb 2 circles simultaneously to break symmetry faster
+            idx = rng.choice(n, size=2, replace=False)
+            old = curr_c[idx].copy()
+            
+            curr_c[idx] += rng.uniform(-scale, scale, (2, 2))
+            curr_c[idx] = np.clip(curr_c[idx], 1e-4, 1.0 - 1e-4)
+            
+            r_new, s_new = solve_lp(curr_c, A, idx_i, idx_j)
+            delta = s_new - curr_s
+            
+            # Simulated Annealing acceptance criterion
+            if delta > 0 or rng.random() < min(1.0, np.exp(delta / T)):
+                curr_s = s_new
+                curr_r = r_new.copy()
+                
+                # Occasional fine polish to settle perturbations
+                if it % 500 == 0:
+                    try:
+                        res_loc = minimize(clearance_obj, curr_c.flatten(), args=(n,), method='Nelder-Mead',
+                                           options={'maxiter': 800, 'xatol': 1e-9, 'fatol': 1e-10})
+                        c_pol = np.clip(res_loc.x.reshape(n, 2), 0.01, 0.99)
+                        r_pol, s_pol = solve_lp(c_pol, A, idx_i, idx_j)
+                        if s_pol > curr_s:
+                            curr_s = s_pol
+                            curr_r = r_pol.copy()
+                            curr_c = c_pol.copy()
+                    except Exception:
+                        pass
+            else:
+                curr_c[idx] = old
+                
+        best_c = curr_c
+        best_r = curr_r
+        best_sum = curr_s
+
+    # Phase 3: Multi-Resolution Coordinate-wise Fine Search
+    for step in np.logspace(-3, -5, 20):
+        improved = False
+        for _ in range(400):
+            idx = rng.integers(n)
+            old = best_c[idx].copy()
+            best_c[idx] += rng.uniform(-step, step, 2)
+            best_c[idx] = np.clip(best_c[idx], 1e-4, 1.0 - 1e-4)
+            
+            r_try, s_try = solve_lp(best_c, A, idx_i, idx_j)
+            if s_try > best_sum + 1e-9:
+                best_sum = s_try
+                best_r = r_try.copy()
+                improved = True
+            else:
+                best_c[idx] = old
+        if not improved:
+            break
+
+    # Phase 4: Strict Numerical Safety Scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = best_r[:, None] + best_r[None, :]
+    min_ratio = np.min(dists[idx_i, idx_j] / np.maximum(r_pair[idx_i, idx_j], 1e-12))
+    scale = min(scale, min_ratio)
+    
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    # Fallback safety net
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp(best_c, A, idx_i, idx_j)
+        
+    return best_c, best_r, best_sum
+```

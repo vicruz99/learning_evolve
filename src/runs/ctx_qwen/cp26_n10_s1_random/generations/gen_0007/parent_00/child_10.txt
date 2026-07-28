@@ -1,0 +1,217 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.631350) and approach the target of 2.636, I will implement a more robust and multi-phase optimization pipeline:
+
+1. **Diverse Initialization**: Generate multiple high-quality starting configurations using hexagonal lattice patterns with varying row distributions, explicitly scaled and centered to utilize boundary space efficiently. Add random perturbations and fully random placements to ensure landscape coverage.
+2. **Joint SLSQP Optimization**: Use `scipy.optimize.minimize` with the SLSQP method to jointly optimize centers and radii. This handles non-linear constraints directly and often finds high-quality local optima quickly.
+3. **Precomputed LP Structure**: The linear programming problem for finding optimal radii given fixed centers has a constant constraint matrix structure. I will precompute `A_ub` once to significantly speed up the LP evaluations during local search.
+4. **Simulated Annealing on Centers**: Since the LP objective `sum(radii(centers))` is non-smooth, gradient methods struggle. I will run two passes of Simulated Annealing that perturbs circle centers and evaluates the true objective via LP. This allows escaping local minima that SLSQP gets trapped in.
+5. **Strict Safety Scaling**: Finally, compute the exact maximum feasible scale factor for the best configuration to guarantee strict numerical validity against the `1e-12` tolerance in the validation function.
+
+This combination of structural LP acceleration, joint non-linear optimization, and derivative-free simulated annealing typically pushes circle packings close to theoretical optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def objective_func(v, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraint_func(v, n):
+    """Inequality constraints >= 0 for valid packing."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    c = []
+    c.append(cx - r)
+    c.append(1.0 - cx - r)
+    c.append(cy - r)
+    c.append(1.0 - cy - r)
+    
+    cx_m = cx[:, None] - cx[None, :]
+    cy_m = cy[:, None] - cy[None, :]
+    r_m = r[:, None] + r[None, :]
+    d2 = cx_m**2 + cy_m**2
+    rs2 = r_m**2
+    idx = np.triu_indices(n, k=1)
+    c.append(d2[idx] - rs2[idx])
+    return np.concatenate(c)
+
+def solve_lp_fast(centers, A_ub, n):
+    """Solves LP to maximize sum of radii for fixed centers using precomputed A_ub."""
+    m_bound = 4 * n
+    m_pair = n * (n - 1) // 2
+    m_total = m_bound + m_pair
+    b_ub = np.empty(m_total)
+    bounds = []
+    idx = 0
+    
+    for i in range(n):
+        x, y = centers[i]
+        mx = max(1e-9, min(x, 1.0-x, y, 1.0-y))
+        bounds.append((0.0, mx))
+        b_ub[idx] = x; idx += 1
+        b_ub[idx] = 1.0-x; idx += 1
+        b_ub[idx] = y; idx += 1
+        b_ub[idx] = 1.0-y; idx += 1
+        
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            b_ub[idx] = d
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return np.maximum(res.x, 1e-9), -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # Precompute A_ub for LP (constant structure)
+    m_bound = 4 * n
+    m_pair = n * (n - 1) // 2
+    m_total = m_bound + m_pair
+    A_ub = np.zeros((m_total, n))
+    
+    idx = 0
+    for i in range(n):
+        for _ in range(4):
+            A_ub[idx, i] = 1.0
+            idx += 1
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            idx += 1
+            
+    # Phase 1: Generate diverse initial configurations
+    inits = []
+    row_patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [5,6,6,4,5], [6,5,5,6,4], [7,6,6,7]
+    ]
+    
+    for row_pat in row_patterns:
+        pts = []
+        r0 = 0.095
+        y = r0
+        for i, cnt in enumerate(row_pat):
+            shift = r0 if i%2==1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 2.0*r0
+            y += np.sqrt(3)*r0
+        while len(pts) < n: pts.append([0.5, 0.5])
+        
+        pts = np.array(pts[:n])
+        # Normalize to comfortably fit inside the square
+        pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.82 + 0.09
+        inits.append(pts)
+        
+        # Add controlled perturbations to break symmetry
+        for _ in range(4):
+            inits.append(np.clip(pts + rng.uniform(-0.02, 0.02, pts.shape), 0.02, 0.98))
+            
+    # Random dense placements
+    for _ in range(12):
+        inits.append(rng.uniform(0.12, 0.88, (n, 2)))
+        
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_opt = [(0.001, 0.999)]*(2*n) + [(0.0001, 0.25)]*n
+    
+    # Phase 2: SLSQP Joint Optimization
+    for cfg in inits:
+        x0 = np.zeros(3*n)
+        x0[:n] = cfg[:, 0]
+        x0[n:2*n] = cfg[:, 1]
+        x0[2*n:] = 0.085
+        
+        try:
+            res = minimize(objective_func, x0, args=(n,), method='SLSQP',
+                           bounds=bounds_opt,
+                           constraints={'type': 'ineq', 'fun': constraint_func, 'args': (n,)},
+                           options={'maxiter': 6000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+                r_lp, s_lp = solve_lp_fast(c_opt, A_ub, n)
+                if r_lp is not None and s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = c_opt.copy()
+                    best_radii = r_lp.copy()
+        except Exception:
+            continue
+            
+    # Phase 3: Simulated Annealing on Centers (Two passes for robustness)
+    if best_centers is not None:
+        for sa_pass in range(2):
+            current_centers = best_centers.copy()
+            current_radii, current_sum = solve_lp_fast(current_centers, A_ub, n)
+            best_radii = current_radii
+            best_sum = current_sum
+            
+            T = 0.012
+            for step in range(6000):
+                idx = rng.integers(n)
+                old_pos = current_centers[idx].copy()
+                
+                move = rng.normal(0, T, 2)
+                current_centers[idx] = np.clip(current_centers[idx] + move, 0.005, 0.995)
+                
+                r_new, s_new = solve_lp_fast(current_centers, A_ub, n)
+                if r_new is None:
+                    current_centers[idx] = old_pos
+                    continue
+                    
+                delta = s_new - current_sum
+                # Standard SA acceptance criterion
+                if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-7)):
+                    current_sum = s_new
+                    current_radii = r_new
+                    if current_sum > best_sum:
+                        best_sum = current_sum
+                        best_centers = current_centers.copy()
+                        best_radii = current_radii.copy()
+                else:
+                    current_centers[idx] = old_pos
+                    
+                T *= 0.9995
+
+    # Phase 4: Strict safety scaling to guarantee numerical validity
+    if best_centers is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_centers[i,0], best_centers[i,1], best_radii[i]
+            if r > 1e-12:
+                scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+                rs = best_radii[i] + best_radii[j]
+                if rs > 1e-12:
+                    scale = min(scale, d/rs)
+        best_radii *= scale * 0.9999999
+        best_sum = float(np.sum(best_radii))
+        
+    # Guaranteed fallback
+    if best_centers is None:
+        best_centers = rng.uniform(0.1, 0.9, (n, 2))
+        best_radii = np.full(n, 0.08)
+        best_sum = float(np.sum(best_radii))
+        
+    return best_centers, best_radii, best_sum
+```

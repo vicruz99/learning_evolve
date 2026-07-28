@@ -1,0 +1,185 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we decouple the problem into two stages:
+1. **Radius Optimization (LP)**: For any fixed set of centers, finding the optimal radii that maximize the sum is a Linear Programming problem. The constraints are linear: each radius is bounded by the distance to the nearest wall, and the sum of any two radii is bounded by the Euclidean distance between their centers.
+2. **Center Optimization (Black-box Search)**: We treat the maximum sum of radii as a black-box function of the centers. Since this function is continuous but non-differentiable (piecewise linear), we use a robust multi-start hill-climbing algorithm with an adaptive step size. This efficiently navigates the landscape and escapes shallow local minima.
+3. **Refinement**: After hill-climbing, we apply a derivative-free local optimizer (`Nelder-Mead`) for fine-tuning. Finally, we apply a strict numerical safety scaling to guarantee the validator's tolerance constraints are met.
+
+This approach leverages the speed of modern LP solvers (`highs`) to evaluate thousands of center configurations quickly, focusing computational effort on exploring promising geometric arrangements (initialized from diverse hexagonal lattices).
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+# Global constants and pre-allocated matrices for speed
+N_CIRCLES = 26
+M_BOUND = 4 * N_CIRCLES
+M_PAIR = N_CIRCLES * (N_CIRCLES - 1) // 2
+
+# Constraint matrix A_ub: each row corresponds to one constraint
+A_MAT = np.zeros((M_BOUND + M_PAIR, N_CIRCLES))
+for i in range(N_CIRCLES):
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    A_MAT[4*i, i] = 1.0
+    A_MAT[4*i+1, i] = 1.0
+    A_MAT[4*i+2, i] = 1.0
+    A_MAT[4*i+3, i] = 1.0
+
+# Pairwise constraints: r_i + r_j <= dist(i,j)
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+A_MAT[M_BOUND:, TRIU_IDX[0]] = 1.0
+A_MAT[M_BOUND:, TRIU_IDX[1]] = 1.0
+
+# RHS vector (updated dynamically)
+B_VEC = np.zeros(M_BOUND + M_PAIR)
+LP_BOUNDS = (0.0, 0.5)
+
+def get_lp_result(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    # Update boundary constraints RHS
+    B_VEC[0::4] = centers[:, 0]
+    B_VEC[1::4] = 1.0 - centers[:, 0]
+    B_VEC[2::4] = centers[:, 1]
+    B_VEC[3::4] = 1.0 - centers[:, 1]
+    
+    # Update pairwise distance constraints RHS
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    B_VEC[M_BOUND:] = np.sqrt(np.sum(diff**2, axis=2))[TRIU_IDX]
+    
+    try:
+        # Minimize -sum(r) => Maximize sum(r)
+        res = linprog(-np.ones(N_CIRCLES), A_ub=A_MAT, b_ub=B_VEC, bounds=LP_BOUNDS, method='highs')
+        if res.success:
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.zeros(N_CIRCLES)
+
+def generate_hex(row_counts, r0, rng):
+    """Generates initial positions on a hexagonal lattice."""
+    pts = []
+    y = r0
+    for idx, cnt in enumerate(row_counts):
+        shift = r0 if idx % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N_CIRCLES: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += r0 * np.sqrt(3)
+    while len(pts) < N_CIRCLES:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:N_CIRCLES])
+
+def hill_climb(start_c, rng, iters):
+    """Iteratively perturbs centers to maximize LP sum of radii."""
+    curr = start_c.copy()
+    curr_sum, curr_r = get_lp_result(curr)
+    best_sum = curr_sum
+    best_c = curr.copy()
+    best_r = curr_r.copy()
+    
+    sigma = 0.045
+    no_imp = 0
+    
+    for step in range(iters):
+        if sigma < 1e-6: break
+        
+        # Randomly pick a circle to perturb
+        i = rng.integers(N_CIRCLES)
+        old = curr[i].copy()
+        
+        # Gaussian perturbation clipped to valid range
+        curr[i] = np.clip(old + rng.normal(0, sigma, 2), 1e-4, 1.0 - 1e-4)
+        
+        ns, nr = get_lp_result(curr)
+        if ns > best_sum:
+            best_sum = ns
+            best_c = curr.copy()
+            best_r = nr.copy()
+            no_imp = 0
+        else:
+            curr[i] = old  # Revert if no improvement
+            no_imp += 1
+            
+        # Adaptive step size decay
+        if no_imp > 250:
+            sigma *= 0.94
+            no_imp = 0
+            
+    return best_c, best_r, best_sum
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    rng = np.random.default_rng(42)
+    
+    # Generate diverse high-quality starting configurations
+    starts = []
+    pats = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], 
+        [6,6,4,6,4], [5,5,6,5,5], [6,4,6,4,6],
+        [5,6,6,5,4], [6,5,4,6,5], [5,5,5,5,6]
+    ]
+    
+    for pat in pats:
+        if sum(pat) == n:
+            c = generate_hex(pat, 0.095, rng)
+            starts.append(c)
+            # Add perturbed variants to break symmetry
+            for _ in range(3):
+                p = c + rng.uniform(-0.02, 0.02, c.shape)
+                starts.append(np.clip(p, 0.05, 0.95))
+                
+    # Add fully random dense starts
+    for _ in range(5):
+        starts.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Multi-start hill climbing
+    for s in starts:
+        c, r, s_val = hill_climb(s, rng, iters=1500)
+        if s_val > best_sum:
+            best_sum = s_val
+            best_centers = c
+            best_radii = r
+            
+    # Phase 2: Local polynomial-free refinement
+    def obj_nm(x):
+        s, _ = get_lp_result(x.reshape(n, 2))
+        return -s
+        
+    try:
+        res_nm = minimize(obj_nm, best_centers.flatten(), method='Nelder-Mead',
+                          options={'maxiter': 4000, 'xatol': 1e-9, 'fatol': 1e-10})
+        if -res_nm.fun > best_sum:
+            best_centers = res_nm.x.reshape(n, 2)
+            best_sum, best_radii = get_lp_result(best_centers)
+    except Exception:
+        pass
+        
+    # Phase 3: Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    # Apply scaling with a tiny buffer to strictly satisfy checker tolerance
+    best_radii *= scale * 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

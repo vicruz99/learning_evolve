@@ -1,0 +1,206 @@
+# sol_000029 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000017 (state bde5dee5) state=81a0d5f4 sum of radii=2.630179 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def get_constraints(vars_arr, n):
+    centers = vars_arr[:2 * n].reshape(n, 2)
+    radii = vars_arr[2 * n:]
+    cons = []
+    
+    # Boundary constraints
+    for i in range(n):
+        cons.append(centers[i, 0] - radii[i])
+        cons.append(1.0 - (centers[i, 0] + radii[i]))
+        cons.append(centers[i, 1] - radii[i])
+        cons.append(1.0 - (centers[i, 1] + radii[i]))
+        
+    # Overlap constraints: dist^2 - (r_i + r_j)^2 >= 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            diff = centers[i] - centers[j]
+            dist_sq = np.dot(diff, diff)
+            r_sum = radii[i] + radii[j]
+            cons.append(dist_sq - r_sum ** 2)
+            
+    return np.array(cons)
+
+def objective_func(vars_arr):
+    # We maximize sum of radii, so we minimize negative sum
+    return -np.sum(vars_arr[2 * 26:])
+
+def force_simulate(centers, radii, steps=3000):
+    n = len(radii)
+    vel = np.zeros_like(centers)
+    dt = 0.008
+    damping = 0.92
+    k_rep = 60.0
+    k_wall = 30.0
+    
+    for _ in range(steps):
+        # Gradually expand radii
+        radii *= 1.00006
+        
+        forces = np.zeros_like(centers)
+        
+        # Pairwise repulsion
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                req = radii[i] + radii[j]
+                if dist < req and dist > 1e-9:
+                    overlap = req - dist
+                    f = k_rep * overlap / dist
+                    forces[i] += f * diff
+                    forces[j] -= f * diff
+                    
+        # Wall repulsion
+        for i in range(n):
+            if centers[i, 0] - radii[i] < 0:
+                forces[i, 0] += k_wall * (radii[i] - centers[i, 0])
+            if centers[i, 0] + radii[i] > 1.0:
+                forces[i, 0] -= k_wall * (centers[i, 0] + radii[i] - 1.0)
+            if centers[i, 1] - radii[i] < 0:
+                forces[i, 1] += k_wall * (radii[i] - centers[i, 1])
+            if centers[i, 1] + radii[i] > 1.0:
+                forces[i, 1] -= k_wall * (centers[i, 1] + radii[i] - 1.0)
+                
+        vel = damping * vel + forces * dt
+        centers += vel
+        centers = np.clip(centers, 0.0, 1.0)
+        
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = -1.0
+    best_result = None
+    
+    np.random.seed(42)
+    
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. Hexagonal lattice pattern (5-6-5-6-4 rows)
+    rows_counts = [5, 6, 5, 6, 4]
+    r_init = 0.09
+    cx, cy = [], []
+    y = r_init + 0.04
+    for idx, count in enumerate(rows_counts):
+        x_start = r_init + 0.04 if idx % 2 == 0 else 2 * r_init + 0.04
+        step = (1.0 - 2 * r_init - 0.08) / max(count - 1, 1)
+        for k in range(count):
+            cx.append(x_start + k * step)
+            cy.append(y)
+        y += r_init * np.sqrt(3) + 0.04
+    configs.append(np.column_stack((cx[:n], cy[:n])))
+    
+    # 2. Uniform grid + center perturbation
+    grid = np.array([(i * 0.18 + 0.1, j * 0.18 + 0.1) for j in range(5) for i in range(5)] + [[0.5, 0.5]])
+    configs.append(grid[:n])
+    
+    # 3. Random valid starts
+    for _ in range(4):
+        configs.append(np.random.uniform(0.12, 0.88, (n, 2)))
+        
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+    
+    for cfg in configs:
+        # Phase 1: Force simulation to find a tight, valid packing
+        sim_centers, sim_radii = force_simulate(cfg.copy(), np.full(n, 0.09))
+        
+        # Phase 2: Precise local optimization with SLSQP
+        # Perturb slightly to explore local neighborhood
+        for _ in range(3):
+            noise = np.random.normal(0, 0.005, size=(n, 2))
+            pert_centers = np.clip(sim_centers + noise, 0.01, 0.99)
+            
+            # Ensure feasible start for SLSQP by slightly shrinking radii
+            x0 = np.concatenate([pert_centers.flatten(), sim_radii * 0.96])
+            
+            try:
+                res = minimize(
+                    objective_func,
+                    x0,
+                    method='SLSQP',
+                    bounds=bounds,
+                    constraints={'type': 'ineq', 'fun': get_constraints, 'args': (n,)},
+                    options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False}
+                )
+                
+                # Extract and validate
+                fc = res.x[:2 * n].reshape(n, 2)
+                fr = np.maximum(res.x[2 * n:], 1e-9)
+                
+                if validate_packing(fc, fr):
+                    s = np.sum(fr)
+                    if s > best_sum:
+                        best_sum = s
+                        best_result = (fc.copy(), fr.copy(), s)
+            except Exception:
+                continue
+                
+    # Fallback to a guaranteed valid configuration if optimization fails
+    if best_result is None:
+        r_fb = 0.095
+        fb_centers = np.array([(i * 2 * r_fb + r_fb, j * 2 * r_fb + r_fb) 
+                               for j in range(5) for i in range(5)] + [[0.55, 0.55]])
+        fb_radii = np.full(26, r_fb)
+        fb_radii[-1] = 0.05
+        best_result = (fb_centers, fb_radii, np.sum(fb_radii))
+        
+    return best_result

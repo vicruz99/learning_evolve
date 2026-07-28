@@ -1,0 +1,166 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need to find a configuration that closely approximates the optimal hexagonal packing topology, while allowing radii to vary slightly to exploit boundary space. The current best sum is ~2.631, and the target is 2.636, which corresponds to the theoretical limit for nearly equal circles (~0.1014 radius each).
+
+Key improvements in this strategy:
+1. **LP Oracle for Radii**: For any fixed set of centers, the optimal radii that maximize their sum can be found exactly via a Linear Program. This is computationally cheap for N=26 and gives a precise evaluation metric for any center configuration.
+2. **Simulated Annealing with Axis-Aligned Moves**: We use a stochastic local search that perturbs one circle's coordinate at a time. Axis-aligned moves naturally perform coordinate descent, helping to untangle tightly packed circles. Simulated annealing allows escaping shallow local minima.
+3. **Diverse High-Quality Initializations**: We generate multiple hexagonal lattice patterns with different row distributions and apply controlled random perturbations. This ensures we explore different topological basins.
+4. **Strict Numerical Safety**: After optimization, we compute the exact scaling factor needed to satisfy all constraints within the validator's `1e-12` tolerance, guaranteeing a valid submission.
+5. **Closure-Free & Efficient Design**: All helper functions are defined at the top level. The LP matrix is reconstructed quickly (325 constraints × 26 variables), and the search loop is tightly optimized for speed and reliability.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_lp(centers, n, ii, jj):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    diffs = centers[ii] - centers[jj]
+    dists = np.sqrt(np.sum(diffs**2, axis=1) + 1e-18)
+    
+    # Construct LP matrices
+    m = len(ii)
+    A = np.zeros((m, n))
+    for k, (i, j) in enumerate(zip(ii, jj)):
+        A[k, i] = 1.0
+        A[k, j] = 1.0
+        
+    b = dists
+    bounds = [(0.0, ub[i]) for i in range(n)]
+    c_obj = -np.ones(n)
+    
+    try:
+        res = linprog(c_obj, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback to geometrically valid radii if LP fails
+    r_fall = ub * 0.95
+    return r_fall, np.sum(r_fall)
+
+def get_start_configs(n, rng):
+    """Generates diverse hexagonal and perturbed initial configurations."""
+    configs = []
+    row_pats = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [7,6,6,7], [8,6,6,6], [5,5,5,5,5,1], [4,6,6,6,4]
+    ]
+    for pat in row_pats:
+        if sum(pat) < n: continue
+        pts = []
+        r0 = 0.098
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3) * r0
+        cfg = np.array(pts[:n])
+        
+        # Normalize to comfortably fit inside [0.1, 0.9]
+        mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+        span = mx - mn
+        if span[0] > 0: cfg[:, 0] = (cfg[:, 0] - mn[0]) / span[0] * 0.8 + 0.1
+        if span[1] > 0: cfg[:, 1] = (cfg[:, 1] - mn[1]) / span[1] * 0.8 + 0.1
+        configs.append(cfg)
+        
+    # Add controlled perturbations to escape symmetry traps
+    for _ in range(8):
+        p = configs[0].copy() + rng.uniform(-0.025, 0.025, (n, 2))
+        configs.append(np.clip(p, 0.05, 0.95))
+        
+    return configs
+
+def optimize_run(start_c, n, ii, jj, rng):
+    """Runs simulated annealing with axis-aligned moves to optimize centers."""
+    curr_c = start_c.copy()
+    _, sum_curr = solve_lp(curr_c, n, ii, jj)
+    best_c = curr_c.copy()
+    best_r, best_sum = solve_lp(best_c, n, ii, jj)
+    
+    step = 0.045
+    temp = 0.06
+    
+    for it in range(1800):
+        idx = rng.integers(n)
+        axis = rng.integers(2)  # 0 for x, 1 for y
+        
+        old = curr_c[idx, axis]
+        new = old + rng.normal(0, step)
+        new = np.clip(new, 0.005, 0.995)
+        
+        curr_c[idx, axis] = new
+        _, sum_new = solve_lp(curr_c, n, ii, jj)
+        
+        if sum_new > best_sum:
+            best_sum = sum_new
+            best_c = curr_c.copy()
+            _, best_r = solve_lp(best_c, n, ii, jj)
+            
+        # Simulated annealing acceptance criterion
+        if sum_new < sum_curr:
+            prob = np.exp((sum_new - sum_curr) / max(temp, 1e-4))
+            if rng.random() < prob:
+                sum_curr = sum_new
+            else:
+                curr_c[idx, axis] = old
+        else:
+            sum_curr = sum_new
+            
+        step *= 0.9994
+        temp *= 0.9985
+        
+    return best_c, best_r, best_sum
+
+def run_packing():
+    n = 26
+    ii, jj = np.triu_indices(n, k=1)
+    rng = np.random.default_rng(42)
+    
+    configs = get_start_configs(n, rng)
+    
+    global_best_c = None
+    global_best_r = None
+    global_best_sum = -1.0
+    
+    # Optimize from each starting configuration
+    for cfg in configs:
+        bc, br, bs = optimize_run(cfg, n, ii, jj, rng)
+        if bs > global_best_sum:
+            global_best_sum = bs
+            global_best_c = bc
+            global_best_r = br
+            
+    # Phase: Strict numerical safety scaling to guarantee 1e-12 validator tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = global_best_c[i,0], global_best_c[i,1], global_best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(global_best_c[i,0]-global_best_c[j,0], 
+                         global_best_c[i,1]-global_best_c[j,1])
+            rs = global_best_r[i] + global_best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    global_best_r *= scale * 0.9999999
+    final_sum = float(np.sum(global_best_r))
+    
+    return global_best_c, global_best_r, final_sum
+```

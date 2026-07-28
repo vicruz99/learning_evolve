@@ -1,0 +1,187 @@
+# sol_000234 | problem=circle_packing_26 entrypoint=run_packing
+# generation=8 parent=sol_000142 (state d65765d5) state=1fe01db3 sum of radii=1.868210 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+# Precompute constant LP matrices for speed
+N = 26
+IDX_I, IDX_J = np.triu_indices(N, k=1)
+M = len(IDX_I)
+A_LP = np.zeros((M, N))
+A_LP[np.arange(M), IDX_I] = 1.0
+A_LP[np.arange(M), IDX_J] = 1.0
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    # Max radius per circle limited by distance to square boundaries
+    wall_dists = np.min([centers[:, 0], 1.0 - centers[:, 0], 
+                         centers[:, 1], 1.0 - centers[:, 1]], axis=0)
+    wall_dists = np.maximum(wall_dists, 0.0)
+    bounds = [(0.0, lim) for lim in wall_dists]
+    
+    # Pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[IDX_I, IDX_J]
+    
+    # Objective: maximize sum(r) => minimize -sum(r)
+    c_obj = -np.ones(N)
+    
+    try:
+        res = linprog(c_obj, A_ub=A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.zeros(N), 0.0
+
+def mmd_objective(v):
+    """Objective for MMD: minimize negative of equal radius t."""
+    return -v[-1]
+
+def mmd_constraints(v):
+    """Inequality constraints for MMD: >= 0."""
+    xs = v[0::2]
+    ys = v[1::2]
+    t = v[-1]
+    
+    c_list = [xs - t, 1.0 - xs - t, ys - t, 1.0 - ys - t]
+    
+    dx = xs[:, np.newaxis] - xs[np.newaxis, :]
+    dy = ys[:, np.newaxis] - ys[np.newaxis, :]
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c_list.append(d2[mask] - 4.0 * t**2)
+    
+    return np.concatenate(c_list)
+
+def generate_starts(rng):
+    """Generates diverse initial configurations for optimization."""
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [4, 6, 6, 6, 4], 
+        [6, 6, 4, 6, 4], [7, 6, 7, 6], [6, 7, 6, 7]
+    ]
+    starts = []
+    
+    for pat in patterns:
+        if sum(pat) != 26: 
+            continue
+        pts = []
+        y_curr = 0.09
+        row = 0
+        for cnt in pat:
+            shift = 0.09 if row % 2 == 1 else 0.0
+            x_curr = 0.09 + shift
+            for _ in range(cnt):
+                if len(pts) >= 26: 
+                    break
+                pts.append([x_curr, y_curr])
+                x_curr += 0.18
+            y_curr += 0.09 * np.sqrt(3)
+            row += 1
+        pts = np.array(pts[:26])
+        
+        # Add perturbed variants
+        for _ in range(4):
+            p = pts + rng.uniform(-0.025, 0.025, pts.shape)
+            p = np.clip(p, 0.05, 0.95)
+            t0 = 0.085
+            v0 = np.concatenate([p.flatten(), [t0]])
+            starts.append(v0)
+            
+    # Add fully random starts
+    for _ in range(8):
+        rc = rng.uniform(0.15, 0.85, (26, 2))
+        t0 = 0.08
+        v0 = np.concatenate([rc.flatten(), [t0]])
+        starts.append(v0)
+        
+    return starts
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+    
+    # Phase 1: MMD Optimization
+    starts = generate_starts(rng)
+    bounds_mmd = [(0.0, 1.0)] * (2 * N) + [(0.05, 0.15)]
+    cons_mmd = {'type': 'ineq', 'fun': mmd_constraints}
+    
+    for v0 in starts:
+        try:
+            res = minimize(mmd_objective, v0, method='SLSQP', bounds=bounds_mmd,
+                           constraints=cons_mmd, options={'maxiter': 10000, 'ftol': 1e-12})
+            if np.isfinite(res.fun):
+                cx = res.x[0::2]
+                cy = res.x[1::2]
+                c_mat = np.column_stack((cx, cy))
+                radii, s = solve_lp_radii(c_mat)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_mat.copy()
+                    best_radii = radii.copy()
+        except Exception:
+            pass
+            
+    if best_centers is None:
+        best_centers = rng.uniform(0.2, 0.8, (26, 2))
+        best_radii, best_sum = solve_lp_radii(best_centers)
+        
+    # Phase 2: Simulated Annealing Hill-Climbing on Centers
+    current_sum = best_sum
+    step_size = 0.06
+    temperature = 0.05
+    
+    for iteration in range(3000):
+        # Decay parameters
+        step_size = 0.06 * (0.997 ** iteration)
+        temperature = 0.05 * (0.995 ** iteration)
+        
+        # Pick a random circle to perturb
+        i = rng.integers(26)
+        old_pos = best_centers[i].copy()
+        
+        # Generate new position
+        best_centers[i] += rng.uniform(-step_size, step_size, 2)
+        best_centers[i] = np.clip(best_centers[i], 0.03, 0.97)
+        
+        radii, s = solve_lp_radii(best_centers)
+        
+        # Acceptance criterion (Simulated Annealing)
+        delta = s - current_sum
+        if delta > 0 or rng.random() < np.exp(delta / (temperature + 1e-12)):
+            current_sum = s
+            best_radii = radii.copy()
+        else:
+            best_centers[i] = old_pos
+            
+    # Phase 3: Final Numerical Safety Scaling
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r < 1e-12: 
+            continue
+        scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+        
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                         best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs < 1e-12: 
+                continue
+            scale = min(scale, d / rs)
+            
+    # Apply strict scaling to guarantee 1e-12 validation tolerance
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

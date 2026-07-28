@@ -1,0 +1,241 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that handles the highly non-convex constraint landscape. The approach combines:
+1. **Linear Programming for Radii**: For fixed centers, the optimal radii are found exactly via LP (`scipy.optimize.linprog`), which maximizes $\sum r_i$ subject to $r_i + r_j \leq d_{ij}$ and boundary constraints.
+2. **Dual Gradient Ascent for Centers**: The gradient of the optimal sum of radii with respect to centers is computed using the LP dual variables (Lagrange multipliers). This provides exact sensitivity directions to move centers apart along bottleneck constraints. We use `L-BFGS-B` with this analytical gradient for fast, precise local optimization.
+3. **Diverse Initial Configurations**: Hexagonal lattice patterns with varying row distributions, rotations, and controlled perturbations are generated to cover promising regions of the configuration space. Random dense starts complement this.
+4. **Local Coordinate Search**: After gradient ascent, a stochastic single-circle perturbation search (similar to simulated annealing) escapes shallow local minima by accepting moves that increase the LP objective.
+5. **Joint SLSQP Polish**: A final nonlinear optimization jointly adjusts centers and radii using exact inequality constraints, tightening the packing to the numerical limit.
+6. **Strict Safety Scaling**: A deterministic post-processing step scales radii down minimally to guarantee strict validity against the `1e-12` tolerance in the validator.
+
+This multi-phase strategy systematically explores, refines, and validates packings, pushing the sum of radii beyond simple grid/equal-radius baselines.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+idx_i, idx_j = np.triu_indices(N, k=1)
+M = len(idx_i)
+
+# Precompute LP constraint matrix structure
+A_ub = np.zeros((M + 4 * N, N))
+A_ub[:M, idx_i] = 1.0
+A_ub[:M, idx_j] = 1.0
+for i in range(N):
+    A_ub[M + i, i] = 1.0
+    A_ub[M + N + i, i] = 1.0
+    A_ub[M + 2 * N + i, i] = 1.0
+    A_ub[M + 3 * N + i, i] = 1.0
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers. Returns radii, sum, and solver result."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-10)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    b_ub = np.zeros(M + 4 * N)
+    diffs = centers[idx_i] - centers[idx_j]
+    b_ub[:M] = np.hypot(diffs[:, 0], diffs[:, 1])
+    
+    for i in range(N):
+        x, y = centers[i]
+        b_ub[M + i] = x
+        b_ub[M + N + i] = 1.0 - x
+        b_ub[M + 2 * N + i] = y
+        b_ub[M + 3 * N + i] = 1.0 - y
+        
+    try:
+        res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun, res
+    except Exception:
+        pass
+    return None, 0.0, None
+
+def obj_grad_func(c_flat):
+    """Objective and gradient for center optimization via LP duals."""
+    c = c_flat.reshape(N, 2)
+    r, s, res = solve_lp(c)
+    if r is None:
+        return 1e6, np.zeros_like(c_flat)
+        
+    g = np.zeros((N, 2))
+    marg = None
+    try:
+        if hasattr(res, 'marginals') and hasattr(res.marginals, 'ineqlin'):
+            marg = np.asarray(res.marginals.ineqlin)
+        elif hasattr(res, 'ineqlin') and hasattr(res.ineqlin, 'marginals'):
+            marg = np.asarray(res.ineqlin.marginals)
+    except Exception:
+        pass
+        
+    if marg is not None:
+        lams = marg[:M]
+        mask = lams > 1e-9
+        if np.any(mask):
+            idx = np.where(mask)[0]
+            lv = lams[idx]
+            ii, jj = idx_i[idx], idx_j[idx]
+            dx = c[ii, 0] - c[jj, 0]
+            dy = c[ii, 1] - c[jj, 1]
+            d = np.sqrt(dx**2 + dy**2)
+            d = np.maximum(d, 1e-12)
+            fx = lv * dx / d
+            fy = lv * dy / d
+            np.add.at(g[:, 0], ii, fx)
+            np.add.at(g[:, 1], ii, fy)
+            np.add.at(g[:, 0], jj, -fx)
+            np.add.at(g[:, 1], jj, -fy)
+            
+        for i in range(N):
+            g[i, 0] += marg[M + i] - marg[M + N + i]
+            g[i, 1] += marg[M + 2 * N + i] - marg[M + 3 * N + i]
+            
+    return -s, -g.flatten()
+
+def joint_obj(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2 * N:])
+
+def joint_cons(v):
+    """Inequality constraints >= 0 for SLSQP."""
+    cx, cy, r = v[:N], v[N:2 * N], v[2 * N:]
+    bc = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    d2 = dx**2 + dy**2
+    rs = r[idx_i] + r[idx_j]
+    pc = d2 - rs**2
+    
+    return np.concatenate([bc, pc])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_s = -1.0
+    best_c = None
+    best_r = None
+    
+    # 1. Generate diverse initial configurations
+    configs = []
+    pats = [
+        [6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5], [4,6,6,6,4], [6,6,5,5,4],
+        [5,7,5,5,4], [6,5,5,6,4], [5,6,6,4,5], [7,6,6,7], [8,6,6,6]
+    ]
+    
+    for pat in pats:
+        if sum(pat) < N: continue
+        pts = []
+        y = 0.08
+        for ri, cnt in enumerate(pat):
+            shift = 0.085 if ri % 2 == 1 else 0.0
+            x = 0.08 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 0.17
+            y += 0.08 * np.sqrt(3.0)
+        base = np.array(pts[:N])
+        configs.append(base)
+        
+        for _ in range(4):
+            pert = base + rng.uniform(-0.025, 0.025, base.shape)
+            configs.append(np.clip(pert, 0.05, 0.95))
+            
+    for _ in range(12):
+        configs.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    bounds_c = [(1e-4, 1.0 - 1e-4)] * (2 * N)
+    
+    # Phase 1: Gradient ascent on centers using LP duals
+    for cfg in configs:
+        c0 = np.clip(cfg, 1e-4, 1.0 - 1e-4)
+        try:
+            res = minimize(obj_grad_func, c0.flatten(), method='L-BFGS-B', jac=True, bounds=bounds_c,
+                           options={'maxiter': 6000, 'ftol': 1e-14, 'gtol': 1e-12})
+            if np.isfinite(res.fun):
+                c_opt = res.x.reshape(N, 2)
+                r_opt, s_opt, _ = solve_lp(c_opt)
+                if r_opt is not None and s_opt > best_s:
+                    best_s = s_opt
+                    best_c = c_opt.copy()
+                    best_r = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local coordinate descent / jiggle search to escape local minima
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_s = best_s
+        step = 0.015
+        
+        for it in range(5000):
+            idx = rng.integers(N)
+            old = curr_c[idx].copy()
+            
+            new = np.clip(curr_c[idx] + rng.uniform(-step, step, 2), 1e-4, 1.0 - 1e-4)
+            curr_c[idx] = new
+            
+            r_try, s_try, _ = solve_lp(curr_c)
+            if r_try is not None and s_try > curr_s + 1e-9:
+                curr_s = s_try
+                if curr_s > best_s:
+                    best_s = curr_s
+                    best_c = curr_c.copy()
+                    best_r = r_try.copy()
+                step = min(step * 1.005, 0.05)
+            else:
+                curr_c[idx] = old
+                if rng.random() < 0.03:
+                    step *= 0.97
+                    
+    # Phase 3: Joint SLSQP polish for precise constraint handling
+    if best_c is not None:
+        for _ in range(4):
+            cp = np.clip(best_c + rng.uniform(-0.004, 0.004, best_c.shape), 1e-4, 1.0 - 1e-4)
+            rp = best_r * 0.995
+            v0 = np.concatenate([cp[:, 0], cp[:, 1], rp])
+            bnd = [(0.0, 1.0)] * (2 * N) + [(1e-6, 0.5)] * N
+            
+            try:
+                res_j = minimize(joint_obj, v0, method='SLSQP', bounds=bnd,
+                                 constraints={'type': 'ineq', 'fun': joint_cons},
+                                 options={'maxiter': 3000, 'ftol': 1e-13})
+                if np.isfinite(res_j.fun):
+                    cj = np.column_stack((res_j.x[:N], res_j.x[N:2 * N]))
+                    rj, sj, _ = solve_lp(cj)
+                    if rj is not None and sj > best_s:
+                        best_s = sj
+                        best_c = cj.copy()
+                        best_r = rj.copy()
+            except Exception:
+                continue
+                
+    # Fallback safety net
+    if best_c is None:
+        best_c = rng.uniform(0.2, 0.8, (N, 2))
+        best_r, best_s, _ = solve_lp(best_c)
+        
+    # Final strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_r *= scale * 0.9999995
+    best_s = float(np.sum(best_r))
+    
+    return best_c, best_r, best_s
+```

@@ -1,0 +1,207 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.6296, we need a more robust and intensive optimization routine that effectively explores the non-convex configuration space. The core strategy involves:
+
+1. **Diverse & Symmetry-Breaking Initializations**: Generate multiple hexagonal lattice patterns with varying row distributions (e.g., [5,6,5,6,4], [4,6,6,6,4], etc.), along with heavily perturbed versions and random placements. This covers both lattice-like optimal structures and asymmetric boundary adaptations.
+2. **LP-Guided Local Search (Hill Climbing)**: For each initialization, run an intensive Monte Carlo local search on circle centers. At each step, perturb a single circle's position, then solve a fast Linear Programming (LP) problem to compute the maximum feasible sum of radii for that fixed center configuration. Accept the move if the sum increases. Use an adaptive step size with a cooling schedule to transition from exploration to precise exploitation. Periodically apply global perturbations to escape local minima.
+3. **Iterative Joint Refinement**: Alternate between the local search and a joint SLSQP optimization of both centers and radii. SLSQP smooths out the configuration and handles constraints analytically, while the LP-based local search precisely maximizes the objective given the non-smooth nature of the packing constraints.
+4. **Strict Numerical Safeguards**: After optimization, compute a conservative scaling factor based on boundary clearances and pairwise distances to guarantee strict feasibility against the $10^{-12}$ tolerance in the validator.
+
+This approach leverages the speed of modern LP solvers (`highs`) to evaluate the true objective landscape directly, avoiding the pitfalls of penalty methods or approximate gradients.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+# Constants
+N = 26
+_TRU_I, _TRU_J = np.triu_indices(N, k=1)
+_M = len(_TRU_I)
+_A_UB = np.zeros((_M, N))
+_A_UB[np.arange(_M), _TRU_I] = 1.0
+_A_UB[np.arange(_M), _TRU_J] = 1.0
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    
+    bounds = np.zeros((N, 2))
+    bounds[:, 1] = lims
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[_TRU_I, _TRU_J]
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=_A_UB, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(N, 1e-9), 0.0
+
+def hill_climb_lp(centers, rng, iters=8000):
+    """Intensive local search on centers evaluated via LP."""
+    c = centers.copy()
+    r, s = solve_lp(c)
+    if s <= 0:
+        return c, r, s
+        
+    step = 0.025
+    for k in range(iters):
+        i = rng.integers(N)
+        old = c[i].copy()
+        
+        # Adaptive perturbation: mix of local jiggle and occasional global shake
+        if k % 2000 == 0 and rng.random() < 0.3:
+            c += rng.uniform(-step * 0.5, step * 0.5, c.shape)
+            c = np.clip(c, 1e-4, 1.0 - 1e-4)
+            new_r, new_s = solve_lp(c)
+            if new_s > s:
+                r, s = new_r, new_s
+            else:
+                c -= rng.uniform(-step * 0.5, step * 0.5, c.shape) # revert
+                c = np.clip(c, 1e-4, 1.0 - 1e-4)
+            continue
+            
+        delta = rng.uniform(-1, 1, 2)
+        c[i] = np.clip(old + step * delta, 1e-4, 1.0 - 1e-4)
+        
+        new_r, new_s = solve_lp(c)
+        if new_s > s + 1e-9:
+            r, s = new_r, new_s
+            step = min(step * 1.0015, 0.05)
+        else:
+            c[i] = old
+            step *= 0.9992
+            
+    return c, r, s
+
+def generate_starts(n, rng):
+    starts = []
+    pats = [
+        [5,6,5,6,4], [6,5,6,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [6,6,4,6,4], [5,6,6,5,4], [7,5,5,5,4], [4,7,5,5,5],
+        [6,6,6,4,4], [5,5,5,5,6], [8,6,6,6], [9,5,6,6],
+        [10,8,8], [9,9,8], [13,13], [12,14], [11,15], [7,7,7,5]
+    ]
+    for pat in pats:
+        if sum(pat) != n:
+            continue
+        pts = []
+        r0 = 0.095
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n:
+                    break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:n])
+        
+        # Normalize to fit comfortably in [0.05, 0.95]
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        span = mx - mn
+        if span[0] > 1e-4 and span[1] > 1e-4:
+            scale = 0.80 / max(span[0] / 0.9, span[1] / 0.9)
+            pts = (pts - mn) * scale + 0.5 * (1.0 - scale)
+        pts = np.clip(pts, 0.05, 0.95)
+        starts.append(pts)
+        
+        # Perturbed variants
+        for _ in range(2):
+            p = pts + rng.uniform(-0.03, 0.03, pts.shape)
+            starts.append(np.clip(p, 0.05, 0.95))
+            
+    # Random starts
+    for _ in range(4):
+        starts.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    return starts
+
+def joint_objective(v, n):
+    return -np.sum(v[2 * n:])
+
+def joint_constraints(v, n):
+    cx = v[:n]
+    cy = v[n:2 * n]
+    r = v[2 * n:]
+    
+    cons = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    dx = cx[_TRU_I] - cx[_TRU_J]
+    dy = cy[_TRU_I] - cy[_TRU_J]
+    dr = r[_TRU_I] + r[_TRU_J]
+    dist = np.sqrt(dx**2 + dy**2 + 1e-16)
+    cons = np.concatenate([cons, dist - dr])
+    
+    return cons
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    starts = generate_starts(N, rng)
+    
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    # Phase 1: Diverse Local Search
+    for s in starts:
+        c, r, s_sum = hill_climb_lp(s, rng, iters=6000)
+        if s_sum > best_sum:
+            best_sum = s_sum
+            best_c = c.copy()
+            best_r = r.copy()
+            
+    # Phase 2: SLSQP Joint Polish
+    bounds_vars = [(1e-4, 1.0 - 1e-4)] * (2 * N) + [(1e-6, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': joint_constraints, 'args': (N,)}
+    
+    x0 = np.zeros(3 * N)
+    x0[:N] = best_c[:, 0]
+    x0[N:2 * N] = best_c[:, 1]
+    x0[2 * N:] = best_r * 0.97
+    
+    try:
+        res = minimize(joint_objective, x0, args=(N,), method='SLSQP', bounds=bounds_vars,
+                       constraints=cons_dict, options={'maxiter': 15000, 'ftol': 1e-14})
+        if np.isfinite(res.fun):
+            c_opt = np.column_stack((res.x[:N], res.x[N:2 * N]))
+            r_opt, s_opt = solve_lp(c_opt)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    except Exception:
+        pass
+        
+    # Phase 3: Final Aggressive Local Search on Best Configuration
+    best_c, best_r, best_sum = hill_climb_lp(best_c, rng, iters=10000)
+    
+    # Phase 4: Strict Safety Scaling
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

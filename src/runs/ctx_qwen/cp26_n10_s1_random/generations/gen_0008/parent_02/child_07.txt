@@ -1,0 +1,162 @@
+
+
+<strategy>
+The current solution uses SLSQP joint optimization followed by LP refinement. While effective, SLSQP often struggles with the non-convex distance constraints and can get trapped in local minima. The gap to the target (2.636) is small (~0.009), suggesting we are near the optimum but need a more robust local search on the center coordinates.
+
+Strategy:
+1. **LP-Oracle Coordinate Descent**: Instead of optimizing centers and radii jointly, we fix centers and exactly solve for the optimal radii using Linear Programming (`scipy.optimize.linprog` with the `highs` solver). This decouples the problem: radii become a fast, exact oracle given centers.
+2. **Iterative Center Perturbation**: We perform coordinate descent on centers. For each circle, we try moving it in multiple directions. If the LP-oracle returns a higher sum of radii, we accept the move. This directly climbs the objective landscape.
+3. **Adaptive Step Size & Random Jumps**: The step size decays when no improvement occurs. Occasionally, we apply random perturbations to escape plateaus.
+4. **Diverse Initializations**: We generate multiple starting configurations (hexagonal lattices, corner-focused layouts, and dense random packs) to explore different basins of attraction.
+5. **Two-Stage Refinement**: After scanning all starts, we run a second, finer-grained optimization pass on the best configuration found to squeeze out the last bits of improvement.
+6. **Strict Safety Scaling**: Finally, we compute the exact feasibility margin and shrink radii slightly to guarantee strict compliance with the `1e-12` validation tolerance.
+
+This approach is highly effective for circle packing because the LP exactly handles the radius constraints, allowing the discrete search to focus purely on geometric layout optimization.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_radii_lp(centers, n, A_ub, i_idx, j_idx):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    limits = np.maximum(limits, 1e-9)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    b_ub = dists[i_idx, j_idx]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def optimize_centers_lp(centers, n, A_ub, i_idx, j_idx, rng, iters=300, step_init=0.025):
+    """Optimizes center positions using LP-oracle coordinate descent."""
+    curr_r, curr_sum = solve_radii_lp(centers, n, A_ub, i_idx, j_idx)
+    if curr_r is None:
+        return centers, np.zeros(n), 0.0
+        
+    best_c = centers.copy()
+    best_r = curr_r.copy()
+    best_s = curr_sum
+    step = step_init
+    
+    for it in range(iters):
+        improved = False
+        order = rng.permutation(n)
+        for i in order:
+            old_pos = best_c[i].copy()
+            for dx, dy in [(step, 0), (-step, 0), (0, step), (0, -step), (step, step), (-step, step)]:
+                best_c[i] = np.clip(old_pos + np.array([dx, dy]), 1e-6, 1.0 - 1e-6)
+                r_try, s_try = solve_radii_lp(best_c, n, A_ub, i_idx, j_idx)
+                if r_try is not None and s_try > best_s + 1e-10:
+                    best_s = s_try
+                    best_r = r_try
+                    improved = True
+                    break
+            if not improved:
+                best_c[i] = old_pos
+                
+        # Occasional random perturbation to escape local minima
+        if it % 25 == 0 and step > 0.005:
+            idx = rng.integers(n)
+            old_pos = best_c[idx].copy()
+            best_c[idx] = np.clip(old_pos + rng.uniform(-step, step, 2), 1e-6, 1.0 - 1e-6)
+            r_try, s_try = solve_radii_lp(best_c, n, A_ub, i_idx, j_idx)
+            if r_try is not None and s_try > best_s:
+                best_s = s_try
+                best_r = r_try
+                improved = True
+            else:
+                best_c[idx] = old_pos
+                
+        if not improved:
+            step *= 0.95
+        if step < 1e-6:
+            break
+            
+    return best_c, best_r, best_s
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    m = len(i_idx)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), i_idx] = 1.0
+    A_ub[np.arange(m), j_idx] = 1.0
+    
+    rng = np.random.default_rng(42)
+    
+    best_c = None
+    best_r = None
+    best_s = -1.0
+    
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. Hexagonal row distributions
+    row_pats = [[6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5], [4,6,6,6,4], [6,6,5,5,4]]
+    for pat in row_pats:
+        pts = []
+        y = 0.08
+        for r_idx, cnt in enumerate(pat):
+            shift = 0.08 if r_idx % 2 == 1 else 0.0
+            width = (cnt - 1) * 0.16
+            x_start = 0.5 - width / 2.0 + shift
+            for k in range(cnt):
+                if len(pts) < n:
+                    pts.append([x_start + k * 0.16, y])
+            y += 0.14
+        configs.append(np.array(pts[:n]))
+        
+    # 2. Corner-focused layouts (large circles in corners, rest packed)
+    for _ in range(5):
+        c = rng.uniform(0.15, 0.85, (n, 2))
+        c[0] = [0.12 + rng.uniform(0, 0.05), 0.12 + rng.uniform(0, 0.05)]
+        c[1] = [0.88 - rng.uniform(0, 0.05), 0.12 + rng.uniform(0, 0.05)]
+        c[2] = [0.12 + rng.uniform(0, 0.05), 0.88 - rng.uniform(0, 0.05)]
+        c[3] = [0.88 - rng.uniform(0, 0.05), 0.88 - rng.uniform(0, 0.05)]
+        configs.append(c)
+        
+    # 3. Random dense configurations
+    for _ in range(10):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # Optimize each configuration
+    for cfg in configs:
+        curr_c, curr_r, curr_s = optimize_centers_lp(cfg, n, A_ub, i_idx, j_idx, rng, iters=300, step_init=0.025)
+        if curr_s > best_s:
+            best_s = curr_s
+            best_c = curr_c.copy()
+            best_r = curr_r.copy()
+            
+    # Final fine-grained refinement on the best configuration found
+    if best_c is not None:
+        best_c, best_r, best_s = optimize_centers_lp(best_c, n, A_ub, i_idx, j_idx, rng, iters=200, step_init=0.008)
+
+    # Strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    dx = best_c[i_idx, 0] - best_c[j_idx, 0]
+    dy = best_c[i_idx, 1] - best_c[j_idx, 1]
+    d = np.sqrt(dx**2 + dy**2)
+    rs = best_r[i_idx] + best_r[j_idx]
+    if np.any(rs > 1e-12):
+        scale = min(scale, np.min(d / np.maximum(rs, 1e-12)))
+        
+    best_r *= scale * 0.999999
+    final_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, final_sum
+```

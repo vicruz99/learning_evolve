@@ -1,0 +1,284 @@
+
+
+<strategy>
+To improve the packing and close the gap to 2.636, I will employ a more theoretically sound and numerically stable optimization pipeline:
+
+1. **LP-Dual Gradient Ascent**: Instead of random hill-climbing, I will compute the exact gradient of the optimal sum of radii with respect to center positions using the dual variables (marginals) from the LP solver. For each active pairwise constraint $r_i + r_j \leq d_{ij}$, the dual variable $\lambda_{ij}$ tells us how much the objective improves if we increase the distance. The gradient for center $i$ is $\sum_{j \neq i} \lambda_{ij} \frac{c_i - c_j}{d_{ij}}$. This directs circles precisely where they need to go to expand.
+
+2. **Robust Multi-Phase Optimization**:
+   - **Phase 1**: Generate diverse hexagonal, grid, corner-focused, and random initial layouts.
+   - **Phase 2**: Run gradient ascent with line-search on centers for each layout. Include occasional large perturbations to escape local plateaus.
+   - **Phase 3**: Joint SLSQP refinement of both centers and radii to smooth out kinks and respect constraints tightly.
+   - **Phase 4**: Final fine-grained hill climbing to squeeze out marginal gains.
+
+3. **Numerical Stability**: Precompute upper-triangular indices to avoid repeated allocations. Use `1e-12` tolerances consistently. Ensure LP bounds and SLSQP constraints are strictly feasible initially by shrinking radii slightly before joint optimization. Handle SciPy version differences for marginal extraction gracefully.
+
+4. **Safety Scaling**: Apply a final strict scaling factor to guarantee the `validate_packing` function passes without numerical edge-case failures.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def get_triu_indices(n):
+    return np.triu_indices(n, k=1)
+
+def compute_lp_and_grad(centers, n, idx_i, idx_j):
+    """Solves LP to maximize sum of radii for fixed centers and computes gradient w.r.t centers."""
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(lim, 1e-10)) for lim in limits]
+    
+    diff = centers[idx_i] - centers[idx_j]
+    dists = np.sqrt(np.sum(diff**2, axis=1) + 1e-15)
+    
+    m = len(idx_i)
+    A_ub = np.zeros((m + n, n))
+    b_ub = np.zeros(m + n)
+    
+    # Pairwise constraints: r_i + r_j <= dist
+    A_ub[:m, idx_i] = 1.0
+    A_ub[:m, idx_j] = 1.0
+    b_ub[:m] = dists
+    
+    # Boundary constraints: r_i <= limit
+    for i in range(n):
+        A_ub[m + i, i] = 1.0
+        b_ub[m + i] = limits[i]
+        
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if not res.success:
+            return None, 0.0, None
+            
+        r_opt = res.x
+        sum_r = -res.fun
+        
+        # Extract duals for pairwise constraints
+        try:
+            mu = res.marginals.ineqlin
+        except AttributeError:
+            try:
+                mu = res.ineqlin.marginals
+            except AttributeError:
+                mu = None
+                
+        grad = np.zeros((n, 2))
+        if mu is not None and len(mu) >= m:
+            lam = np.maximum(mu[:m], 0.0)
+            active = np.where(lam > 1e-8)[0]
+            for k_idx in active:
+                lam_v = lam[k_idx]
+                i_c = idx_i[k_idx]
+                j_c = idx_j[k_idx]
+                d_v = dists[k_idx]
+                if d_v < 1e-9:
+                    d_v = 1.0
+                vec = diff[k_idx] / d_v
+                grad[i_c] += lam_v * vec
+                grad[j_c] -= lam_v * vec
+                
+        return r_opt, sum_r, grad
+    except Exception:
+        return None, 0.0, None
+
+def optimize_centers_grad(c_init, n, idx_i, idx_j, rng, max_iter=1500):
+    """Gradient ascent on centers using LP duals."""
+    c = c_init.copy()
+    curr_r, curr_s, _ = compute_lp_and_grad(c, n, idx_i, idx_j)
+    if curr_r is None:
+        return c, np.full(n, 1e-5), 0.0
+        
+    step = 0.02
+    for it in range(max_iter):
+        _, _, g = compute_lp_and_grad(c, n, idx_i, idx_j)
+        if g is None:
+            break
+            
+        gn = np.linalg.norm(g)
+        if gn < 1e-9:
+            c += rng.uniform(-0.015, 0.015, c.shape)
+            c = np.clip(c, 0.01, 0.99)
+            continue
+            
+        # Line search
+        best_c = c
+        best_s = curr_s
+        for _ in range(20):
+            c_try = c + step * g / gn
+            c_try = np.clip(c_try, 0.01, 0.99)
+            r_try, s_try, _ = compute_lp_and_grad(c_try, n, idx_i, idx_j)
+            if r_try is not None and s_try > best_s:
+                best_s = s_try
+                best_c = c_try.copy()
+                curr_r = r_try
+                curr_s = s_try
+            else:
+                break
+                
+        c = best_c
+        step = min(step * 1.02, 0.05)
+        
+        # Occasional large jump to escape local minima
+        if it % 200 == 0 and rng.random() < 0.4:
+            c_jump = c + rng.uniform(-0.04, 0.04, c.shape)
+            c_jump = np.clip(c_jump, 0.05, 0.95)
+            r_j, s_j, _ = compute_lp_and_grad(c_jump, n, idx_i, idx_j)
+            if r_j is not None and s_j > curr_s + 1e-6:
+                c = c_jump
+                curr_r = r_j
+                curr_s = s_j
+                step = 0.02
+                
+    return c, curr_r, curr_s
+
+def constraints_slsqp(v, n, idx_i, idx_j):
+    """Inequality constraints >= 0 for SLSQP."""
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    
+    c_list = []
+    c_list.append(x - r)
+    c_list.append(1.0 - x - r)
+    c_list.append(y - r)
+    c_list.append(1.0 - y - r)
+    
+    dx = x[idx_i] - x[idx_j]
+    dy = y[idx_i] - y[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    d = np.sqrt(dx**2 + dy**2 + 1e-12)
+    c_list.append(d - dr)
+    
+    return np.concatenate(c_list)
+
+def objective_slsqp(v, n):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    idx_i, idx_j = get_triu_indices(n)
+    rng = np.random.default_rng(123)
+    
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,4,6,4], [5,5,6,5,5],
+        [4,6,6,6,4], [5,6,4,6,5], [6,4,6,4,6], [5,5,5,5,6],
+        [7,5,5,5,4], [4,7,5,5,5], [5,5,7,5,4], [6,6,5,5,4],
+        [5,4,6,6,5], [6,5,4,6,5], [5,6,6,5,4], [4,5,6,6,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != n: continue
+        pts = []
+        r0 = 0.095
+        y = r0
+        for ri, cnt in enumerate(pat):
+            shift = r0 if ri % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:n])
+        
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        span = mx - mn
+        if span[0] > 1e-4 and span[1] > 1e-4:
+            scale = 0.8 / max(span[0], span[1])
+            pts = (pts - mn) * scale + 0.1 + (0.8 - scale * span) / 2.0
+        inits.append(np.clip(pts, 0.05, 0.95))
+        
+        for _ in range(3):
+            p = pts + rng.uniform(-0.02, 0.02, pts.shape)
+            inits.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(8):
+        inits.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    c_pts = []
+    corners = [[0.1,0.1], [0.9,0.1], [0.1,0.9], [0.9,0.9]]
+    for cp in corners:
+        c_pts.append(cp)
+    for _ in range(n-4):
+        c_pts.append(rng.uniform(0.2, 0.8, 2))
+    inits.append(np.array(c_pts))
+    
+    for cfg in inits:
+        # Phase 1: Gradient ascent on centers
+        c_opt, r_opt, s_opt = optimize_centers_grad(cfg, n, idx_i, idx_j, rng, max_iter=1500)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            best_r = r_opt.copy()
+            
+        # Phase 2: SLSQP joint refinement
+        if c_opt is not None:
+            x0 = np.zeros(3*n)
+            x0[:n] = c_opt[:,0]
+            x0[n:2*n] = c_opt[:,1]
+            x0[2*n:] = r_opt * 0.95  # Shrink to ensure strict feasibility
+            
+            bounds_slqp = [(0.0, 1.0)]*(2*n) + [(1e-7, 0.5)]*n
+            try:
+                res = minimize(objective_slsqp, x0, args=(n,), method='SLSQP',
+                               bounds=bounds_slqp,
+                               constraints={'type': 'ineq', 'fun': constraints_slsqp, 'args': (n, idx_i, idx_j)},
+                               options={'maxiter': 6000, 'ftol': 1e-12})
+                if np.isfinite(res.fun):
+                    c_slqp = np.column_stack((res.x[:n], res.x[n:2*n]))
+                    r_slqp, s_slqp, _ = compute_lp_and_grad(c_slqp, n, idx_i, idx_j)
+                    if r_slqp is not None and s_slqp > best_sum:
+                        best_sum = s_slqp
+                        best_c = c_slqp.copy()
+                        best_r = r_slqp.copy()
+            except Exception:
+                pass
+
+    if best_c is None:
+        best_c = inits[0]
+        best_r, best_sum, _ = compute_lp_and_grad(best_c, n, idx_i, idx_j)
+        if best_r is None: best_r = np.full(n, 0.08)
+        
+    # Phase 3: Fine-grained hill climbing
+    step = 0.008
+    for _ in range(1000):
+        idx = rng.integers(n)
+        old = best_c[idx].copy()
+        best_c[idx] += rng.uniform(-step, step, 2)
+        best_c[idx] = np.clip(best_c[idx], 1e-4, 1.0 - 1e-4)
+        
+        r_try, s_try, _ = compute_lp_and_grad(best_c, n, idx_i, idx_j)
+        if r_try is not None and s_try > best_sum + 1e-7:
+            best_sum = s_try
+            best_r = r_try.copy()
+        else:
+            best_c[idx] = old
+        step *= 0.998
+        
+    # Phase 4: Strict safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

@@ -1,0 +1,221 @@
+
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def compute_min_clearance(centers):
+    n = centers.shape[0]
+    d_wall = np.minimum(
+        np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    )
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+    np.fill_diagonal(dists, np.inf)
+    min_pair = np.min(dists) / 2.0
+    return min(np.min(d_wall), min_pair)
+
+def solve_lp_radii(centers):
+    n = centers.shape[0]
+    c = -np.ones(n)
+    bounds = [(0.0, None)] * n
+    
+    num_pairs = n * (n - 1) // 2
+    num_constraints = 4 * n + num_pairs
+    A_ub = np.zeros((num_constraints, n))
+    b_ub = np.zeros(num_constraints)
+    
+    idx = 0
+    for i in range(n):
+        x, y = centers[i]
+        A_ub[idx, i] = 1.0; b_ub[idx] = x; idx += 1
+        A_ub[idx, i] = 1.0; b_ub[idx] = 1.0 - x; idx += 1
+        A_ub[idx, i] = 1.0; b_ub[idx] = y; idx += 1
+        A_ub[idx, i] = 1.0; b_ub[idx] = 1.0 - y; idx += 1
+        
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+    np.fill_diagonal(dists, np.inf)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def objective_joint(vars_arr, n):
+    return -np.sum(vars_arr[2*n:])
+
+def constraints_joint(vars_arr, n):
+    xs = vars_arr[:n]
+    ys = vars_arr[n:2*n]
+    rs = vars_arr[2*n:]
+    
+    c_bound = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+    
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dr = rs[:, None] + rs[None, :]
+    
+    dist_sq = dx**2 + dy**2
+    r_sum_sq = dr**2
+    
+    iu, ju = np.triu_indices(n, k=1)
+    c_pairwise = dist_sq[iu, ju] - r_sum_sq[iu, ju]
+    
+    return np.concatenate([c_bound, c_pairwise])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # Generate diverse hexagonal initializations
+    configs = []
+    row_patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 6, 6, 5, 4],
+        [5, 5, 5, 5, 6], [6, 5, 5, 5, 5], [5, 5, 5, 6, 5],
+        [5, 5, 5, 5, 5, 1], [4, 5, 6, 6, 5], [5, 7, 5, 6, 3]
+    ]
+    
+    for rp in row_patterns:
+        pts = []
+        y = 0.09
+        for i, cnt in enumerate(rp):
+            shift = 0.09 if i % 2 == 1 else 0.0
+            row_width = (cnt - 1) * 0.18
+            x_start = 0.5 - row_width / 2.0 + shift
+            for k in range(cnt):
+                if len(pts) >= n: break
+                x = x_start + k * 0.18
+                pts.append([x, y])
+            y += np.sqrt(3) * 0.09
+        while len(pts) < n:
+            pts.append([0.5 + rng.uniform(-0.1, 0.1), 0.5 + rng.uniform(-0.1, 0.1)])
+        configs.append(np.array(pts[:n]))
+        
+        # Add controlled perturbations to escape symmetry traps
+        for _ in range(4):
+            pert = configs[-1].copy()
+            pert += rng.uniform(-0.015, 0.015, pert.shape)
+            configs.append(np.clip(pert, 0.05, 0.95))
+            
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-7, 0.5)] * n
+    cons_dict = {'type': 'ineq', 'fun': constraints_joint, 'args': (n,)}
+    
+    for cfg in configs:
+        # Phase 1: Quick force-directed relaxation to spread centers optimally
+        centers_relaxed = cfg.copy()
+        dt = 0.005
+        for _ in range(800):
+            forces = np.zeros_like(centers_relaxed)
+            diff = centers_relaxed[:, None, :] - centers_relaxed[None, :, :]
+            dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-10)
+            mask = dists < 0.20
+            rep = (0.20 - dists) / (dists + 1e-6) * diff
+            rep = np.where(mask[:, :, None], rep, 0.0)
+            forces += np.sum(rep, axis=1)
+            forces += (centers_relaxed - 0.05) * (centers_relaxed < 0.05) * 50.0
+            forces -= (centers_relaxed - 0.95) * (centers_relaxed > 0.95) * 50.0
+            centers_relaxed += forces * dt
+            centers_relaxed = np.clip(centers_relaxed, 1e-4, 1.0 - 1e-4)
+            
+        # Phase 2: LP to get a feasible and tight radii estimate for warm start
+        r_lp, sum_lp = solve_lp_radii(centers_relaxed)
+        if r_lp is None:
+            r_lp = np.full(n, 0.08)
+            
+        v0 = np.zeros(3*n)
+        v0[:n] = centers_relaxed[:, 0]
+        v0[n:2*n] = centers_relaxed[:, 1]
+        v0[2*n:] = r_lp
+        
+        # Phase 3: SLSQP joint refinement on centers and radii
+        try:
+            res = minimize(
+                objective_joint, 
+                v0, 
+                method='SLSQP', 
+                bounds=bounds,
+                constraints=cons_dict,
+                args=(n,),
+                options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False}
+            )
+            
+            cx = res.x[:n]
+            cy = res.x[n:2*n]
+            rs = res.x[2*n:]
+            
+            # Strict validity check matching grader tolerance
+            if np.any(rs < 1e-7): continue
+            if np.any(cx - rs < -1e-9) or np.any(cx + rs > 1.0 + 1e-9) or \
+               np.any(cy - rs < -1e-9) or np.any(cy + rs > 1.0 + 1e-9):
+                continue
+                
+            dx = cx[:, None] - cx[None, :]
+            dy = cy[:, None] - cy[None, :]
+            dist = np.sqrt(dx**2 + dy**2)
+            rs_sum = rs[:, None] + rs[None, :]
+            mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+            if np.any(dist[mask] < rs_sum[mask] - 1e-9):
+                continue
+                
+            s = np.sum(rs)
+            if s > best_sum:
+                best_sum = s
+                best_centers = np.column_stack((cx, cy))
+                best_radii = rs.copy()
+        except Exception:
+            continue
+            
+        # Phase 4: LP refinement on optimized centers to extract any remaining geometric slack
+        if best_centers is not None:
+            r_lp_refined, sum_lp_refined = solve_lp_radii(best_centers)
+            if r_lp_refined is not None and sum_lp_refined > best_sum:
+                best_radii = r_lp_refined
+                best_sum = sum_lp_refined
+
+    # Fallback configuration if optimization unexpectedly fails
+    if best_centers is None:
+        best_centers = configs[0]
+        best_radii = np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+        
+    # Final safety scaling to guarantee strict numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs_sum = best_radii[i] + best_radii[j]
+            if rs_sum > 1e-12:
+                scale = min(scale, d / rs_sum)
+                
+    best_radii *= max(scale * 0.999999, 0.0)
+    best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, float(best_sum)
+```

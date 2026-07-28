@@ -1,0 +1,240 @@
+
+
+<strategy>
+To improve the packing sum from ~2.6307 to >2.636, we need a more robust and efficient optimization pipeline that escapes local minima while precisely maximizing the sum of radii. 
+
+Key improvements:
+1. **Direct Optimization & LP Oracle**: Instead of parameterizing boundaries, we optimize $(x_i, y_i, r_i)$ directly with explicit constraints. This gives better gradients for SLSQP.
+2. **Precomputed LP Structure**: The Linear Program to maximize radii for fixed centers has a constant constraint matrix. We precompute it to make the LP oracle extremely fast, allowing thousands of calls during local search.
+3. **Multi-Phase Strategy**:
+   - *Phase 1*: Generate diverse hexagonal lattice patterns and random starts. Run SLSQP from each to find strong local optima.
+   - *Phase 2*: Coordinate-wise hill climbing using the LP oracle. This precisely adjusts centers to maximize the LP-sum of radii, which is often smoother and more effective than joint optimization in later stages.
+   - *Phase 3*: Fine-tuning with smaller step sizes to squeeze out the remaining gap.
+4. **Numerical Safeguards**: Final scaling ensures strict compliance with the validator's $10^{-12}$ tolerance.
+5. **Performance**: Reduced redundant array allocations, efficient distance calculations, and targeted iteration counts ensure the solution runs quickly while exploring the landscape thoroughly.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+triu_i, triu_j = np.triu_indices(N, k=1)
+PAIRS = list(zip(triu_i, triu_j))
+
+def build_lp_matrix():
+    """Builds the constant inequality matrix for the LP radius solver."""
+    m_bound = 4 * N
+    m_pair = N * (N - 1) // 2
+    A = np.zeros((m_bound + m_pair, N))
+    k = 0
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    for i in range(N):
+        for _ in range(4):
+            A[k, i] = 1.0
+            k += 1
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    for i, j in PAIRS:
+        A[k, i] = 1.0
+        A[k, j] = 1.0
+        k += 1
+    return A
+
+LP_A = build_lp_matrix()
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers using precomputed A."""
+    b_bound = np.empty(4 * N)
+    k = 0
+    for i in range(N):
+        x, y = centers[i]
+        b_bound[k] = x; k += 1
+        b_bound[k] = 1.0 - x; k += 1
+        b_bound[k] = y; k += 1
+        b_bound[k] = 1.0 - y; k += 1
+        
+    b_pair = np.empty(len(PAIRS))
+    for k, (i, j) in enumerate(PAIRS):
+        b_pair[k] = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+        
+    b_full = np.concatenate([b_bound, b_pair])
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=LP_A, b_ub=b_full, bounds=(0.0, 0.5), method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(N, 1e-6), 0.0
+
+def compute_constraints(vars_arr):
+    """Inequality constraints >= 0 for valid packing."""
+    x = vars_arr[0:N]
+    y = vars_arr[N:2*N]
+    r = vars_arr[2*N:3*N]
+    
+    c = []
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[:, None] + r[None, :]
+    c.append(dist_sq[triu_i, triu_j] - r_sum[triu_i, triu_j]**2)
+    
+    return np.concatenate(c)
+
+def objective(vars_arr):
+    return -np.sum(vars_arr[2*N:3*N])
+
+def make_hex(rows, r0=0.095):
+    """Generates initial positions on a hexagonal lattice."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(rows):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+    while len(pts) < N:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(12345)
+    
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], [4, 6, 6, 6, 4],
+        [5, 7, 5, 5, 4], [5, 5, 5, 5, 6], [6, 6, 5, 5, 4], [5, 6, 4, 6, 5],
+        [6, 6, 6, 4, 4], [4, 5, 6, 5, 6], [5, 4, 6, 5, 6], [5, 6, 6, 5, 4],
+        [7, 6, 6, 7], [6, 7, 6, 7], [5, 6, 5, 6, 5, 1]
+    ]
+    
+    starts = []
+    for pat in patterns:
+        if sum(pat) >= N:
+            c = make_hex(pat)
+            starts.append(c)
+            for _ in range(3):
+                c_p = c + rng.uniform(-0.02, 0.02, c.shape)
+                starts.append(np.clip(c_p, 0.05, 0.95))
+                
+    for _ in range(8):
+        starts.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    bounds_vars = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    # Phase 1: SLSQP from multiple starts
+    for cfg in starts:
+        r_init, _ = solve_lp(cfg)
+        x0 = np.concatenate([cfg.flatten(), r_init])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds_vars,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if np.isfinite(res.fun):
+                c_val = compute_constraints(res.x)
+                if np.min(c_val) >= -1e-6:
+                    s = np.sum(res.x[2*N:3*N])
+                    if s > best_sum:
+                        best_sum = s
+                        best_c = res.x[:2*N].reshape(N, 2)
+                        best_r = res.x[2*N:3*N].copy()
+        except Exception:
+            pass
+            
+    if best_c is None:
+        best_c = starts[0]
+        best_r, best_sum = solve_lp(best_c)
+        
+    # Phase 2 & 3: LP-refined Hill Climbing
+    centers = best_c.copy()
+    radii = best_r.copy()
+    current_sum = best_sum
+    
+    # Stage A: Moderate step hill climbing
+    step = 0.018
+    for _ in range(1200):
+        i = rng.integers(N)
+        old_pos = centers[i].copy()
+        best_move = None
+        best_move_sum = current_sum
+        
+        for _ in range(6):
+            trial = old_pos + rng.uniform(-step, step, 2)
+            trial = np.clip(trial, 1e-4, 1.0 - 1e-4)
+            centers[i] = trial
+            r_new, s_new = solve_lp(centers)
+            if s_new > best_move_sum:
+                best_move_sum = s_new
+                best_move = trial.copy()
+        centers[i] = old_pos
+        
+        if best_move is not None:
+            centers[i] = best_move
+            radii = solve_lp(centers)[0]
+            current_sum = best_move_sum
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_c = centers.copy()
+                best_r = radii.copy()
+        step *= 0.9992
+        
+    # Stage B: Fine-tuning hill climbing
+    step = 0.003
+    for _ in range(1500):
+        i = rng.integers(N)
+        old_pos = centers[i].copy()
+        best_move = None
+        best_move_sum = current_sum
+        
+        for _ in range(12):
+            trial = old_pos + rng.uniform(-step, step, 2)
+            trial = np.clip(trial, 1e-4, 1.0 - 1e-4)
+            centers[i] = trial
+            r_new, s_new = solve_lp(centers)
+            if s_new > best_move_sum:
+                best_move_sum = s_new
+                best_move = trial.copy()
+        centers[i] = old_pos
+        
+        if best_move is not None:
+            centers[i] = best_move
+            radii = solve_lp(centers)[0]
+            current_sum = best_move_sum
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_c = centers.copy()
+                best_r = radii.copy()
+        step *= 0.9995
+        
+    # Final safety scaling to guarantee strict numerical validity
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    best_r *= scale * 0.9999999
+    final_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, final_sum
+```

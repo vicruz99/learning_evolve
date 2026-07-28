@@ -1,0 +1,146 @@
+# sol_000046 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000007 (state 5778b268) state=0aa7241c sum of radii=2.624527 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def run_packing():
+    n = 26
+    
+    def objective(vars):
+        # Minimize negative sum of radii => Maximize sum of radii
+        return -np.sum(vars[2::3])
+        
+    def constraint_vector(vars):
+        x = vars[0::3]
+        y = vars[1::3]
+        r = vars[2::3]
+        
+        c_list = []
+        # Boundary constraints: circle must be inside [0,1]x[0,1]
+        c_list.append(x - r)          # x - r >= 0
+        c_list.append(1.0 - x - r)    # 1 - x - r >= 0
+        c_list.append(y - r)          # y - r >= 0
+        c_list.append(1.0 - y - r)    # 1 - y - r >= 0
+        
+        # Pairwise non-overlap constraints: dist(i,j) >= r_i + r_j
+        x_diff = x[:, None] - x[None, :]
+        y_diff = y[:, None] - y[None, :]
+        dists = np.sqrt(x_diff**2 + y_diff**2)
+        r_sum = r[:, None] + r[None, :]
+        
+        rows, cols = np.triu_indices(n, k=1)
+        c_list.append(dists[rows, cols] - r_sum[rows, cols])
+        
+        return np.concatenate(c_list)
+
+    # Bounds for [x, y, r] for each circle
+    bounds = [(0, 1), (0, 1), (0, 0.5)] * n
+    constraint_dict = {'type': 'ineq', 'fun': constraint_vector}
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    np.random.seed(42)
+    configs = []
+    
+    # 1. Hexagonal patterns with different row distributions (known to be dense)
+    for rows_dist in [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6], [4, 6, 6, 6, 4], [5, 5, 6, 5, 5]]:
+        r_init = 0.10
+        y = r_init
+        row_idx = 0
+        pts = []
+        for count in rows_dist:
+            shift = r_init if row_idx % 2 == 1 else 0.0
+            x = r_init + shift
+            for _ in range(count):
+                if len(pts) < n:
+                    pts.append([x, y])
+                x += 2 * r_init
+            y += np.sqrt(3) * r_init
+            row_idx += 1
+        pts = np.array(pts[:n])
+        
+        # Create multiple perturbed versions of each layout
+        for _ in range(3):
+            v = np.zeros(3 * n)
+            noise = np.random.uniform(-0.01, 0.01, pts.shape)
+            p = np.clip(pts + noise, 0.05, 0.95)
+            v[0::3] = p[:, 0]
+            v[1::3] = p[:, 1]
+            v[2::3] = 0.09 + np.random.uniform(-0.005, 0.005)
+            configs.append(v)
+            
+    # 2. Random starts to explore other local minima
+    for _ in range(5):
+        v = np.zeros(3 * n)
+        pts = np.random.uniform(0.1, 0.9, (n, 2))
+        v[0::3] = pts[:, 0]
+        v[1::3] = pts[:, 1]
+        v[2::3] = 0.05
+        configs.append(v)
+
+    # Run optimization on each configuration
+    for cfg in configs:
+        try:
+            res = opt.minimize(
+                objective,
+                cfg,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraint_dict,
+                options={'maxiter': 5000, 'ftol': 1e-12}
+            )
+            
+            if res.success:
+                x_opt = res.x[0::3]
+                y_opt = res.x[1::3]
+                r_opt = res.x[2::3]
+                
+                # Skip if any radius is degenerate
+                if np.any(r_opt < 1e-7): continue
+                
+                # Strict validity check
+                valid = True
+                if np.any(x_opt - r_opt < -1e-9) or np.any(x_opt + r_opt > 1 + 1e-9): valid = False
+                if np.any(y_opt - r_opt < -1e-9) or np.any(y_opt + r_opt > 1 + 1e-9): valid = False
+                
+                if valid:
+                    centers = np.column_stack((x_opt, y_opt))
+                    dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+                    r_sums = r_opt[:, None] + r_opt[None, :]
+                    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+                    if np.any(dists[mask] < r_sums[mask] - 1e-9):
+                        valid = False
+                
+                if valid:
+                    current_sum = np.sum(r_opt)
+                    if current_sum > best_sum:
+                        best_sum = current_sum
+                        best_centers = np.column_stack((x_opt, y_opt))
+                        best_radii = r_opt.copy()
+        except Exception:
+            continue
+
+    # Fallback to a valid grid packing if optimization yields nothing
+    if best_centers is None:
+        best_centers = np.zeros((n, 2))
+        best_radii = np.zeros(n)
+        k = 0
+        for i in range(6):
+            for j in range(5):
+                if k >= n: break
+                best_centers[k] = [0.1 + j*0.18, 0.1 + i*0.18]
+                best_radii[k] = 0.08
+                k += 1
+        best_sum = np.sum(best_radii)
+
+    # Safety scaling to guarantee strict validity against 1e-12 tolerance
+    best_radii *= 0.99999
+    best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, best_sum

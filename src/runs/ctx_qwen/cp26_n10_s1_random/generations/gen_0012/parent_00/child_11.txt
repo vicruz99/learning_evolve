@@ -1,0 +1,227 @@
+
+
+<strategy>
+To improve the packing beyond 2.6308 and target 2.636+, I will employ a multi-phase optimization pipeline that leverages the exact gradients of the sum of radii with respect to center positions. 
+
+Key improvements:
+1. **LP Gradient Ascent**: For fixed centers, the optimal radii are found via Linear Programming. The dual variables (marginals) from the LP directly provide the gradient of the sum of radii with respect to the centers. This allows us to move centers in the direction that most increases the total radius sum, efficiently escaping local minima that pure SLSQP often gets stuck in.
+2. **Diverse Structural Initialization**: Multiple hexagonal row-distribution patterns are generated and scaled/perturbed to cover different topological basins.
+3. **Coarse-to-Fine Hill Climbing**: After gradient ascent, a coordinate-wise perturbation phase with LP evaluation refines positions further.
+4. **Joint SLSQP Polish**: Finally, a constrained nonlinear optimizer jointly tunes centers and radii to satisfy exact boundary and non-overlap constraints while maximizing the sum.
+5. **Strict Safety Scaling**: A final deterministic scaling step guarantees numerical validity against the validator's `1e-12` tolerance.
+
+This approach separates the combinatorial placement problem (handled by LP gradients + hill climbing) from the continuous feasibility enforcement (handled by SLSQP), which has proven highly effective for dense circle packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, k=1)
+M = len(TRIU_I)
+A_ub_struct = np.zeros((M, N))
+A_ub_struct[np.arange(M), TRIU_I] = 1.0
+A_ub_struct[np.arange(M), TRIU_J] = 1.0
+
+def solve_lp_and_grad(centers):
+    n = centers.shape[0]
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    wall_lim = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                          np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(w, 1e-9)) for w in wall_lim]
+    b_ub = dists[TRIU_I, TRIU_J]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub_struct, b_ub=b_ub, bounds=bounds, method='highs')
+        if not res.success or not np.isfinite(res.fun):
+            return None, None, None
+    except Exception:
+        return None, None, None
+        
+    r = res.x
+    s = -res.fun
+    grad = np.zeros((n, 2))
+    
+    try:
+        lams = np.asarray(res.ineqlin.marginals)
+        active_lams = np.maximum(lams, 0.0)
+        mask = active_lams > 1e-6
+        if np.any(mask):
+            k = np.where(mask)[0]
+            ii = TRIU_I[k]
+            jj = TRIU_J[k]
+            d = dists[ii, jj]
+            d = np.where(d < 1e-9, 1.0, d)
+            diff_k = centers[ii] - centers[jj]
+            factors = active_lams[k][:, np.newaxis] / d[:, np.newaxis]
+            np.add.at(grad, ii, diff_k * factors)
+            np.add.at(grad, jj, -diff_k * factors)
+    except Exception:
+        pass
+        
+    return r, s, grad
+
+def objective_joint(v, n):
+    return -np.sum(v[2*n:])
+
+def constraints_joint(v, n):
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    c = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    dx = x[TRIU_I] - x[TRIU_J]
+    dy = y[TRIU_I] - y[TRIU_J]
+    dr = r[TRIU_I] + r[TRIU_J]
+    c.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(c)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [6,6,4,6,4],
+        [5,5,6,5,5], [6,4,6,4,6], [5,6,6,5,4], [6,5,4,6,5],
+        [5,5,5,5,6], [6,6,6,4,4], [4,5,6,5,6], [5,4,6,5,6],
+        [7,6,6,7], [6,7,6,7], [5,6,5,6,5,1], [8,5,6,7]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != N: continue
+        pts = []
+        r0 = 0.095
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:N])
+        
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        span = mx - mn
+        if span.max() > 1e-4:
+            pts = (pts - mn) / span * 0.7 + 0.15
+        inits.append(pts)
+        
+        for _ in range(3):
+            p = pts + rng.uniform(-0.02, 0.02, pts.shape)
+            inits.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(6):
+        inits.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    bounds_vars = [(0.0, 1.0)]*(2*N) + [(1e-6, 0.5)]*N
+    
+    for cfg in inits:
+        c = cfg.copy()
+        r, s, g = solve_lp_and_grad(c)
+        if r is None: continue
+        
+        step = 0.06
+        for it in range(400):
+            r, s, g = solve_lp_and_grad(c)
+            if r is None: break
+            gn = np.linalg.norm(g)
+            if gn > 1e-7:
+                c_new = c + step * g / gn
+                c_new = np.clip(c_new, 1e-4, 1.0 - 1e-4)
+                r_new, s_new, _ = solve_lp_and_grad(c_new)
+                if r_new is not None and s_new > s + 1e-8:
+                    c = c_new
+                    r = r_new
+                    s = s_new
+                    step = min(step * 1.015, 0.12)
+                else:
+                    step *= 0.94
+            else:
+                c_shake = c + rng.uniform(-0.025, 0.025, c.shape)
+                c_shake = np.clip(c_shake, 0.05, 0.95)
+                r_sh, s_sh, _ = solve_lp_and_grad(c_shake)
+                if r_sh is not None and s_sh > s:
+                    c = c_shake
+                    r = r_sh
+                    s = s_sh
+                    step = 0.06
+                    
+        if s > best_sum:
+            best_sum = s
+            best_c = c.copy()
+            best_r = r.copy()
+            
+        x0 = np.concatenate([c.flatten(), r * 0.97])
+        try:
+            res = minimize(objective_joint, x0, args=(N,), method='SLSQP', bounds=bounds_vars,
+                           constraints={'type': 'ineq', 'fun': constraints_joint, 'args': (N,)},
+                           options={'maxiter': 6000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_pol = np.column_stack((res.x[:N], res.x[N:2*N]))
+                r_pol, s_pol, _ = solve_lp_and_grad(c_pol)
+                if r_pol is not None and s_pol > best_sum:
+                    best_sum = s_pol
+                    best_c = c_pol.copy()
+                    best_r = r_pol.copy()
+        except Exception:
+            pass
+            
+        curr_c = best_c.copy()
+        curr_r, curr_s = solve_lp_and_grad(curr_c)
+        for sweep in range(6):
+            step = 0.012 * (0.85 ** sweep)
+            improved = False
+            for i in range(N):
+                old = curr_c[i].copy()
+                best_move = None
+                best_move_s = curr_s
+                for _ in range(8):
+                    move = rng.uniform(-step, step, 2)
+                    curr_c[i] = np.clip(old + move, 1e-4, 0.999)
+                    r_try, s_try, _ = solve_lp_and_grad(curr_c)
+                    if r_try is not None and s_try > best_move_s:
+                        best_move_s = s_try
+                        best_move = curr_c[i].copy()
+                    curr_c[i] = old
+                if best_move is not None:
+                    curr_c[i] = best_move
+                    curr_r, curr_s, _ = solve_lp_and_grad(curr_c)
+                    if curr_s > best_sum + 1e-8:
+                        best_sum = curr_s
+                        best_c = curr_c.copy()
+                        best_r = curr_r.copy()
+                        improved = True
+            if not improved:
+                break
+                
+    if best_c is None:
+        best_c = rng.uniform(0.1, 0.9, (N, 2))
+        best_r = np.full(N, 0.08)
+        best_sum = np.sum(best_r)
+        
+    scale = 1.0
+    for i in range(N):
+        x, y, r_val = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r_val > 1e-12:
+            scale = min(scale, x/r_val, (1.0-x)/r_val, y/r_val, (1.0-y)/r_val)
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

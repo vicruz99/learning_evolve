@@ -1,0 +1,197 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need to navigate a highly non-convex optimization landscape. The objective function (sum of radii optimized via Linear Programming for fixed centers) is piecewise linear and non-smooth. 
+
+Key improvements over previous attempts:
+1. **Robust LP Oracle**: Precompute the constraint matrix structure `A_ub` to speed up repeated LP calls. The LP maximizes $\sum r_i$ subject to $r_i + r_j \leq \text{dist}(i,j)$ and boundary limits.
+2. **Diverse Initialization**: Generate hexagonal lattice patterns with varying row distributions, apply rotations, and add random dense configurations. This covers multiple topological basins.
+3. **Multi-Phase Optimization**:
+   - **Phase 1**: Use `Nelder-Mead` (derivative-free, handles non-smooth landscapes well) to optimize center positions for each initialization, maximizing the LP-sum objective.
+   - **Phase 2**: Coordinate Ascent with LP Oracle. Iteratively perturb individual circles with decaying step sizes, accepting moves that increase the LP sum. This fine-tunes positions past the granularity of direct optimizers.
+   - **Phase 3**: Multi-circle perturbation to escape symmetry traps and local minima, followed by rapid local refinement.
+4. **Strict Validation & Safety**: Apply a final scaling factor to guarantee numerical validity against the $10^{-12}$ tolerance in the checker, without sacrificing meaningful area.
+
+This pipeline combines global exploration with precise local exploitation, targeting the theoretical upper bound for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def get_lp_sum_and_radii(centers, n, idx_i, idx_j, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    wall = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    wall = np.maximum(wall, 1e-12)
+    
+    dx = centers[idx_i, 0] - centers[idx_j, 0]
+    dy = centers[idx_i, 1] - centers[idx_j, 1]
+    b_ub = np.hypot(dx, dy)
+    
+    bounds = [(0.0, w) for w in wall]
+    c_obj = -np.ones(n)
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return -res.fun, res.x
+    except Exception:
+        pass
+        
+    # Fallback: geometric minimum clearance
+    dists = np.hypot(dx, dy)
+    min_d = np.minimum(np.min(dists) / 2.0, np.min(wall))
+    val = n * max(0.0, min_d - 1e-7)
+    return val, np.full(n, max(0.0, min_d - 1e-7))
+
+def objective(centers_flat, n, idx_i, idx_j, A_ub):
+    """Objective for center optimization: minimize negative LP sum."""
+    centers = centers_flat.reshape(n, 2)
+    s, _ = get_lp_sum_and_radii(centers, n, idx_i, idx_j, A_ub)
+    return -s
+
+def generate_hex_config(n, row_counts, r0):
+    """Generates a hexagonal lattice initialization."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(row_counts):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= n: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+        if len(pts) >= n: break
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    n_pairs = len(idx_i)
+    A_ub = np.zeros((n_pairs, n))
+    A_ub[np.arange(n_pairs), idx_i] = 1.0
+    A_ub[np.arange(n_pairs), idx_j] = 1.0
+    
+    best_s = 0.0
+    best_c = None
+    best_r = None
+    
+    configs = []
+    patterns = [[5,6,5,6,4], [6,5,6,5,4], [5,5,6,5,5], [4,6,6,6,4], 
+                [6,6,5,5,4], [5,7,5,5,4], [5,6,4,6,5], [7,5,6,5,3]]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        cfg = generate_hex_config(n, pat, 0.09)
+        mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+        span = mx - mn
+        span[span < 1e-9] = 1.0
+        cfg_n = (cfg - mn) / span * 0.8 + 0.1
+        configs.append(cfg_n)
+        
+        for ang in np.linspace(-0.4, 0.4, 9):
+            c = np.mean(cfg_n, axis=0)
+            cfg_c = cfg_n - c
+            R = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+            cfg_r = cfg_c @ R.T
+            mn, mx = cfg_r.min(axis=0), cfg_r.max(axis=0)
+            span = mx - mn
+            span[span < 1e-9] = 1.0
+            cfg_n2 = (cfg_r - mn) / span * 0.8 + 0.1
+            configs.append(cfg_n2)
+            
+    rng = np.random.default_rng(42)
+    for _ in range(20):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    bounds_c = [(0.02, 0.98)] * (2 * n)
+    
+    for cfg in configs:
+        try:
+            res = minimize(objective, cfg.flatten(), args=(n, idx_i, idx_j, A_ub),
+                          method='Nelder-Mead', bounds=bounds_c,
+                          options={'maxiter': 8000, 'xatol': 1e-7, 'fatol': 1e-9})
+            c_opt = res.x.reshape(n, 2)
+            s, r = get_lp_sum_and_radii(c_opt, n, idx_i, idx_j, A_ub)
+            if s > best_s:
+                best_s = s
+                best_c = c_opt.copy()
+                best_r = r.copy()
+        except Exception:
+            pass
+            
+    if best_c is not None:
+        step = 0.025
+        for _ in range(1800):
+            i = rng.integers(n)
+            old = best_c[i].copy()
+            best_move = old
+            best_val = best_s
+            
+            for _ in range(16):
+                trial = old + rng.uniform(-step, step, 2)
+                trial = np.clip(trial, 0.02, 0.98)
+                best_c[i] = trial
+                s, _ = get_lp_sum_and_radii(best_c, n, idx_i, idx_j, A_ub)
+                if s > best_val:
+                    best_val = s
+                    best_move = trial.copy()
+                    
+            best_c[i] = best_move
+            if best_val > best_s:
+                best_s = best_val
+                _, best_r = get_lp_sum_and_radii(best_c, n, idx_i, idx_j, A_ub)
+                
+            step *= 0.9985
+            step = max(step, 0.005)
+            
+        for _ in range(40):
+            c_pert = best_c.copy()
+            k = rng.integers(3, 7)
+            idxs = rng.choice(n, size=k, replace=False)
+            c_pert[idxs] += rng.uniform(-0.015, 0.015, (k, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            
+            s_p, r_p = get_lp_sum_and_radii(c_pert, n, idx_i, idx_j, A_ub)
+            if s_p > best_s:
+                best_s = s_p
+                best_c = c_pert.copy()
+                best_r = r_p.copy()
+                
+                for _ in range(500):
+                    j = rng.integers(n)
+                    old_j = best_c[j].copy()
+                    best_c[j] += rng.uniform(-0.01, 0.01, 2)
+                    best_c[j] = np.clip(best_c[j], 0.02, 0.98)
+                    s_t, _ = get_lp_sum_and_radii(best_c, n, idx_i, idx_j, A_ub)
+                    if s_t > best_s:
+                        best_s = s_t
+                        _, best_r = get_lp_sum_and_radii(best_c, n, idx_i, idx_j, A_ub)
+                    else:
+                        best_c[j] = old_j
+                        break
+                        
+    if best_c is None:
+        cfg = configs[0]
+        best_s, best_r = get_lp_sum_and_radii(cfg, n, idx_i, idx_j, A_ub)
+        best_c = cfg
+        
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999999
+    best_s = float(np.sum(best_r))
+    
+    return best_c, best_r, best_s
+```

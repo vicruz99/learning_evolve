@@ -1,0 +1,186 @@
+
+
+<strategy>
+To improve the packing sum beyond 2.631, we need a more robust global exploration combined with precise local refinement. The current approach uses coordinate ascent with LP oracle, which is effective but can get trapped in local minima due to the non-convex landscape of circle packings.
+
+Key improvements:
+1. **Enhanced Initialization**: Generate a wider variety of hexagonal and grid-based patterns, carefully scaled and centered to cover different symmetries. This increases the chance of starting in the basin of the global optimum.
+2. **Iterative Local Search with Jitter**: Instead of a single long optimization run, we perform multiple shorter passes of coordinate ascent. After each pass, we apply a controlled global jitter to the centers. This allows the optimizer to escape local traps and explore neighboring configurations.
+3. **LP Oracle Efficiency**: The linear programming solver (`scipy.optimize.linprog` with `highs`) is extremely fast for 26 variables. We leverage it as an exact oracle for radii given fixed centers, ensuring we always extract the maximum possible sum for any center configuration.
+4. **Greedy Multi-Sampling**: For each circle moved, we sample multiple perturbation directions and greedily accept the best. This accelerates convergence compared to single-step updates.
+5. **Strict Numerical Safety**: A final scaling pass guarantees all constraints satisfy the `1e-12` tolerance in the validator, preventing false negatives due to floating-point drift.
+
+This strategy balances exploration (diverse inits + jitter) and exploitation (fast LP oracle + greedy coordinate ascent) to systematically approach the theoretical optimum for n=26, which is known to be near `sum ≈ 2.636`.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    m_b = 4 * n
+    m_p = n * (n - 1) // 2
+    A = np.zeros((m_b + m_p, n))
+    b = np.zeros(m_b + m_p)
+    idx = 0
+    
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        x, y = centers[i]
+        lims = (x, 1.0 - x, y, 1.0 - y)
+        for lim in lims:
+            A[idx, i] = 1.0
+            b[idx] = lim
+            idx += 1
+            
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = d
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback to geometrically valid radii if LP unexpectedly fails
+    lims = np.min(np.stack([centers[:,0], 1.0-centers[:,0], centers[:,1], 1.0-centers[:,1]], axis=1), axis=1)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_d = np.min(dists, axis=1) / 2.0
+    r_fall = np.minimum(lims, min_d) * 0.99
+    return r_fall, np.sum(r_fall)
+
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    configs = []
+    row_dists = [
+        [6,5,6,5,4], [5,6,5,6,4], [7,6,6,7], [8,6,6,6], 
+        [9,5,6,6], [6,6,5,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [6,5,5,5,5], [5,5,5,5,6], [10,8,8], [9,9,8], 
+        [5,5,5,5,5,1], [6,6,6,5,3], [7,7,6,6], [8,8,6,4],
+        [6,5,6,4,5], [5,7,5,6,3], [4,5,6,5,6]
+    ]
+    
+    # 1. Generate diverse hexagonal initial configurations
+    for rd in row_dists:
+        if sum(rd) < n: continue
+        for _ in range(5):
+            r0 = rng.uniform(0.09, 0.11)
+            pts = []
+            y = r0
+            for idx_r, cnt in enumerate(rd):
+                shift = r0 if idx_r % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) >= n: break
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+            cfg = np.array(pts[:n])
+            mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+            span = mx - mn
+            if span[0] > 0: cfg[:, 0] = (cfg[:, 0] - mn[0]) / span[0] * 0.86 + 0.07
+            if span[1] > 0: cfg[:, 1] = (cfg[:, 1] - mn[1]) / span[1] * 0.86 + 0.07
+            cfg += rng.uniform(-0.015, 0.015, cfg.shape)
+            cfg = np.clip(cfg, 0.04, 0.96)
+            configs.append(cfg)
+            
+    # Add random starts for robustness
+    for _ in range(10):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    # 2. Optimization loop: Coordinate Ascent + Global Jitter
+    for cfg in configs:
+        curr_c = cfg.copy()
+        curr_r, curr_s = solve_lp(curr_c, n)
+        
+        if curr_s > best_sum:
+            best_sum = curr_s
+            best_c = curr_c.copy()
+            best_r = curr_r.copy()
+            
+        # Multiple refinement passes with decaying step size
+        for pass_num in range(6):
+            step = 0.028 / (pass_num + 1)
+            for it in range(1200):
+                idx = rng.integers(n)
+                old = curr_c[idx].copy()
+                
+                best_trial = old
+                best_val = curr_s
+                
+                # Sample multiple perturbation directions
+                for _ in range(4):
+                    trial = old + rng.uniform(-step, step, 2)
+                    trial = np.clip(trial, 0.02, 0.98)
+                    curr_c[idx] = trial
+                    r_try, s_try = solve_lp(curr_c, n)
+                    if s_try > best_val:
+                        best_val = s_try
+                        best_trial = trial.copy()
+                        
+                curr_c[idx] = best_trial
+                if best_val > curr_s:
+                    curr_s = best_val
+                    _, curr_r = solve_lp(curr_c, n)
+                    
+                if curr_s > best_sum + 1e-9:
+                    best_sum = curr_s
+                    best_c = curr_c.copy()
+                    best_r = curr_r.copy()
+                    
+            # Global jitter to escape local minima between passes
+            curr_c += rng.uniform(-0.012, 0.012, curr_c.shape)
+            curr_c = np.clip(curr_c, 0.05, 0.95)
+            curr_r, curr_s = solve_lp(curr_c, n)
+            
+    # 3. Final fine-tuning with micro-perturbations
+    curr_c = best_c.copy()
+    curr_s = best_sum
+    for it in range(2000):
+        idx = rng.integers(n)
+        old = curr_c[idx].copy()
+        curr_c[idx] = old + rng.uniform(-0.004, 0.004, 2)
+        curr_c[idx] = np.clip(curr_c[idx], 0.02, 0.98)
+        r_try, s_try = solve_lp(curr_c, n)
+        if s_try > curr_s + 1e-9:
+            curr_s = s_try
+            best_c = curr_c.copy()
+            best_r = r_try.copy()
+            best_sum = curr_s
+        else:
+            curr_c[idx] = old
+            
+    # 4. Strict numerical safety scaling to guarantee validator pass
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999999
+    final_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, final_sum
+```

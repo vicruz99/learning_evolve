@@ -1,0 +1,260 @@
+# sol_000021 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state cd0e5d1c) state=e14e8c08 sum of radii=2.601669 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def run_packing():
+    n = 26
+    
+    # Function to compute constraints and objective
+    def objective(vars_flat):
+        # vars_flat contains [x0, y0, r0, x1, y1, r1, ...]
+        # We want to maximize sum(r), so minimize -sum(r)
+        r = vars_flat[2::3]
+        return -np.sum(r)
+
+    def constraints(vars_flat):
+        constraints_list = []
+        
+        # Extract x, y, r
+        x = vars_flat[0::3]
+        y = vars_flat[1::3]
+        r = vars_flat[2::3]
+        
+        # 1. Boundary constraints: x - r >= 0, x + r <= 1, etc.
+        # x - r >= 0  => x - r >= 0
+        # x + r <= 1  => 1 - x - r >= 0
+        # y - r >= 0  => y - r >= 0
+        # y + r <= 1  => 1 - y - r >= 0
+        for i in range(n):
+            constraints_list.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})       # x - r >= 0
+            constraints_list.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[3*i] - v[3*i+2]}) # 1 - x - r >= 0
+            constraints_list.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})   # y - r >= 0
+            constraints_list.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[3*i+1] - v[3*i+2]}) # 1 - y - r >= 0
+            
+        # 2. Non-overlap constraints: dist(i,j) >= r_i + r_j
+        # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        # This is quadratic. SLSQP handles general constraints but might be slow with many.
+        # We will define them.
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Indices in vars_flat
+                idx_xi, idx_yi, idx_ri = 3*i, 3*i+1, 3*i+2
+                idx_xj, idx_yj, idx_rj = 3*j, 3*j+1, 3*j+2
+                
+                # Define constraint function
+                def make_constraint(i_idx, j_idx):
+                    def constraint(v):
+                        xi, yi, ri = v[i_idx], v[i_idx+1], v[i_idx+2]
+                        xj, yj, rj = v[j_idx], v[j_idx+1], v[j_idx+2]
+                        dist_sq = (xi - xj)**2 + (yi - yj)**2
+                        r_sum = ri + rj
+                        return dist_sq - r_sum**2
+                    return constraint
+                
+                constraints_list.append({'type': 'ineq', 'fun': make_constraint(3*i, 3*j)})
+
+        return constraints_list
+
+    # Initialization
+    # Try to place circles in a hexagonal pattern or a grid
+    # A 6x5 grid has 30 spots. We pick 26.
+    # Or a perturbed 5x5 grid + 1.
+    # Let's try a dense hexagonal packing initialization.
+    
+    # Heuristic initialization:
+    # Pack circles in rows. 
+    # Rows with 5 circles need width ~ 10r. Rows with 6 need 12r.
+    # To allow larger r, we prefer rows of 5.
+    # 26 circles: 5 rows of 5 (25) + 1 extra.
+    # Or 3 rows of 9? No.
+    # Let's use a grid initialization with small radius and let optimizer grow them.
+    
+    initial_radii = 0.05 # Small enough to fit 26 easily
+    initial_x = np.random.uniform(initial_radii, 1-initial_radii, n)
+    initial_y = np.random.uniform(initial_radii, 1-initial_radii, n)
+    
+    # Better initialization: Hexagonal lattice
+    # Approximate radius for 26 circles in hex packing might be around 0.1
+    # Let's try to place them on a lattice with spacing 0.25 (r=0.125)
+    # and let optimizer shrink/move.
+    
+    # Generate lattice points
+    pts = []
+    # 5 rows
+    for row in range(6):
+        # Alternate row length
+        if row % 2 == 0:
+            count = 5
+            offset = 0.0
+        else:
+            count = 5
+            offset = 0.5 # shift by half spacing
+            
+        # Spacing
+        dx = 1.0 / 6.0 # roughly
+        dy = 1.0 / 6.0
+        
+        for col in range(count):
+            if len(pts) < 26:
+                x = 0.1 + col * 0.2 + offset * 0.1 # Just a rough guess
+                y = 0.1 + row * 0.15
+                # Clip to valid range
+                x = np.clip(x, 0.1, 0.9)
+                y = np.clip(y, 0.1, 0.9)
+                pts.append([x, y])
+
+    # Fill remaining if needed (unlikely with above logic if careful)
+    while len(pts) < 26:
+        pts.append([np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)])
+    
+    pts = np.array(pts[:26])
+    
+    initial_radii_val = 0.04 # Start small to be feasible
+    
+    x0 = []
+    for i in range(26):
+        x0.extend([pts[i, 0], pts[i, 1], initial_radii_val])
+        
+    x0 = np.array(x0)
+    
+    # Bounds for variables: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+        bounds.append((0, 0.5)) # r
+
+    # Optimization
+    # Since constraints are many, we might use a penalty method if SLSQP is too slow/memory heavy.
+    # But let's try SLSQP first.
+    
+    cons = constraints(x0)
+    
+    # To speed up, we might not check all constraints in every iteration if possible, 
+    # but scipy handles it. 300+ constraints might be slow.
+    # Alternative: Use a penalty function in objective.
+    
+    def objective_penalty(vars_flat):
+        r = vars_flat[2::3]
+        x = vars_flat[0::3]
+        y = vars_flat[1::3]
+        
+        obj = -np.sum(r)
+        
+        # Penalty parameter
+        mu = 100.0
+        
+        # Boundary penalties
+        # x - r >= 0 -> penalty if x - r < 0
+        boundary_viol = np.maximum(0, r - x) + np.maximum(0, r - (1-x)) + \
+                        np.maximum(0, r - y) + np.maximum(0, r - (1-y))
+        obj += mu * np.sum(boundary_viol**2)
+        
+        # Overlap penalties
+        # Vectorized check might be heavy, let's loop or vectorize carefully
+        # For 26 circles, 325 pairs.
+        # Dist matrix
+        centers = np.column_stack((x, y))
+        # Compute pairwise distances
+        # diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        # dists = np.linalg.norm(diff, axis=2)
+        # This creates a 26x26 matrix.
+        
+        # Efficient loop for penalty
+        overlap_pen = 0.0
+        for i in range(n):
+            xi, yi, ri = x[i], y[i], r[i]
+            for j in range(i + 1, n):
+                xj, yj, rj = x[j], y[j], r[j]
+                dist = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+                req = ri + rj
+                if dist < req:
+                    overlap_pen += (req - dist)**2
+        obj += mu * overlap_pen
+        
+        return obj
+
+    # Using minimize with BFGS or L-BFGS-B (supports bounds)
+    # L-BFGS-B is good for large problems.
+    # We use the penalty objective to avoid passing explicit constraints list which is heavy.
+    
+    # Increase mu over time (simulated annealing of penalty) could be good, 
+    # but let's try fixed high mu.
+    
+    res = opt.minimize(objective_penalty, x0, method='L-BFGS-B', bounds=bounds, 
+                       options={'maxiter': 1000, 'ftol': 1e-9})
+    
+    # Post-processing: Ensure valid radii and positions
+    # The penalty method might result in slight violations, we need to clean up.
+    # Or we can re-run with a tighter penalty or projected gradient.
+    
+    # Let's extract result
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    for i in range(n):
+        centers[i] = [res.x[3*i], res.x[3*i+1]]
+        radii[i] = res.x[3*i+2]
+        
+    # Clip radii to be non-negative (though bounds should handle it)
+    radii = np.maximum(radii, 0)
+    
+    # Check validity and adjust if necessary
+    # If overlaps exist, we might need to shrink circles slightly to make valid.
+    # But the optimizer should have pushed them apart.
+    # Let's verify with a simple check and shrink if needed.
+    
+    # However, to guarantee validity for the grader, we can run a quick repair.
+    # Repair: If overlap, reduce radii or move centers.
+    # Simple repair: Scale down all radii slightly if any overlap?
+    # Or just trust the optimizer.
+    
+    # Let's calculate sum
+    sum_radii = np.sum(radii)
+    
+    # Refinement loop to fix any numerical overlaps
+    for _ in range(100):
+        max_violation = 0
+        # Check boundaries
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < 0:
+                radii[i] = x
+            if x + r > 1:
+                radii[i] = 1 - x
+            if y - r < 0:
+                radii[i] = y
+            if y + r > 1:
+                radii[i] = 1 - y
+            radii[i] = max(radii[i], 0)
+            
+        # Check overlaps
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                r_sum = radii[i] + radii[j]
+                if dist < r_sum:
+                    # Shrink radii to fit
+                    # Proportional shrink or equal shrink?
+                    # Let's reduce sum of radii by overlap amount
+                    excess = r_sum - dist
+                    # Reduce each by half
+                    radii[i] -= excess / 2
+                    radii[j] -= excess / 2
+                    radii[i] = max(radii[i], 0)
+                    radii[j] = max(radii[j], 0)
+                    changed = True
+        if not changed:
+            break
+            
+    # Recalculate sum after repair
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

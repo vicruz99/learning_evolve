@@ -1,0 +1,170 @@
+
+
+<strategy>
+The strategy focuses on decoupling the optimization of centers and radii. Since the maximum sum of radii for fixed centers can be computed exactly and efficiently using Linear Programming (LP), we treat the center coordinates as the optimization variables and the LP solution as the objective function. 
+
+1. **Initialization**: Generate diverse starting configurations using hexagonal lattice patterns with varying row counts, shifts, and densities, plus random configurations. This covers potential optimal structures.
+2. **LP Evaluation**: Implement a robust LP solver (`solve_radii_lp`) that takes centers and returns the maximum feasible radii and their sum, respecting boundary and pairwise non-overlap constraints.
+3. **Coordinate Descent on Centers**: Use a greedy coordinate descent algorithm to optimize the centers. For each circle, try multiple displacement directions. If moving a circle increases the LP-computed sum of radii, keep the move. This derivative-free method handles the non-smooth landscape of the LP objective effectively.
+4. **Refinement**: Run multiple passes of coordinate descent with decaying step sizes to converge to a high-quality local optimum. Repeat from the best found configuration to polish.
+5. **Safety Scaling**: Apply a final scaling factor to ensure strict numerical validity against the $10^{-12}$ tolerance in the validator.
+
+This approach leverages the exactness of LP for radii and the robustness of coordinate descent for centers, typically yielding denser packings than gradient-based joint optimization which struggles with inequality constraints and non-smoothness.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_radii_lp(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    # Maximum radius allowed by boundaries
+    lim = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                     np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lim = np.maximum(lim, 1e-9)
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, lim[i]) for i in range(n)]
+    
+    # Pairwise distances
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    b_ub = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def coordinate_descent_lp(centers, n, rng, max_iter=300):
+    """Optimizes centers by greedily moving circles to maximize LP sum of radii."""
+    c_curr = centers.copy()
+    _, val_curr = solve_radii_lp(c_curr)
+    
+    step = 0.015
+    for it in range(max_iter):
+        improved = False
+        # Shuffle order to avoid systematic bias
+        idxs = rng.permutation(n)
+        for i in idxs:
+            old_c = c_curr[i].copy()
+            best_val = val_curr
+            best_c = old_c
+            
+            # Try 4 axis-aligned directions + 8 random directions
+            d_steps = np.array([[step, 0], [-step, 0], [0, step], [0, -step]])
+            d_steps = np.vstack([d_steps, rng.uniform(-step, step, (8, 2))])
+            
+            for d in d_steps:
+                trial_c = c_curr.copy()
+                trial_c[i] = np.clip(trial_c[i] + d, 0.001, 0.999)
+                _, trial_val = solve_radii_lp(trial_c)
+                if trial_val > best_val + 1e-8:
+                    best_val = trial_val
+                    best_c = trial_c[i]
+                    
+            if best_c[0] != old_c[0] or best_c[1] != old_c[1]:
+                c_curr[i] = best_c
+                val_curr = best_val
+                improved = True
+                
+        if not improved:
+            step *= 0.6
+            if step < 1e-5:
+                break
+    return c_curr, val_curr
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    rng = np.random.default_rng(42)
+    
+    # Generate diverse initial configurations
+    inits = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 7, 5, 5, 4],
+        [5, 5, 5, 5, 6], [5, 4, 6, 5, 6], [6, 4, 5, 6, 5],
+        [5, 6, 5, 5, 5], [7, 5, 6, 5, 3]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        for r0 in [0.09, 0.095, 0.10]:
+            pts = []
+            y = r0
+            for i, cnt in enumerate(pat):
+                shift = r0 if i % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) < n:
+                        pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0 * 0.99
+            inits.append(np.clip(np.array(pts[:n]), 0.05, 0.95))
+            
+    for _ in range(8):
+        inits.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    # Phase 1: Coordinate descent from multiple diverse starts
+    for cfg in inits:
+        # Small perturbation to break exact lattice symmetry
+        cfg_pert = cfg + rng.uniform(-0.004, 0.004, cfg.shape)
+        cfg_pert = np.clip(cfg_pert, 0.02, 0.98)
+        
+        c_opt, val_opt = coordinate_descent_lp(cfg_pert, n, rng, max_iter=250)
+        
+        if val_opt > best_sum:
+            best_sum = val_opt
+            best_centers = c_opt.copy()
+            best_radii, _ = solve_radii_lp(c_opt)
+            
+    # Phase 2: Refinement passes on the best configuration found
+    if best_centers is not None:
+        for _ in range(4):
+            c_curr, val_curr = coordinate_descent_lp(best_centers, n, rng, max_iter=300)
+            if val_curr > best_sum:
+                best_sum = val_curr
+                best_centers = c_curr.copy()
+                
+        best_radii, best_sum = solve_radii_lp(best_centers)
+        
+    # Fallback
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii, best_sum = solve_radii_lp(best_centers)
+        
+    # Final safety scaling to strictly satisfy 1e-12 validator tolerance
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(n):
+        if r[i] > 1e-12:
+            scale = min(scale, c[i,0]/r[i], (1.0-c[i,0])/r[i], c[i,1]/r[i], (1.0-c[i,1])/r[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(c[i]-c[j])
+            r_sum = r[i] + r[j]
+            if r_sum > 1e-12:
+                scale = min(scale, d / r_sum)
+                
+    r *= scale * 0.999999
+    best_sum = float(np.sum(r))
+    best_radii = r
+    
+    return best_centers, best_radii, best_sum
+```

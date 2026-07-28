@@ -1,0 +1,228 @@
+# sol_000224 | problem=circle_packing_26 entrypoint=run_packing
+# generation=8 parent=sol_000187 (state 7cba18f0) state=969c1269 sum of radii=1.741420 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_radii_lp(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    lim = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                     np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lim = np.maximum(lim, 1e-9)
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, lim[i]) for i in range(n)]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def joint_objective(vars_array, n):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(vars_array[2*n:])
+
+def joint_constraints(vars_array, n):
+    """Returns inequality constraints >= 0 for valid packing."""
+    c = vars_array[:2*n].reshape(n, 2)
+    r = vars_array[2*n:]
+    
+    bc = np.concatenate([c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r])
+    
+    dx = c[:, 0:1] - c[:, 0:1].T
+    dy = c[:, 1:2] - c[:, 1:2].T
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    return np.concatenate([bc, d2[mask] - r_sum**2[mask]])
+
+def hill_climb_centers(centers, n, steps, rng):
+    """Derivative-free hill climbing optimizing centers by LP-evaluated radii sum."""
+    best_c = centers.copy()
+    _, best_val = solve_radii_lp(best_c)
+    step_size = 0.012
+    
+    for k in range(steps):
+        i = rng.integers(n)
+        trial_c = best_c.copy()
+        trial_c[i] += rng.normal(0, step_size, 2)
+        trial_c[i] = np.clip(trial_c[i], 0.001, 0.999)
+        
+        _, val = solve_radii_lp(trial_c)
+        if val > best_val + 1e-8:
+            best_c = trial_c
+            best_val = val
+            
+        # Adaptive step decay
+        if k % 150 == 0 and k > 0:
+            step_size *= 0.85
+            
+    return best_c, best_val
+
+def force_expand_centers(centers, n, iters, rng):
+    """Physics-based expansion to increase clearances between circles."""
+    best_c = centers.copy()
+    _, best_val = solve_radii_lp(best_c)
+    
+    for _ in range(iters):
+        r, _ = solve_radii_lp(best_c)
+        forces = np.zeros((n, 2))
+        
+        # Wall repulsion
+        for i in range(n):
+            x, y = best_c[i]
+            if x - r[i] < 0.001: forces[i, 0] += (0.002 - (x - r[i])) * 8.0
+            if x + r[i] > 0.999: forces[i, 0] -= (1.002 - (x + r[i])) * 8.0
+            if y - r[i] < 0.001: forces[i, 1] += (0.002 - (y - r[i])) * 8.0
+            if y + r[i] > 0.999: forces[i, 1] -= (1.002 - (y + r[i])) * 8.0
+            
+        # Pairwise repulsion on active/tight constraints
+        diffs = best_c[:, np.newaxis, :] - best_c[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        np.fill_diagonal(dists, 1.0)
+        r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+        
+        # Soft repulsion potential to push apart circles that are close to touching
+        overlaps = np.maximum(0.0, r_sum - dists)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if overlaps[i, j] > 0:
+                    dir_ = diffs[i, j] / dists[i, j]
+                    f = overlaps[i, j] * 4.0
+                    forces[i] += dir_ * f
+                    forces[j] -= dir_ * f
+                    
+        best_c += forces * 0.004
+        best_c = np.clip(best_c, 0.001, 0.999)
+        
+        _, new_val = solve_radii_lp(best_c)
+        if new_val > best_val:
+            best_val = new_val
+        else:
+            # Revert if degradation occurs to maintain stability
+            best_c -= forces * 0.004
+            best_c = np.clip(best_c, 0.001, 0.999)
+            
+    return best_c, best_val
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    rng = np.random.default_rng(42)
+    
+    # 1. Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 7, 5, 5, 4],
+        [5, 5, 5, 5, 6], [5, 4, 6, 5, 6], [6, 4, 5, 6, 5],
+        [5, 6, 5, 5, 5], [4, 5, 6, 5, 6], [6, 5, 5, 6, 4]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        for r0 in [0.095, 0.10, 0.105]:
+            pts = []
+            y = r0
+            for i, cnt in enumerate(pat):
+                shift = r0 if i % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) < n: pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+            configs.append(np.clip(np.array(pts[:n]), 0.05, 0.95))
+            
+    for _ in range(12):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    bounds_vars = [(0.0, 1.0)] * (2 * n) + [(1e-5, 0.2)] * n
+    cons_dict = {'type': 'ineq', 'fun': joint_constraints, 'args': (n,)}
+    
+    # 2. Joint SLSQP Optimization Phase
+    for cfg in configs:
+        r0 = np.full(n, 0.08)
+        x0 = np.concatenate([cfg.flatten(), r0])
+        
+        try:
+            res = minimize(joint_objective, x0, method='SLSQP', args=(n,),
+                          bounds=bounds_vars, constraints=cons_dict,
+                          options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if np.isfinite(res.fun):
+                c_opt = res.x[:2*n].reshape(n, 2)
+                c_opt = np.clip(c_opt, 0.001, 0.999)
+                
+                # LP refinement
+                r_lp, s_lp = solve_radii_lp(c_opt)
+                
+                # Hill climb refinement
+                c_hc, s_hc = hill_climb_centers(c_opt, n, steps=800, rng=rng)
+                if s_hc > s_lp:
+                    s_lp = s_hc
+                    c_opt = c_hc
+                    
+                # Force expansion refinement
+                c_fe, s_fe = force_expand_centers(c_opt, n, iters=300, rng=rng)
+                if s_fe > s_lp:
+                    s_lp = s_fe
+                    c_opt = c_fe
+                    
+                if s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = c_opt.copy()
+                    best_radii = solve_radii_lp(best_centers)[0]
+        except Exception:
+            pass
+            
+    # Fallback safety net
+    if best_centers is None:
+        best_centers = np.clip(np.array([[i*0.2, j*0.2] for j in range(5) for i in range(5)] + [[0.5,0.5]]), 0.1, 0.9)
+        best_radii, best_sum = solve_radii_lp(best_centers)
+        
+    # 3. Final safety scaling to strictly satisfy 1e-12 validator tolerance
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(n):
+        if r[i] > 1e-12:
+            scale = min(scale, c[i,0]/r[i], (1.0-c[i,0])/r[i], c[i,1]/r[i], (1.0-c[i,1])/r[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(c[i]-c[j])
+            r_sum = r[i] + r[j]
+            if r_sum > 1e-12:
+                scale = min(scale, d / r_sum)
+                
+    r *= scale * 0.9999995
+    best_sum = float(np.sum(r))
+    best_radii = r
+    
+    return best_centers, best_radii, best_sum

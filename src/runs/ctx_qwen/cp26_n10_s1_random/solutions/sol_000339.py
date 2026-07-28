@@ -1,0 +1,197 @@
+# sol_000339 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000152 (state 06e8663d) state=8b4a9560 sum of radii=2.466646 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+N = 26
+
+def solve_lp_and_grad(centers):
+    """Solves LP to maximize sum of radii for fixed centers and computes gradient."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    # Radius limits based on distance to boundaries
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    # Pairwise non-overlap constraints: r_i + r_j <= dist(i, j)
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    num_pairs = len(i_idx)
+    A_ub = np.zeros((num_pairs, n))
+    A_ub[np.arange(num_pairs), i_idx] = 1.0
+    A_ub[np.arange(num_pairs), j_idx] = 1.0
+    b_ub = np.hypot(centers[i_idx, 0] - centers[j_idx, 0], 
+                    centers[i_idx, 1] - centers[j_idx, 1])
+                    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if not res.success:
+            return None, None, 0.0
+            
+        radii = res.x
+        sum_r = -res.fun
+        
+        # Compute gradient using LP dual variables (marginals)
+        grad = np.zeros((n, 2))
+        if hasattr(res, 'marginals') and hasattr(res.marginals, 'ineqlin'):
+            lams = res.marginals.ineqlin[:num_pairs]
+            mask = lams > 1e-10
+            if np.any(mask):
+                idx = np.where(mask)[0]
+                vals = lams[idx]
+                ii = i_idx[idx]
+                jj = j_idx[idx]
+                dx = centers[ii, 0] - centers[jj, 0]
+                dy = centers[ii, 1] - centers[jj, 1]
+                d = np.hypot(dx, dy)
+                d = np.maximum(d, 1e-12)
+                
+                fx = vals * dx / d
+                fy = vals * dy / d
+                
+                np.add.at(grad[:, 0], ii, fx)
+                np.add.at(grad[:, 1], ii, fy)
+                np.add.at(grad[:, 0], jj, -fx)
+                np.add.at(grad[:, 1], jj, -fy)
+                
+        return radii, grad, sum_r
+    except Exception:
+        return None, None, 0.0
+
+def obj_and_grad(c_flat):
+    """Objective and gradient for scipy.minimize: minimizes negative sum of radii."""
+    c = c_flat.reshape(N, 2)
+    r, g, s = solve_lp_and_grad(c)
+    if r is None:
+        return 1e6, np.zeros_like(c_flat)
+    return -s, -g.flatten()
+
+def generate_inits():
+    """Generates diverse initial configurations (hexagonal, grid, random)."""
+    configs = []
+    rng = np.random.default_rng(123)
+    
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [4, 6, 6, 6, 4],
+        [5, 5, 6, 5, 5], [6, 6, 5, 5, 4], [5, 6, 5, 5, 5],
+        [7, 6, 6, 7], [6, 7, 6, 7], [5, 7, 5, 5, 4]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < N: continue
+        r0 = 0.095
+        pts = []
+        y = r0
+        for ri, cnt in enumerate(pat):
+            shift = r0 if ri % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+        base = np.array(pts[:N])
+        
+        # Normalize to fit comfortably inside [0.02, 0.98]
+        mn = base.min(axis=0)
+        mx = base.max(axis=0)
+        span = mx - mn + 1e-9
+        norm = (base - mn) / span * 0.88 + 0.06
+        configs.append(norm)
+        
+        for _ in range(3):
+            p = norm + rng.uniform(-0.025, 0.025, norm.shape)
+            configs.append(np.clip(p, 0.02, 0.98))
+            
+    # 5x5 grid + center
+    gx = np.linspace(0.12, 0.88, 5)
+    gy = np.linspace(0.12, 0.88, 5)
+    grid = np.array([(x, y) for y in gy for x in gx])
+    grid = np.vstack([grid, [0.5, 0.5]])
+    configs.append(grid)
+    
+    # Random dense starts
+    for _ in range(6):
+        configs.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    return configs
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_s = -1.0
+    best_c = None
+    best_r = None
+    
+    configs = generate_inits()
+    bounds_c = [(1e-4, 1.0 - 1e-4)] * (2 * N)
+    
+    # Phase 1: Gradient ascent on centers via LP duals
+    for cfg in configs:
+        c0 = np.clip(cfg, 1e-4, 1.0 - 1e-4)
+        for _ in range(2):
+            c_pert = np.clip(c0 + rng.uniform(-0.008, 0.008, c0.shape), 1e-4, 1.0-1e-4)
+            try:
+                res = minimize(obj_and_grad, c_pert.flatten(), method='L-BFGS-B', 
+                               jac=True, bounds=bounds_c,
+                               options={'maxiter': 4000, 'ftol': 1e-14, 'gtol': 1e-11})
+                if np.isfinite(res.fun):
+                    c_opt = res.x.reshape(N, 2)
+                    r_opt, _, s_opt = solve_lp_and_grad(c_opt)
+                    if r_opt is not None and s_opt > best_s:
+                        best_s = s_opt
+                        best_c = c_opt.copy()
+                        best_r = r_opt.copy()
+            except Exception:
+                continue
+                
+    if best_c is None:
+        best_c = configs[0]
+        best_r, _, best_s = solve_lp_and_grad(best_c)
+        
+    # Phase 2: Local coordinate descent / jiggle search to escape local minima
+    curr_c, curr_r, curr_s = best_c.copy(), best_r.copy(), best_s
+    step = 0.012
+    for _ in range(4000):
+        idx = rng.integers(N)
+        old = curr_c[idx].copy()
+        move = rng.uniform(-step, step, 2)
+        curr_c[idx] = np.clip(curr_c[idx] + move, 1e-4, 1.0 - 1e-4)
+        r_try, _, s_try = solve_lp_and_grad(curr_c)
+        if r_try is not None and s_try > curr_s + 1e-10:
+            curr_s = s_try
+            curr_r = r_try.copy()
+            if curr_s > best_s:
+                best_s = curr_s
+                best_c = curr_c.copy()
+                best_r = curr_r.copy()
+            step *= 0.999
+        else:
+            curr_c[idx] = old
+            if rng.random() < 0.03:
+                step *= 0.94
+                
+    # Final strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999995
+    best_s = float(np.sum(best_r))
+    
+    return best_c, best_r, best_s

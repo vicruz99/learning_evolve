@@ -1,0 +1,214 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a two-phase optimization strategy:
+
+1. **Equal-Radius Phase**: First, we optimize for a configuration where all circles have the same radius $r$. This reduces the problem to 53 variables (52 center coordinates + 1 radius) and finds a highly symmetric, dense packing. Equal-radius packings are well-studied and avoid many pathological local minima that plague unequal-radius optimizations. We use `SLSQP` with multiple perturbed hexagonal lattice initializations to find the largest feasible $r$.
+
+2. **Joint Optimization Phase**: Using the best centers from Phase 1 as a starting point, we relax the equal-radius constraint and optimize centers and radii jointly. This allows circles to adjust sizes to fill remaining gaps, potentially increasing the total sum.
+
+3. **Geometric Refinement & Safety Scaling**: After optimization, we compute the exact maximal feasible radius for each circle given the fixed centers (limited by boundaries and nearest neighbors). This guarantees strict non-overlap and boundary compliance. Finally, we apply a tiny multiplicative safety factor to account for floating-point precision in the validator.
+
+This approach leverages the structural optimality of hexagonal packing, refines it with gradient-based constrained optimization, and guarantees validity through geometric projection.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective_equal(v):
+    """Objective for equal-radius phase: maximize r => minimize -r"""
+    return -v[-1]
+
+def constraints_equal(v):
+    """Constraints for equal-radius phase"""
+    xs = v[0::2]
+    ys = v[1::2]
+    r = v[-1]
+    con = []
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    con.append(xs - r)
+    con.append(1.0 - xs - r)
+    con.append(ys - r)
+    con.append(1.0 - ys - r)
+    
+    # Pairwise non-overlap: dist^2 >= (2r)^2
+    diff_x = xs[:, None] - xs[None, :]
+    diff_y = ys[:, None] - ys[None, :]
+    dist_sq = diff_x**2 + diff_y**2
+    # Use upper triangular mask to enforce each pair once
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    con.append(dist_sq[mask] - 4.0 * r**2)
+    
+    return np.concatenate(con)
+
+def objective_joint(v):
+    """Objective for joint phase: maximize sum(r) => minimize -sum(r)"""
+    return -np.sum(v[2*N:3*N])
+
+def constraints_joint(v):
+    """Constraints for joint optimization"""
+    cx = v[:N]
+    cy = v[N:2*N]
+    r = v[2*N:3*N]
+    con = []
+    
+    # Boundary constraints
+    con.append(cx - r)
+    con.append(1.0 - cx - r)
+    con.append(cy - r)
+    con.append(1.0 - cy - r)
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    cx_m = cx[:, None] - cx[None, :]
+    cy_m = cy[:, None] - cy[None, :]
+    dist_sq = cx_m**2 + cy_m**2
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    r_sum = r[:, None] + r[None, :]
+    con.append(dist_sq[mask] - r_sum[mask]**2)
+    
+    return np.concatenate(con)
+
+def get_hex_init(r0):
+    """Generates an initial hexagonal lattice of N circles"""
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < N:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x + r0 <= 1.0 and len(pts) < N:
+            pts.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    best_r_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    best_eq_r = 0.0
+    best_eq_centers = None
+    
+    # --- Phase 1: Equal Radius Optimization ---
+    bounds_eq = [(0.0, 1.0)] * (2*N) + [(0.05, 0.15)]
+    
+    for trial in range(6):
+        init_pts = get_hex_init(0.09)
+        if trial > 0:
+            init_pts += np.random.uniform(-0.015, 0.015, init_pts.shape)
+            init_pts = np.clip(init_pts, 0.05, 0.95)
+            
+        v0 = np.zeros(2*N + 1)
+        v0[0::2] = init_pts[:, 0]
+        v0[1::2] = init_pts[:, 1]
+        v0[-1] = 0.06  # Start with a clearly feasible radius
+        
+        try:
+            res = minimize(objective_equal, v0, method='SLSQP', bounds=bounds_eq,
+                           constraints={'type': 'ineq', 'fun': constraints_equal},
+                           options={'maxiter': 2000, 'ftol': 1e-12})
+            if res.x[-1] > best_eq_r:
+                best_eq_r = res.x[-1]
+                best_eq_centers = res.x[:2*N].reshape(N, 2)
+        except Exception:
+            pass
+            
+    # --- Phase 2: Joint Center & Radius Optimization ---
+    bounds_j = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    
+    if best_eq_centers is not None:
+        v0 = np.zeros(3*N)
+        v0[:N] = best_eq_centers[:, 0]
+        v0[N:2*N] = best_eq_centers[:, 1]
+        v0[2*N:] = best_eq_r
+        
+        for trial in range(4):
+            curr_v0 = v0.copy()
+            if trial > 0:
+                curr_v0[:2*N] += np.random.uniform(-0.008, 0.008, 2*N)
+                curr_v0[:2*N] = np.clip(curr_v0[:2*N], 0.01, 0.99)
+                
+            try:
+                res = minimize(objective_joint, curr_v0, method='SLSQP', bounds=bounds_j,
+                               constraints={'type': 'ineq', 'fun': constraints_joint},
+                               options={'maxiter': 3000, 'ftol': 1e-12})
+                               
+                c_opt = res.x[:2*N].reshape(N, 2)
+                r_opt = res.x[2*N:]
+                
+                # Strict validation check
+                valid = True
+                if np.any(r_opt <= 0):
+                    valid = False
+                elif np.any(c_opt[:, 0] < r_opt - 1e-9) or np.any(c_opt[:, 0] > 1 - r_opt + 1e-9):
+                    valid = False
+                elif np.any(c_opt[:, 1] < r_opt - 1e-9) or np.any(c_opt[:, 1] > 1 - r_opt + 1e-9):
+                    valid = False
+                else:
+                    diff = c_opt[:, None, :] - c_opt[None, :, :]
+                    dist = np.sqrt(np.sum(diff**2, axis=2))
+                    np.fill_diagonal(dist, np.inf)
+                    r_sum_mat = r_opt[:, None] + r_opt[None, :]
+                    if np.any(dist < r_sum_mat - 1e-9):
+                        valid = False
+                        
+                if valid:
+                    s = np.sum(r_opt)
+                    if s > best_r_sum:
+                        best_r_sum = s
+                        best_centers = c_opt.copy()
+                        best_radii = r_opt.copy()
+            except Exception:
+                pass
+                
+    # Fallback if optimization fails
+    if best_centers is None:
+        best_centers = best_eq_centers
+        best_radii = np.full(N, best_eq_r)
+        best_r_sum = N * best_eq_r
+        
+    # --- Phase 3: Geometric Refinement ---
+    # Compute exact maximal radii for the fixed centers. This guarantees validity
+    # and often extracts a few extra bits of sum from tight packings.
+    if best_centers is not None:
+        r_refined = np.zeros(N)
+        for i in range(N):
+            d_wall = min(best_centers[i, 0], 1.0 - best_centers[i, 0],
+                         best_centers[i, 1], 1.0 - best_centers[i, 1])
+            
+            dists = np.linalg.norm(best_centers[i] - best_centers, axis=1)
+            dists[i] = np.inf
+            d_other = np.min(dists)
+            
+            r_refined[i] = min(d_wall, d_other / 2.0)
+            
+        if np.sum(r_refined) > best_r_sum:
+            best_radii = r_refined
+            best_r_sum = np.sum(r_refined)
+            
+    # Final safety scaling to strictly satisfy validator tolerance
+    k = 1.0
+    for i in range(N):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 0:
+            k = min(k, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 0:
+                k = min(k, d/rs)
+                
+    best_radii *= k * 0.99999
+    best_r_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, float(best_r_sum)
+```

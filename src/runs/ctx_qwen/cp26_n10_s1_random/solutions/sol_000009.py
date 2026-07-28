@@ -1,0 +1,293 @@
+# sol_000009 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state abc5794a) state=7fe97d8a sum of radii=0.031075 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    centers = np.zeros((n, 2))
+    
+    # 1. Heuristic Initialization: Hexagonal packing approximation
+    # We aim for a radius r ~ 0.101.
+    # We arrange circles in rows with offset to maximize density.
+    row_radii = [0.101, 0.101, 0.101, 0.101, 0.101, 0.101] # Placeholder, will be adjusted
+    r_init = 0.09 # Start slightly smaller to allow relaxation
+    
+    # Layout: 5, 5, 5, 5, 4, 2? Or 5, 5, 5, 5, 6? 
+    # Let's try a dense 6-row hexagonal pattern.
+    # Rows: 5, 5, 5, 5, 5, 1 (Total 26) - might be inefficient.
+    # Rows: 5, 6, 5, 6, 4 (Total 26) - Hexagonal packing.
+    
+    counts = [5, 6, 5, 6, 4]
+    total = sum(counts)
+    if total < n:
+        # Pad if needed, though 26 is exact
+        pass
+    
+    idx = 0
+    # Vertical spacing for hex grid is r * sqrt(3)
+    # We want to fit 5 rows of circles vertically.
+    # Height = (rows-1)*r*sqrt(3) + 2r.
+    # Let's calculate optimal spacing based on 1.0 height.
+    # 4 * h_step + 2*r = 1.0 => h_step = (1 - 2r)/4.
+    # But in hex, h_step = r * sqrt(3).
+    # Let's just use a fixed r_init and scale coordinates later.
+    
+    r_init = 0.095
+    h_step = r_init * math.sqrt(3)
+    
+    # Adjust vertical start to center the pack
+    # Total height of 5 rows (indices 0 to 4)
+    # y_0 = r_init + margin
+    # y_4 = 1 - r_init - margin
+    # Actually, let's just start at r_init and let it expand.
+    
+    current_y = r_init + 0.02 # small margin
+    row_idx = 0
+    
+    for count in counts:
+        # Horizontal shift for odd rows (1, 3, 5...)
+        shift = r_init if row_idx % 2 == 1 else 0.0
+        
+        # Number of gaps between circles
+        gaps = count - 1
+        # Total width required = 2*r_init (margins) + gaps * (2*r_init)
+        # If this exceeds 1, we scale down x positions.
+        width_req = 2 * r_init + gaps * (2 * r_init)
+        if width_req > 1.0:
+            scale_x = (1.0 - 2*r_init) / width_req * (2*r_init) # This logic is flawed, let's just space them evenly
+            # Evenly space centers in [r_init, 1-r_init]
+            x_start = r_init
+            x_end = 1.0 - r_init
+            if count > 1:
+                spacing = (x_end - x_start) / (count - 1)
+            else:
+                spacing = 0
+            
+            # Apply shift to the whole row block? No, shift centers relative to ideal grid.
+            # Better: Place centers evenly, then apply shift? 
+            # Let's place them in the valid range [r_init, 1-r_init]
+            for k in range(count):
+                if count > 1:
+                    x = x_start + k * spacing
+                else:
+                    x = 0.5 # Center
+                centers[idx, 0] = x
+                centers[idx, 1] = current_y
+                idx += 1
+        else:
+            # Fits easily, place at hex positions
+            x_start = r_init + shift
+            # Actually, if it fits, we can place them with 2r spacing
+            # But to be safe and centered:
+            total_width = (count - 1) * 2 * r_init
+            start_x = (1.0 - total_width) / 2.0
+            for k in range(count):
+                centers[idx, 0] = start_x + k * 2 * r_init
+                centers[idx, 1] = current_y
+                idx += 1
+        
+        current_y += h_step
+        row_idx += 1
+    
+    # Ensure we have 26 centers (should be exact based on counts)
+    if idx < n:
+        # Fill remaining with random points if logic fails
+        for i in range(idx, n):
+            centers[i, 0] = np.random.rand()
+            centers[i, 1] = np.random.rand()
+
+    # 2. Repulsive Force Relaxation to expand radii
+    # We will iteratively increase radius and resolve overlaps
+    radii = np.full(n, r_init)
+    
+    # Force simulation parameters
+    dt = 0.001
+    repulsion_strength = 10.0
+    boundary_strength = 5.0
+    
+    for expansion_step in range(1000):
+        # Try to increase radii
+        can_expand = True
+        for i in range(n):
+            radii[i] += 0.0001
+            
+        # Check validity and apply forces if invalid
+        # We compute forces based on overlap
+        forces = np.zeros_like(centers)
+        
+        for i in range(n):
+            x_i, y_i = centers[i]
+            r_i = radii[i]
+            
+            # Boundary forces
+            if x_i - r_i < 0:
+                forces[i, 0] += boundary_strength * (r_i - x_i)
+            if x_i + r_i > 1:
+                forces[i, 0] -= boundary_strength * (x_i + r_i - 1)
+            if y_i - r_i < 0:
+                forces[i, 1] += boundary_strength * (r_i - y_i)
+            if y_i + r_i > 1:
+                forces[i, 1] -= boundary_strength * (y_i + r_i - 1)
+            
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist and dist > 1e-9:
+                    # Overlap
+                    overlap = min_dist - dist
+                    # Unit vector from j to i
+                    ux = dx / dist
+                    uy = dy / dist
+                    
+                    # Repulsive force proportional to overlap
+                    f = repulsion_strength * overlap
+                    forces[i, 0] += ux * f
+                    forces[i, 1] += uy * f
+                    forces[j, 0] -= ux * f
+                    forces[j, 1] -= uy * f
+        
+        # Update centers
+        # Use a simple damping to prevent oscillation
+        centers += forces * dt
+        
+        # Clip centers to valid range (approx) to prevent explosion
+        centers = np.clip(centers, 0, 1)
+        
+        # If forces are small, we might be stable. 
+        # But we are continuously expanding radii, so forces will persist.
+        
+    # 3. Coordinate-Ascent Local Optimization
+    # Fine-tune positions to maximize min-clearance
+    for iteration in range(1000):
+        best_improvement = 0.0
+        best_move = None
+        move_idx = -1
+        
+        for i in range(n):
+            # Try moving circle i in 4 directions + center (stay)
+            # And also try small random perturbations?
+            # Let's try pushing away from nearest neighbors
+            
+            # Find nearest neighbor or boundary
+            min_gap = float('inf')
+            threat = None # 'boundary' or index j
+            
+            # Check boundaries
+            for coord_idx in [0, 1]:
+                if centers[i, coord_idx] - radii[i] < min_gap:
+                    min_gap = centers[i, coord_idx] - radii[i]
+                    threat = (f'boundary_{coord_idx}_min', -1)
+                if 1 - centers[i, coord_idx] - radii[i] < min_gap:
+                    min_gap = 1 - centers[i, coord_idx] - radii[i]
+                    threat = (f'boundary_{coord_idx}_max', 1)
+            
+            # Check neighbors
+            for j in range(n):
+                if i == j: continue
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                gap = dist - radii[i] - radii[j]
+                if gap < min_gap:
+                    min_gap = gap
+                    threat = ('neighbor', j)
+            
+            # Move away from threat
+            if threat is not None:
+                type_, param = threat
+                direction = np.zeros(2)
+                
+                if type_ == 'neighbor':
+                    j = param
+                    dx = centers[i, 0] - centers[j, 0]
+                    dy = centers[i, 1] - centers[j, 1]
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    if dist > 0:
+                        direction = np.array([dx, dy]) / dist
+                elif type_.startswith('boundary'):
+                    if 'min' in type_:
+                        # Move positive direction
+                        direction = np.array([1, 0] if '0' in type_ else [0, 1])
+                    else:
+                        # Move negative direction
+                        direction = np.array([-1, 0] if '0' in type_ else [0, -1])
+                
+                # Try moving in direction
+                old_pos = centers[i].copy()
+                step_size = 0.001 * (1 + abs(min_gap)) # Adaptive step
+                new_pos = old_pos + direction * step_size
+                
+                # Clip to [0,1]
+                new_pos = np.clip(new_pos, 0.0, 1.0)
+                
+                # Check if new position improves minimum gap for circle i
+                # We need to check gaps with all other circles and boundaries
+                new_min_gap = float('inf')
+                
+                # Boundaries
+                for coord_idx in [0, 1]:
+                    new_min_gap = min(new_min_gap, new_pos[coord_idx])
+                    new_min_gap = min(new_min_gap, 1 - new_pos[coord_idx])
+                
+                # Neighbors
+                for j in range(n):
+                    if i == j: continue
+                    dx = new_pos[0] - centers[j, 0]
+                    dy = new_pos[1] - centers[j, 1]
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    new_min_gap = min(new_min_gap, dist - radii[i] - radii[j])
+                
+                # Original gap
+                old_min_gap = min_gap # This was the bottleneck
+                
+                # If new gap is better (larger) or at least not worse significantly, accept?
+                # We want to maximize the global min radius, but locally we just want to increase clearance.
+                if new_min_gap > min_gap:
+                    centers[i] = new_pos
+                    best_improvement = max(best_improvement, new_min_gap - min_gap)
+        
+        # If no improvement, break
+        if best_improvement < 1e-7:
+            break
+
+    # 4. Final Radius Calculation
+    # Calculate the maximum possible equal radius for this configuration
+    min_dist = float('inf')
+    
+    # Dist to boundaries
+    for i in range(n):
+        min_dist = min(min_dist, centers[i, 0])
+        min_dist = min(min_dist, 1 - centers[i, 0])
+        min_dist = min(min_dist, centers[i, 1])
+        min_dist = min(min_dist, 1 - centers[i, 1])
+        
+    # Dist between circles
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = math.sqrt(dx*dx + dy*dy)
+            min_dist = min(min_dist, dist)
+            
+    final_r = min_dist / 2.0
+    
+    # Set all radii to this max possible value
+    final_radii = np.full(n, final_r)
+    
+    sum_radii = np.sum(final_radii)
+    
+    return centers, final_radii, sum_radii
+
+if __name__ == "__main__":
+    # Quick test
+    centers, radii, sum_r = run_packing()
+    print(f"Sum of radii: {sum_r}")
+    # Optional validation call if needed

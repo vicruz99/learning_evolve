@@ -1,0 +1,308 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.627, I will employ a multi-phase optimization strategy that combines physical simulation, rigorous mathematical programming, and gradient-based ascent:
+
+1. **Explicit Constraint LP with Dual Extraction**: Instead of precomputing boundary limits, I will encode all pairwise and boundary constraints explicitly in the LP. This allows accurate extraction of dual variables (marginals), which provide the exact gradient of the maximum sum of radii with respect to circle centers. This gradient accounts for both inter-circle repulsion and boundary pressure.
+2. **Force-Directed Initialization**: A growing-radius force simulation will quickly generate dense, non-overlapping configurations that respect the square boundaries. This serves as a robust starting point for gradient-based methods.
+3. **L-BFGS-B Gradient Ascent**: Using the analytical LP gradient, I will perform L-BFGS-B optimization on the center coordinates. This efficiently navigates the non-convex landscape to find local maxima of the radius sum.
+4. **SLSQP Joint Refinement**: A simultaneous optimization of centers and radii using SLSQP with squared distance constraints will polish the configuration and handle tight boundary interactions smoothly.
+5. **Coordinate Ascent & Perturbation Search**: Independent circle movements combined with small random perturbations will help escape remaining local minima.
+6. **Numerical Safety**: A final scaling step ensures strict compliance with the `1e-12` validation tolerance without sacrificing significant area.
+
+This pipeline leverages both the speed of physical simulation and the precision of mathematical optimization, directly targeting the geometric bottlenecks that limit the sum of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+M_PAIRS = len(PAIR_I)
+
+def compute_lp_and_grad(centers):
+    """Solves LP for max sum of radii given centers, returns radii, sum, and gradient w.r.t centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    diffs = centers[PAIR_I] - centers[PAIR_J]
+    dists = np.sqrt(np.sum(diffs**2, axis=1) + 1e-16)
+    
+    # Constraints: M_PAIRS + 4*N
+    n_constraints = M_PAIRS + 4 * N
+    A_ub = np.zeros((n_constraints, N))
+    b_ub = np.zeros(n_constraints)
+    
+    # Pairwise: r_i + r_j <= dist_ij
+    A_ub[:M_PAIRS, PAIR_I] = 1.0
+    A_ub[:M_PAIRS, PAIR_J] = 1.0
+    b_ub[:M_PAIRS] = dists
+    
+    # Boundary: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    idx_offset = M_PAIRS
+    A_ub[idx_offset + np.arange(N), np.arange(N)] = 1.0
+    b_ub[idx_offset + np.arange(N)] = centers[:, 0]
+    
+    idx_offset += N
+    A_ub[idx_offset + np.arange(N), np.arange(N)] = 1.0
+    b_ub[idx_offset + np.arange(N)] = 1.0 - centers[:, 0]
+    
+    idx_offset += N
+    A_ub[idx_offset + np.arange(N), np.arange(N)] = 1.0
+    b_ub[idx_offset + np.arange(N)] = centers[:, 1]
+    
+    idx_offset += N
+    A_ub[idx_offset + np.arange(N), np.arange(N)] = 1.0
+    b_ub[idx_offset + np.arange(N)] = 1.0 - centers[:, 1]
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if not res.success or not np.isfinite(res.fun):
+            return None, 0.0, np.zeros((N, 2))
+            
+        r = np.maximum(res.x, 0.0)
+        s = -res.fun
+        
+        grad = np.zeros((N, 2))
+        try:
+            marg = res.marginals.ineqlin
+        except AttributeError:
+            try:
+                marg = res.ineqlin.marginals
+            except AttributeError:
+                marg = None
+                
+        if marg is not None:
+            # Pairwise gradients
+            active_lam = marg[:M_PAIRS]
+            mask = active_lam > 1e-7
+            if np.any(mask):
+                idx = np.where(mask)[0]
+                lam = active_lam[idx]
+                ii = PAIR_I[idx]
+                jj = PAIR_J[idx]
+                d = dists[idx]
+                d = np.where(d > 1e-9, d, 1.0)
+                vec = lam[:, np.newaxis] * (centers[ii] - centers[jj]) / d[:, np.newaxis]
+                grad[ii] += vec
+                grad[jj] -= vec
+                
+            # Boundary gradients
+            lam_x = marg[M_PAIRS : M_PAIRS + N]
+            lam_1x = marg[M_PAIRS + N : M_PAIRS + 2*N]
+            lam_y = marg[M_PAIRS + 2*N : M_PAIRS + 3*N]
+            lam_1y = marg[M_PAIRS + 3*N : M_PAIRS + 4*N]
+            
+            mask_x = lam_x > 1e-7
+            if np.any(mask_x):
+                grad[mask_x, 0] -= lam_x[mask_x]
+                
+            mask_1x = lam_1x > 1e-7
+            if np.any(mask_1x):
+                grad[mask_1x, 0] += lam_1x[mask_1x]
+                
+            mask_y = lam_y > 1e-7
+            if np.any(mask_y):
+                grad[mask_y, 1] -= lam_y[mask_y]
+                
+            mask_1y = lam_1y > 1e-7
+            if np.any(mask_1y):
+                grad[mask_1y, 1] += lam_1y[mask_1y]
+                
+        return r, s, grad
+    except Exception:
+        return None, 0.0, np.zeros((N, 2))
+
+def force_sim(centers, steps=3000):
+    """Vectorized force-directed simulation to find dense packings."""
+    c = centers.copy()
+    r = np.full(N, 0.035)
+    vel = np.zeros_like(c)
+    
+    for step in range(steps):
+        dt = 0.008 * (1.0 - 0.6 * step / steps) + 0.001
+        damp = 0.82
+        growth = 1.00015 * (1.0 - 0.4 * step / steps)
+        k = 300.0
+        
+        r *= growth
+        
+        diff = c[:, None, :] - c[None, :, :]
+        dist = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+        np.fill_diagonal(dist, 1e9)
+        
+        overlap = np.maximum(0.0, r[:, None] + r[None, :] - dist)
+        inv_d = 1.0 / (dist + 1e-9)
+        rep = overlap * inv_d * k
+        f_rep = np.sum(diff * rep[:, :, None], axis=1)
+        
+        f_wall = np.zeros_like(c)
+        f_wall[:, 0] += np.clip(r - c[:, 0], 0, None) * k
+        f_wall[:, 0] -= np.clip(c[:, 0] + r - 1.0, 0, None) * k
+        f_wall[:, 1] += np.clip(r - c[:, 1], 0, None) * k
+        f_wall[:, 1] -= np.clip(c[:, 1] + r - 1.0, 0, None) * k
+        
+        vel = vel * damp + (f_rep + f_wall) * dt
+        c += vel
+        c = np.clip(c, 1e-4, 1.0 - 1e-4)
+        
+    return c, r
+
+def slqp_obj(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2 * N:])
+
+def slqp_cons(v):
+    """Inequality constraints >= 0 using squared distances for smooth gradients."""
+    cx = v[:N]
+    cy = v[N:2 * N]
+    r = v[2 * N:]
+    
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    dx = cx[PAIR_I] - cx[PAIR_J]
+    dy = cy[PAIR_I] - cy[PAIR_J]
+    dr = r[PAIR_I] + r[PAIR_J]
+    
+    c = np.concatenate([c, dx**2 + dy**2 - dr**2])
+    return c
+
+def _obj_and_grad(v):
+    """Objective and gradient for L-BFGS-B using LP duals."""
+    c = v.reshape(N, 2)
+    r, s, g = compute_lp_and_grad(c)
+    if r is None:
+        return 0.0, np.zeros_like(v)
+    return -s, -g.flatten()
+
+def lbfgs_optimize(c0):
+    """Optimize centers using L-BFGS-B with analytical LP gradient."""
+    res = minimize(_obj_and_grad, c0.flatten(), method='L-BFGS-B', 
+                   bounds=[(1e-4, 0.999)] * (2 * N),
+                   options={'maxiter': 2500, 'ftol': 1e-12})
+    return res.x.reshape(N, 2), -res.fun
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    configs = []
+    pats = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 6, 6, 5, 4],
+        [7, 5, 5, 5, 4], [4, 5, 7, 5, 5], [8, 6, 6, 6], [9, 5, 6, 6]
+    ]
+    
+    # Generate hexagonal base patterns
+    for pat in pats:
+        if sum(pat) < N:
+            continue
+        pts = []
+        y = 0.09
+        for i, cnt in enumerate(pat):
+            shift = 0.09 if i % 2 == 1 else 0.0
+            x = 0.09 + shift
+            for _ in range(cnt):
+                if len(pts) >= N:
+                    break
+                pts.append([x, y])
+                x += 0.18
+            y += 0.09 * np.sqrt(3)
+        cfg = np.array(pts[:N])
+        mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+        span = mx - mn + 1e-9
+        cfg = (cfg - mn) / span * 0.8 + 0.1
+        configs.append(cfg)
+        for _ in range(3):
+            configs.append(np.clip(cfg + rng.uniform(-0.025, 0.025, cfg.shape), 0.05, 0.95))
+            
+    for _ in range(10):
+        configs.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    # Main optimization pipeline
+    for cfg in configs:
+        # Phase 1: Force simulation
+        c_sim, r_sim = force_sim(cfg, steps=2500)
+        
+        # Phase 2: SLSQP joint polish
+        v0 = np.concatenate([c_sim[:, 0], c_sim[:, 1], r_sim * 0.94])
+        bounds_v = [(0.0, 1.0)] * (2 * N) + [(1e-6, 0.5)] * N
+        try:
+            res = minimize(slqp_obj, v0, method='SLSQP', bounds=bounds_v,
+                          constraints={'type': 'ineq', 'fun': slqp_cons},
+                          options={'maxiter': 3000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_slq = np.column_stack((res.x[:N], res.x[N:2*N]))
+                r_lp, s_lp, _ = compute_lp_and_grad(c_slq)
+                if r_lp is not None and s_lp > best_sum:
+                    best_sum = s_lp
+                    best_c = c_slq.copy()
+                    best_r = r_lp.copy()
+        except Exception:
+            pass
+            
+        # Phase 3: L-BFGS-B gradient ascent on centers
+        c_opt, s_opt = lbfgs_optimize(c_sim)
+        if s_opt > best_sum:
+            r_lp, best_sum, _ = compute_lp_and_grad(c_opt)
+            best_c = c_opt.copy()
+            best_r = r_lp.copy()
+            
+    # Phase 4: Coordinate Ascent refinement
+    if best_c is not None:
+        curr_c, curr_r, curr_s = best_c.copy(), best_r.copy(), best_sum
+        step = 0.015
+        
+        for iteration in range(2500):
+            i = rng.integers(N)
+            old = curr_c[i].copy()
+            curr_c[i] += rng.uniform(-step, step, 2)
+            curr_c[i] = np.clip(curr_c[i], 1e-4, 0.999)
+            
+            r_try, s_try, _ = compute_lp_and_grad(curr_c)
+            if s_try > curr_s + 1e-8:
+                curr_s = s_try
+                curr_r = r_try.copy()
+                step = min(step * 1.012, 0.04)
+            else:
+                curr_c[i] = old
+                step *= 0.996
+                
+        best_c, best_r, best_sum = curr_c, curr_r, curr_s
+        
+        # Phase 5: Perturbation & Gradient Ascent loop
+        for _ in range(15):
+            c_pert = best_c + rng.uniform(-0.006, 0.006, (N, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            c_opt, s_opt = lbfgs_optimize(c_pert)
+            if s_opt > best_sum:
+                r_lp, best_sum, _ = compute_lp_and_grad(c_opt)
+                best_c = c_opt.copy()
+                best_r = r_lp.copy()
+                
+    # Phase 6: Strict Numerical Safety Scaling
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-16)
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = dists[i, j]
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

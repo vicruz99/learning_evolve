@@ -1,0 +1,258 @@
+# sol_000331 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000308 (state b85a4809) state=7f307b6e sum of radii=2.603577 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+M_PAIRS = len(PAIR_I)
+M_CON = M_PAIRS + 4 * N
+
+# Precompute sparse-like constraint matrix for LP
+A_LP = np.zeros((M_CON, N))
+for k, (i, j) in enumerate(zip(PAIR_I, PAIR_J)):
+    A_LP[k, i] = 1.0
+    A_LP[k, j] = 1.0
+for i in range(N):
+    A_LP[M_PAIRS + i, i] = 1.0
+    A_LP[M_PAIRS + N + i, i] = 1.0
+    A_LP[M_PAIRS + 2*N + i, i] = 1.0
+    A_LP[M_PAIRS + 3*N + i, i] = 1.0
+
+def solve_lp_and_grad(centers):
+    """Solves LP to maximize sum of radii and computes exact gradient via duals."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    
+    b_ub = np.empty(M_CON)
+    diffs = centers[PAIR_I] - centers[PAIR_J]
+    b_ub[:M_PAIRS] = np.hypot(diffs[:, 0], diffs[:, 1])
+    for i in range(N):
+        x, y = centers[i]
+        b_ub[M_PAIRS + i] = x
+        b_ub[M_PAIRS + N + i] = 1.0 - x
+        b_ub[M_PAIRS + 2*N + i] = y
+        b_ub[M_PAIRS + 3*N + i] = 1.0 - y
+        
+    bounds = [(0.0, lim) for lim in lims]
+    try:
+        res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+        if not res.success:
+            return None, 0.0, np.zeros((N, 2))
+            
+        s = -res.fun
+        grad = np.zeros((N, 2))
+        
+        # Robust marginal extraction across scipy versions
+        marg = None
+        if hasattr(res, 'marginals') and hasattr(res.marginals, 'ineqlin'):
+            marg = res.marginals.ineqlin
+        elif hasattr(res, 'ineqlin') and hasattr(res.ineqlin, 'marginals'):
+            marg = res.ineqlin.marginals
+            
+        if marg is not None:
+            marg = np.asarray(marg)
+            
+            # Pairwise constraint contributions
+            lams = marg[:M_PAIRS]
+            mask = lams > 1e-7
+            if np.any(mask):
+                idx = np.where(mask)[0]
+                lam_vals = lams[idx]
+                ii = PAIR_I[idx]
+                jj = PAIR_J[idx]
+                dx = centers[ii, 0] - centers[jj, 0]
+                dy = centers[ii, 1] - centers[jj, 1]
+                d = np.sqrt(dx**2 + dy**2)
+                d = np.maximum(d, 1e-12)
+                fx = lam_vals * dx / d
+                fy = lam_vals * dy / d
+                grad[ii, 0] += fx
+                grad[ii, 1] += fy
+                grad[jj, 0] -= fx
+                grad[jj, 1] -= fy
+                
+            # Boundary constraint contributions
+            marg_b = marg[M_PAIRS:]
+            grad[:, 0] += marg_b[:N] - marg_b[N:2*N]
+            grad[:, 1] += marg_b[2*N:3*N] - marg_b[3*N:]
+            
+        return res.x, s, grad
+    except Exception:
+        return None, 0.0, np.zeros((N, 2))
+
+def obj_grad(c_flat):
+    """Objective and gradient for center optimization."""
+    c = c_flat.reshape(N, 2)
+    _, s, g = solve_lp_and_grad(c)
+    return -s, -g.flatten()
+
+def joint_obj(v):
+    """Objective for joint SLSQP optimization."""
+    return -np.sum(v[2*N:])
+
+def joint_cons(v):
+    """Inequality constraints >= 0 for valid packing in SLSQP."""
+    cx = v[:N]
+    cy = v[N:2*N]
+    r = v[2*N:]
+    bc = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    dx = cx[PAIR_I] - cx[PAIR_J]
+    dy = cy[PAIR_I] - cy[PAIR_J]
+    d2 = dx**2 + dy**2
+    rs = r[PAIR_I] + r[PAIR_J]
+    pc = d2 - rs**2
+    return np.concatenate([bc, pc])
+
+def generate_hex_config(row_counts, r0, rng):
+    """Generates a hexagonal lattice configuration."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(row_counts):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+    while len(pts) < N:
+        pts.append([rng.uniform(0.1, 0.9), rng.uniform(0.1, 0.9)])
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_s = -1.0
+    best_c = None
+    best_r = None
+    
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [7,6,6,7], [5,6,6,4,5], [8,6,6,6], [7,7,6,6], [6,5,5,6,4],
+        [5,5,5,5,6], [6,5,5,5,5], [5,5,5,6,5], [5,5,6,6,4], [5,6,5,5,5],
+        [6,6,4,6,4], [5,7,6,5,3], [6,4,6,6,4], [7,5,7,5,2]
+    ]
+    
+    # Generate diverse hexagonal starts with varying densities
+    for pat in patterns:
+        if sum(pat) < N: continue
+        for r0 in [0.080, 0.090, 0.100, 0.110]:
+            cfg = generate_hex_config(pat, r0, rng)
+            mn = cfg.min(axis=0)
+            mx = cfg.max(axis=0)
+            span = mx - mn + 1e-9
+            norm_cfg = (cfg - mn) / span * 0.86 + 0.07
+            configs.append(norm_cfg)
+            
+    # Corner-hugging configurations (often yield larger boundary circles)
+    for _ in range(8):
+        c_cfg = np.zeros((N, 2))
+        c_cfg[0] = [0.14, 0.14]
+        c_cfg[1] = [0.86, 0.14]
+        c_cfg[2] = [0.14, 0.86]
+        c_cfg[3] = [0.86, 0.86]
+        c_cfg[4:] = rng.uniform(0.1, 0.9, (N-4, 2))
+        configs.append(c_cfg)
+        
+    # Random dense starts
+    for _ in range(12):
+        configs.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    bounds_c = [(1e-4, 1.0 - 1e-4)] * (2 * N)
+    
+    # Phase 1: L-BFGS-B gradient ascent on centers using LP duals
+    for cfg in configs:
+        c0 = np.clip(cfg, 1e-4, 1.0 - 1e-4)
+        try:
+            res = minimize(obj_grad, c0.flatten(), method='L-BFGS-B', jac=True, bounds=bounds_c,
+                           options={'maxiter': 3000, 'ftol': 1e-13, 'gtol': 1e-8})
+            if np.isfinite(res.fun):
+                c_opt = res.x.reshape(N, 2)
+                r_opt, s_opt, _ = solve_lp_and_grad(c_opt)
+                if r_opt is not None and s_opt > best_s:
+                    best_s = s_opt
+                    best_c = c_opt.copy()
+                    best_r = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Stochastic jiggle search to escape local contact-graph traps
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_s = best_s
+        step = 0.012
+        
+        for it in range(3000):
+            # Perturb a random subset of circles
+            k = rng.integers(1, 5)
+            idxs = rng.choice(N, k, replace=False)
+            old = curr_c[idxs].copy()
+            
+            moves = rng.uniform(-step, step, (k, 2))
+            new_pos = np.clip(curr_c[idxs] + moves, 1e-4, 1.0 - 1e-4)
+            curr_c[idxs] = new_pos
+            
+            r_try, s_try, _ = solve_lp_and_grad(curr_c)
+            if r_try is not None and s_try > curr_s + 1e-9:
+                curr_s = s_try
+                if curr_s > best_s:
+                    best_s = curr_s
+                    best_c = curr_c.copy()
+                    best_r = r_try.copy()
+                step *= 1.01
+            else:
+                curr_c[idxs] = old
+                if rng.random() < 0.03:
+                    step *= 0.94
+                    
+    # Phase 3: Joint SLSQP polish for precise constraint handling
+    if best_c is not None:
+        for _ in range(8):
+            c_pert = np.clip(best_c + rng.uniform(-0.003, 0.003, best_c.shape), 1e-4, 1.0-1e-4)
+            r_pert = best_r * 0.99
+            v0 = np.concatenate([c_pert[:, 0], c_pert[:, 1], r_pert])
+            bounds_slqp = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+            
+            try:
+                res_j = minimize(joint_obj, v0, method='SLSQP', bounds=bounds_slqp,
+                                 constraints={'type': 'ineq', 'fun': joint_cons},
+                                 options={'maxiter': 3000, 'ftol': 1e-13})
+                if np.isfinite(res_j.fun):
+                    c_j = np.column_stack((res_j.x[:N], res_j.x[N:2*N]))
+                    r_j, s_j, _ = solve_lp_and_grad(c_j)
+                    if r_j is not None and s_j > best_s:
+                        best_s = s_j
+                        best_c = c_j.copy()
+                        best_r = r_j.copy()
+            except Exception:
+                continue
+                
+    # Fallback safety net
+    if best_c is None:
+        best_c = np.clip(configs[0], 1e-4, 1.0-1e-4)
+        best_r, best_s, _ = solve_lp_and_grad(best_c)
+        
+    # Final strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999995
+    best_s = float(np.sum(best_r))
+    
+    return best_c, best_r, best_s

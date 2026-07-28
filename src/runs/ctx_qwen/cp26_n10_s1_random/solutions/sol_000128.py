@@ -1,0 +1,151 @@
+# sol_000128 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000081 (state 6da8454c) state=d526ad93 sum of radii=2.615943 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def obj_eq(vars_arr, n):
+    """Objective for equal circles: maximize radius r."""
+    return -vars_arr[2 * n]
+
+def cons_eq(vars_arr, n):
+    """Constraints for equal circles."""
+    xs = vars_arr[:n]
+    ys = vars_arr[n:2 * n]
+    r = vars_arr[2 * n]
+    
+    # Boundary constraints
+    c = np.concatenate([xs - r, 1.0 - xs - r, ys - r, 1.0 - ys - r])
+    
+    # Pairwise non-overlap: dist^2 >= (2r)^2
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    d2 = dx**2 + dy**2
+    idx = np.triu_indices(n, 1)
+    return np.concatenate([c, d2[idx] - 4.0 * r * r])
+
+def obj_all(vars_arr, n):
+    """Objective for variable circles: maximize sum of radii."""
+    return -np.sum(vars_arr[2::3])
+
+def cons_all(vars_arr, n):
+    """Constraints for variable circles."""
+    xs = vars_arr[0::3]
+    ys = vars_arr[1::3]
+    rs = vars_arr[2::3]
+    
+    # Boundary constraints
+    c = np.concatenate([xs - rs, 1.0 - xs - rs, ys - rs, 1.0 - ys - rs])
+    
+    # Pairwise non-overlap: dist^2 >= (ri + rj)^2
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    d2 = dx**2 + dy**2
+    rs2 = (rs[:, None] + rs[None, :])**2
+    idx = np.triu_indices(n, 1)
+    return np.concatenate([c, d2[idx] - rs2[idx]])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # Generate diverse initial configurations based on hexagonal patterns
+    inits = []
+    patterns = [
+        [6, 5, 5, 5, 5], [5, 6, 5, 5, 5], [5, 5, 6, 5, 5],
+        [5, 5, 5, 6, 5], [5, 5, 5, 5, 6], [6, 6, 5, 5, 4],
+        [5, 6, 6, 5, 4], [4, 6, 6, 6, 4], [5, 5, 5, 5, 5, 1],
+        [5, 5, 5, 5, 5, 5]
+    ]
+    
+    for pat in patterns:
+        pts = []
+        y = 0.08
+        for i, cnt in enumerate(pat):
+            shift = 0.08 if i % 2 == 1 else 0.0
+            row_w = (cnt - 1) * 0.16
+            x_start = 0.5 - row_w / 2.0 + shift
+            for k in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x_start + k * 0.16, y])
+            y += 0.08 * np.sqrt(3)
+        inits.append(np.array(pts[:n]))
+        
+    # Add controlled perturbations to escape symmetry traps
+    for _ in range(8):
+        base = inits[0].copy()
+        base += rng.uniform(-0.025, 0.025, base.shape)
+        base = np.clip(base, 0.05, 0.95)
+        inits.append(base)
+        
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_eq = [(0.0, 1.0)] * (2 * n) + [(0.05, 0.15)]
+    bounds_all = [(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)] * n
+    
+    for cfg in inits:
+        # Phase 1: Optimize equal radii to find dense geometry
+        v0_eq = np.concatenate([cfg[:, 0], cfg[:, 1], [0.09]])
+        try:
+            res_eq = minimize(obj_eq, v0_eq, args=(n,), method='SLSQP',
+                              bounds=bounds_eq,
+                              constraints={'type': 'ineq', 'fun': cons_eq, 'args': (n,)},
+                              options={'maxiter': 5000, 'ftol': 1e-12})
+            if not np.isfinite(res_eq.fun): continue
+            cx1, cy1, r1 = res_eq.x[:n], res_eq.x[n:2 * n], res_eq.x[2 * n]
+        except Exception: continue
+            
+        # Phase 2: Optimize variable radii to maximize sum
+        v0_all = np.zeros(3 * n)
+        v0_all[0::3] = cx1
+        v0_all[1::3] = cy1
+        v0_all[2::3] = r1
+        
+        try:
+            res_all = minimize(obj_all, v0_all, args=(n,), method='SLSQP',
+                               bounds=bounds_all,
+                               constraints={'type': 'ineq', 'fun': cons_all, 'args': (n,)},
+                               options={'maxiter': 6000, 'ftol': 1e-12})
+            if not np.isfinite(res_all.fun): continue
+            cx, cy, r = res_all.x[0::3], res_all.x[1::3], res_all.x[2::3]
+        except Exception: continue
+            
+        # Strict validation
+        if np.all(r >= 1e-6) and np.all(cx >= r) and np.all(cx <= 1 - r) and np.all(cy >= r) and np.all(cy <= 1 - r):
+            d2 = (cx[:, None] - cx[None, :])**2 + (cy[:, None] - cy[None, :])**2
+            r2 = (r[:, None] + r[None, :])**2
+            idx = np.triu_indices(n, 1)
+            if np.all(d2[idx] >= r2[idx] - 1e-9):
+                s = np.sum(r)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = np.column_stack((cx, cy))
+                    best_radii = r.copy()
+                    
+    # Final safety scaling to guarantee strict numerical validity
+    if best_centers is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+            if r > 1e-12:
+                scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(best_centers[i] - best_centers[j])
+                rs = best_radii[i] + best_radii[j]
+                if rs > 1e-12:
+                    scale = min(scale, d / rs)
+        best_radii *= scale * 0.999999
+        best_sum = np.sum(best_radii)
+    else:
+        # Fallback configuration
+        best_centers = inits[0]
+        best_radii = np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, float(best_sum)

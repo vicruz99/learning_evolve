@@ -1,0 +1,231 @@
+
+
+<strategy>
+To push the sum of radii past 2.636, we need a more robust global search strategy combined with precise local refinement. The current approach relies heavily on hexagonal lattice initializations and SLSQP, which can get trapped in local optima due to the non-convex, piecewise-linear nature of the LP objective over center positions.
+
+Key improvements in this strategy:
+1. **Global Center Optimization via Differential Evolution (DE)**: Instead of relying solely on structured hex grids, we use `differential_evolution` to globally optimize the 52 center coordinates. The fitness function evaluates the maximum possible sum of radii via LP for any given center configuration. DE efficiently explores the configuration space and escapes local minima that grid-based starts miss.
+2. **LP-Guided Joint Refinement**: The best configurations from DE and diverse structural starts are fed into a joint SLSQP optimizer that simultaneously adjusts centers and radii. Initial radii are set via LP and slightly shrunk to ensure strict feasibility for the constraint-based optimizer.
+3. **Adaptive Hill Climbing**: After SLSQP converges, a coordinate-descent hill climbing phase fine-tunes individual circle positions. The step size anneals over time to allow precise adjustments.
+4. **Perturbation & Re-optimization**: Small random perturbations are applied to the best solution, followed by another round of SLSQP to escape shallow local basins.
+5. **Strict Numerical Safety**: A final scaling step guarantees all constraints satisfy the validator's `1e-12` tolerance by computing the exact safety margin across all boundary and pairwise interactions.
+
+This hybrid approach combines global exploration (DE), gradient-based local optimization (SLSQP), and stochastic fine-tuning (Hill Climbing), significantly increasing the likelihood of finding a near-optimal packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize, differential_evolution
+
+def build_lp_matrix(n):
+    """Precomputes the constant inequality matrix structure for the LP solver."""
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    k = 0
+    for i in range(n):
+        for _ in range(4):
+            A[k, i] = 1.0
+            k += 1
+    idx = np.triu_indices(n, k=1)
+    A[4*n:, idx[0]] = 1.0
+    A[4*n:, idx[1]] = 1.0
+    return A
+
+def solve_lp(centers, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    b = np.zeros(4*n + n*(n-1)//2)
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        b[k] = x; k += 1
+        b[k] = 1.0 - x; k += 1
+        b[k] = y; k += 1
+        b[k] = 1.0 - y; k += 1
+        
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    idx = np.triu_indices(n, k=1)
+    b[4*n:] = dists[idx]
+    
+    res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b, bounds=(0, None), method='highs')
+    if res.success and np.isfinite(res.fun):
+        return res.x, -res.fun
+    return np.full(n, 1e-6), 0.0
+
+def lp_fitness(centers_flat, A_ub):
+    """Fitness function for DE: returns negative sum of radii."""
+    centers = centers_flat.reshape((26, 2))
+    _, s = solve_lp(centers, A_ub)
+    return -s
+
+def joint_obj(v, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def joint_cons(v, n, triu_i, triu_j):
+    """Inequality constraints >= 0 for valid packing."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    dx = cx[triu_i] - cx[triu_j]
+    dy = cy[triu_i] - cy[triu_j]
+    dist = np.hypot(dx, dy)
+    r_sum = r[triu_i] + r[triu_j]
+    return np.concatenate([c, dist - r_sum])
+
+def generate_hex(n, rows, r0):
+    """Generates initial positions on a hexagonal lattice with specified row distribution."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(rows):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= n:
+                break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.seterr(all='ignore')
+    n = 26
+    rng = np.random.default_rng(42)
+    A_ub = build_lp_matrix(n)
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Diverse structural patterns
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5],
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,6,4],
+        [5,6,6,4,5], [6,5,5,6,4], [5,5,5,6,5], [6,5,6,4,5]
+    ]
+    
+    configs = []
+    for pat in patterns:
+        if sum(pat) >= n:
+            c = generate_hex(n, pat, 0.095)
+            configs.append(c)
+            for _ in range(3):
+                cp = c + rng.uniform(-0.025, 0.025, (n,2))
+                configs.append(np.clip(cp, 0.05, 0.95))
+                
+    for _ in range(15):
+        configs.append(rng.uniform(0.1, 0.9, (n,2)))
+        
+    # Phase 1: Differential Evolution for global center optimization
+    bounds_de = [(0.05, 0.95)] * (2*n)
+    try:
+        res_de = differential_evolution(
+            lp_fitness, bounds_de, args=(A_ub,),
+            popsize=15, maxiter=80, tol=1e-7, mutation=(0.5, 1.2),
+            recombination=0.9, seed=42, workers=1, polish=True
+        )
+        de_best_c = res_de.x.reshape(n, 2)
+        de_best_r, de_best_s = solve_lp(de_best_c, A_ub)
+        if de_best_s > best_sum:
+            best_sum = de_best_s
+            best_centers = de_best_c.copy()
+            best_radii = de_best_r.copy()
+    except Exception:
+        pass
+        
+    # Phase 2: Multi-start SLSQP from diverse configs & DE result
+    all_starts = configs + [de_best_c] if de_best_c is not None else configs
+    bounds_v = [(0.0, 1.0)]*(2*n) + [(1e-6, 0.5)]*n
+    
+    for cfg in all_starts:
+        r_lp, _ = solve_lp(cfg, A_ub)
+        v0 = np.concatenate([cfg[:,0], cfg[:,1], r_lp])
+        # Slight shrink to guarantee strict feasibility for constraint-based optimizer
+        v0[2*n:] *= 0.98
+        
+        try:
+            res = minimize(joint_obj, v0, args=(n,), method='SLSQP',
+                           bounds=bounds_v,
+                           constraints={'type': 'ineq', 'fun': joint_cons, 'args': (n, triu_i, triu_j)},
+                           options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if np.isfinite(res.fun):
+                c_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+                r_opt, s_opt = solve_lp(c_opt, A_ub)
+                if s_opt > best_sum:
+                    best_sum = s_opt
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+        except Exception:
+            pass
+            
+    # Phase 3: Local Hill Climbing on centers
+    if best_centers is not None:
+        curr_c = best_centers.copy()
+        curr_s = best_sum
+        step = 0.015
+        for it in range(3000):
+            i = rng.integers(n)
+            old = curr_c[i].copy()
+            curr_c[i] += rng.uniform(-step, step, 2)
+            curr_c[i] = np.clip(curr_c[i], 0.005, 0.995)
+            
+            r_try, s_try = solve_lp(curr_c, A_ub)
+            if s_try > curr_s + 1e-9:
+                curr_s = s_try
+                if s_try > best_sum:
+                    best_sum = s_try
+                    best_centers = curr_c.copy()
+                    best_radii = r_try.copy()
+            else:
+                curr_c[i] = old
+            step *= 0.9995
+            
+        # Phase 4: Perturbation & SLSQP refinement to escape shallow basins
+        for _ in range(20):
+            pert = best_centers + rng.uniform(-0.004, 0.004, (n,2))
+            pert = np.clip(pert, 0.02, 0.98)
+            r_p, _ = solve_lp(pert, A_ub)
+            v0_p = np.concatenate([pert[:,0], pert[:,1], r_p * 0.98])
+            try:
+                res_p = minimize(joint_obj, v0_p, args=(n,), method='SLSQP',
+                                 bounds=bounds_v,
+                                 constraints={'type': 'ineq', 'fun': joint_cons, 'args': (n, triu_i, triu_j)},
+                                 options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                if np.isfinite(res_p.fun):
+                    c_p = np.column_stack((res_p.x[:n], res_p.x[n:2*n]))
+                    r_lp_p, s_lp_p = solve_lp(c_p, A_ub)
+                    if s_lp_p > best_sum:
+                        best_sum = s_lp_p
+                        best_centers = c_p.copy()
+                        best_radii = r_lp_p.copy()
+            except Exception:
+                pass
+
+    # Final strict safety scaling to guarantee numerical validity
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(n):
+        x, y = c[i]
+        ri = r[i]
+        if ri > 1e-12:
+            scale = min(scale, x/ri, (1.0-x)/ri, y/ri, (1.0-y)/ri)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(c[i,0]-c[j,0], c[i,1]-c[j,1])
+            rs = r[i] + r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    r *= scale * 0.9999995
+    final_sum = float(np.sum(r))
+    
+    return c, r, final_sum
+```

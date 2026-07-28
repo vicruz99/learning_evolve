@@ -1,0 +1,194 @@
+
+
+<strategy>
+To improve the sum of radii beyond the current 2.6129 and reach the target of 2.636, we need a more robust basin exploration strategy and a numerically stable optimization pipeline. The previous approach used a parameterized formulation which can restrict the search space near boundaries. 
+
+Key improvements in this strategy:
+1. **Direct Constraint Formulation**: Switch to explicit inequality constraints for boundaries and pairwise distances. This is more numerically stable for SLSQP and avoids artificial parameterization limits.
+2. **Diverse Initialization**: Generate a wide variety of starting configurations including hexagonal lattices with different rotations and scales, perturbed grids, and random valid placements. This helps escape local minima that trap simpler searches.
+3. **Iterative Perturbation & Refinement**: For each initial configuration, run multiple optimizations with slight random perturbations to centers and radii. This "basin hopping" within promising regions significantly increases the chance of finding the global optimum.
+4. **Strict Safety Scaling**: After optimization, compute the exact maximum feasible scaling factor for the radii based on the final centers. Apply a tight safety margin to guarantee strict compliance with the validator's `1e-12` tolerance, preventing false failures due to floating-point noise.
+5. **Robust Fallback & Validation**: Ensure the function always returns a valid packing, even if optimization encounters numerical issues, by maintaining a verified safe configuration.
+
+These changes collectively allow the optimizer to explore unequal-radius configurations more effectively, pushing circles into corners and gaps where they can grow larger, thereby increasing the total sum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars, n, triu_i, triu_j):
+    """
+    Returns array of constraint values >= 0 for valid packing.
+    Constraints:
+    1. Boundary: x >= r, x <= 1-r, y >= r, y <= 1-r
+    2. Non-overlap: (xi-xj)^2 + (yi-yj)^2 >= (ri+rj)^2
+    """
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    # Boundary constraints
+    b_cons = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints (vectorized)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    
+    rs = r[:, None] + r[None, :]
+    rs2 = rs**2
+    
+    p_cons = d2[triu_i, triu_j] - rs2[triu_i, triu_j]
+    
+    return np.concatenate([b_cons, p_cons])
+
+def get_hex_init(n, r_init, rot=0.0, scale=1.0):
+    """Generates a hexagonal lattice initialization, optionally rotated and scaled."""
+    pts = []
+    y = r_init
+    row = 0
+    while len(pts) < n + 10:  # Generate extra points to fill square after rotation
+        shift = r_init if row % 2 == 1 else 0.0
+        x = r_init + shift
+        while x + r_init <= 1.0:
+            pts.append([x, y])
+            x += 2.0 * r_init
+        y += np.sqrt(3) * r_init
+        row += 1
+    pts = np.array(pts[:n])
+    
+    if rot != 0.0:
+        cos_t, sin_t = np.cos(rot), np.sin(rot)
+        pts = pts @ np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+        # Re-center and scale to fit within [0, 1] safely
+        pts -= pts.min(axis=0)
+        pts /= pts.max(axis=0)
+        pts = pts * 0.8 * scale + 0.1 * (1 - 0.8 * scale)
+        
+    return pts
+
+def run_packing():
+    n = 26
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    
+    # Variable bounds: x,y in [0,1], r in [small_positive, 0.5]
+    bounds = [(0.0, 1.0)] * n + [(0.0, 1.0)] * n + [(1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func, 'args': (n, triu_i, triu_j)}
+    
+    best_sum = -np.inf
+    best_vars = None
+    rng = np.random.default_rng(42)
+    
+    # --- Generate diverse initial configurations ---
+    configs = []
+    
+    # 1. Hexagonal patterns with various rotations and scales
+    for rot in [0.0, 0.15, 0.3, 0.5, np.pi/6]:
+        for scale in [0.9, 1.0, 1.1]:
+            pts = get_hex_init(n, 0.09, rot=rot, scale=scale)
+            configs.append(pts)
+            
+    # 2. Perturbed grids to break symmetry
+    for _ in range(5):
+        pts = get_hex_init(n, 0.09)
+        noise = rng.uniform(-0.04, 0.04, (n, 2))
+        configs.append(np.clip(pts + noise, 0.05, 0.95))
+        
+    # 3. Random valid starts
+    for _ in range(8):
+        pts = rng.uniform(0.15, 0.85, (n, 2))
+        configs.append(pts)
+        
+    # --- Optimization loop with iterative perturbation ---
+    for cfg in configs:
+        x0 = np.zeros(3 * n)
+        x0[0::3] = cfg[:, 0]
+        x0[1::3] = cfg[:, 1]
+        x0[2::3] = 0.05  # Start with a small, guaranteed feasible radius
+        
+        # Run multiple perturbed optimizations from this basin
+        for trial in range(3):
+            v0 = x0.copy()
+            if trial > 0:
+                # Perturb centers slightly, keep radii similar
+                v0[0::3] += rng.uniform(-0.01, 0.01, n)
+                v0[1::3] += rng.uniform(-0.01, 0.01, n)
+                v0[2::3] *= rng.uniform(0.95, 1.05, n)
+                v0[0::3] = np.clip(v0[0::3], 0.0, 1.0)
+                v0[1::3] = np.clip(v0[1::3], 0.0, 1.0)
+                v0[2::3] = np.clip(v0[2::3], 1e-6, 0.5)
+                
+            try:
+                res = minimize(
+                    objective, 
+                    v0, 
+                    method='SLSQP', 
+                    bounds=bounds,
+                    constraints=cons,
+                    options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False}
+                )
+                
+                if np.isfinite(res.fun):
+                    c_vals = constraint_func(res.x, n, triu_i, triu_j)
+                    # Allow tiny numerical tolerance for convergence
+                    if np.min(c_vals) >= -1e-8:
+                        current_sum = np.sum(res.x[2::3])
+                        if current_sum > best_sum:
+                            best_sum = current_sum
+                            best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # Fallback if optimization yields no valid result
+    if best_vars is None:
+        pts = get_hex_init(n, 0.09)
+        best_vars = np.zeros(3 * n)
+        best_vars[0::3] = pts[:, 0]
+        best_vars[1::3] = pts[:, 1]
+        best_vars[2::3] = 0.08
+        best_sum = np.sum(best_vars[2::3])
+        
+    # --- Decode results ---
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3].copy()
+    
+    # --- Final strict validation and safety adjustment ---
+    full_vars = np.concatenate([centers[:, 0], centers[:, 1], radii])
+    c_vals = constraint_func(full_vars, n, triu_i, triu_j)
+    
+    if np.min(c_vals) < -1e-10:
+        # If any constraint is violated, uniformly scale radii down slightly
+        # to guarantee validity against the 1e-12 grader tolerance
+        scale = 1.0
+        
+        # Check boundary limits
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if r < 1e-12: continue
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+        # Check pairwise distance limits
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                r_sum = radii[i] + radii[j]
+                if r_sum < 1e-12: continue
+                scale = min(scale, d / r_sum)
+                
+        # Apply scale with a tiny safety margin for numerical precision
+        radii *= max(0.0, scale * 0.99995)
+        best_sum = float(np.sum(radii))
+        
+    return centers, radii, best_sum
+```

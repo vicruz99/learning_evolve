@@ -1,0 +1,172 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that avoids local minima and precisely respects non-overlap and boundary constraints. Previous solutions used SLSQP and hill-climbing, which can get stuck or struggle with non-smooth constraint boundaries.
+
+Key improvements in this approach:
+1. **LP Dual Gradients**: For any fixed set of centers, the optimal radii and their sum can be found exactly via a Linear Program. More importantly, the LP's dual variables (marginals) give the exact gradient of the sum of radii with respect to the center coordinates. This provides a highly accurate, piecewise-linear gradient landscape.
+2. **L-BFGS-B Optimization**: Instead of hand-rolled hill-climbing, we use `scipy.optimize.minimize` with `L-BFGS-B` and the analytic LP-derived gradient. L-BFGS-B efficiently handles bound constraints and converges rapidly on the piecewise-linear objective.
+3. **Diverse Initialization**: We generate multiple hexagonal lattice patterns with varying row counts and random configurations to ensure coverage of the configuration space.
+4. **Strict Safety Scaling**: After optimization, we compute a global scaling factor that guarantees all circles satisfy `dist(i,j) >= r_i + r_j - 1e-12` and stay within `[0,1]`, compensating for floating-point precision limits.
+
+This combination of exact LP evaluation, dual-based gradients, and a robust quasi-Newton optimizer consistently pushes past local optima in circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def solve_lp_and_grad(c, n, A_ub, idx, bounds_r, c_obj):
+    """Solves LP for radii and computes gradient of sum(r) w.r.t centers."""
+    m_total = A_ub.shape[0]
+    b_ub = np.empty(m_total)
+    
+    # Wall constraints RHS
+    b_ub[0:n] = c[:, 0]
+    b_ub[n:2*n] = 1.0 - c[:, 0]
+    b_ub[2*n:3*n] = c[:, 1]
+    b_ub[3*n:4*n] = 1.0 - c[:, 1]
+    
+    # Pairwise distances RHS
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub[4*n:] = dists[idx[0], idx[1]]
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+    except Exception:
+        return np.full(n, 1e-7), 0.0, np.zeros((n, 2))
+        
+    if not res.success or not np.isfinite(res.fun):
+        return np.full(n, 1e-7), 0.0, np.zeros((n, 2))
+        
+    r = res.x
+    s = -res.fun
+    grad = np.zeros((n, 2))
+    
+    # Extract marginals (dual variables)
+    if hasattr(res, 'ineqlin') and res.ineqlin.marginal is not None:
+        lams = np.maximum(np.asarray(res.ineqlin.marginal).ravel(), 0.0)
+    else:
+        lams = np.zeros(m_total)
+        
+    # Wall gradients
+    grad[:, 0] += lams[0:n] - lams[n:2*n]
+    grad[:, 1] += lams[2*n:3*n] - lams[3*n:4*n]
+    
+    # Pairwise gradients
+    lams_p = lams[4*n:]
+    mask = lams_p > 1e-8
+    ii = idx[0][mask]
+    jj = idx[1][mask]
+    ds = dists[ii, jj]
+    ds = np.where(ds > 1e-12, ds, 1.0)
+    diffs = c[ii] - c[jj]
+    factors = lams_p[mask][:, None] / ds[:, None]
+    
+    np.add.at(grad, ii, diffs * factors)
+    np.add.at(grad, jj, -diffs * factors)
+    
+    return r, s, grad
+
+def obj_and_grad(c_flat, n, A_ub, idx, bounds_r, c_obj):
+    """Objective and gradient for L-BFGS-B."""
+    c = c_flat.reshape(n, 2)
+    _, s, g = solve_lp_and_grad(c, n, A_ub, idx, bounds_r, c_obj)
+    return -s, g.flatten()
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # Precompute constant structures for LP
+    m_pairs = n * (n - 1) // 2
+    m_total = 4 * n + m_pairs
+    A_ub = np.zeros((m_total, n))
+    for i in range(n):
+        A_ub[4*i, i] = 1.0
+        A_ub[4*i+1, i] = 1.0
+        A_ub[4*i+2, i] = 1.0
+        A_ub[4*i+3, i] = 1.0
+    idx = np.triu_indices(n, k=1)
+    for k, (i, j) in enumerate(zip(idx[0], idx[1])):
+        A_ub[4*n + k, i] = 1.0
+        A_ub[4*n + k, j] = 1.0
+        
+    c_obj = -np.ones(n)
+    bounds_r = [(0.0, None)] * n
+    bounds_opt = [(0.01, 0.99)] * (2 * n)
+    
+    # Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5],
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,6,4],
+        [5,6,6,4,5], [6,5,5,6,4], [5,5,5,6,5], [6,5,6,4,5],
+        [6,6,6,4,4], [5,6,5,5,5], [4,5,7,5,5], [5,5,6,6,4],
+        [6,5,5,5,5], [5,6,6,5,4], [4,6,5,6,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.095
+        for ri, cnt in enumerate(pat):
+            shift = 0.095 if ri % 2 == 1 else 0.0
+            x = 0.095 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.190
+            y += 0.095 * np.sqrt(3.0)
+        while len(pts) < n:
+            pts.append([0.5, 0.5])
+        configs.append(np.array(pts[:n]))
+        
+    for _ in range(20):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    for cfg in configs:
+        c0 = np.clip(cfg, 0.05, 0.95).flatten()
+        try:
+            res = minimize(obj_and_grad, c0, args=(n, A_ub, idx, bounds_r, c_obj),
+                           method='L-BFGS-B', jac=True, bounds=bounds_opt,
+                           options={'maxiter': 3000, 'ftol': 1e-14, 'gtol': 1e-12})
+            if np.isfinite(res.fun):
+                c_opt = res.x.reshape(n, 2)
+                r_opt, s_opt, _ = solve_lp_and_grad(c_opt, n, A_ub, idx, bounds_r, c_obj)
+                if s_opt > best_sum:
+                    best_sum = s_opt
+                    best_c = c_opt.copy()
+                    best_r = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Final strict safety scaling to guarantee numerical validity
+    if best_c is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y = best_c[i]
+            ri = best_r[i]
+            if ri > 1e-12:
+                scale = min(scale, x/ri, (1.0-x)/ri, y/ri, (1.0-y)/ri)
+        diff = best_c[:, None, :] - best_c[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, 1e9)
+        r_pair = best_r[:, None] + best_r[None, :]
+        scale = min(scale, np.min(dists[idx[0], idx[1]] / np.maximum(r_pair[idx[0], idx[1]], 1e-12)))
+        
+        best_r *= scale * 0.999999
+        final_sum = float(np.sum(best_r))
+    else:
+        # Fallback
+        best_c = rng.uniform(0.1, 0.9, (n, 2))
+        best_r = np.full(n, 0.08)
+        final_sum = float(np.sum(best_r))
+        
+    return best_c, best_r, final_sum
+```

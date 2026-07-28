@@ -1,0 +1,177 @@
+# sol_000033 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000021 (state e14e8c08) state=90426af2 sum of radii=0.431614 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(x, n):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def compute_constraints(x, n, mask):
+    """
+    Computes all inequality constraints (must be >= 0).
+    x: 1D array of [x0, y0, r0, x1, y1, r1, ...]
+    mask: boolean mask for upper triangle of pairwise distances.
+    """
+    c = x[:n*2].reshape(n, 2)
+    r = x[2*n:]
+    
+    cons = []
+    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    cons.append(c[:, 0] - r)
+    cons.append(1.0 - c[:, 0] - r)
+    cons.append(c[:, 1] - r)
+    cons.append(1.0 - c[:, 1] - r)
+    
+    # Overlap constraints: dist^2 - (r_i + r_j)^2 >= 0
+    diffs = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists_sq = np.sum(diffs**2, axis=2)
+    r_sum_sq = (r[:, np.newaxis] + r[np.newaxis, :])**2
+    
+    # Extract only upper triangle to avoid duplicates and self-interactions
+    overlap_cons = dists_sq[mask] - r_sum_sq[mask]
+    cons.append(overlap_cons)
+    
+    return np.concatenate(cons)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    # Precompute mask for pairwise constraints
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    
+    # Variable bounds: centers in [0, 1], radii in [0, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    
+    best_sum = -np.inf
+    best_x = None
+    
+    # Deterministic seed for reproducibility
+    np.random.seed(42)
+    
+    inits = []
+    
+    # 1. Hexagonal-ish grid starts with random perturbations
+    for seed in range(18):
+        rng = np.random.RandomState(seed)
+        r_start = 0.09 + rng.uniform(-0.01, 0.01)
+        
+        pts = []
+        y = r_start
+        row = 0
+        # Generate points in a hexagonal pattern
+        while y < 1.0 and len(pts) < 26:
+            shift = r_start if row % 2 == 1 else 0.0
+            x = r_start + shift
+            while x < 1.0 and len(pts) < 26:
+                pts.append([x, y])
+                x += 2 * r_start
+            y += r_start * np.sqrt(3)
+            row += 1
+            
+        # Fill remaining spots randomly if needed
+        while len(pts) < 26:
+            pts.append([rng.uniform(0.1, 0.9), rng.uniform(0.1, 0.9)])
+            
+        pts = np.array(pts[:26])
+        # Perturb positions to escape symmetry and find better local optima
+        pts += rng.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        
+        r_init = np.full(26, r_start)
+        inits.append(np.concatenate([pts.flatten(), r_init]))
+        
+    # 2. Purely random starts for diversity
+    for seed in range(8):
+        rng = np.random.RandomState(seed + 1000)
+        c = rng.uniform(0.15, 0.85, (26, 2))
+        r = np.full(26, 0.07)
+        inits.append(np.concatenate([c.flatten(), r]))
+        
+    # Define constraint dictionary for SLSQP
+    cons_dict = {
+        'type': 'ineq',
+        'fun': compute_constraints,
+        'args': (n, mask)
+    }
+    
+    # Run optimization from each start
+    for x0 in inits:
+        try:
+            res = minimize(
+                compute_objective,
+                x0,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=cons_dict,
+                args=(n,),
+                options={'maxiter': 1500, 'ftol': 1e-10}
+            )
+            
+            # Check if feasible within numerical tolerance
+            if res.success or not np.isinf(res.fun):
+                c_vals = compute_constraints(res.x, n, mask)
+                if np.min(c_vals) >= -1e-6:
+                    s = np.sum(res.x[2::3])
+                    if s > best_sum:
+                        best_sum = s
+                        best_x = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback if optimization fails (highly unlikely)
+    if best_x is None:
+        c_fb = np.random.uniform(0.2, 0.8, (26, 2))
+        r_fb = np.full(26, 0.05)
+        best_x = np.concatenate([c_fb.flatten(), r_fb])
+        
+    centers = best_x[:n*2].reshape(n, 2)
+    radii = best_x[2*n:]
+    
+    # Post-processing: Ensure strict validity for the grader's 1e-12 tolerance
+    margin = 1e-7
+    for _ in range(50):
+        changed = False
+        
+        # Fix boundary violations
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < -margin:
+                radii[i] = x + margin
+                changed = True
+            if x + r > 1.0 + margin:
+                radii[i] = 1.0 - x + margin
+                changed = True
+            if y - r < -margin:
+                radii[i] = y + margin
+                changed = True
+            if y + r > 1.0 + margin:
+                radii[i] = 1.0 - y + margin
+                changed = True
+                
+        # Fix overlap violations
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                req = radii[i] + radii[j]
+                if dist < req - margin:
+                    excess = req - dist - margin
+                    s = radii[i] + radii[j]
+                    if s > 0:
+                        # Shrink radii proportionally to preserve shape
+                        radii[i] -= excess * (radii[i] / s)
+                        radii[j] -= excess * (radii[j] / s)
+                    changed = True
+                    
+        if not changed:
+            break
+            
+    # Final safety clamping
+    radii = np.maximum(radii, 0.0)
+    centers = np.clip(centers, 0.0, 1.0)
+    
+    return centers, radii, float(np.sum(radii))

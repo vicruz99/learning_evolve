@@ -1,0 +1,159 @@
+
+
+<strategy>
+1. **Problem Reformulation**: The circle packing problem can be decoupled into two stages: (a) For fixed centers, find optimal radii using Linear Programming (LP), and (b) Optimize center coordinates to maximize the LP objective (sum of radii). This transformation is exact and avoids non-convex pairwise distance constraints in the outer optimizer.
+2. **LP Formulation**: For fixed centers $C$, maximize $\sum r_i$ subject to $r_i \leq x_i, 1-x_i, y_i, 1-y_i$ (boundary constraints) and $r_i + r_j \leq \|c_i - c_j\|_2$ (non-overlap). This is a standard LP solved efficiently with `scipy.optimize.linprog` (HiGHS solver).
+3. **Center Optimization**: The resulting objective function $f(C) = \sum r_i^*(C)$ is piecewise-linear and non-smooth. Derivative-free methods like `Powell`'s method are ideal here. We clip centers to $[0,1]^2$ inside the objective to enforce domain constraints without gradient issues.
+4. **Multi-Start & Local Search**: We generate diverse initial configurations using hexagonal lattice patterns (varying row counts) and random perturbations. We run `Powell` from each start, then perform iterative perturbation-based local search around the best configuration to escape local minima.
+5. **Numerical Safety**: A final scaling step ensures all constraints strictly satisfy the validator's $10^{-12}$ tolerance margin.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_radii_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    centers = np.clip(centers, 0.0, 1.0)
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    b = np.zeros(m)
+    k = 0
+    
+    # Boundary constraints: r_i <= dist to each wall
+    for i in range(n):
+        x, y = centers[i]
+        A[k, i] = 1.0; b[k] = x; k += 1
+        A[k, i] = 1.0; b[k] = 1.0 - x; k += 1
+        A[k, i] = 1.0; b[k] = y; k += 1
+        A[k, i] = 1.0; b[k] = 1.0 - y; k += 1
+        
+    # Pairwise constraints: r_i + r_j <= Euclidean distance
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            b[k] = d
+            k += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=(0, None), method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 1e-9)
+
+def obj_func(vars_flat, n):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    centers = vars_flat.reshape(n, 2)
+    # Enforce unit square bounds strictly
+    centers = np.clip(centers, 1e-7, 1.0 - 1e-7)
+    r = solve_radii_lp(centers, n)
+    return -np.sum(r)
+
+def generate_starts(n, rng):
+    """Generates diverse high-quality initial configurations."""
+    starts = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], 
+        [5, 5, 6, 5, 5], [4, 6, 6, 6, 4], [5, 7, 5, 5, 4],
+        [6, 4, 6, 6, 4], [5, 6, 4, 6, 5], [7, 6, 5, 6], [6, 7, 5, 6]
+    ]
+    
+    for p in patterns:
+        pts = []
+        y = 0.09
+        for ri, cnt in enumerate(p):
+            shift = 0.09 if ri % 2 == 1 else 0.0
+            x = 0.09 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.18
+            y += 0.09 * np.sqrt(3)
+        starts.append(np.array(pts[:n]))
+        
+        # Perturbed variants
+        for _ in range(4):
+            pert = np.array(pts[:n]) + rng.uniform(-0.03, 0.03, (n, 2))
+            starts.append(np.clip(pert, 0.05, 0.95))
+            
+    # Random dense starts
+    for _ in range(15):
+        starts.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    starts = generate_starts(n, rng)
+    
+    # Phase 1: Multi-start derivative-free optimization
+    for cfg in starts:
+        x0 = cfg.flatten()
+        try:
+            res = minimize(obj_func, x0, args=(n,), method='Powell', 
+                           options={'maxiter': 2500, 'xtol': 1e-9, 'ftol': 1e-10})
+            if np.isfinite(res.fun):
+                c_opt = np.clip(res.x.reshape(n, 2), 0.0, 1.0)
+                r_opt = solve_radii_lp(c_opt, n)
+                s = np.sum(r_opt)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Iterative perturbation refinement to escape local minima
+    if best_centers is not None:
+        for _ in range(50):
+            pert = best_centers + rng.uniform(-0.006, 0.006, best_centers.shape)
+            pert = np.clip(pert, 0.02, 0.98)
+            try:
+                res = minimize(obj_func, pert.flatten(), args=(n,), method='Powell',
+                               options={'maxiter': 1500, 'xtol': 1e-9, 'ftol': 1e-10})
+                if np.isfinite(res.fun):
+                    c_opt = np.clip(res.x.reshape(n, 2), 0.0, 1.0)
+                    r_opt = solve_radii_lp(c_opt, n)
+                    s = np.sum(r_opt)
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = c_opt.copy()
+                        best_radii = r_opt.copy()
+            except Exception:
+                pass
+                
+    # Fallback if optimization unexpectedly fails
+    if best_centers is None:
+        best_centers = starts[0]
+        best_radii = solve_radii_lp(best_centers, n)
+        best_sum = np.sum(best_radii)
+        
+    # Final numerical safety scaling to strictly satisfy validator tolerances
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

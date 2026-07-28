@@ -1,0 +1,204 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we combine three powerful techniques:
+1. **Structured Initialization**: Generate multiple high-quality starting configurations based on hexagonal lattices with varying row distributions (e.g., 6-5-6-5-4), perturbed to break symmetry.
+2. **LP Radius Oracle**: For any fixed set of centers, the maximum sum of radii is a linear programming problem. Constraints are $r_i \le \text{dist to walls}$ and $r_i + r_j \le \text{dist}_{ij}$. We use `scipy.optimize.linprog` with the `highs` solver, which is extremely fast and exact for this size.
+3. **Iterative Refinement Pipeline**:
+   - **SLSQP Joint Optimization**: Optimize centers and radii simultaneously using gradient-based constrained optimization to escape initial lattice rigidity.
+   - **Coordinate Ascent / Local Search**: Fix radii via LP, then iteratively perturb one circle's center at a time. If the LP oracle reports a higher sum of radii, accept the move. This effectively performs a simulated annealing-like climb on the non-convex landscape of the packing density.
+   - **Final Polish**: Run SLSQP again on the best local search result to smooth out numerical artifacts, followed by strict safety scaling to guarantee validation tolerance.
+
+This approach systematically pushes circles into the most efficient configuration, allowing unequal radii where geometrically beneficial, consistently surpassing equal-circle bounds.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+from itertools import combinations
+
+N_CIRCLES = 26
+PAIRS = list(combinations(range(N_CIRCLES), 2))
+A_UB = np.zeros((len(PAIRS), N_CIRCLES))
+for k, (i, j) in enumerate(PAIRS):
+    A_UB[k, i] = 1.0
+    A_UB[k, j] = 1.0
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    bounds = []
+    b_ub = np.empty(len(PAIRS))
+    for i in range(n):
+        x, y = centers[i]
+        lim = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(lim, 1e-9)))
+    for k, (i, j) in enumerate(PAIRS):
+        dx = centers[i, 0] - centers[j, 0]
+        dy = centers[i, 1] - centers[j, 1]
+        b_ub[k] = np.hypot(dx, dy)
+    try:
+        res = linprog(-np.ones(n), A_ub=A_UB, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def obj_func(x):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(x[2*N_CIRCLES:])
+
+def cons_func(x):
+    """Inequality constraints >= 0 for valid packing."""
+    n = N_CIRCLES
+    c = x[:2*n].reshape(n, 2)
+    r = x[2*n:]
+    out = []
+    out.append(c[:, 0] - r)
+    out.append(1.0 - c[:, 0] - r)
+    out.append(c[:, 1] - r)
+    out.append(1.0 - c[:, 1] - r)
+    diff = c[:, None, :] - c[None, :, :]
+    d2 = np.sum(diff**2, axis=2)
+    rs = r[:, None] + r[None, :]
+    idx = np.triu_indices(n, 1)
+    out.append(d2[idx] - rs[idx]**2)
+    return np.concatenate(out)
+
+def hex_init(rows, r0=0.095):
+    """Generates initial positions on a hexagonal lattice."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(rows):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= N_CIRCLES: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+    while len(pts) < N_CIRCLES:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:N_CIRCLES])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    rng = np.random.default_rng(42)
+    
+    starts = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4], [6, 4, 6, 6, 4], [5, 6, 6, 4, 5], [6, 5, 5, 6, 4]
+    ]
+    for pat in patterns:
+        if sum(pat) < n: continue
+        c = hex_init(pat)
+        starts.append(c)
+        for _ in range(2):
+            pc = c + rng.uniform(-0.015, 0.015, c.shape)
+            starts.append(np.clip(pc, 0.05, 0.95))
+    for _ in range(8):
+        starts.append(rng.uniform(0.15, 0.85, (n, 2)))
+
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    bounds_vars = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': cons_func}
+    
+    for cfg in starts:
+        min_d = np.full(n, 0.2)
+        for i in range(n):
+            dw = min(cfg[i,0], 1-cfg[i,0], cfg[i,1], 1-cfg[i,1])
+            dn = np.min(np.sqrt(np.sum((cfg-cfg[i])**2, axis=1)))
+            min_d[i] = min(dw, dn/2)
+        r0 = min_d * 0.85
+        
+        x0 = np.concatenate([cfg.flatten(), r0])
+        try:
+            res = minimize(obj_func, x0, method='SLSQP', bounds=bounds_vars,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_tmp = res.x[:2*n].reshape(n, 2)
+                con_vals = cons_func(res.x)
+                if np.min(con_vals) >= -1e-5:
+                    r_lp, s_lp = solve_lp(c_tmp)
+                    if s_lp > best_sum:
+                        best_sum = s_lp
+                        best_c = c_tmp.copy()
+                        best_r = r_lp.copy()
+        except Exception:
+            pass
+
+    if best_c is None:
+        best_c = starts[0]
+        best_r, best_sum = solve_lp(best_c)
+        
+    # Phase 2: Local Search / Hill Climbing with LP oracle
+    c = best_c.copy()
+    cur_sum = best_sum
+    step = 0.025
+    
+    for it in range(4000):
+        i = rng.integers(n)
+        old = c[i].copy()
+        
+        best_move = None
+        best_move_sum = cur_sum
+        
+        for _ in range(8):
+            trial = old + rng.uniform(-step, step, 2)
+            trial = np.clip(trial, 1e-4, 1.0-1e-4)
+            c[i] = trial
+            tr, ts = solve_lp(c)
+            if ts > best_move_sum:
+                best_move_sum = ts
+                best_move = trial.copy()
+        c[i] = old
+        
+        if best_move is not None:
+            c[i] = best_move
+            r_new = solve_lp(c)[0]
+            cur_sum = best_move_sum
+            if cur_sum > best_sum:
+                best_sum = cur_sum
+                best_c = c.copy()
+                best_r = r_new.copy()
+                
+        step *= 0.9995
+        
+    # Phase 3: Final SLSQP Polish
+    x0_final = np.concatenate([best_c.flatten(), best_r * 0.95])
+    try:
+        res_final = minimize(obj_func, x0_final, method='SLSQP', bounds=bounds_vars,
+                             constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+        if np.isfinite(res_final.fun):
+            c_fin = res_final.x[:2*n].reshape(n, 2)
+            r_fin, s_fin = solve_lp(c_fin)
+            if s_fin > best_sum:
+                best_c = c_fin
+                best_r = r_fin
+                best_sum = s_fin
+    except Exception:
+        pass
+
+    # Phase 4: Safety scaling to guarantee strict numerical validity
+    scale = 1.0
+    for i in range(n):
+        x, y, rv = best_c[i, 0], best_c[i, 1], best_r[i]
+        if rv > 1e-9:
+            scale = min(scale, x/rv, (1.0-x)/rv, y/rv, (1.0-y)/rv)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-9:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999999
+    final_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, final_sum
+```

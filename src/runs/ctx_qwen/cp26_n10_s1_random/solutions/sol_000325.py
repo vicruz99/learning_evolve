@@ -1,0 +1,174 @@
+# sol_000325 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000308 (state b85a4809) state=b8956724 sum of radii=2.621287 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+IDX_I, IDX_J = np.triu_indices(N, k=1)
+M_PAIRS = len(IDX_I)
+
+def get_constraints(vars_array):
+    """Computes inequality constraints >= 0 for valid packing."""
+    cx = vars_array[:N]
+    cy = vars_array[N:2*N]
+    r = vars_array[2*N:]
+    
+    # Boundary constraints
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    
+    r_sum = r[:, None] + r[None, :]
+    r_sum2 = r_sum**2
+    
+    c = np.concatenate([c, d2[IDX_I, IDX_J] - r_sum2[IDX_I, IDX_J]])
+    return c
+
+def objective(vars_array):
+    """Objective: minimize negative sum of radii => maximize sum of radii."""
+    return -np.sum(vars_array[2*N:])
+
+def solve_lp_centers(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds_lp = [(0.0, l) for l in lims]
+    
+    A_ub = np.zeros((M_PAIRS, N))
+    A_ub[np.arange(M_PAIRS), IDX_I] = 1.0
+    A_ub[np.arange(M_PAIRS), IDX_J] = 1.0
+    
+    diffs = centers[IDX_I] - centers[IDX_J]
+    b_ub = np.hypot(diffs[:, 0], diffs[:, 1])
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=bounds_lp, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    bounds_opt = [(0.0, 1.0)] * (2 * N) + [(1e-5, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': get_constraints}
+    
+    configs = []
+    patterns = [
+        [5,6,5,6,4], [6,5,6,5,4], [5,5,6,5,5], [4,6,6,6,4], [5,6,6,4,5],
+        [6,6,5,5,4], [5,7,5,5,4], [6,5,5,6,4], [7,6,6,7], [8,6,6,6],
+        [5,5,5,5,6], [6,5,5,5,5], [5,5,5,6,5], [5,5,6,6,4], [5,6,5,5,5]
+    ]
+    
+    # Generate diverse hexagonal initial configurations
+    for pat in patterns:
+        if sum(pat) < N: continue
+        pts = []
+        r0 = 0.095
+        y = r0
+        for ri, cnt in enumerate(pat):
+            shift = r0 if ri % 2 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+        cfg = np.array(pts[:N])
+        mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+        span = mx - mn + 1e-9
+        cfg = (cfg - mn) / span * 0.85 + 0.075
+        configs.append(cfg)
+        
+        for _ in range(3):
+            p = cfg + rng.uniform(-0.025, 0.025, cfg.shape)
+            configs.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(12):
+        configs.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    # Phase 1: SLSQP Multi-Start Optimization
+    for cfg in configs:
+        r_init, _ = solve_lp_centers(cfg)
+        if r_init is None:
+            r_init = np.full(N, 0.06)
+        else:
+            r_init = np.maximum(r_init * 0.99, 1e-5)
+            
+        x0 = np.concatenate([cfg[:, 0], cfg[:, 1], r_init])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds_opt, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            if np.isfinite(res.fun):
+                c_opt = np.column_stack((res.x[:N], res.x[N:2*N]))
+                r_lp, s_lp = solve_lp_centers(c_opt)
+                if r_lp is not None and s_lp > best_sum:
+                    best_sum = s_lp
+                    best_c = c_opt.copy()
+                    best_r = r_lp.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Basin Hopping / Jiggle Search to escape local minima
+    if best_c is not None:
+        for _ in range(40):
+            c_pert = best_c + rng.uniform(-0.006, 0.006, best_c.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            r_lp, s_lp = solve_lp_centers(c_pert)
+            if r_lp is not None and s_lp > best_sum:
+                best_sum = s_lp
+                best_c = c_pert.copy()
+                best_r = r_lp.copy()
+                
+                # Polish the improved configuration
+                r_init = np.maximum(r_lp * 0.99, 1e-5)
+                x0 = np.concatenate([c_pert[:, 0], c_pert[:, 1], r_init])
+                try:
+                    res = minimize(objective, x0, method='SLSQP', bounds=bounds_opt, constraints=cons,
+                                   options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                    if np.isfinite(res.fun):
+                        c_new = np.column_stack((res.x[:N], res.x[N:2*N]))
+                        r_new, s_new = solve_lp_centers(c_new)
+                        if r_new is not None and s_new > best_sum:
+                            best_sum = s_new
+                            best_c = c_new.copy()
+                            best_r = r_new.copy()
+                except Exception:
+                    pass
+                    
+    # Fallback if optimization unexpectedly fails
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp_centers(best_c)
+        
+    # Phase 3: Strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum

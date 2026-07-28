@@ -1,0 +1,185 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a multi-phase optimization strategy focusing on center placement, as the radii are optimally determined by the centers via a Linear Programming (LP) relaxation. The LP guarantees the maximal sum of radii for any fixed center configuration, satisfying all boundary and non-overlap constraints exactly.
+
+1. **Diverse Initialization**: We generate multiple starting configurations using hexagonal lattice patterns with various row distributions, fully random placements, and corner-biased layouts. This ensures broad coverage of the solution space and avoids early trapping in poor local minima.
+2. **Force-Directed Layout**: Each initial configuration undergoes a physics-based simulation. Circles repel each other and walls, gradually shrinking a target radius to pack them tightly and feasibly. This provides high-quality, valid starting points for numerical optimizers.
+3. **Derivative-Free Optimization (Nelder-Mead)**: We optimize the center coordinates directly by minimizing the negative LP sum of radii. Nelder-Mead is chosen because the LP objective is continuous but non-smooth (piecewise linear), making gradient-based methods prone to stagnation. This phase efficiently navigates the center space to find tight packings.
+4. **Perturbation & Restart**: To escape shallow local minima, we perturb the best found configuration multiple times and re-run the Nelder-Mead optimization.
+5. **Stochastic Hill-Climbing**: We perform a fine-grained, coordinate-wise hill-climbing search. One circle is randomly perturbed at a time, and the LP is re-evaluated. If the sum of radii improves, the move is accepted. The step size decays over time to allow precise fine-tuning.
+6. **Strict Safety Scaling**: Finally, we compute a scaling factor to ensure all circles strictly satisfy the `1e-12` tolerance requirements of the validator, shrinking radii uniformly just enough to guarantee validity without sacrificing significant sum.
+
+This hybrid approach combines global exploration, physics-based feasibility, derivative-free optimization for non-smooth objectives, and local fine-tuning, which is highly effective for dense circle packing problems.
+</strategy>
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except:
+        pass
+    return np.full(n, 1e-9), 0.0
+
+def lp_objective(centers_flat):
+    """Objective function for Nelder-Mead: minimize negative sum of LP radii."""
+    centers = centers_flat.reshape(-1, 2)
+    centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+    _, s = solve_lp_radii(centers)
+    return -s
+
+def force_layout(centers, steps=800):
+    """Force-directed repulsion simulation to spread circles evenly and tightly."""
+    n = len(centers)
+    c = centers.copy()
+    r = np.full(n, 0.09)
+    v = np.zeros_like(c)
+    dt = 0.001
+    damp = 0.95
+    for _ in range(steps):
+        f = np.zeros_like(c)
+        diff = c[:, None, :] - c[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, np.inf)
+        req = r[:, None] + r[None, :]
+        overlap = np.maximum(0.0, req - dists)
+        force_mat = overlap / (dists + 1e-6) * 80.0
+        fx = np.sum(diff[:, :, 0] * force_mat, axis=1)
+        fy = np.sum(diff[:, :, 1] * force_mat, axis=1)
+        f[:, 0] += fx
+        f[:, 1] += fy
+        
+        f[:, 0] += np.clip(r - c[:, 0], 0, None) * 80.0
+        f[:, 0] -= np.clip(c[:, 0] + r - 1.0, 0, None) * 80.0
+        f[:, 1] += np.clip(r - c[:, 1], 0, None) * 80.0
+        f[:, 1] -= np.clip(c[:, 1] + r - 1.0, 0, None) * 80.0
+        
+        v = damp * v + f * dt
+        c += v
+        c = np.clip(c, 1e-4, 1.0-1e-4)
+        r = np.maximum(r * 0.9999, 0.06)
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Generate diverse initial configurations
+    starts = []
+    patterns = [[6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5], [4,6,6,6,4], [6,6,5,5,4], [7,5,5,5,4], [5,4,6,6,5]]
+    for pat in patterns:
+        pts = []
+        r0 = 0.095
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx%2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:n])
+        starts.append(pts)
+        
+    for _ in range(10):
+        starts.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # Phase 2 & 3: Force layout + Nelder-Mead optimization on LP objective
+    for cfg in starts:
+        c_sim = force_layout(cfg, steps=600)
+        
+        res_nm = minimize(lp_objective, c_sim.flatten(), method='Nelder-Mead', 
+                          options={'maxiter': 2000, 'xatol': 1e-8, 'fatol': 1e-9})
+        c_nm = res_nm.x.reshape(n, 2)
+        r_nm, s_nm = solve_lp_radii(c_nm)
+        if s_nm > best_sum:
+            best_sum = s_nm
+            best_centers = c_nm.copy()
+            best_radii = r_nm.copy()
+            
+    # Phase 4: Perturbation restarts to escape local minima
+    if best_centers is not None:
+        for _ in range(5):
+            pert = best_centers + rng.uniform(-0.01, 0.01, best_centers.shape)
+            pert = np.clip(pert, 0.05, 0.95)
+            res_nm = minimize(lp_objective, pert.flatten(), method='Nelder-Mead', 
+                              options={'maxiter': 1000, 'xatol': 1e-8, 'fatol': 1e-9})
+            c_p = res_nm.x.reshape(n, 2)
+            r_p, s_p = solve_lp_radii(c_p)
+            if s_p > best_sum:
+                best_sum = s_p
+                best_centers = c_p.copy()
+                best_radii = r_p.copy()
+                
+        # Phase 5: Stochastic Hill-Climbing for fine-tuning
+        curr_c = best_centers.copy()
+        curr_s = best_sum
+        step = 0.015
+        for _ in range(3000):
+            i = rng.integers(n)
+            old = curr_c[i].copy()
+            curr_c[i] += rng.uniform(-step, step, 2)
+            curr_c[i] = np.clip(curr_c[i], 1e-4, 1.0-1e-4)
+            r_try, s_try = solve_lp_radii(curr_c)
+            if s_try > curr_s:
+                curr_s = s_try
+                if s_try > best_sum:
+                    best_sum = s_try
+                    best_centers = curr_c.copy()
+                    best_radii = r_try.copy()
+            else:
+                curr_c[i] = old
+            step *= 0.998
+
+    # Fallback safety net
+    if best_centers is None:
+        best_centers = np.random.uniform(0.1, 0.9, (n, 2))
+        best_radii, best_sum = solve_lp_radii(best_centers)
+
+    # Phase 6: Strict safety scaling to guarantee numerical validity
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i,0] - best_centers[j,0], 
+                         best_centers[i,1] - best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

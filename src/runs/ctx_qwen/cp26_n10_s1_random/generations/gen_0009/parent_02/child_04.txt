@@ -1,0 +1,223 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we use a hybrid optimization strategy that combines Linear Programming (LP) with position-based hill climbing and gradient-based polishing:
+
+1. **LP-Driven Evaluation**: For any fixed set of centers, the maximum sum of radii is exactly solvable via Linear Programming (`scipy.optimize.linprog`). This gives a precise objective value for any configuration.
+2. **Greedy Hill Climbing**: We optimize circle centers by iteratively moving them. Each move is accepted if and only if the LP-computed sum of radii strictly increases. This directly targets the true objective without relying on loose proxy functions.
+3. **Diverse Initialization**: We start from multiple structured hexagonal lattices (varying row distributions) and random layouts to cover different topological basins.
+4. **Iterative Refinement**: After finding a good configuration via hill climbing, we run additional refinement passes with decaying step sizes to escape shallow local minima.
+5. **SLSQP Polish**: A final gradient-based optimization jointly tweaks centers and radii to squeeze out microscopic improvements that discrete moves might miss.
+6. **Numerical Safety**: A strict post-processing scale ensures all constraints satisfy the `1e-12` tolerance in the validator.
+
+This approach is highly robust for circle packing because it leverages the exact LP radius solver as the ground-truth objective for position search, avoiding the common pitfall of optimizing approximate metrics.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def build_lp_matrix(n):
+    """Constructs the constant inequality matrix for the radius LP solver."""
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    k = 0
+    for i in range(n):
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            k += 1
+    return A
+
+def solve_radii_lp(centers, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    m = A_ub.shape[0]
+    b = np.empty(m)
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        b[k] = x; k += 1
+        b[k] = 1.0 - x; k += 1
+        b[k] = y; k += 1
+        b[k] = 1.0 - y; k += 1
+        
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    b[k:] = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b, bounds=(0, None), method='highs')
+        if res.success and np.isfinite(res.fun):
+            return np.maximum(res.x, 0.0)
+    except Exception:
+        pass
+    return np.full(n, 1e-6)
+
+def hill_climb_centers(centers, A_ub, rng, steps):
+    """Optimizes circle positions using greedy hill climbing guided by LP sum of radii."""
+    n = centers.shape[0]
+    current_r = solve_radii_lp(centers, A_ub)
+    current_sum = np.sum(current_r)
+    step = 0.025
+    
+    for _ in range(steps):
+        i = rng.integers(n)
+        old_pos = centers[i].copy()
+        
+        centers[i] += rng.uniform(-step, step, 2)
+        centers[i] = np.clip(centers[i], 1e-4, 1.0 - 1e-4)
+        
+        new_r = solve_radii_lp(centers, A_ub)
+        new_sum = np.sum(new_r)
+        
+        if new_sum > current_sum + 1e-8:
+            current_r = new_r
+            current_sum = new_sum
+        else:
+            centers[i] = old_pos
+            
+        step *= 0.997
+    return centers, current_r
+
+def generate_configs(n, rng):
+    """Generates diverse initial configurations."""
+    configs = []
+    r0 = 0.09
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], [6, 6, 5, 5, 4],
+        [5, 7, 5, 5, 4], [5, 5, 5, 5, 6], [4, 6, 6, 6, 4], [5, 6, 4, 6, 5]
+    ]
+    for p in patterns:
+        if sum(p) >= n:
+            pts = []
+            y = r0
+            for ri, cnt in enumerate(p):
+                shift = r0 if ri % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) >= n: break
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3.0) * r0
+            while len(pts) < n:
+                pts.append([0.5, 0.5])
+            configs.append(np.array(pts[:n]))
+            
+            pert = np.array(pts[:n]) + rng.uniform(-0.02, 0.02, (n, 2))
+            configs.append(np.clip(pert, 0.05, 0.95))
+            
+    for _ in range(8):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+    return configs
+
+def get_obj(v, n):
+    return -np.sum(v[2 * n:])
+
+def get_constraints(v, n, triu_i, triu_j):
+    cx = v[:n]
+    cy = v[n:2 * n]
+    r = v[2 * n:]
+    c = []
+    c.append(cx - r)
+    c.append(1.0 - cx - r)
+    c.append(cy - r)
+    c.append(1.0 - cy - r)
+    dx = cx[triu_i] - cx[triu_j]
+    dy = cy[triu_i] - cy[triu_j]
+    dist = np.hypot(dx, dy)
+    r_sum = r[triu_i] + r[triu_j]
+    c.append(dist - r_sum)
+    return np.concatenate(c)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    A_ub = build_lp_matrix(n)
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    configs = generate_configs(n, rng)
+    
+    # Phase 1: Broad search with LP-guided hill climbing
+    for cfg in configs:
+        c_opt, r_opt = hill_climb_centers(cfg.copy(), A_ub, rng, steps=1200)
+        s = np.sum(r_opt)
+        if s > best_sum:
+            best_sum = s
+            best_centers = c_opt.copy()
+            best_radii = r_opt.copy()
+            
+    # Phase 2: Iterative refinement to escape local minima
+    if best_centers is not None:
+        for _ in range(4):
+            c_curr, r_curr = best_centers.copy(), best_radii.copy()
+            # Slightly perturb to jump out of basin
+            c_curr += rng.uniform(-0.01, 0.01, c_curr.shape)
+            c_curr = np.clip(c_curr, 0.01, 0.99)
+            
+            c_curr, r_curr = hill_climb_centers(c_curr, A_ub, rng, steps=2000)
+            s_new = np.sum(r_curr)
+            if s_new > best_sum + 1e-7:
+                best_sum = s_new
+                best_centers = c_curr
+                best_radii = r_curr
+                
+            # SLSQP Polish
+            x0 = np.zeros(3 * n)
+            x0[:n] = best_centers[:, 0]
+            x0[n:2 * n] = best_centers[:, 1]
+            x0[2 * n:] = best_radii * 0.995
+            
+            try:
+                res = minimize(
+                    get_obj, x0, args=(n,), method='SLSQP',
+                    bounds=[(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n,
+                    constraints={'type': 'ineq', 'fun': get_constraints, 'args': (n, triu_i, triu_j)},
+                    options={'maxiter': 4000, 'ftol': 1e-14}
+                )
+                if np.isfinite(res.fun):
+                    fc = np.column_stack((res.x[:n], res.x[n:2 * n]))
+                    fr = solve_radii_lp(fc, A_ub)
+                    s_polish = np.sum(fr)
+                    if s_polish > best_sum + 1e-7:
+                        best_sum = s_polish
+                        best_centers = fc
+                        best_radii = fr
+            except Exception:
+                pass
+
+    # Fallback safety
+    if best_centers is None:
+        best_centers = generate_configs(n, rng)[0]
+        best_radii = solve_radii_lp(best_centers, A_ub)
+        best_sum = np.sum(best_radii)
+
+    # Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

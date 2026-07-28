@@ -1,0 +1,181 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust multi-stage optimization strategy that escapes local minima and strictly enforces geometric constraints. The approach involves:
+1. **Diverse Initializations**: Generate multiple starting configurations including hexagonal lattices, regular grids, and random/perturbed points to cover different topological arrangements.
+2. **Penalty-Based Global Search**: Use L-BFGS-B with a high quadratic penalty function to simultaneously optimize centers and radii. This efficiently navigates the non-convex landscape without getting stuck on strict constraint boundaries early on.
+3. **Exact Radius Computation**: For any given set of centers, the optimal radii are determined by the minimum distance to boundaries and neighboring circles. This reduces the problem to optimizing 52 center coordinates.
+4. **Non-Smooth Local Refinement**: Apply Nelder-Mead directly on the center coordinates to maximize the sum of these exact maximal radii. This handles the non-differentiable "min" operation naturally and often finds tighter packings.
+5. **Strict Constraint Fine-Tuning**: Use SLSQP with explicit inequality constraints to perform a final, mathematically rigorous local optimization, ensuring circles are perfectly tangent or safely separated.
+6. **Safety Scaling & Validation**: Apply a deterministic scaling step to guarantee all circles strictly satisfy the validator's tolerance margins before returning.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def compute_max_radii(centers):
+    """Computes the maximum valid radius for each circle given fixed centers."""
+    n = centers.shape[0]
+    radii = np.zeros(n)
+    for i in range(n):
+        # Distance to square boundaries
+        d_wall = min(centers[i, 0], 1.0 - centers[i, 0], 
+                     centers[i, 1], 1.0 - centers[i, 1])
+        # Distance to all other centers
+        d_centers = np.linalg.norm(centers - centers[i], axis=1)
+        d_centers[i] = np.inf
+        # Radius is half the minimum distance to boundary or neighbor
+        radii[i] = min(d_wall, np.min(d_centers) / 2.0)
+    return radii
+
+def obj_centers_wrapper(c_flat, n):
+    """Objective for Nelder-Mead: maximize sum of exact maximal radii."""
+    return -np.sum(compute_max_radii(c_flat.reshape(n, 2)))
+
+def slsqp_objective(vars, n):
+    """Objective for SLSQP: maximize sum of radii."""
+    return -np.sum(vars[2*n:])
+
+def slsqp_constraints(vars, n):
+    """Explicit inequality constraints >= 0 for SLSQP."""
+    c = vars[:2*n].reshape(n, 2)
+    r = vars[2*n:]
+    cons = []
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    cons.extend(c[:, 0] - r)
+    cons.extend(1.0 - c[:, 0] - r)
+    cons.extend(c[:, 1] - r)
+    cons.extend(1.0 - c[:, 1] - r)
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = c[i, 0] - c[j, 0]
+            dy = c[i, 1] - c[j, 1]
+            cons.append(dx*dx + dy*dy - (r[i] + r[j])**2)
+    return np.array(cons)
+
+def objective_penalty(vars, n, mu):
+    """Smooth penalty objective for L-BFGS-B exploration."""
+    c = vars[:2*n].reshape(n, 2)
+    r = vars[2*n:]
+    obj = -np.sum(r)
+    penalty = 0.0
+    
+    # Boundary penalties
+    v = c[:, 0] - r
+    penalty += np.sum(np.maximum(0, -v)**2)
+    v = 1.0 - c[:, 0] - r
+    penalty += np.sum(np.maximum(0, -v)**2)
+    v = c[:, 1] - r
+    penalty += np.sum(np.maximum(0, -v)**2)
+    v = 1.0 - c[:, 1] - r
+    penalty += np.sum(np.maximum(0, -v)**2)
+    
+    # Overlap penalties
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    viol = np.maximum(0, r_sum - dists)
+    triu_idx = np.triu_indices(n, k=1)
+    penalty += np.sum(viol[triu_idx]**2)
+    
+    return obj + mu * penalty
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    np.random.seed(42)
+
+    configs = []
+    
+    # 1. Hexagonal lattice initialization
+    pts = []
+    r0 = 0.1
+    y = r0
+    row = 0
+    while len(pts) < n:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x + r0 <= 1.0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(pts) < n:
+        pts.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)])
+    configs.append(np.array(pts[:n]))
+    
+    # 2. Regular 5x5 grid + center circle
+    pts2 = []
+    for i in range(5):
+        for j in range(5):
+            pts2.append([0.1 + i*0.2, 0.1 + j*0.2])
+    pts2.append([0.5, 0.5])
+    configs.append(np.array(pts2[:n]))
+    
+    # 3-8. Perturbed and random configurations to escape symmetry traps
+    for _ in range(4):
+        configs.append(configs[0] + np.random.uniform(-0.03, 0.03, (n, 2)))
+    configs.append(np.random.uniform(0.1, 0.9, (n, 2)))
+    configs.append(np.random.uniform(0.1, 0.9, (n, 2)))
+
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+
+    for cfg in configs:
+        cfg = np.clip(cfg, 0.05, 0.95)
+        x0 = np.concatenate([cfg.flatten(), np.full(n, 0.09)])
+
+        # Phase 1: Penalty-based global exploration
+        res_pen = minimize(objective_penalty, x0, args=(n, 20000.0), 
+                           method='L-BFGS-B', bounds=bounds, options={'maxiter': 10000})
+        c_opt = res_pen.x[:2*n].reshape(n, 2)
+        r_exact = compute_max_radii(c_opt)
+
+        # Phase 2: Nelder-Mead refinement on centers only (handles non-smooth min)
+        res_nm = minimize(obj_centers_wrapper, c_opt.flatten(), args=(n,), 
+                          method='Nelder-Mead', options={'maxiter': 15000, 'xatol': 1e-7, 'fatol': 1e-9})
+        c_opt = res_nm.x.reshape(n, 2)
+        r_exact = compute_max_radii(c_opt)
+
+        # Phase 3: SLSQP strict constraint fine-tuning
+        x0_slsqp = np.concatenate([c_opt.flatten(), r_exact])
+        try:
+            res_slsqp = minimize(slsqp_objective, x0_slsqp, args=(n,), method='SLSQP', bounds=bounds,
+                                 constraints={'type': 'ineq', 'fun': slsqp_constraints, 'args': (n,)},
+                                 options={'maxiter': 2000, 'ftol': 1e-12})
+            c_opt = res_slsqp.x[:2*n].reshape(n, 2)
+            r_exact = res_slsqp.x[2*n:]
+        except Exception:
+            pass
+
+        current_sum = np.sum(r_exact)
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = c_opt.copy()
+            best_radii = r_exact.copy()
+
+    # Final safety scaling to guarantee strict validity against checker tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r < 1e-9: continue
+        scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, dist / rs)
+                
+    best_radii *= scale * 0.99999
+    best_sum = np.sum(best_radii)
+
+    return best_centers, best_radii, float(best_sum)
+```

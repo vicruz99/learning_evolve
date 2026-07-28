@@ -1,0 +1,197 @@
+# sol_000192 | problem=circle_packing_26 entrypoint=run_packing
+# generation=5 parent=sol_000163 (state 5ceb6a50) state=b5670b84 sum of radii=2.625196 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def objective_equal(x, n):
+    """Objective for equal-radius packing: minimize -t"""
+    return -x[2 * n]
+
+def constraints_equal(x, n):
+    """Inequality constraints >= 0 for equal-radius packing"""
+    xs = x[:n]
+    ys = x[n:2 * n]
+    t = x[2 * n]
+    c = np.concatenate([xs - t, 1.0 - xs - t, ys - t, 1.0 - ys - t])
+    dx = xs[:, np.newaxis] - xs[np.newaxis, :]
+    dy = ys[:, np.newaxis] - ys[np.newaxis, :]
+    idx = np.triu_indices(n, k=1)
+    c = np.concatenate([c, (dx[idx] ** 2 + dy[idx] ** 2) - 4.0 * t ** 2])
+    return c
+
+def objective_variable(x, n):
+    """Objective for variable-radius packing: minimize -sum(r)"""
+    return -np.sum(x[2 * n:])
+
+def constraints_variable(x, n):
+    """Inequality constraints >= 0 for variable-radius packing"""
+    xs = x[:n]
+    ys = x[n:2 * n]
+    rs = x[2 * n:]
+    c = np.concatenate([xs - rs, 1.0 - xs - rs, ys - rs, 1.0 - ys - rs])
+    dx = xs[:, np.newaxis] - xs[np.newaxis, :]
+    dy = ys[:, np.newaxis] - ys[np.newaxis, :]
+    dr = rs[:, np.newaxis] + rs[np.newaxis, :]
+    idx = np.triu_indices(n, k=1)
+    c = np.concatenate([c, (dx[idx] ** 2 + dy[idx] ** 2) - dr[idx] ** 2])
+    return c
+
+def solve_lp_radii(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers"""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 0.0)
+    bounds = [(0.0, lim) for lim in lims]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs ** 2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    idx = np.triu_indices(n, k=1)
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = dists[idx]
+    for k, (i, j) in enumerate(zip(idx[0], idx[1])):
+        A_ub[k, i] = 1.0
+        A_ub[k, j] = 1.0
+        
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def generate_initial_configs(n):
+    """Generates diverse high-quality hexagonal lattice initial configurations"""
+    configs = []
+    row_patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], 
+        [5, 5, 6, 5, 5], [4, 6, 6, 6, 4]
+    ]
+    rng = np.random.default_rng(42)
+    
+    for pat in row_patterns:
+        pts = []
+        y = 0.08
+        for idx, cnt in enumerate(pat):
+            shift = 0.085 if idx % 2 == 1 else 0.0
+            width = (cnt - 1) * 0.17
+            x_start = 0.5 - width / 2.0 + shift
+            for c in range(cnt):
+                if len(pts) < n:
+                    pts.append([x_start + c * 0.17, y])
+            y += 0.148
+            if len(pts) >= n:
+                break
+        base = np.array(pts[:n])
+        configs.append(base)
+        
+        # Add perturbed versions to break symmetry and escape local minima
+        for _ in range(2):
+            pert = base + rng.uniform(-0.015, 0.015, base.shape)
+            pert = np.clip(pert, 0.05, 0.95)
+            configs.append(pert)
+            
+    return configs
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_eq = [(0.0, 1.0)] * (2 * n) + [(0.04, 0.15)]
+    bounds_var = [(0.0, 1.0)] * (2 * n) + [(1e-5, 0.5)] * n
+    
+    configs = generate_initial_configs(n)
+    
+    for cfg in configs:
+        # Phase 1: Equal radius optimization to find tight geometric structure
+        v0_eq = np.concatenate([cfg.flatten(), [0.08]])
+        try:
+            res_eq = minimize(objective_equal, v0_eq, args=(n,), method='SLSQP',
+                              bounds=bounds_eq, 
+                              constraints={'type': 'ineq', 'fun': constraints_equal, 'args': (n,)},
+                              options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            if np.isfinite(res_eq.fun):
+                cx_eq = res_eq.x[:n]
+                cy_eq = res_eq.x[n:2 * n]
+                centers_eq = np.column_stack((cx_eq, cy_eq))
+                
+                # Phase 2: LP refinement to assign optimal variable radii for fixed centers
+                radii_lp, _ = solve_lp_radii(centers_eq, n)
+                if radii_lp is None:
+                    continue
+                    
+                # Phase 3: Joint optimization of centers and variable radii
+                v0_var = np.zeros(3 * n)
+                v0_var[:n] = centers_eq[:, 0]
+                v0_var[n:2 * n] = centers_eq[:, 1]
+                v0_var[2 * n:] = np.maximum(radii_lp * 0.97, 1e-5)
+                
+                try:
+                    res_var = minimize(objective_variable, v0_var, args=(n,), method='SLSQP',
+                                       bounds=bounds_var,
+                                       constraints={'type': 'ineq', 'fun': constraints_variable, 'args': (n,)},
+                                       options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+                    
+                    if np.isfinite(res_var.fun):
+                        cx_var = res_var.x[:n]
+                        cy_var = res_var.x[n:2 * n]
+                        r_var = res_var.x[2 * n:]
+                        
+                        # Strict validation before accepting
+                        valid = True
+                        if np.any(cx_var - r_var < -1e-9) or np.any(cx_var + r_var > 1.0 + 1e-9): valid = False
+                        if np.any(cy_var - r_var < -1e-9) or np.any(cy_var + r_var > 1.0 + 1e-9): valid = False
+                        
+                        if valid:
+                            dx = cx_var[:, None] - cx_var[None, :]
+                            dy = cy_var[:, None] - cy_var[None, :]
+                            dist2 = dx**2 + dy**2
+                            rs = r_var[:, None] + r_var[None, :]
+                            idx = np.triu_indices(n, k=1)
+                            if np.any(dist2[idx] < rs[idx]**2 - 1e-9):
+                                valid = False
+                                
+                        if valid:
+                            s = np.sum(r_var)
+                            if s > best_sum:
+                                best_sum = s
+                                best_centers = np.column_stack((cx_var, cy_var))
+                                best_radii = r_var.copy()
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    # Fallback configuration if optimization fails unexpectedly
+    if best_centers is None:
+        cfg = configs[0]
+        radii_fb, _ = solve_lp_radii(cfg, n)
+        best_centers = cfg
+        best_radii = radii_fb if radii_fb is not None else np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+
+    # Final safety scaling to guarantee strict numerical validity for the checker
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.999999
+    best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, float(best_sum)

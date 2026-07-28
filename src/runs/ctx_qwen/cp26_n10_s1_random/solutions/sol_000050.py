@@ -1,0 +1,125 @@
+# sol_000050 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000007 (state 5778b268) state=09aa517b sum of radii=1.300000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def objective(vars):
+    """Objective: minimize negative sum of radii"""
+    return -np.sum(vars[2::3])
+
+def get_constraints(vars, n):
+    """Compute all inequality constraints >= 0"""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    
+    # Pairwise non-overlap constraints: dist(i,j) >= r_i + r_j
+    xi = x[:, None]
+    yi = y[:, None]
+    ri = r[:, None]
+    
+    dists = np.sqrt((xi - xi.T)**2 + (yi - yi.T)**2)
+    r_sums = ri + ri.T
+    
+    idx = np.triu_indices(n, k=1)
+    c.append(dists[idx] - r_sums[idx])
+    
+    return np.concatenate(c)
+
+def generate_hex_config(n, r_init):
+    """Generate initial positions on a hexagonal lattice"""
+    pts = []
+    row = 0
+    y = r_init
+    dy = np.sqrt(3) * r_init
+    while len(pts) < n:
+        shift = r_init if row % 2 == 1 else 0.0
+        x = r_init + shift
+        while x <= 1.0 - r_init and len(pts) < n:
+            pts.append([x, y])
+            x += 2 * r_init
+        y += dy
+        row += 1
+        if y > 1.0 - r_init: break
+        
+    # Fallback pad if lattice didn't yield enough points (unlikely with small r_init)
+    while len(pts) < n:
+        pts.append([np.random.uniform(r_init, 1-r_init), np.random.uniform(r_init, 1-r_init)])
+        
+    return np.array(pts[:n])
+
+def run_packing():
+    n = 26
+    bounds = [(0, 1), (0, 1), (1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': get_constraints, 'args': (n,)}
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    configs = []
+    r_init = 0.025
+    
+    # 1. Base hexagonal configuration
+    configs.append(generate_hex_config(n, r_init))
+    
+    # 2. Perturbed hexagonal configurations to escape symmetry/local minima
+    np.random.seed(42)
+    for i in range(5):
+        cfg = generate_hex_config(n, r_init)
+        cfg += np.random.normal(0, 0.015, cfg.shape)
+        cfg = np.clip(cfg, r_init, 1.0 - r_init)
+        configs.append(cfg)
+        
+    # 3. Random configurations
+    for i in range(3):
+        np.random.seed(i + 100)
+        cfg = np.random.uniform(r_init, 1.0 - r_init, size=(n, 2))
+        configs.append(cfg)
+        
+    for cfg in configs:
+        v0 = np.zeros(3 * n)
+        v0[0::3] = cfg[:, 0]
+        v0[1::3] = cfg[:, 1]
+        v0[2::3] = r_init
+        
+        try:
+            res = opt.minimize(objective, v0, method='SLSQP', bounds=bounds,
+                              constraints=cons, options={'maxiter': 6000, 'ftol': 1e-12})
+            
+            if np.isfinite(res.fun):
+                r_opt = res.x[2::3]
+                if np.all(r_opt > 1e-9):
+                    # Quick validity verification
+                    valid = True
+                    c_opt = res.x[:2*n].reshape(n, 2)
+                    dists = np.linalg.norm(c_opt[:, None] - c_opt[None, :], axis=2)
+                    r_sums = r_opt[:, None] + r_opt[None, :]
+                    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+                    
+                    if np.any(dists[mask] < r_sums[mask] - 1e-9):
+                        valid = False
+                        
+                    if valid:
+                        s = np.sum(r_opt)
+                        if s > best_sum:
+                            best_sum = s
+                            best_centers = c_opt.copy()
+                            best_radii = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Guaranteed fallback
+    if best_centers is None:
+        best_centers = generate_hex_config(n, 0.05)
+        best_radii = np.full(n, 0.05)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, best_sum

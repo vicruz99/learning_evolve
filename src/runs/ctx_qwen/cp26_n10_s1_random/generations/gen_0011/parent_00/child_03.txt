@@ -1,0 +1,257 @@
+
+
+<strategy>
+1. **Precompute LP Structures**: Generate the upper-triangular indices and constraint matrix `A` for the linear programming problem once. This avoids repeated memory allocations and speeds up the frequent LP calls during optimization.
+2. **Diverse Initializations**: Create a mix of hexagonal lattice configurations with varying row distributions, perturbed grids, and random starts. This covers different topological arrangements that might yield higher density.
+3. **Phase 1: Nelder-Mead on Centers**: Optimize centers directly by maximizing the sum of radii computed via LP. Nelder-Mead is derivative-free and robust to the non-smooth nature of the LP objective function.
+4. **Phase 2: Joint SLSQP Refinement**: Use a sequential quadratic programming method to jointly optimize centers and radii. This smoothens the landscape and helps escape local minima that coordinate-wise or LP-only methods might trap in.
+5. **Phase 3: Simulated Annealing / Hill Climbing**: Implement a temperature-decaying local search that perturbs 1-3 circles simultaneously. It evaluates the LP sum of radii and accepts moves that improve the sum or probabilistically accepts worse moves early on to escape local traps.
+6. **Phase 4: Coordinate-wise Line Search**: For each circle, perform a small line search along x and y directions to find local maxima of the LP objective, squeezing out marginal gains.
+7. **Strict Safety Scaling**: Finally, compute the maximum feasible scale factor that guarantees all constraints are satisfied within the `1e-12` numerical tolerance required by the validator, apply it, and return the results.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def get_pairwise_indices(n):
+    """Returns indices for the upper triangle of the distance matrix."""
+    return np.triu_indices(n, k=1)
+
+def build_lp_matrix(n, idx_i, idx_j):
+    """Constructs the constraint matrix A for the LP: r_i + r_j <= dist_ij."""
+    m = len(idx_i)
+    A = np.zeros((m, n))
+    A[np.arange(m), idx_i] = 1.0
+    A[np.arange(m), idx_j] = 1.0
+    return A
+
+def solve_lp(centers, A, idx_i, idx_j):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    wall = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    bounds = [(0.0, max(w, 1e-12)) for w in wall]
+    
+    # Pairwise constraints: r_i + r_j <= dist(i,j)
+    diff = centers[idx_i] - centers[idx_j]
+    b_ub = np.sqrt(np.sum(diff**2, axis=1))
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            r = np.maximum(res.x, 0.0)
+            return r, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def nelder_obj(x_flat, n, centers_cache, A, idx_i, idx_j):
+    """Objective for Nelder-Mead: maximize sum of radii (computed via LP)."""
+    centers_cache[:] = x_flat.reshape(n, 2)
+    _, s = solve_lp(centers_cache, A, idx_i, idx_j)
+    return -s  # Minimize negative sum
+
+def joint_obj(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def joint_cons(v, n, idx_i, idx_j):
+    """Inequality constraints >= 0 for SLSQP joint optimization."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    
+    # Boundary constraints
+    con = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    con = np.concatenate([con, dx**2 + dy**2 - dr**2])
+    return con
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    idx_i, idx_j = get_pairwise_indices(n)
+    A = build_lp_matrix(n, idx_i, idx_j)
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Generate diverse initial configurations
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,5,5],
+        [5,5,5,5,5,1], [5,5,5,6,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.10
+        for i, cnt in enumerate(pat):
+            shift = 0.10 if i % 2 == 1 else 0.0
+            x = 0.10 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.20
+            y += 0.10 * np.sqrt(3)
+        c = np.array(pts[:n])
+        configs.append(c)
+        
+    # Perturbed variants to break symmetry
+    for base in configs[:4]:
+        for _ in range(3):
+            cp = base + rng.uniform(-0.02, 0.02, base.shape)
+            configs.append(np.clip(cp, 0.05, 0.95))
+            
+    # Random starts
+    for _ in range(8):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    centers_cache = np.zeros((n, 2))
+    
+    # Phase 1: Nelder-Mead on centers maximizing LP sum of radii
+    for cfg in configs:
+        try:
+            res_nm = minimize(nelder_obj, cfg.flatten(), args=(n, centers_cache, A, idx_i, idx_j), 
+                              method='Nelder-Mead', options={'maxiter': 2000, 'xatol': 1e-9, 'fatol': 1e-10})
+            c_opt = np.clip(res_nm.x.reshape(n, 2), 0.01, 0.99)
+            r_lp, s_lp = solve_lp(c_opt, A, idx_i, idx_j)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_c = c_opt.copy()
+                best_r = r_lp.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: SLSQP Joint Polish
+    if best_c is not None:
+        bounds_v = [(0.0, 1.0)]*(2*n) + [(1e-5, 0.5)]*n
+        x0 = np.concatenate([best_c[:,0], best_c[:,1], best_r * 0.98])
+        
+        try:
+            res_slqp = minimize(joint_obj, x0, args=(n,), method='SLSQP',
+                                bounds=bounds_v,
+                                constraints={'type': 'ineq', 'fun': joint_cons, 'args': (n, idx_i, idx_j)},
+                                options={'maxiter': 4000, 'ftol': 1e-13})
+            if np.isfinite(res_slqp.fun):
+                c_s = np.column_stack((res_slqp.x[:n], res_slqp.x[n:2*n]))
+                r_s, s_s = solve_lp(c_s, A, idx_i, idx_j)
+                if r_s is not None and s_s > best_sum:
+                    best_sum = s_s
+                    best_c = c_s.copy()
+                    best_r = r_s.copy()
+        except Exception:
+            pass
+
+    # Phase 3: Simulated Annealing / Hill Climbing
+    curr_c = best_c.copy()
+    curr_r = best_r.copy()
+    curr_s = best_sum
+    temperature = 0.005
+    
+    for it in range(2000):
+        temperature = 0.003 * (1.0 - it / 2000.0)**0.6
+        num_pert = rng.choice([1, 2, 3], p=[0.7, 0.2, 0.1])
+        idx = rng.choice(n, size=num_pert, replace=False)
+        old = curr_c[idx].copy()
+        
+        step = temperature * rng.uniform(0.5, 1.5, (num_pert, 2))
+        direction = rng.choice([-1, 1], size=(num_pert, 2))
+        
+        curr_c[idx] += step * direction
+        curr_c[idx] = np.clip(curr_c[idx], 1e-4, 1.0 - 1e-4)
+        
+        r_new, s_new = solve_lp(curr_c, A, idx_i, idx_j)
+        delta = s_new - curr_s
+        
+        accept = False
+        if delta > 0:
+            accept = True
+        elif rng.random() < np.exp(delta / max(temperature, 1e-7)):
+            accept = True
+            
+        if accept:
+            curr_s = s_new
+            curr_r = r_new.copy()
+        else:
+            curr_c[idx] = old
+            
+        if s_new > best_sum:
+            best_sum = s_new
+            best_c = curr_c.copy()
+            best_r = curr_r.copy()
+            
+    curr_c, curr_r, curr_s = best_c, best_r, best_sum
+    
+    # Phase 4: Coordinate-wise Line Search
+    for _ in range(3):
+        for i in range(n):
+            for dim in range(2):
+                base = curr_c[i, dim]
+                best_val = curr_s
+                best_pos = base
+                
+                for trial in range(-5, 6):
+                    shift = trial * 0.0005
+                    curr_c[i, dim] = np.clip(base + shift, 1e-4, 1.0 - 1e-4)
+                    r_try, s_try = solve_lp(curr_c, A, idx_i, idx_j)
+                    if s_try > best_val:
+                        best_val = s_try
+                        best_pos = curr_c[i, dim]
+                        
+                curr_c[i, dim] = best_pos
+                if best_val > curr_s:
+                    curr_s = best_val
+                    curr_r = r_try.copy()
+                    
+        best_c = curr_c.copy()
+        best_r = curr_r.copy()
+        best_sum = curr_s
+
+    # Phase 5: Strict Numerical Safety Scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = best_r[:, None] + best_r[None, :]
+    min_ratio = np.min(dists[idx_i, idx_j] / np.maximum(r_pair[idx_i, idx_j], 1e-12))
+    scale = min(scale, min_ratio)
+    
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    # Fallback safety net
+    if best_c is None or best_sum < 1.0:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp(best_c, A, idx_i, idx_j)
+        # Re-scale for safety
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+            if r > 1e-12:
+                scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+                rs = best_r[i] + best_r[j]
+                if rs > 1e-12:
+                    scale = min(scale, d/rs)
+        best_r *= scale * 0.999999
+        best_sum = float(np.sum(best_r))
+        
+    return best_c, best_r, best_sum
+```

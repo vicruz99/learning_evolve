@@ -1,0 +1,138 @@
+# sol_000114 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000034 (state e427cf82) state=da783a2c sum of radii=2.408670 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_radii_lp(centers):
+    """
+    Solves the LP to maximize sum of radii for fixed centers.
+    Constraints: r_i + r_j <= dist(i,j) and r_i <= dist(i, boundary)
+    """
+    n = centers.shape[0]
+    c_obj = -np.ones(n)  # Maximize sum(r) <=> minimize -sum(r)
+    
+    num_boundary = 4 * n
+    num_pairs = n * (n - 1) // 2
+    num_constraints = num_boundary + num_pairs
+    
+    A_ub = np.zeros((num_constraints, n))
+    b_ub = np.zeros(num_constraints)
+    
+    idx = 0
+    # Boundary constraints: r_i <= x, 1-x, y, 1-y
+    for i in range(n):
+        x, y = centers[i]
+        limits = (x, 1.0 - x, y, 1.0 - y)
+        for lim in limits:
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = lim
+            idx += 1
+            
+    # Pairwise constraints: r_i + r_j <= ||c_i - c_j||
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx*dx + dy*dy)
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dist
+            idx += 1
+            
+    bounds = [(0.0, None)] * n
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def hill_climb(init_centers, n, iterations=2500):
+    """
+    Stochastic hill-climbing on center coordinates, using LP to evaluate objective.
+    """
+    centers = init_centers.copy()
+    best_centers = centers.copy()
+    best_radii, best_sum = solve_radii_lp(centers)
+    
+    step_base = 0.025
+    for it in range(iterations):
+        # Exponentially decaying step size for fine-tuning
+        step = step_base * (0.9985 ** it)
+        
+        # Perturb one random circle
+        i = np.random.randint(n)
+        old_c = centers[i].copy()
+        centers[i] += np.random.uniform(-step, step, 2)
+        # Keep strictly inside [0,1] to ensure LP feasibility
+        centers[i] = np.clip(centers[i], 1e-4, 1.0 - 1e-4)
+        
+        radii, curr_sum = solve_radii_lp(centers)
+        if radii is not None and curr_sum > best_sum:
+            best_centers = centers.copy()
+            best_radii = radii
+            best_sum = curr_sum
+        else:
+            centers[i] = old_c  # Revert
+            
+    return best_centers, best_radii, best_sum
+
+def run_packing():
+    np.random.seed(42)
+    n = 26
+    
+    # Initialization 1: 5x5 Grid + 1 circle
+    # 5x5 grid of spacing ~0.211 gives r ~ 0.1055 for 25 circles.
+    c1 = np.zeros((n, 2))
+    idx = 0
+    for r in range(5):
+        for c in range(5):
+            c1[idx, 0] = 0.1055 + c * 0.211
+            c1[idx, 1] = 0.1055 + r * 0.211
+            idx += 1
+    # Place 26th circle in a corner gap
+    c1[idx, 0] = 0.5
+    c1[idx, 1] = 0.08 
+    
+    # Initialization 2: Hexagonal Lattice (denser packing structure)
+    c2_pts = []
+    y = 0.08
+    row = 0
+    while len(c2_pts) < 30:
+        x = 0.08
+        shift = 0.08 if row % 2 == 1 else 0.0
+        while x < 0.92:
+            c2_pts.append([x + shift, y])
+            x += 0.16
+        y += 0.138
+        row += 1
+    c2_pts = np.array(c2_pts)
+    # Pick 26 points closest to center to minimize edge effects
+    dists = np.sum((c2_pts - 0.5)**2, axis=1)
+    c2 = c2_pts[np.argsort(dists)[:n]]
+    
+    configs = [c1, c2]
+    
+    best_overall_sum = 0.0
+    best_overall_centers = None
+    best_overall_radii = None
+    
+    # Run hill climbing from each initialization
+    for cfg in configs:
+        b_c, b_r, b_s = hill_climb(cfg, n, iterations=3000)
+        if b_s > best_overall_sum:
+            best_overall_sum = b_s
+            best_overall_centers = b_c
+            best_overall_radii = b_r
+            
+    # Apply tiny safety margin to guarantee strict numerical validity against 1e-12 tolerance
+    best_overall_radii *= 0.9999999
+    best_overall_sum = float(np.sum(best_overall_radii))
+    
+    return best_overall_centers, best_overall_radii, best_overall_sum

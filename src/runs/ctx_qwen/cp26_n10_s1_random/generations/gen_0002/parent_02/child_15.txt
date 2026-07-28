@@ -1,0 +1,188 @@
+
+
+<strategy>
+To improve the packing and push the sum of radii beyond 2.636, we will employ a robust optimization pipeline:
+1. **Diverse Initializations**: Generate multiple starting configurations including hexagonal lattices (with different row distributions), a regular grid, and random perturbations. This helps escape local minima common in non-convex packing problems.
+2. **Smooth Penalty Method with L-BFGS-B**: Instead of relying solely on constrained optimizers (like SLSQP) which can struggle with hundreds of inequality constraints, we use a penalty method. This transforms constraints into a smooth penalty term added to the objective, which L-BFGS-B handles efficiently and stably. A high penalty weight ensures strict feasibility.
+3. **Radius Re-estimation Step**: After the initial optimization, the radii found by the penalty method are often conservatively small to avoid penalty regions. We compute the exact maximal feasible radius for each circle given the optimized centers (limited by boundaries and nearest neighbors). This typically yields a larger sum of radii.
+4. **Secondary Refinement**: We use the re-estimated radii as a new starting point for another round of L-BFGS-B optimization, allowing centers to adjust to the larger radii and further increase the sum.
+5. **Strict Validation & Safety Scaling**: Finally, we compute a global scaling factor to guarantee all circles strictly satisfy the boundary and non-overlap constraints with a comfortable margin, accounting for the `1e-12` tolerance in the validator.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_penalty(vars, n, mu):
+    """
+    Objective function combining negative sum of radii with a smooth penalty 
+    for boundary violations and circle overlaps.
+    """
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    obj = -np.sum(r)
+    pen = 0.0
+    
+    # Boundary penalties: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    pen += np.sum(np.maximum(0, -(x - r))**2)
+    pen += np.sum(np.maximum(0, -(1.0 - x - r))**2)
+    pen += np.sum(np.maximum(0, -(y - r))**2)
+    pen += np.sum(np.maximum(0, -(1.0 - y - r))**2)
+    
+    # Overlap penalties: dist(i,j) >= r_i + r_j
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)
+    
+    r_sum = r[:, None] + r[None, :]
+    viol = r_sum - dist
+    triu = np.triu(np.ones((n, n), dtype=bool), k=1)
+    pen += np.sum(np.maximum(0, viol[triu])**2)
+    
+    return obj + mu * pen
+
+def generate_start(idx, n, rng):
+    """Generates diverse initial configurations for the optimizer."""
+    pts = np.zeros((n, 2))
+    if idx == 0:
+        rows = [5, 6, 5, 6, 4]
+        r0 = 0.1
+        y = r0
+        row_idx = 0
+        cnt = 0
+        for c in rows:
+            shift = r0 if row_idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(c):
+                if cnt < n:
+                    pts[cnt] = [x, y]
+                    cnt += 1
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row_idx += 1
+    elif idx == 1:
+        rows = [6, 5, 6, 5, 4]
+        r0 = 0.1
+        y = r0
+        row_idx = 0
+        cnt = 0
+        for c in rows:
+            shift = r0 if row_idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(c):
+                if cnt < n:
+                    pts[cnt] = [x, y]
+                    cnt += 1
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row_idx += 1
+    elif idx == 2:
+        c = 0
+        for i in range(5):
+            for j in range(5):
+                pts[c] = [0.1 + i*0.2, 0.1 + j*0.2]
+                c += 1
+        pts[25] = [0.5, 0.5]
+    else:
+        pts = rng.uniform(0.1, 0.9, (n, 2))
+        
+    # Normalize to fit comfortably inside [0, 1]
+    min_p = pts.min(axis=0)
+    max_p = pts.max(axis=0)
+    pts = (pts - min_p) / (max_p - min_p) * 0.9 + 0.05
+    
+    v = np.zeros(3*n)
+    v[0::3] = pts[:, 0]
+    v[1::3] = pts[:, 1]
+    v[2::3] = 0.095
+    return v
+
+def run_packing():
+    n = 26
+    mu = 100000.0  # High penalty weight to strictly enforce constraints
+    bounds = [(0, 1)] * (2*n) + [(1e-5, 0.5)] * n
+    
+    best_sum = -1.0
+    best_vars = None
+    rng = np.random.default_rng(42)
+    
+    # Generate a diverse set of starting points
+    starts = []
+    for i in range(3):
+        starts.append(generate_start(0, n, rng))
+        starts.append(generate_start(1, n, rng))
+        starts.append(generate_start(2, n, rng))
+        starts.append(generate_start(3, n, rng))
+        
+    # Add perturbed versions to escape symmetric local minima
+    for s in starts.copy():
+        p = s + rng.uniform(-0.02, 0.02, 3*n)
+        p[:2*n] = np.clip(p[:2*n], 0.05, 0.95)
+        starts.append(p)
+        
+    # Phase 1: Penalty-based optimization from multiple starts
+    for x0 in starts:
+        res = minimize(objective_penalty, x0, args=(n, mu), method='L-BFGS-B', 
+                       bounds=bounds, options={'maxiter': 20000, 'ftol': 1e-14})
+        
+        r_opt = res.x[2::3]
+        if np.all(r_opt > 1e-6) and np.sum(r_opt) > best_sum:
+            best_vars = res.x.copy()
+            best_sum = np.sum(r_opt)
+            
+    # Phase 2: Exact radius re-estimation for the best centers
+    # The penalty method often leaves radii smaller than theoretically possible.
+    # We compute the maximal feasible radius for each circle given fixed centers.
+    c_best = best_vars[0::3].copy()
+    r_best = best_vars[2::3].copy()
+    
+    for i in range(n):
+        # Distance to boundaries
+        min_d = min(c_best[i, 0], 1.0 - c_best[i, 0], 
+                    c_best[i, 1], 1.0 - c_best[i, 1])
+        # Distance to other circles
+        for j in range(n):
+            if i != j:
+                d = np.linalg.norm(c_best[i] - c_best[j])
+                if d < min_d:
+                    min_d = d
+        r_best[i] = min_d / 2.0
+        
+    best_vars[2::3] = r_best
+    best_sum = np.sum(r_best)
+    
+    # Phase 3: Secondary refinement with updated radii
+    res_final = minimize(objective_penalty, best_vars, args=(n, mu), method='L-BFGS-B',
+                         bounds=bounds, options={'maxiter': 15000, 'ftol': 1e-14})
+    if np.sum(res_final.x[2::3]) > best_sum:
+        best_vars = res_final.x
+        
+    # Extract final results
+    final_centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    final_radii = best_vars[2::3]
+    
+    # Safety scaling to guarantee strict validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = final_centers[i]
+        r = final_radii[i]
+        if r < 1e-9: 
+            continue
+        scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+        
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(final_centers[i] - final_centers[j])
+            rs = final_radii[i] + final_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d/rs)
+                
+    # Apply scaling with a tiny buffer for numerical stability
+    final_radii *= scale * 0.99999
+    best_sum = np.sum(final_radii)
+    
+    return final_centers, final_radii, best_sum
+```

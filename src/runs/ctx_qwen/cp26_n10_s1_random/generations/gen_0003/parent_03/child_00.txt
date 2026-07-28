@@ -1,0 +1,184 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need to approach the known theoretical limit for dense circle packing (~2.636 for equal circles). The strategy involves a two-phase optimization:
+
+1. **Penalty-Based Global Search (L-BFGS-B)**: We use a smooth penalty function that penalizes boundary violations and pairwise overlaps quadratically. This allows us to optimize centers and radii simultaneously without hard constraints initially, making the landscape easier to navigate. We anneal the penalty weight `C` from 100 to 8000 to gradually enforce feasibility while maximizing radius sum. Multiple hexagonal lattice initializations with different row distributions (e.g., 5-6-5-6-4, 4-6-6-6-4, etc.) are tested to cover different basins of attraction.
+
+2. **Constraint-Based Local Refinement (SLSQP)**: Once a high-quality feasible (or near-feasible) configuration is found, we switch to SLSQP with hard inequality constraints. This precisely pushes the solution to the boundary of the feasible region, squeezing out additional radius sum. Multiple perturbations around the best penalty result are tried to escape shallow local minima.
+
+3. **Safety Projection**: Finally, we compute a strict scaling factor based on the minimum clearance to boundaries and other circles. This guarantees that the returned configuration strictly satisfies the validator's `1e-12` tolerance.
+
+All helper functions are defined at the top level with no closures or lambda functions, adhering strictly to the constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def penalty_obj(v, n, C):
+    """Smooth penalty objective for unconstrained-like optimization."""
+    r = v[:n]
+    c = v[n:].reshape(n, 2)
+    pen = 0.0
+    
+    # Boundary penalties
+    pen += np.sum(np.maximum(0, r - c[:, 0])**2)
+    pen += np.sum(np.maximum(0, r - (1.0 - c[:, 0]))**2)
+    pen += np.sum(np.maximum(0, r - c[:, 1])**2)
+    pen += np.sum(np.maximum(0, r - (1.0 - c[:, 1]))**2)
+    
+    # Pairwise overlap penalties
+    dx = c[:, 0:1] - c[:, 0:1].T
+    dy = c[:, 1:2] - c[:, 1:2].T
+    d = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(d, np.inf)
+    rs = r[:, None] + r[None, :]
+    pen += 0.5 * np.sum(np.maximum(0, rs - d)**2)
+    
+    return -np.sum(r) + C * pen
+
+def slsqp_obj(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[:n])
+
+def slsqp_con(v, n):
+    """Hard inequality constraints for SLSQP."""
+    r = v[:n]
+    c = v[n:].reshape(n, 2)
+    con = []
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    con.extend(c[:, 0] - r)
+    con.extend(1.0 - c[:, 0] - r)
+    con.extend(c[:, 1] - r)
+    con.extend(1.0 - c[:, 1] - r)
+    
+    # Pairwise non-overlap: dist^2 - (r_i + r_j)^2 >= 0
+    dx = c[:, 0:1] - c[:, 0:1].T
+    dy = c[:, 1:2] - c[:, 1:2].T
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    rs = r[:, None] + r[None, :]
+    con.extend(d2[mask] - rs[mask]**2)
+    
+    return np.array(con)
+
+def get_config(n, pattern, r_base=0.095):
+    """Generates an initial hexagonal lattice configuration based on row pattern."""
+    pts = []
+    y = r_base
+    row_idx = 0
+    for count in pattern:
+        shift = r_base if row_idx % 2 == 1 else 0.0
+        x = r_base + shift
+        for _ in range(count):
+            if len(pts) >= n:
+                break
+            pts.append([x, y])
+            x += 2.0 * r_base
+        y += np.sqrt(3) * r_base
+        row_idx += 1
+        
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+        
+    pts = np.array(pts[:n])
+    pts -= pts.min(axis=0)
+    if pts.max(axis=0).max() > 0:
+        pts /= pts.max(axis=0)
+    pts = pts * 0.8 + 0.1
+    return pts
+
+def run_packing():
+    np.random.seed(42)
+    n = 26
+    
+    # Diverse hexagonal row distributions summing to 26
+    row_patterns = [
+        [5, 6, 5, 6, 4],
+        [4, 6, 6, 6, 4],
+        [5, 5, 6, 5, 5],
+        [6, 5, 5, 5, 5],
+        [5, 6, 6, 5, 4],
+        [6, 6, 5, 5, 4]
+    ]
+    
+    best_sum = 0.0
+    best_vars = None
+    bounds_pen = [(1e-4, 0.5)] * n + [(0.0, 1.0)] * (2 * n)
+    
+    # Phase 1: Penalty-based optimization with L-BFGS-B
+    for pat in row_patterns:
+        for trial in range(3):
+            c_init = get_config(n, pat)
+            if trial > 0:
+                noise = np.random.uniform(-0.03, 0.03, (n, 2))
+                c_init = np.clip(c_init + noise, 0.05, 0.95)
+                
+            r_init = np.full(n, 0.09)
+            x0 = np.concatenate([r_init, c_init.flatten()])
+            current_x = x0.copy()
+            
+            # Anneal penalty weight to drive feasibility while maximizing radii
+            for C in [100.0, 500.0, 2000.0, 8000.0]:
+                res = minimize(penalty_obj, current_x, args=(n, C),
+                              method='L-BFGS-B', bounds=bounds_pen,
+                              options={'maxiter': 5000, 'ftol': 1e-12, 'gtol': 1e-8})
+                current_x = res.x
+            
+            s = np.sum(current_x[:n])
+            if s > best_sum:
+                best_sum = s
+                best_vars = current_x.copy()
+
+    # Phase 2: SLSQP refinement with hard constraints
+    if best_vars is not None:
+        bounds_slq = [(1e-4, 0.5)] * n + [(0.0, 1.0)] * (2 * n)
+        for trial in range(3):
+            x0_slq = best_vars.copy()
+            if trial > 0:
+                x0_slq[:n] *= np.random.uniform(0.98, 1.02, n)
+                x0_slq[n:] += np.random.uniform(-0.005, 0.005, 2 * n)
+                x0_slq[n:] = np.clip(x0_slq[n:], 0, 1)
+                
+            try:
+                res = minimize(slsqp_obj, x0_slq, args=(n,), method='SLSQP',
+                              bounds=bounds_slq,
+                              constraints={'type': 'ineq', 'fun': slsqp_con, 'args': (n,)},
+                              options={'maxiter': 4000, 'ftol': 1e-12})
+                if np.isfinite(res.fun):
+                    c_val = slsqp_con(res.x, n)
+                    if np.min(c_val) >= -1e-6:
+                        s = -res.fun
+                        if s > best_sum:
+                            best_sum = s
+                            best_vars = res.x.copy()
+            except Exception:
+                pass
+
+    # Extract final results
+    r_out = best_vars[:n]
+    c_out = best_vars[n:].reshape(n, 2)
+    
+    # Strict safety scaling to guarantee validator passes with 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = c_out[i]
+        r = r_out[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(c_out[i] - c_out[j])
+            rs = r_out[i] + r_out[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    r_out *= scale * 0.999999
+    best_sum = float(np.sum(r_out))
+    
+    return c_out, r_out, best_sum
+```

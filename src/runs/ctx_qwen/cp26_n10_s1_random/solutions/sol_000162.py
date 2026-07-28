@@ -1,0 +1,181 @@
+# sol_000162 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000133 (state e4602328) state=339ee073 sum of radii=2.304112 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def compute_min_clearance(centers, n):
+    """Computes the maximum feasible equal radius for given centers."""
+    d_bound = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                         np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    min_bound = np.min(d_bound)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_pairwise = np.min(dists) / 2.0
+    
+    return min(min_bound, min_pairwise)
+
+def neg_clearance(x, n):
+    """Objective for Nelder-Mead: maximize minimum clearance."""
+    centers = x.reshape(n, 2)
+    return -compute_min_clearance(centers, n)
+
+def solve_lp_radii(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(l, 0.0)) for l in lims]
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    idx = np.triu_indices(n, k=1)
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = dists[idx]
+    for k, (i, j) in enumerate(zip(idx[0], idx[1])):
+        A_ub[k, i] = 1.0
+        A_ub[k, j] = 1.0
+        
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def hex_init(row_counts, r_guess=0.10):
+    """Generates a centered hexagonal lattice configuration."""
+    pts = []
+    y = r_guess
+    for idx, cnt in enumerate(row_counts):
+        shift = r_guess if idx % 2 == 1 else 0.0
+        row_width = (cnt - 1) * 2 * r_guess
+        x_start = 0.5 - row_width / 2.0 + shift
+        for c in range(cnt):
+            pts.append([x_start + c * 2 * r_guess, y])
+        y += np.sqrt(3) * r_guess
+    return np.array(pts)
+
+def obj_combined(v, n):
+    """Objective for SLSQP: maximize sum of radii."""
+    return -np.sum(v[2::3])
+
+def cons_combined(v, n):
+    """Inequality constraints >= 0 for SLSQP."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = []
+    # Boundary constraints
+    c.extend(x - r)
+    c.extend(1.0 - x - r)
+    c.extend(y - r)
+    c.extend(1.0 - y - r)
+    
+    # Pairwise non-overlap constraints
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    idx = np.triu_indices(n, k=1)
+    c.extend((dx[idx]**2 + dy[idx]**2) - dr[idx]**2)
+    return np.array(c)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    np.random.seed(42)
+    configs = []
+    
+    # Diverse row distributions known to be near-optimal for n=26
+    row_configs = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 6, 4],
+        [4, 6, 6, 5, 5], [6, 6, 5, 5, 4], [5, 6, 6, 5, 4], [5,5,5,5,5,1]
+    ]
+    
+    for rc in row_configs:
+        c = hex_init(rc)
+        configs.append(c)
+        # Perturb to escape symmetry traps
+        for _ in range(4):
+            cp = c.copy()
+            cp += np.random.uniform(-0.025, 0.025, cp.shape)
+            configs.append(cp)
+            
+    # Scaled versions to aggressively fill space
+    for rc in row_configs[:3]:
+        c = hex_init(rc)
+        mn = c.min(axis=0)
+        mx = c.max(axis=0)
+        scale = 0.92 / np.max(mx - mn)
+        c_scaled = (c - mn) * scale + 0.5 * (1.0 - scale)
+        configs.append(c_scaled)
+        
+    bounds_slqp = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    # Phase 1 & 2: Optimize centers for equal radius, then LP for varying radii
+    for init in configs:
+        x0 = init.flatten()
+        res_nm = minimize(neg_clearance, x0, args=(n,), method='Nelder-Mead',
+                          options={'maxiter': 6000, 'xatol': 1e-9, 'fatol': 1e-12})
+        centers_opt = res_nm.x.reshape(n, 2)
+        
+        radii_lp, s_lp = solve_lp_radii(centers_opt, n)
+        if radii_lp is not None and s_lp > best_sum:
+            best_sum = s_lp
+            best_centers = centers_opt.copy()
+            best_radii = radii_lp.copy()
+            
+    # Phase 3: Joint SLSQP refinement
+    if best_centers is not None:
+        x0_slqp = np.zeros(3*n)
+        x0_slqp[0::3] = best_centers[:, 0]
+        x0_slqp[1::3] = best_centers[:, 1]
+        x0_slqp[2::3] = best_radii
+        
+        res_slqp = minimize(obj_combined, x0_slqp, args=(n,), method='SLSQP', 
+                            bounds=bounds_slqp,
+                            constraints={'type': 'ineq', 'fun': cons_combined, 'args': (n,)},
+                            options={'maxiter': 8000, 'ftol': 1e-14})
+        
+        if np.isfinite(res_slqp.fun):
+            c_f = np.column_stack((res_slqp.x[0::3], res_slqp.x[1::3]))
+            r_f = res_slqp.x[2::3]
+            s_f = np.sum(r_f)
+            if s_f > best_sum:
+                best_centers = c_f
+                best_radii = r_f
+                best_sum = s_f
+                
+    # Final safety scaling to guarantee strict numerical validity
+    if best_centers is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+            if r > 1e-12:
+                scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.linalg.norm(best_centers[i] - best_centers[j])
+                rs = best_radii[i] + best_radii[j]
+                if rs > 1e-12:
+                    scale = min(scale, d/rs)
+        best_radii *= scale * 0.9999995
+        best_sum = np.sum(best_radii)
+    else:
+        # Fallback configuration
+        best_centers = hex_init([5, 6, 5, 6, 4])
+        best_radii = np.full(n, 0.09)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, float(best_sum)

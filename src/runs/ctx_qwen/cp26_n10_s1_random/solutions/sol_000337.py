@@ -1,0 +1,189 @@
+# sol_000337 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000152 (state 06e8663d) state=a192d13a sum of radii=2.259999 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_lp_radii(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    limits = np.maximum(limits, 1e-9)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m + 4*n, n))
+    b_ub = np.zeros(m + 4*n)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    for i in range(n):
+        x, y = centers[i]
+        for lim in [x, 1.0-x, y, 1.0-y]:
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = lim
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def penalty_obj_centers(c_flat, radii, n):
+    """Penalty function for center optimization with fixed radii."""
+    c = c_flat.reshape(n, 2)
+    pen = 0.0
+    for i in range(n):
+        x, y = c[i]
+        r = radii[i]
+        if x < r: pen += (x - r)**2
+        if x > 1.0 - r: pen += (x - (1.0 - r))**2
+        if y < r: pen += (y - r)**2
+        if y > 1.0 - r: pen += (y - (1.0 - r))**2
+        
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(c[i, 0] - c[j, 0], c[i, 1] - c[j, 1])
+            rs = radii[i] + radii[j]
+            if d < rs:
+                pen += (d - rs)**2
+    return pen
+
+def joint_obj(v):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    n = v.size // 3
+    return -np.sum(v[2*n:])
+
+def joint_cons(v):
+    """Inequality constraints >= 0 for valid packing."""
+    n = v.size // 3
+    cx, cy, r = v[:n], v[n:2*n], v[2*n:]
+    c = np.concatenate([cx-r, 1.0-cx-r, cy-r, 1.0-cy-r])
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+    rs = r[:, None] + r[None, :]
+    idx = np.triu_indices(n, k=1)
+    c = np.concatenate([c, d2[idx] - rs[idx]**2])
+    return c
+
+def make_hex(rows, r0=0.09):
+    """Generates a hexagonal lattice configuration for 26 circles."""
+    pts = []
+    y = r0
+    for i, cnt in enumerate(rows):
+        shift = r0 if i % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= 26: break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    return np.array(pts[:26])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    configs = []
+    patterns = [[6,5,6,5,4], [5,6,5,6,4], [5,5,6,6,4], [4,6,6,5,5], [6,6,5,5,4]]
+    for p in patterns:
+        c = make_hex(p)
+        configs.append(c)
+        for _ in range(4):
+            configs.append(np.clip(c + rng.uniform(-0.03, 0.03, c.shape), 0.05, 0.95))
+    for _ in range(6):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # Phase 1: Alternating LP + Center Penalty Optimization
+    for cfg in configs:
+        curr_c = np.clip(cfg, 0.05, 0.95)
+        curr_r, curr_s = solve_lp_radii(curr_c)
+        if curr_r is None: continue
+        
+        for _ in range(15):
+            res_c = minimize(penalty_obj_centers, curr_c.flatten(), args=(curr_r, n),
+                             method='L-BFGS-B', bounds=[(0.0, 1.0)]*(2*n),
+                             options={'maxiter': 2000, 'ftol': 1e-13})
+            curr_c = res_c.x.reshape(n, 2)
+            
+            new_r, new_s = solve_lp_radii(curr_c)
+            if new_r is not None and new_s > curr_s:
+                curr_r, curr_s = new_r, new_s
+                
+        if curr_s > best_sum:
+            best_sum = curr_s
+            best_c = curr_c.copy()
+            best_r = curr_r.copy()
+            
+    # Phase 2: Joint SLSQP Polish
+    if best_c is not None:
+        x0 = np.concatenate([best_c.flatten(), best_r * 0.98])
+        bounds_slqp = [(0.0, 1.0)]*(2*n) + [(1e-5, 0.5)]*n
+        
+        try:
+            res = minimize(joint_obj, x0, method='SLSQP', bounds=bounds_slqp,
+                           constraints={'type': 'ineq', 'fun': joint_cons},
+                           options={'maxiter': 6000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_opt = res.x[:2*n].reshape(n, 2)
+                r_lp, s_lp = solve_lp_radii(c_opt)
+                if r_lp is not None and s_lp > best_sum:
+                    best_sum = s_lp
+                    best_c = c_opt.copy()
+                    best_r = r_lp.copy()
+        except Exception:
+            pass
+            
+        # Jiggle search
+        for _ in range(40):
+            pert = best_c + rng.uniform(-0.003, 0.003, best_c.shape)
+            pert = np.clip(pert, 0.02, 0.98)
+            r_try, s_try = solve_lp_radii(pert)
+            if r_try is not None and s_try > best_sum:
+                best_sum = s_try
+                best_c = pert.copy()
+                best_r = r_try.copy()
+                
+    if best_c is None:
+        best_c = np.clip(make_hex([6,5,6,5,4]), 0.05, 0.95)
+        best_r, best_sum = solve_lp_radii(best_c)
+        
+    # Safety scaling to strictly satisfy 1e-12 validator tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum

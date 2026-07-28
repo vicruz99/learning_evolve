@@ -1,0 +1,191 @@
+
+
+<strategy>
+To improve the sum of radii beyond the current 2.6178, we need a more robust optimization strategy that avoids getting trapped in local minima typical of strict constraint-based optimizers like SLSQP. The approach combines three powerful techniques:
+
+1. **Penalty-Based Center Optimization**: Instead of hard constraints, we use a smooth penalty function added to the objective. This transforms the problem into an unconstrained (except for bounds) optimization, which `L-BFGS-B` handles very efficiently. We use a two-stage continuation method: first with a low penalty to explore the basin of attraction, then with a high penalty to strictly enforce non-overlap and boundary conditions.
+2. **LP Refinement for Radii**: After finding optimized centers, we decouple the radius assignment by solving a Linear Program. This guarantees that for the fixed centers, the radii are maximally packed and strictly feasible. The LP constraints are $r_i \leq \text{dist}(i, \text{boundary})$ and $r_i + r_j \leq \text{dist}(i, j)$. This step often yields a higher sum than joint optimization because it removes non-linear coupling between radii.
+3. **Diverse Initializations & Safety Scaling**: We generate multiple hexagonal lattice configurations with controlled perturbations and random starts to cover different topological packings. A final uniform scaling step ensures strict compliance with the validator's $10^{-12}$ tolerance.
+
+This hybrid approach leverages the speed of gradient-based methods, the exactness of linear programming, and robust multi-start exploration to reliably exceed the 2.636 target.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def penalty_objective(vars_arr, n, mu):
+    """
+    Computes the penalized objective function for circle packing.
+    Minimizes negative sum of radii while penalizing boundary and overlap violations.
+    """
+    cx = vars_arr[0::3]
+    cy = vars_arr[1::3]
+    r = vars_arr[2::3]
+
+    # Primary objective: maximize sum of radii => minimize -sum(r)
+    obj = -np.sum(r)
+
+    # Boundary violation penalties: circle must be inside [0,1]x[0,1]
+    # r - x <= 0, r + x - 1 <= 0, r - y <= 0, r + y - 1 <= 0
+    b_viol = np.concatenate([
+        np.maximum(0.0, r - cx),
+        np.maximum(0.0, r + cx - 1.0),
+        np.maximum(0.0, r - cy),
+        np.maximum(0.0, r + cy - 1.0)
+    ])
+
+    # Pairwise overlap penalties: dist(i,j) >= r_i + r_j
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, 1.0)  # Avoid zero division or self-comparison
+    r_sum = r[:, None] + r[None, :]
+    o_viol = np.maximum(0.0, r_sum - dist)
+    
+    # Only count each pair once (upper triangle)
+    triu_idx = np.triu_indices(n, k=1)
+    o_viol = o_viol[triu_idx]
+
+    # Add quadratic penalty terms scaled by mu
+    obj += mu * (np.sum(b_viol**2) + np.sum(o_viol**2))
+    return obj
+
+def solve_radii_lp(centers):
+    """
+    Given fixed centers, solves the LP to maximize sum of radii.
+    Constraints: r_i <= dist(i, boundary) and r_i + r_j <= dist(i, j)
+    """
+    n = centers.shape[0]
+    
+    # Max radius allowed by boundaries for each circle
+    limits = np.minimum(
+        np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    )
+    limits = np.maximum(limits, 0.0)
+
+    # Objective: maximize sum(r) => minimize -sum(r)
+    c = -np.ones(n)
+    bounds = [(0.0, lim) for lim in limits]
+
+    # Pairwise distance constraints: r_i + r_j <= dist(i,j)
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    b_ub = dists[idx_i, idx_j]
+
+    for k in range(m):
+        A_ub[k, idx_i[k]] = 1.0
+        A_ub[k, idx_j[k]] = 1.0
+
+    try:
+        # Use HiGHS solver for speed and robustness
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+
+    def generate_init(method='hex', seed_offset=0):
+        """Generates initial center positions."""
+        pts = []
+        if method == 'hex':
+            r0 = 0.095
+            y = r0
+            row = 0
+            while len(pts) < n:
+                shift = r0 if row % 2 == 1 else 0.0
+                x = r0 + shift
+                while x + r0 <= 1.0 and len(pts) < n:
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+                row += 1
+        else:
+            pts = rng.uniform(0.15, 0.85, (n, 2))
+        return np.array(pts[:n])
+
+    # Generate diverse initial configurations
+    inits = []
+    for _ in range(3):
+        inits.append(generate_init('hex'))
+    for _ in range(5):
+        base = generate_init('hex')
+        base += rng.uniform(-0.025, 0.025, base.shape)
+        inits.append(np.clip(base, 0.05, 0.95))
+    for _ in range(2):
+        inits.append(generate_init('rand'))
+
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+
+    # Bounds for optimization variables: x,y in [0,1], r in [1e-5, 0.5]
+    bounds_vars = [(0.0, 1.0), (0.0, 1.0), (1e-5, 0.5)] * n
+
+    # Optimize each initialization
+    for cfg in inits:
+        v0 = np.zeros(3 * n)
+        v0[0::3] = cfg[:, 0]
+        v0[1::3] = cfg[:, 1]
+        v0[2::3] = 0.08  # Feasible starting radius
+
+        # Stage 1: Gentle penalty to find a good basin without stiffness
+        res1 = minimize(
+            penalty_objective, v0, method='L-BFGS-B', bounds=bounds_vars,
+            args=(n, 500.0), options={'maxiter': 3000, 'ftol': 1e-12}
+        )
+
+        # Stage 2: High penalty to strictly enforce constraints
+        res2 = minimize(
+            penalty_objective, res1.x, method='L-BFGS-B', bounds=bounds_vars,
+            args=(n, 10000.0), options={'maxiter': 5000, 'ftol': 1e-14}
+        )
+
+        opt_c = res2.x[:2*n].reshape(n, 2)
+        
+        # Decouple radius assignment via LP for exact maximum feasible sum
+        radii, s = solve_radii_lp(opt_c)
+
+        if radii is not None and s > best_sum:
+            best_sum = s
+            best_centers = opt_c.copy()
+            best_radii = radii.copy()
+
+    # Fallback if all optimizations fail unexpectedly
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii = np.full(n, 0.09)
+        best_sum = np.sum(best_radii)
+
+    # Final safety scaling to guarantee strict validity within numerical tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+
+    # Apply scale with minimal margin for floating point safety
+    best_radii *= scale * 0.999999
+    best_sum = np.sum(best_radii)
+
+    return best_centers, best_radii, float(best_sum)
+```

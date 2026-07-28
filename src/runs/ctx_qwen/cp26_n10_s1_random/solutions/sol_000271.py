@@ -1,0 +1,227 @@
+# sol_000271 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000250 (state 61d3a642) state=427e495a sum of radii=0.260000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def compute_lp_data(centers, n, idx_i, idx_j):
+    """Prepares LP constraint bounds and RHS for fixed centers."""
+    wall = np.minimum(np.minimum(centers[:,0], 1.0-centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0-centers[:,1]))
+    bounds = [(0.0, max(w, 1e-9)) for w in wall]
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[idx_i, idx_j]
+    return bounds, b_ub
+
+def solve_lp(centers, n, idx_i, idx_j, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    bounds, b_ub = compute_lp_data(centers, n, idx_i, idx_j)
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return -res.fun, np.maximum(res.x, 0.0)
+    except Exception:
+        pass
+    return 0.0, np.zeros(n)
+
+def obj_single_circle(pos, idx, base_centers, n, idx_i, idx_j, A_ub):
+    """Objective for optimizing a single circle's position."""
+    c = base_centers.copy()
+    c[idx] = np.clip(pos, 1e-4, 1.0-1e-4)
+    s, _ = solve_lp(c, n, idx_i, idx_j, A_ub)
+    return -s
+
+def physics_simulate(centers, radii, steps=800):
+    """Vectorized force-directed simulation to spread circles and grow radii."""
+    n = len(radii)
+    vel = np.zeros_like(centers)
+    dt = 0.005
+    damp = 0.85
+    for _ in range(steps):
+        radii *= 1.00005
+        diff = centers[:, None, :] - centers[None, :, :]
+        dist = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dist, 1e9)
+        
+        overlap = np.maximum(0.0, radii[:, None] + radii[None, :] - dist)
+        force_mag = overlap * 120.0 / (dist + 1e-9)
+        f = np.sum(diff * force_mag[:, :, None], axis=1)
+        
+        # Wall repulsion
+        wall_f = np.zeros_like(centers)
+        mask_l = centers[:, 0] < radii
+        mask_r = centers[:, 0] > 1.0 - radii
+        mask_b = centers[:, 1] < radii
+        mask_t = centers[:, 1] > 1.0 - radii
+        wall_f[mask_l, 0] += (radii[mask_l] - centers[mask_l, 0]) * 250.0
+        wall_f[mask_r, 0] -= (centers[mask_r, 0] + radii[mask_r] - 1.0) * 250.0
+        wall_f[mask_b, 1] += (radii[mask_b] - centers[mask_b, 1]) * 250.0
+        wall_f[mask_t, 1] -= (centers[mask_t, 1] + radii[mask_t] - 1.0) * 250.0
+        
+        f += wall_f
+        vel = damp * vel + f * dt
+        centers += vel
+        centers = np.clip(centers, 0.001, 0.999)
+    return centers, radii
+
+def objective_joint(v, n):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraints_joint(v, n, idx_i, idx_j):
+    """Inequality constraints >= 0 for valid packing."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    c = np.concatenate([c, dx**2 + dy**2 - dr**2])
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    m = len(idx_i)
+    A_ub = np.zeros((m, n))
+    A_ub[np.arange(m), idx_i] = 1.0
+    A_ub[np.arange(m), idx_j] = 1.0
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # --- Phase 1: Diverse Initial Configurations ---
+    configs = []
+    
+    # 1. Hexagonal patterns
+    row_pats = [[6,5,6,5,4], [5,6,5,6,4], [6,6,4,6,4], [4,6,5,6,5], [5,5,6,5,5], [5,7,5,5,4]]
+    for pat in row_pats:
+        for r0 in [0.090, 0.098, 0.105]:
+            pts = []
+            y = r0
+            for i, cnt in enumerate(pat):
+                shift = r0 if i % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) >= n: break
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+            while len(pts) < n:
+                pts.append([rng.uniform(0.3, 0.7), rng.uniform(0.3, 0.7)])
+            cfg = np.array(pts[:n])
+            configs.append(cfg)
+            # Perturbed variants
+            cfg_p = cfg + rng.uniform(-0.02, 0.02, cfg.shape)
+            configs.append(np.clip(cfg_p, 0.05, 0.95))
+            
+    # 2. Corner-focused start
+    pts_corner = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+    pts_corner += [[0.5, 0.5]]
+    # Fill remaining with hex around corners
+    for i in range(21):
+        pts_corner.append([rng.uniform(0.15, 0.85), rng.uniform(0.15, 0.85)])
+    configs.append(np.array(pts_corner[:n]))
+    
+    # 3. Random starts
+    for _ in range(5):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    # --- Phase 2: Optimization Loop ---
+    bounds_opt = [(0.0, 1.0)]*(2*n) + [(1e-5, 0.5)]*n
+    
+    for cfg in configs:
+        # Physics pre-processing
+        c_sim, r_sim = physics_simulate(cfg.copy(), np.full(n, 0.08), steps=600)
+        
+        # SLSQP Joint Polish
+        x0 = np.concatenate([c_sim[:,0], c_sim[:,1], np.maximum(r_sim, 1e-4)])
+        try:
+            res = minimize(objective_joint, x0, args=(n, idx_i, idx_j), method='SLSQP', 
+                           bounds=bounds_opt,
+                           constraints={'type': 'ineq', 'fun': constraints_joint, 'args': (n, idx_i, idx_j)},
+                           options={'maxiter': 4000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+                s_lp, r_lp = solve_lp(c_opt, n, idx_i, idx_j, A_ub)
+                
+                # LP-Guided Local Search (Powell on each circle)
+                curr_c = c_opt.copy()
+                curr_s = s_lp
+                curr_r = r_lp
+                
+                for _ in range(3): # 3 passes over all circles
+                    for i in range(n):
+                        x0_circle = curr_c[i]
+                        res_c = minimize(obj_single_circle, x0_circle, args=(i, curr_c, n, idx_i, idx_j, A_ub),
+                                        method='Powell', options={'maxiter': 150, 'xatol': 1e-8, 'ftol': 1e-10})
+                        if np.isfinite(res_c.fun) and -res_c.fun > curr_s + 1e-7:
+                            curr_c[i] = res_c.x
+                            curr_s, curr_r = solve_lp(curr_c, n, idx_i, idx_j, A_ub)
+                            
+                if curr_s > best_sum:
+                    best_sum = curr_s
+                    best_c = curr_c.copy()
+                    best_r = curr_r.copy()
+        except Exception:
+            continue
+            
+    # --- Phase 3: Shake & Refine (Escape Local Minima) ---
+    if best_c is not None:
+        for shake_scale in [0.015, 0.008, 0.003]:
+            c_shake = best_c + rng.uniform(-shake_scale, shake_scale, best_c.shape)
+            c_shake = np.clip(c_shake, 0.05, 0.95)
+            
+            s_sh, r_sh = solve_lp(c_shake, n, idx_i, idx_j, A_ub)
+            curr_c = c_shake.copy()
+            curr_s = s_sh
+            curr_r = r_sh
+            
+            # Quick local search on shaken config
+            for _ in range(2):
+                for i in range(n):
+                    res_c = minimize(obj_single_circle, curr_c[i], args=(i, curr_c, n, idx_i, idx_j, A_ub),
+                                    method='Powell', options={'maxiter': 100, 'xatol': 1e-8, 'ftol': 1e-9})
+                    if np.isfinite(res_c.fun) and -res_c.fun > curr_s + 1e-7:
+                        curr_c[i] = res_c.x
+                        curr_s, curr_r = solve_lp(curr_c, n, idx_i, idx_j, A_ub)
+                        
+            if curr_s > best_sum:
+                best_sum = curr_s
+                best_c = curr_c.copy()
+                best_r = curr_r.copy()
+
+    # --- Phase 4: Final Safety Scaling ---
+    if best_c is None:
+        best_c = configs[0]
+        best_r = np.full(n, 0.085)
+        best_sum = np.sum(best_r)
+        
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    r_pair = best_r[:, None] + best_r[None, :]
+    
+    pair_dists = dists[idx_i, idx_j]
+    pair_rs = r_pair[idx_i, idx_j]
+    valid_pairs = pair_rs > 1e-12
+    if np.any(valid_pairs):
+        scale = min(scale, np.min(pair_dists[valid_pairs] / pair_rs[valid_pairs]))
+        
+    best_r *= scale * 0.9999998
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum

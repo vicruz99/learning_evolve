@@ -1,0 +1,201 @@
+# sol_000122 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000066 (state 7dd8b726) state=01147b9a sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def objective_eq(vars_array, n):
+    """Objective for equal-radius phase: minimize negative radius R"""
+    return -vars_array[-1]
+
+def constraints_eq(vars_array, n):
+    """Constraints for equal-radius phase: boundaries and pairwise non-overlap"""
+    R = vars_array[-1]
+    c = vars_array[:2*n].reshape(n, 2)
+    con = np.concatenate([
+        c[:, 0] - R,
+        1.0 - c[:, 0] - R,
+        c[:, 1] - R,
+        1.0 - c[:, 1] - R
+    ])
+    dx = c[:, 0:1] - c[:, 0:1].T
+    dy = c[:, 1:2] - c[:, 1:2].T
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    con = np.concatenate([con, d2[mask] - 4.0 * R**2])
+    return con
+
+def solve_radii_lp(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    limits = np.maximum(limits, 0.0)
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 0.01)
+
+def obj_joint(vars_array, n):
+    """Objective for joint phase: minimize negative sum of radii"""
+    return -np.sum(vars_array[2*n:])
+
+def con_joint(vars_array, n):
+    """Constraints for joint phase: boundaries and pairwise non-overlap"""
+    c = vars_array[:2*n].reshape(n, 2)
+    r = vars_array[2*n:]
+    con = np.concatenate([
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ])
+    dx = c[:, 0:1] - c[:, 0:1].T
+    dy = c[:, 1:2] - c[:, 1:2].T
+    d2 = dx**2 + dy**2
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    rs2 = rs**2
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    con = np.concatenate([con, d2[mask] - rs2[mask]])
+    return con
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    np.random.seed(42)
+    configs = []
+    
+    # 1. Rotated hexagonal lattices to explore boundary alignments
+    for rot in np.linspace(0, 0.5, 7):
+        pts = []
+        y = 0.09
+        row = 0
+        while len(pts) < n + 10:
+            shift = 0.09 if row % 2 == 1 else 0.0
+            x = 0.09 + shift
+            while x + 0.09 <= 1.0:
+                pts.append([x, y])
+                x += 0.18
+            y += 0.09 * np.sqrt(3)
+            row += 1
+        pts = np.array(pts[:n])
+        if rot > 0:
+            cos_t, sin_t = np.cos(rot), np.sin(rot)
+            pts = pts @ np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+            pts -= pts.min(axis=0)
+            pts /= pts.max(axis=0)
+            pts = pts * 0.8 + 0.1
+        configs.append(np.concatenate([pts.flatten(), [0.09]]))
+        
+    # 2. Perturbed uniform grids
+    for _ in range(5):
+        grid = np.linspace(0.15, 0.85, 5)
+        pts = np.array([[x, y] for y in grid for x in grid][:n])
+        pts += np.random.uniform(-0.03, 0.03, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        configs.append(np.concatenate([pts.flatten(), [0.09]]))
+
+    bounds_eq = [(0.0, 1.0)] * (2 * n) + [(0.08, 0.12)]
+    
+    # Phase 1: Optimize centers for equal-radius layout, then polish with LP
+    for x0 in configs:
+        try:
+            res = minimize(objective_eq, x0, method='SLSQP', bounds=bounds_eq,
+                           constraints={'type': 'ineq', 'fun': constraints_eq, 'args': (n,)},
+                           options={'maxiter': 3000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_opt = res.x[:2*n].reshape(n, 2)
+                r_opt = solve_radii_lp(c_opt)
+                s = np.sum(r_opt)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Joint center-radius optimization from best found, followed by LP polish
+    if best_centers is not None:
+        bounds_joint = [(0.0, 1.0)] * (2 * n) + [(1e-4, 0.5)] * n
+        x0_joint = np.concatenate([best_centers.flatten(), best_radii])
+        
+        for trial in range(4):
+            v0 = x0_joint.copy()
+            if trial > 0:
+                v0[:2*n] += np.random.uniform(-0.005, 0.005, 2*n)
+                v0[:2*n] = np.clip(v0[:2*n], 0.0, 1.0)
+                v0[2*n:] *= np.random.uniform(0.95, 1.05, n)
+                
+            try:
+                res = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_joint,
+                               constraints={'type': 'ineq', 'fun': con_joint, 'args': (n,)},
+                               options={'maxiter': 5000, 'ftol': 1e-13})
+                if np.isfinite(res.fun):
+                    c_final = res.x[:2*n].reshape(n, 2)
+                    r_final = solve_radii_lp(c_final)
+                    s_final = np.sum(r_final)
+                    if s_final > best_sum:
+                        best_sum = s_final
+                        best_centers = c_final.copy()
+                        best_radii = r_final.copy()
+            except Exception:
+                continue
+                
+    # Fallback if optimization fails
+    if best_centers is None:
+        pts = []
+        for i in range(5):
+            for j in range(5):
+                pts.append([0.1 + j*0.2, 0.1 + i*0.2])
+        pts.append([0.5, 0.5])
+        best_centers = np.array(pts[:n])
+        best_radii = np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+        
+    # Strict numerical safety scaling to satisfy 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r < 1e-9: continue
+        scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if rs < 1e-9: continue
+            scale = min(scale, d/rs)
+            
+    best_radii *= scale * 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

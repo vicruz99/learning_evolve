@@ -1,0 +1,155 @@
+# sol_000154 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000140 (state 07ed95ff) state=fe72a514 sum of radii=2.501974 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def generate_hex_configs(n, num_configs):
+    """Generates multiple initial configurations based on a hexagonal lattice."""
+    configs = []
+    base_pts = []
+    y = 0.0
+    row = 0
+    # Generate a larger hex grid to have enough candidates
+    while len(base_pts) < n + 10:
+        x = 0.0
+        shift = 1.0 if row % 2 == 1 else 0.0
+        while x + 2 <= 12 and len(base_pts) < n + 10:
+            base_pts.append([x + shift, y])
+            x += 2.0
+        y += np.sqrt(3)
+        row += 1
+        
+    base_pts = np.array(base_pts[:n])
+    # Normalize to fit comfortably inside [0,1]^2
+    base_pts -= base_pts.min(axis=0)
+    scale = 0.85 / base_pts.max(axis=0).max()
+    base_pts = base_pts * scale + (1.0 - scale) / 2.0
+    configs.append(base_pts)
+    
+    rng = np.random.default_rng(42)
+    for _ in range(num_configs - 1):
+        pert = base_pts + rng.uniform(-0.05, 0.05, (n, 2))
+        configs.append(np.clip(pert, 0.05, 0.95))
+    return configs
+
+def solve_mmd(centers_init, n):
+    """Optimizes centers to maximize the equal radius r (Maximum Minimum Distance problem)."""
+    def objective(v):
+        return -v[-1]
+        
+    def constraints(v):
+        c = v[:2*n].reshape(n, 2)
+        r = v[-1]
+        cons = [
+            c[:, 0] - r, 
+            1.0 - c[:, 0] - r, 
+            c[:, 1] - r, 
+            1.0 - c[:, 1] - r
+        ]
+        # Pairwise squared distances >= 4r^2
+        dx = c[:, 0, np.newaxis] - c[:, 0]
+        dy = c[:, 1, np.newaxis] - c[:, 1]
+        d_sq = dx**2 + dy**2
+        np.fill_diagonal(d_sq, 1.0)
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        cons.append(d_sq[mask] - 4.0 * r**2)
+        return np.concatenate(cons)
+        
+    x0 = np.concatenate([centers_init.flatten(), [0.09]])
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)]
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                   constraints=cons_dict, options={'maxiter': 8000, 'ftol': 1e-14})
+    return res.x[:2*n].reshape(n, 2), res.x[-1]
+
+def solve_radii_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    diffs = centers[idx_i] - centers[idx_j]
+    dists = np.sqrt(np.sum(diffs**2, axis=1))
+    
+    # Boundary limits for each circle
+    limits = np.minimum(
+        np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    )
+    bounds = [(0.0, max(0.0, lim)) for lim in limits]
+    
+    # Pairwise constraints: r_i + r_j <= dist(i,j)
+    A_ub = np.zeros((len(idx_i), n))
+    A_ub[np.arange(len(idx_i)), idx_i] = 1.0
+    A_ub[np.arange(len(idx_i)), idx_j] = 1.0
+    b_ub = dists
+    
+    c_obj = -np.ones(n)
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.zeros(n), 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: MMD Optimization on diverse hex-based starts
+    configs = generate_hex_configs(n, 8)
+    for cfg in configs:
+        try:
+            c_opt, r_eq = solve_mmd(cfg, n)
+            r_lp, s_lp = solve_radii_lp(c_opt, n)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_centers = c_opt.copy()
+                best_radii = r_lp.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Stochastic refinement alternating LP and center perturbation
+    rng = np.random.default_rng(123)
+    if best_centers is not None:
+        for _ in range(200):
+            c_pert = best_centers + rng.normal(0, 0.003, (n, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            r_p, s_p = solve_radii_lp(c_pert, n)
+            if s_p > best_sum:
+                best_sum = s_p
+                best_centers = c_pert.copy()
+                best_radii = r_p.copy()
+                
+    # Phase 3: Numerical safety scaling
+    if best_radii is not None:
+        scale = 1.0
+        for i in range(n):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+            if r > 1e-9:
+                scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(best_centers[i,0]-best_centers[j,0], 
+                             best_centers[i,1]-best_centers[j,1])
+                rs = best_radii[i] + best_radii[j]
+                if rs > 1e-9:
+                    scale = min(scale, d/rs)
+        # Apply scaling with a tiny buffer to strictly satisfy checker tolerance
+        best_radii *= scale * 0.9999995
+        best_sum = float(np.sum(best_radii))
+        
+    # Fallback (should not be reached with valid optimization)
+    if best_centers is None:
+        best_centers = np.tile(np.linspace(0.1, 0.9, 5), 5).reshape(25, 1)
+        best_centers = np.hstack([best_centers, np.repeat(np.linspace(0.1, 0.9, 5), 5).reshape(25, 1)])
+        best_centers = np.vstack([best_centers, [[0.5, 0.5]]])
+        best_radii = np.full(n, 0.09)
+        best_sum = float(np.sum(best_radii))
+        
+    return best_centers, best_radii, best_sum

@@ -1,0 +1,198 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a multi-stage optimization pipeline that combines diverse geometric initializations, joint nonlinear optimization, exact linear programming refinement, and stochastic local search.
+
+1. **Initialization Diversity**: Generate hexagonal lattices with varying row distributions, scales, and rotations. Add uniform random configurations to avoid symmetry traps.
+2. **Joint SLSQP Optimization**: For each initialization, optimize centers and radii simultaneously using SLSQP. This method handles the nonlinear distance constraints directly and often finds high-quality local arrangements.
+3. **LP Refinement**: Fix the optimized centers and solve a linear program to maximize $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and boundary constraints. The `highs` solver is highly efficient for this small-scale LP.
+4. **Stochastic Local Search**: Perturb circles one-by-one with a decaying step size. After each perturbation, re-solve the LP. Accept the move if the sum of radii increases. This escapes local minima that gradient methods might miss.
+5. **Strict Feasibility Scaling**: Apply a conservative scaling factor to all radii to guarantee strict compliance with the $10^{-12}$ numerical tolerance in the validator.
+
+All helper functions are defined at the top level with no closures or lambdas to comply with constraints. The combination of LP evaluation and local search is particularly effective for unequal circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def _compute_lp(centers, n, triu_i, triu_j, A_ub_struct):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    dx = centers[:, np.newaxis, 0] - centers[np.newaxis, :, 0]
+    dy = centers[:, np.newaxis, 1] - centers[np.newaxis, :, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, 1e9)
+    b_ub = dists[triu_i, triu_j]
+    
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(l, 1e-9)) for l in lims]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub_struct, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def _local_search(centers, n, triu_i, triu_j, A_ub_struct, rng):
+    """Perturbs centers iteratively and evaluates via LP to find better packings."""
+    best_c = centers.copy()
+    r_best, s_best = _compute_lp(best_c, n, triu_i, triu_j, A_ub_struct)
+    step = 0.025
+    
+    for _ in range(1000):
+        i = rng.integers(n)
+        old_pos = best_c[i].copy()
+        best_c[i] += rng.uniform(-step, step, 2)
+        best_c[i] = np.clip(best_c[i], 1e-4, 1.0 - 1e-4)
+        
+        r_try, s_try = _compute_lp(best_c, n, triu_i, triu_j, A_ub_struct)
+        if s_try > s_best + 1e-9:
+            s_best = s_try
+            r_best = r_try
+            step *= 0.998
+        else:
+            best_c[i] = old_pos
+            if rng.random() < 0.08:
+                step *= 0.95
+    return best_c, r_best, s_best
+
+def _obj_slsqp(x, n):
+    """Objective for SLSQP: maximize sum of radii."""
+    return -np.sum(x[2*n:])
+
+def _cons_slsqp(x, n, triu_i, triu_j):
+    """Inequality constraints >= 0 for valid packing in SLSQP."""
+    cx = x[:n]
+    cy = x[n:2*n]
+    r = x[2*n:]
+    c = np.empty(4*n + len(triu_i))
+    c[:n] = cx - r
+    c[n:2*n] = 1.0 - cx - r
+    c[2*n:3*n] = cy - r
+    c[3*n:4*n] = 1.0 - cy - r
+    
+    cx_m = cx[:, None] - cx[None, :]
+    cy_m = cy[:, None] - cy[None, :]
+    dists = np.sqrt(cx_m**2 + cy_m**2)
+    r_sum = r[:, None] + r[None, :]
+    c[4*n:] = dists[triu_i, triu_j] - r_sum[triu_i, triu_j]
+    return c
+
+def _slsqp_opt(centers, n, triu_i, triu_j, A_ub_struct, rng):
+    """Jointly optimizes centers and radii using SLSQP."""
+    x0 = np.zeros(3*n)
+    x0[:n] = centers[:, 0]
+    x0[n:2*n] = centers[:, 1]
+    x0[2*n:] = np.full(n, 0.08)
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': _cons_slsqp, 'args': (n, triu_i, triu_j)}
+    
+    try:
+        res = minimize(_obj_slsqp, x0, args=(n,), method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13})
+        if np.isfinite(res.fun):
+            c_opt = res.x[:2*n].reshape(n, 2)
+            return c_opt
+    except Exception:
+        pass
+    return centers
+
+def _make_hex(pat, r0, n):
+    """Generates a hexagonal lattice initialization."""
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(pat):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) < n:
+                pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    n_pairs = len(triu_i)
+    
+    A_ub_struct = np.zeros((n_pairs, n))
+    for k, (i, j) in enumerate(zip(triu_i, triu_j)):
+        A_ub_struct[k, i] = 1.0
+        A_ub_struct[k, j] = 1.0
+        
+    rng = np.random.default_rng(42)
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    configs = []
+    row_pats = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], [4, 6, 6, 6, 4],
+        [6, 6, 5, 5, 4], [5, 6, 4, 6, 5], [5, 4, 6, 5, 6], [6, 5, 5, 6, 4]
+    ]
+    
+    # Generate hexagonal base configurations
+    for pat in row_pats:
+        for r0 in [0.095, 0.100, 0.105]:
+            cfg = _make_hex(pat, r0, n)
+            cfg = np.clip(cfg, 0.05, 0.95)
+            configs.append(cfg)
+            
+    # Generate rotated hex configurations to break symmetry
+    for cfg_base in configs[:3]:
+        for angle in [0.1, -0.1, 0.15, -0.15]:
+            cos_t, sin_t = np.cos(angle), np.sin(angle)
+            rot = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+            cfg_rot = cfg_base @ rot
+            cfg_rot = (cfg_rot - cfg_rot.min(axis=0)) / (cfg_rot.max(axis=0) - cfg_rot.min(axis=0))
+            cfg_rot = cfg_rot * 0.88 + 0.06
+            configs.append(np.clip(cfg_rot, 0.05, 0.95))
+            
+    # Add random dense starts
+    for _ in range(6):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    # Optimization pipeline over diverse starts
+    for cfg in configs:
+        # Phase 1: SLSQP joint optimization
+        c_slqp = _slsqp_opt(cfg, n, triu_i, triu_j, A_ub_struct, rng)
+        r_slqp, s_slqp = _compute_lp(c_slqp, n, triu_i, triu_j, A_ub_struct)
+        
+        # Phase 2: Local perturbation search
+        c_ls, r_ls, s_ls = _local_search(c_slqp, n, triu_i, triu_j, A_ub_struct, rng)
+        
+        if s_ls > best_sum:
+            best_sum = s_ls
+            best_centers = c_ls.copy()
+            best_radii = r_ls.copy()
+            
+    # Fallback safety net
+    if best_centers is None:
+        best_centers = np.clip(_make_hex([5, 6, 5, 6, 4], 0.09, n), 0.1, 0.9)
+        best_radii, best_sum = _compute_lp(best_centers, n, triu_i, triu_j, A_ub_struct)
+        
+    # Final safety scaling to strictly satisfy 1e-12 validator tolerance
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(n):
+        if r[i] > 1e-12:
+            scale = min(scale, c[i,0]/r[i], (1-c[i,0])/r[i], c[i,1]/r[i], (1-c[i,1])/r[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(c[i]-c[j])
+            r_sum = r[i] + r[j]
+            if r_sum > 1e-12:
+                scale = min(scale, d / r_sum)
+                
+    r *= scale * 0.9999995
+    best_sum = float(np.sum(r))
+    best_radii = r
+    
+    return best_centers, best_radii, best_sum
+```

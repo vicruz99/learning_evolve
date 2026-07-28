@@ -1,0 +1,185 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we leverage a hybrid approach combining geometric initialization, force-directed relaxation for basin exploration, and a Linear Programming (LP) driven local search that directly optimizes the target objective.
+
+Key improvements over previous attempts:
+1. **LP-Driven Objective**: For any fixed set of centers, the optimal radii maximizing the sum are found exactly via a linear program (`scipy.optimize.linprog`). This avoids the approximations and convergence issues of SLSQP on non-convex constraints.
+2. **Force-Directed Relaxation**: Before LP evaluation, we run a short force-directed simulation that pushes circles apart. This efficiently explores the geometric landscape and escapes initial clustering, providing much better starting points for the LP.
+3. **Aggressive LP Local Search**: We perform a simulated-annealing-like random walk over the centers. Each step evaluates the LP to see if the move increases the sum of radii. The step size anneals over time, allowing coarse exploration followed by fine-tuning.
+4. **Diverse & Structured Starts**: We generate hexagonal lattice patterns with various row distributions, perturbed grids, and random configurations. Each is processed through relaxation and local search.
+5. **Strict Numerical Safety**: After optimization, we compute a global scaling factor that guarantees all boundary and pairwise distance constraints satisfy the `1e-12` tolerance strictly.
+
+This strategy directly targets the non-linear objective through exact sub-problem solving (LP) and robust derivative-free search, consistently pushing past local optima found by gradient-based methods.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    m = n*(n-1)//2
+    A = np.zeros((m, n))
+    b = np.zeros(m)
+    k = 0
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            b[k] = d
+            k += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-5), 0.0
+
+def force_relax(centers, n, steps=800, dt=0.008):
+    """Force-directed relaxation to spread circles apart."""
+    c = centers.copy()
+    for _ in range(steps):
+        forces = np.zeros_like(c)
+        for i in range(n):
+            for d in range(2):
+                dist_wall = min(c[i, d], 1.0 - c[i, d])
+                forces[i, d] -= 0.8 / (dist_wall + 0.02)**2
+                
+            for j in range(i+1, n):
+                diff = c[i] - c[j]
+                dist = np.hypot(diff[0], diff[1])
+                if dist < 0.25:
+                    f = 1.5 / (dist + 0.001)**2
+                    dir_vec = diff / (dist + 1e-8)
+                    forces[i] += dir_vec * f
+                    forces[j] -= dir_vec * f
+                    
+        c += forces * dt
+        c = np.clip(c, 0.002, 0.998)
+        dt *= 0.999
+    return c
+
+def lp_local_search(centers, n, rng, steps=6000, init_step=0.015):
+    """Derivative-free hill climbing optimizing centers by LP-evaluated radii sum."""
+    c = centers.copy()
+    r, val = solve_lp(c)
+    best_c, best_r, best_val = c.copy(), r.copy(), val
+    
+    step = init_step
+    for it in range(steps):
+        i = rng.integers(n)
+        trial_c = c.copy()
+        trial_c[i] += rng.uniform(-step, step, 2)
+        trial_c[i] = np.clip(trial_c[i], 0.002, 0.998)
+        
+        r_t, val_t = solve_lp(trial_c)
+        if val_t > best_val + 1e-7:
+            c = trial_c
+            best_c = c.copy()
+            best_r = r_t.copy()
+            best_val = val_t
+        elif rng.random() < 0.005:
+            best_c = trial_c.copy()
+            best_r = r_t.copy()
+            best_val = val_t
+            c = trial_c
+            
+        step *= 0.9996
+    return best_c, best_r, best_val
+
+def generate_hex(rows, r0):
+    """Generates a hexagonal lattice initialization with specified row counts."""
+    pts = []
+    y = r0
+    for i, cnt in enumerate(rows):
+        shift = r0 if i % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) < 26:
+                pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+    return np.array(pts[:26])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 7, 5, 5, 4],
+        [5, 5, 5, 5, 6], [5, 4, 6, 5, 6], [6, 4, 5, 6, 5],
+        [7, 5, 6, 8], [6, 6, 6, 8], [5, 5, 8, 8]
+    ]
+    
+    configs = []
+    for p in patterns:
+        if sum(p) < n: continue
+        for r0 in [0.09, 0.095, 0.10, 0.105]:
+            cfg = generate_hex(p, r0)
+            configs.append(np.clip(cfg, 0.05, 0.95))
+            
+    for _ in range(12):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    for cfg in configs:
+        # 1. Force relaxation to find good geometric arrangement
+        c_relax = force_relax(cfg, n, steps=600, dt=0.006)
+        
+        # 2. LP to get initial radii for relaxed config
+        r_lp, s_lp = solve_lp(c_relax)
+        if s_lp > best_sum:
+            best_sum = s_lp
+            best_centers = c_relax.copy()
+            best_radii = r_lp.copy()
+            
+    # 3. Aggressive LP-Driven Local Search
+    if best_centers is not None:
+        c_opt, r_opt, s_opt = lp_local_search(best_centers, n, rng, steps=7000, init_step=0.018)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_centers = c_opt
+            best_radii = r_opt
+            
+        # 4. Multiple restarts from perturbed best to escape remaining local minima
+        for _ in range(18):
+            pert = best_centers + rng.uniform(-0.004, 0.004, best_centers.shape)
+            pert = np.clip(pert, 0.05, 0.95)
+            c2, r2, s2 = lp_local_search(pert, n, rng, steps=3500, init_step=0.012)
+            if s2 > best_sum:
+                best_sum = s2
+                best_centers = c2
+                best_radii = r2
+                
+    # 5. Strict numerical safety scaling to guarantee validation tolerance
+    scale = 1.0
+    for i in range(n):
+        if best_radii[i] > 1e-12:
+            scale = min(scale, best_centers[i,0]/best_radii[i], (1.0-best_centers[i,0])/best_radii[i],
+                        best_centers[i,1]/best_radii[i], (1.0-best_centers[i,1])/best_radii[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(best_centers[i]-best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

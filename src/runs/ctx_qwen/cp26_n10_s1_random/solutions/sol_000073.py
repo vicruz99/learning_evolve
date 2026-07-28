@@ -1,0 +1,148 @@
+# sol_000073 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000052 (state e51e4326) state=15074c51 sum of radii=2.303923 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_penalty(vars_array, n, mu, triu_i, triu_j):
+    """
+    Computes the objective (negative sum of radii) plus penalty for violations.
+    """
+    c = vars_array[:2*n].reshape(n, 2)
+    r = vars_array[2*n:]
+    
+    # Objective: maximize sum(r) => minimize -sum(r)
+    obj = -np.sum(r)
+    pen = 0.0
+    
+    # Boundary penalties: circles must stay within [0, 1]
+    # Left: x - r >= 0
+    pen += np.sum(np.maximum(0.0, r - c[:, 0])**2)
+    # Right: 1 - x - r >= 0
+    pen += np.sum(np.maximum(0.0, c[:, 0] + r - 1.0)**2)
+    # Bottom: y - r >= 0
+    pen += np.sum(np.maximum(0.0, r - c[:, 1])**2)
+    # Top: 1 - y - r >= 0
+    pen += np.sum(np.maximum(0.0, c[:, 1] + r - 1.0)**2)
+    
+    # Overlap penalties: dist(i,j) >= r_i + r_j
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.maximum(np.sum(diff**2, axis=2), 1e-12))
+    np.fill_diagonal(dists, np.inf)
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    violations = np.maximum(0.0, r_sum[triu_i, triu_j] - dists[triu_i, triu_j])**2
+    pen += np.sum(violations)
+    
+    return obj + mu * pen
+
+def get_hex_init(n, perturb, rng):
+    """Generates a hexagonal lattice initialization with optional perturbation."""
+    pts = []
+    r0 = 0.08
+    dy = np.sqrt(3) * r0
+    dx = 2.0 * r0
+    y = r0
+    row = 0
+    while len(pts) < n:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x + r0 <= 1.0 and len(pts) < n:
+            pts.append([x, y])
+            x += dx
+        y += dy
+        row += 1
+        
+    pts = np.array(pts[:n])
+    if perturb > 0:
+        pts += rng.uniform(-perturb, perturb, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    triu_i, triu_j = np.triu_indices(n, k=1)
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-5, 0.5)] * n
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    rng = np.random.default_rng(42)
+    configs = []
+    
+    # 1. Strict hexagonal lattice
+    configs.append(get_hex_init(n, perturb=0.0, rng=rng))
+    # 2-4. Perturbed hexagonal lattices to escape symmetry
+    for _ in range(3):
+        configs.append(get_hex_init(n, perturb=0.025, rng=rng))
+        
+    # 5. Regular grid alternative
+    grid_pts = []
+    for i in range(6):
+        for j in range(5):
+            if len(grid_pts) < n:
+                grid_pts.append([0.08 + i*0.15, 0.08 + j*0.18])
+    configs.append(np.array(grid_pts[:n]))
+    
+    # 6-8. Randomized dense starts
+    for _ in range(3):
+        r_start = rng.uniform(0.06, 0.09, n)
+        cx = rng.uniform(r_start, 1.0 - r_start)
+        cy = rng.uniform(r_start, 1.0 - r_start)
+        configs.append(np.column_stack((cx, cy)))
+        
+    # Optimize with increasing penalty weights for robust convergence
+    penalty_weights = [2000.0, 5000.0, 10000.0]
+    
+    for mu in penalty_weights:
+        for cfg in configs:
+            x0 = np.concatenate([cfg.flatten(), np.full(n, 0.06)])
+            try:
+                res = minimize(
+                    compute_penalty, 
+                    x0, 
+                    args=(n, mu, triu_i, triu_j),
+                    method='L-BFGS-B', 
+                    bounds=bounds,
+                    options={'maxiter': 15000, 'ftol': 1e-14}
+                )
+                
+                if np.isfinite(res.fun):
+                    c_opt = res.x[:2*n].reshape(n, 2)
+                    r_opt = res.x[2*n:]
+                    s = np.sum(r_opt)
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = c_opt.copy()
+                        best_radii = r_opt.copy()
+            except Exception:
+                continue
+                
+    # Fallback safety
+    if best_centers is None:
+        best_centers = configs[0]
+        best_radii = np.full(n, 0.05)
+        best_sum = 1.3
+        
+    # Final strict validity scaling to satisfy 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r < 1e-9: continue
+        m = min(x, 1.0 - x, y, 1.0 - y)
+        if m < r: scale = min(scale, m / r)
+        
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(best_centers[i] - best_centers[j])
+            rs = best_radii[i] + best_radii[j]
+            if d < rs: scale = min(scale, d / rs)
+            
+    best_radii *= scale * 0.99999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

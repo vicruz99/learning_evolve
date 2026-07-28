@@ -1,0 +1,276 @@
+# sol_000346 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000299 (state 3e7613e7) state=f14d0608 sum of radii=2.628314 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, k=1)
+M_PAIRS = len(TRIU_I)
+
+# Precompute LP constraint matrix structure (constant)
+A_LP = np.zeros((M_PAIRS, N))
+for k, (i, j) in enumerate(zip(TRIU_I, TRIU_J)):
+    A_LP[k, i] = 1.0
+    A_LP[k, j] = 1.0
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lims = np.maximum(lims, 1e-9)
+    bounds = [(0.0, l) for l in lims]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    b_ub = dists[TRIU_I, TRIU_J]
+    
+    try:
+        res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun, res
+    except Exception:
+        pass
+    return np.full(N, 1e-6), 0.0, None
+
+def get_lp_gradient(centers, lp_res):
+    """Computes gradient of LP objective w.r.t centers using dual variables."""
+    grad = np.zeros((N, 2))
+    if lp_res is None or not lp_res.success:
+        return grad
+        
+    try:
+        marg = getattr(lp_res, 'marginals', None)
+        if marg is None: return grad
+        ineqlin = getattr(marg, 'ineqlin', None)
+        if ineqlin is None: return grad
+        lams = ineqlin[:M_PAIRS]
+    except Exception:
+        return grad
+        
+    active = lams > 1e-7
+    if not np.any(active):
+        return grad
+        
+    ii = TRIU_I[active]
+    jj = TRIU_J[active]
+    lam_vals = lams[active]
+    
+    dx = centers[ii, 0] - centers[jj, 0]
+    dy = centers[ii, 1] - centers[jj, 1]
+    dist = np.hypot(dx, dy)
+    dist_safe = np.where(dist > 1e-8, dist, 1.0)
+    
+    fx = lam_vals * dx / dist_safe
+    fy = lam_vals * dy / dist_safe
+    
+    np.add.at(grad[:, 0], ii, fx)
+    np.add.at(grad[:, 1], ii, fy)
+    np.add.at(grad[:, 0], jj, -fx)
+    np.add.at(grad[:, 1], jj, -fy)
+    return grad
+
+def obj_grad(c_flat):
+    """Objective and gradient for center optimization via LP duals."""
+    c = c_flat.reshape(N, 2)
+    r, s, res = solve_lp(c)
+    if r is None:
+        return 1e6, np.zeros_like(c_flat)
+    grad = get_lp_gradient(c, res)
+    return -s, -grad.flatten()
+
+def joint_obj(v):
+    return -np.sum(v[2*N:])
+
+def joint_cons(v):
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    dx = x[TRIU_I] - x[TRIU_J]
+    dy = y[TRIU_I] - y[TRIU_J]
+    dr = r[TRIU_I] + r[TRIU_J]
+    c = np.concatenate([c, dx**2 + dy**2 - dr**2])
+    return c
+
+def generate_starts(rng):
+    starts = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [6,6,4,6,4],
+        [5,5,6,5,5], [6,4,6,4,6], [5,6,6,5,4], [6,5,4,6,5],
+        [5,5,5,5,6], [6,6,6,4,4], [4,5,6,5,6], [5,4,6,5,6],
+        [7,6,5,6,2], [8,6,5,5,2], [9,5,5,5,2], [10,5,5,4,2]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != N: continue
+        pts = []
+        r0 = 0.095
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx%2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= N: break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3)
+        pts = np.array(pts[:N])
+        mn, mx = pts.min(axis=0), pts.max(axis=0)
+        span = mx - mn + 1e-9
+        pts = (pts - mn) / span * 0.75 + 0.125
+        starts.append(pts)
+        
+        for _ in range(4):
+            p = pts + rng.uniform(-0.03, 0.03, pts.shape)
+            starts.append(np.clip(p, 0.05, 0.95))
+            
+    for _ in range(10):
+        starts.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    for _ in range(5):
+        pts = rng.uniform(0.15, 0.85, (N, 2))
+        corners = [[0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]]
+        for i, c in enumerate(corners):
+            pts[i] = c + rng.uniform(-0.05, 0.05, 2)
+        starts.append(np.clip(pts, 0.05, 0.95))
+        
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_c = [(1e-4, 1.0 - 1e-4)] * (2 * N)
+    starts = generate_starts(rng)
+    
+    # Phase 1: Gradient ascent with L-BFGS-B on diverse starts
+    for cfg in starts:
+        c0 = np.clip(cfg, 1e-3, 1.0 - 1e-3)
+        try:
+            res = minimize(obj_grad, c0.flatten(), method='L-BFGS-B', jac=True, bounds=bounds_c,
+                           options={'maxiter': 3000, 'ftol': 1e-13, 'gtol': 1e-10})
+            if np.isfinite(res.fun):
+                c_opt = res.x.reshape(N, 2)
+                r_opt, s_opt, _ = solve_lp(c_opt)
+                if r_opt is not None and s_opt > best_sum:
+                    best_sum = s_opt
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+        except Exception:
+            continue
+            
+    if best_centers is None:
+        best_centers = starts[0]
+        best_radii, best_sum, _ = solve_lp(best_centers)
+
+    # Phase 1b: Iterative refinement via gradient ascent on perturbations
+    for _ in range(4):
+        c_pert = np.clip(best_centers + rng.uniform(-0.012, 0.012, best_centers.shape), 1e-3, 1.0-1e-3)
+        try:
+            res = minimize(obj_grad, c_pert.flatten(), method='L-BFGS-B', jac=True, bounds=bounds_c,
+                           options={'maxiter': 2000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_opt = res.x.reshape(N, 2)
+                r_opt, s_opt, _ = solve_lp(c_opt)
+                if r_opt is not None and s_opt > best_sum:
+                    best_sum = s_opt
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Single-circle Jiggle Search
+    curr_c = best_centers.copy()
+    curr_r, curr_s, _ = solve_lp(curr_c)
+    step = 0.025
+    
+    for it in range(3000):
+        idx = rng.integers(N)
+        old = curr_c[idx].copy()
+        
+        move = rng.uniform(-step, step, 2)
+        new_pos = np.clip(curr_c[idx] + move, 1e-3, 1.0 - 1e-3)
+        curr_c[idx] = new_pos
+        
+        r_try, s_try, _ = solve_lp(curr_c)
+        if s_try > curr_s + 1e-8:
+            curr_s = s_try
+            curr_r = r_try.copy()
+            step *= 1.005
+            if curr_s > best_sum:
+                best_sum = curr_s
+                best_centers = curr_c.copy()
+                best_radii = curr_r.copy()
+        else:
+            curr_c[idx] = old
+            step *= 0.996
+            
+    # Phase 3: Pairwise Jiggle for resolving tight clusters
+    for it in range(2000):
+        i, j = rng.choice(N, 2, replace=False)
+        old_i, old_j = curr_c[i].copy(), curr_c[j].copy()
+        
+        move_i = rng.uniform(-step/2, step/2, 2)
+        move_j = rng.uniform(-step/2, step/2, 2)
+        
+        curr_c[i] = np.clip(curr_c[i] + move_i, 1e-3, 1.0 - 1e-3)
+        curr_c[j] = np.clip(curr_c[j] + move_j, 1e-3, 1.0 - 1e-3)
+        
+        r_try, s_try, _ = solve_lp(curr_c)
+        if s_try > curr_s + 1e-8:
+            curr_s = s_try
+            curr_r = r_try.copy()
+            step *= 1.002
+            if curr_s > best_sum:
+                best_sum = curr_s
+                best_centers = curr_c.copy()
+                best_radii = curr_r.copy()
+        else:
+            curr_c[i], curr_c[j] = old_i, old_j
+            step *= 0.997
+            
+    # Phase 4: SLSQP Joint Polish
+    bounds_slqp = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    for _ in range(3):
+        c_pert = np.clip(best_centers + rng.uniform(-0.005, 0.005, best_centers.shape), 1e-3, 1.0-1e-3)
+        r_pert = best_radii * 0.995
+        v0 = np.concatenate([c_pert[:, 0], c_pert[:, 1], r_pert])
+        
+        try:
+            res_j = minimize(joint_obj, v0, method='SLSQP', bounds=bounds_slqp,
+                             constraints={'type': 'ineq', 'fun': joint_cons},
+                             options={'maxiter': 4000, 'ftol': 1e-13})
+            if np.isfinite(res_j.fun):
+                c_j = np.column_stack((res_j.x[:N], res_j.x[N:2*N]))
+                r_j, s_j, _ = solve_lp(c_j)
+                if r_j is not None and s_j > best_sum:
+                    best_sum = s_j
+                    best_centers = c_j.copy()
+                    best_radii = r_j.copy()
+        except Exception:
+            continue
+
+    # Phase 5: Strict Safety Scaling
+    scale = 1.0
+    for i in range(N):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

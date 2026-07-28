@@ -1,0 +1,210 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.628, I will focus on a more robust optimization pipeline that directly maximizes the LP-relaxed sum of radii. The key insights are:
+1. **LP as Exact Inner Solver**: For any fixed set of centers, the maximum sum of radii is given exactly by a linear program. This avoids heuristic radius assignment and guarantees optimality for fixed positions.
+2. **Derivative-Free Outer Optimization**: The LP objective is piecewise-linear and concave, making gradient-based methods unreliable. I will use `Nelder-Mead` for full-vector optimization, combined with iterative perturbation to escape local minima.
+3. **Coordinate-wise Refinement**: After global perturbation, I will perform coordinate ascent (optimizing one circle's position at a time). This reduces dimensionality to 2 per step, allowing the optimizer to navigate the non-smooth landscape more effectively and squeeze out remaining slack.
+4. **Diverse Initializations**: I'll generate multiple hexagonal lattice patterns with varying row counts and perturbations, plus random starts, to cover different topological configurations (e.g., corner-heavy vs center-heavy packings).
+5. **Strict Validity & Safety**: A final scaling step ensures all constraints are satisfied within the validator's `1e-12` tolerance, accounting for floating-point precision limits.
+
+This approach systematically explores the configuration space while leveraging the exact LP formulation to maximize the objective at each step.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def build_lp_matrix(n):
+    """Builds the constant inequality matrix for the LP radius solver."""
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    k = 0
+    for i in range(n):
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            k += 1
+    return A
+
+def eval_lp(centers, A_ub, n):
+    """Solves LP to maximize sum of radii for fixed centers. Returns (sum_r, radii)."""
+    m = A_ub.shape[0]
+    b = np.empty(m)
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        b[k] = x; k += 1
+        b[k] = 1.0 - x; k += 1
+        b[k] = y; k += 1
+        b[k] = 1.0 - y; k += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            b[k] = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            k += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b, bounds=(0, None), method='highs')
+        if res.success:
+            return -res.fun, res.x
+    except Exception:
+        pass
+    # Fallback if LP fails (rare with valid centers)
+    return 0.0, np.full(n, 1e-6)
+
+def objective_func(params, n, A_ub):
+    """Objective for minimization: negative of LP sum of radii."""
+    centers = params.reshape(n, 2)
+    centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+    s, _ = eval_lp(centers, A_ub, n)
+    return -s
+
+def coord_obj(params, idx, centers, n, A_ub):
+    """Objective for coordinate-wise optimization: negative LP sum when moving circle idx."""
+    c = centers.copy()
+    c[idx] = params
+    c = np.clip(c, 1e-5, 1.0 - 1e-5)
+    s, _ = eval_lp(c, A_ub, n)
+    return -s
+
+def generate_hex(rows, r0, rng):
+    """Generates initial positions on a hexagonal lattice with specified row distribution."""
+    n = 26
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(rows):
+        shift = r0 if ri % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= n:
+                break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+    while len(pts) < n:
+        pts.append([rng.uniform(0.2, 0.8), rng.uniform(0.2, 0.8)])
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    A_ub = build_lp_matrix(n)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], [4, 6, 6, 6, 4],
+        [5, 7, 5, 5, 4], [5, 5, 5, 5, 6], [6, 6, 5, 5, 4], [5, 6, 4, 6, 5],
+        [7, 6, 6, 7], [6, 7, 6, 7], [5, 6, 5, 6, 5, 1]
+    ]
+    
+    inits = []
+    for p in patterns:
+        if sum(p) >= n:
+            base = generate_hex(p, 0.095, rng)
+            inits.append(base)
+            for _ in range(4):
+                pert = base + rng.uniform(-0.025, 0.025, (n, 2))
+                inits.append(np.clip(pert, 0.05, 0.95))
+                
+    for _ in range(8):
+        inits.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    bounds_vars = [(0.001, 0.999)] * (2 * n)
+    
+    # Phase 1: Multi-start local optimization
+    for cfg in inits:
+        try:
+            res = minimize(objective_func, cfg.flatten(), args=(n, A_ub), method='Nelder-Mead',
+                           bounds=bounds_vars, options={'maxiter': 3000, 'xatol': 1e-7, 'fatol': 1e-8})
+            if np.isfinite(res.fun):
+                c_opt = np.clip(res.x.reshape(n, 2), 1e-5, 1.0 - 1e-5)
+                s, r = eval_lp(c_opt, A_ub, n)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = r.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Iterative perturbation & refinement to escape local minima
+    if best_centers is not None:
+        step = 0.015
+        while step > 0.0005:
+            improved = False
+            for _ in range(40):
+                pert = best_centers + rng.uniform(-step, step, best_centers.shape)
+                pert = np.clip(pert, 0.001, 0.999)
+                
+                try:
+                    res = minimize(objective_func, pert.flatten(), args=(n, A_ub), method='Nelder-Mead',
+                                   bounds=bounds_vars, options={'maxiter': 800, 'xatol': 1e-7, 'fatol': 1e-8})
+                    if np.isfinite(res.fun):
+                        c_opt = np.clip(res.x.reshape(n, 2), 1e-5, 1.0 - 1e-5)
+                        s, r = eval_lp(c_opt, A_ub, n)
+                        if s > best_sum + 1e-7:
+                            best_sum = s
+                            best_centers = c_opt.copy()
+                            best_radii = r.copy()
+                            improved = True
+                            break
+                except Exception:
+                    continue
+            if not improved:
+                step *= 0.6
+                
+    # Phase 3: Coordinate-wise refinement to squeeze out extra radius
+    if best_centers is not None:
+        improved = True
+        while improved:
+            improved = False
+            for i in range(n):
+                old_pos = best_centers[i].copy()
+                try:
+                    res_i = minimize(coord_obj, old_pos, args=(i, best_centers, n, A_ub), method='Nelder-Mead',
+                                     bounds=[(0.001, 0.999), (0.001, 0.999)],
+                                     options={'maxiter': 500, 'xatol': 1e-7, 'fatol': 1e-8})
+                    if np.isfinite(res_i.fun):
+                        new_pos = np.clip(res_i.x, 1e-5, 1.0 - 1e-5)
+                        temp_c = best_centers.copy()
+                        temp_c[i] = new_pos
+                        s_new, r_new = eval_lp(temp_c, A_ub, n)
+                        if s_new > best_sum + 1e-7:
+                            best_sum = s_new
+                            best_centers = temp_c
+                            best_radii = r_new
+                            improved = True
+                except Exception:
+                    continue
+                    
+    # Fallback if optimization unexpectedly fails
+    if best_centers is None:
+        best_centers = generate_hex([5, 6, 5, 6, 4], 0.095, rng)
+        best_sum, best_radii = eval_lp(best_centers, A_ub, n)
+        
+    # Final safety scaling to guarantee strict validity within numerical tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

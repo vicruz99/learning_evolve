@@ -1,0 +1,217 @@
+# sol_000255 | problem=circle_packing_26 entrypoint=run_packing
+# generation=9 parent=sol_000241 (state 5de10eaf) state=9c9fca7e sum of radii=2.624429 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def build_lp_matrix(n):
+    """Builds the constant inequality matrix for the LP radius solver."""
+    m = 4 * n + n * (n - 1) // 2
+    A = np.zeros((m, n))
+    k = 0
+    for i in range(n):
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+        A[k, i] = 1.0; k += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            k += 1
+    return A
+
+def solve_lp(centers, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    m = A_ub.shape[0]
+    b = np.zeros(m)
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        b[k] = x; k += 1
+        b[k] = 1.0 - x; k += 1
+        b[k] = y; k += 1
+        b[k] = 1.0 - y; k += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            b[k] = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            k += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b, bounds=(0, None), method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 1e-6)
+
+def objective_joint(x, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(x[2 * n:])
+
+def constraints_joint(x, n):
+    """Inequality constraints >= 0 for valid packing."""
+    cx = x[:n]
+    cy = x[n:2 * n]
+    r = x[2 * n:]
+    
+    con = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    dx = cx[i_idx] - cx[j_idx]
+    dy = cy[i_idx] - cy[j_idx]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[i_idx] + r[j_idx]
+    con = np.concatenate([con, dist_sq - r_sum**2])
+    return con
+
+def get_hex_init(n, r0):
+    """Generates initial positions on a hexagonal lattice."""
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < n:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x <= 1.0 - r0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+    return np.array(pts[:n])
+
+def run_force_sim(centers, radii, steps=800):
+    """Force-directed simulation to tighten packing and expand radii."""
+    n = len(radii)
+    vel = np.zeros_like(centers)
+    dt = 0.004
+    for _ in range(steps):
+        radii *= 1.00015
+        forces = np.zeros_like(centers)
+        
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, 1e9)
+        r_sums = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlaps = np.maximum(0.0, r_sums - dists)
+        inv_dists = np.where(dists > 1e-9, 1.0 / dists, 0.0)
+        rep_strength = overlaps * inv_dists * 120.0
+        
+        forces += np.sum(diff * rep_strength[:, :, np.newaxis], axis=1)
+        
+        wall_forces = np.zeros_like(centers)
+        wall_forces[:, 0] += np.clip(radii - centers[:, 0], 0, None) * 60.0
+        wall_forces[:, 0] -= np.clip(centers[:, 0] + radii - 1.0, 0, None) * 60.0
+        wall_forces[:, 1] += np.clip(radii - centers[:, 1], 0, None) * 60.0
+        wall_forces[:, 1] -= np.clip(centers[:, 1] + radii - 1.0, 0, None) * 60.0
+        forces += wall_forces
+        
+        vel = vel * 0.85 + forces * dt
+        centers += vel
+        centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    A_ub = build_lp_matrix(n)
+    bounds_vars = [(0.0, 1.0)] * (2 * n) + [(1e-7, 0.5)] * n
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    configs = []
+    # Hexagonal starts with varying densities
+    for r0 in [0.075, 0.08, 0.085, 0.09, 0.095, 0.10]:
+        configs.append(get_hex_init(n, r0))
+    # Diverse random starts
+    for _ in range(12):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    for cfg in configs:
+        # Phase 1: Force simulation to find a dense, valid layout
+        sim_c, sim_r = run_force_sim(cfg.copy(), np.full(n, 0.085))
+        sim_r *= 0.96  # Shrink slightly to guarantee SLSQP feasibility
+        
+        # Phase 2: Joint SLSQP refinement
+        x0 = np.concatenate([sim_c.flatten(), sim_r])
+        try:
+            res = minimize(objective_joint, x0, args=(n,), method='SLSQP',
+                           bounds=bounds_vars,
+                           constraints={'type': 'ineq', 'fun': constraints_joint, 'args': (n,)},
+                           options={'maxiter': 8000, 'ftol': 1e-14})
+            
+            if np.isfinite(res.fun):
+                cx = res.x[:n]
+                cy = res.x[n:2*n]
+                r = np.maximum(res.x[2*n:], 1e-9)
+                centers_opt = np.column_stack((cx, cy))
+                
+                # Phase 3: LP refinement for fixed optimal centers
+                r_lp = solve_lp(centers_opt, A_ub)
+                s_lp = np.sum(r_lp)
+                
+                # Strict validity verification
+                valid = True
+                if np.any(centers_opt[:, 0] < r_lp - 1e-9) or np.any(centers_opt[:, 0] > 1 - r_lp + 1e-9):
+                    valid = False
+                if np.any(centers_opt[:, 1] < r_lp - 1e-9) or np.any(centers_opt[:, 1] > 1 - r_lp + 1e-9):
+                    valid = False
+                
+                if valid:
+                    idx_i, idx_j = np.triu_indices(n, k=1)
+                    dx = centers_opt[:, 0][:, None] - centers_opt[:, 0][None, :]
+                    dy = centers_opt[:, 1][:, None] - centers_opt[:, 1][None, :]
+                    d2 = dx[idx_i, idx_j]**2 + dy[idx_i, idx_j]**2
+                    rs2 = (r_lp[idx_i] + r_lp[idx_j])**2
+                    if np.any(d2 < rs2 - 1e-9):
+                        valid = False
+                        
+                if valid and s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = centers_opt.copy()
+                    best_radii = r_lp.copy()
+                    
+        except Exception:
+            continue
+            
+    # Phase 4: Iterative local perturbation to escape local minima
+    if best_centers is not None:
+        for _ in range(80):
+            pert = best_centers + rng.uniform(-0.006, 0.006, best_centers.shape)
+            pert = np.clip(pert, 0.05, 0.95)
+            r_pert = solve_lp(pert, A_ub)
+            s_pert = np.sum(r_pert)
+            if s_pert > best_sum + 1e-8:
+                best_sum = s_pert
+                best_centers = pert.copy()
+                best_radii = r_pert.copy()
+                
+    # Fallback configuration
+    if best_centers is None:
+        best_centers = get_hex_init(n, 0.09)
+        best_radii = solve_lp(best_centers, A_ub)
+        best_sum = np.sum(best_radii)
+        
+    # Final strict numerical scaling to guarantee validator tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-9:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_centers[i, 0] - best_centers[j, 0], best_centers[i, 1] - best_centers[j, 1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d / rs)
+                
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

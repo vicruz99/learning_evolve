@@ -1,0 +1,172 @@
+# sol_000119 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000066 (state 7dd8b726) state=c96f4911 sum of radii=1.389351 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_triu_idx(n):
+    return np.triu_indices(n, k=1)
+
+def objective(vars_array, n):
+    return -np.sum(vars_array[2::3])
+
+def constraint_func(vars_array, n, triu_idx):
+    x = vars_array[0::3]
+    y = vars_array[1::3]
+    r = vars_array[2::3]
+    
+    b = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    
+    d2 = dx**2 + dy**2
+    r2 = dr**2
+    
+    p = d2[triu_idx] - r2[triu_idx]
+    return np.concatenate([b, p])
+
+def force_relax_init(n, seed):
+    rng = np.random.RandomState(seed)
+    pts = rng.rand(n, 2)
+    pts = pts * 0.8 + 0.1
+    r_init = 0.08
+    
+    for _ in range(400):
+        forces = np.zeros_like(pts)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = pts[i] - pts[j]
+                dist = np.linalg.norm(diff)
+                if dist < 0.3:
+                    f = (0.3 - dist) * 15.0 / (dist + 1e-6)
+                    forces[i] += diff * f
+                    forces[j] -= diff * f
+            for d in [0, 1]:
+                if pts[i, d] < r_init + 0.04:
+                    forces[i, d] += 8.0 * (r_init + 0.04 - pts[i, d])
+                if pts[i, d] > 1.0 - r_init - 0.04:
+                    forces[i, d] -= 8.0 * (pts[i, d] - (1.0 - r_init - 0.04))
+        pts += forces * 0.015
+        pts = np.clip(pts, 0.05, 0.95)
+    return pts
+
+def run_packing():
+    n = 26
+    np.random.seed(42)
+    triu_idx = compute_triu_idx(n)
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * n
+    
+    configs = []
+    
+    # Phase 1: Force-relaxed random starts
+    for seed in range(10):
+        pts = force_relax_init(n, seed)
+        v = np.zeros(3*n)
+        v[0::3] = pts[:, 0]
+        v[1::3] = pts[:, 1]
+        v[2::3] = 0.09
+        configs.append(v)
+        
+    # Phase 2: Rotated hexagonal starts with perturbations
+    for rot in np.linspace(0, np.pi/6, 6):
+        pts = []
+        r_h = 0.10
+        y = r_h
+        row = 0
+        while len(pts) < n + 15:
+            shift = r_h if row % 2 == 1 else 0.0
+            x = r_h + shift
+            while x + r_h <= 1.0:
+                pts.append([x, y])
+                x += 2.0 * r_h
+            y += np.sqrt(3) * r_h
+            row += 1
+        pts = np.array(pts[:n])
+        
+        c, s = np.cos(rot), np.sin(rot)
+        pts = pts @ np.array([[c, -s], [s, c]])
+        pts -= pts.min(axis=0)
+        pts /= pts.max(axis=0)
+        pts = pts * 0.9 + 0.05
+        
+        for _ in range(3):
+            p = pts.copy()
+            p += np.random.uniform(-0.015, 0.015, p.shape)
+            p = np.clip(p, 0.05, 0.95)
+            v = np.zeros(3*n)
+            v[0::3] = p[:, 0]
+            v[1::3] = p[:, 1]
+            v[2::3] = 0.095
+            configs.append(v)
+            
+    best_sum = -1.0
+    best_vars = None
+    
+    # Phase 3: Constrained Optimization
+    for v0 in configs:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraint_func, 'args': (n, triu_idx)},
+                           options={'maxiter': 6000, 'ftol': 1e-14, 'disp': False})
+            if np.isfinite(res.fun):
+                c_vals = constraint_func(res.x, n, triu_idx)
+                if np.min(c_vals) > -1e-6:
+                    s = -res.fun
+                    if s > best_sum:
+                        best_sum = s
+                        best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_vars is None:
+        best_vars = configs[0]
+        best_sum = np.sum(best_vars[2::3])
+        
+    # Phase 4: Coordinate Ascent on Radii
+    r = best_vars[2::3].copy()
+    x = best_vars[0::3].copy()
+    y = best_vars[1::3].copy()
+    
+    for _ in range(80):
+        improved = False
+        for i in range(n):
+            max_r = min(x[i], 1.0 - x[i], y[i], 1.0 - y[i])
+            for j in range(n):
+                if i == j: continue
+                d = np.sqrt((x[i]-x[j])**2 + (y[i]-y[j])**2)
+                max_r = min(max_r, d - r[j])
+            if max_r > r[i] + 1e-9:
+                r[i] = max_r - 1e-10
+                improved = True
+        if not improved:
+            break
+            
+    best_vars[2::3] = r
+    best_sum = np.sum(r)
+    
+    # Phase 5: Strict Safety Projection
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    
+    scale = 1.0
+    for i in range(n):
+        if radii[i] < 1e-12: continue
+        scale = min(scale, centers[i,0]/radii[i], (1.0-centers[i,0])/radii[i],
+                    centers[i,1]/radii[i], (1.0-centers[i,1])/radii[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            rs = radii[i] + radii[j]
+            if rs < 1e-12: continue
+            scale = min(scale, d / rs)
+            
+    if scale < 1.0:
+        radii *= scale * 0.999995
+        best_sum = float(np.sum(radii))
+        
+    return centers, radii, float(best_sum)

@@ -1,0 +1,259 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we will employ a multi-phase optimization strategy that combines structured initialization, joint constrained optimization, exact linear programming refinement, and gradient-driven local search.
+
+1. **Diverse Structured Initialization**: We generate multiple starting configurations based on hexagonal lattice patterns with varying row distributions (e.g., 6-5-6-5-4, 5-6-5-6-4, etc.). These patterns naturally approximate optimal packing densities. We also add random dense configurations to escape symmetry traps.
+
+2. **Joint SLSQP Optimization**: For each initial configuration, we run a Sequential Least Squares Programming (SLSQP) optimization that simultaneously adjusts circle centers and radii. This phase handles the non-smooth constraint boundaries and pushes the configuration towards a locally optimal dense packing.
+
+3. **Exact LP Refinement**: After SLSQP, we fix the optimized centers and solve a Linear Program (LP) to maximize the sum of radii. This guarantees that for any fixed set of centers, we obtain the mathematically exact maximal radii respecting all pairwise and boundary constraints.
+
+4. **LP Gradient Ascent**: The LP's dual variables (marginals) provide the exact sensitivity of the objective function to changes in pairwise distances. We compute the gradient of the sum of radii with respect to center positions: `∂(Σr)/∂x_i = Σ_j λ_ij * (x_i - x_j)/d_ij`. We perform steepest ascent using this gradient, with adaptive step sizing and backtracking. This efficiently navigates the configuration space to increase packing density.
+
+5. **Coordinate-wise Hill Climbing**: We perform fine-grained local search by perturbing one circle at a time, accepting moves that increase the LP-optimized sum. This handles discrete topological changes that gradient methods might miss.
+
+6. **Strict Safety Scaling**: Finally, we compute a global scaling factor to ensure all circles strictly satisfy boundary and non-overlap constraints within the validator's `1e-12` tolerance, guaranteeing a valid submission.
+
+This combination of geometric initialization, exact LP evaluation, and gradient-driven refinement is highly effective for high-dimensional circle packing problems and should push the sum of radii beyond the current baseline.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+TRIU_I, TRIU_J = np.triu_indices(N_CIRCLES, k=1)
+N_PAIRS = len(TRIU_I)
+
+def solve_lp(centers):
+    """Solves LP to maximize sum of radii for fixed centers. Returns radii, sum, duals, and gradient."""
+    n = N_CIRCLES
+    c_obj = -np.ones(n)
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    A_ub = np.zeros((N_PAIRS, n))
+    A_ub[np.arange(N_PAIRS), TRIU_I] = 1.0
+    A_ub[np.arange(N_PAIRS), TRIU_J] = 1.0
+    
+    diff = centers[TRIU_I] - centers[TRIU_J]
+    dists = np.sqrt(np.sum(diff**2, axis=1) + 1e-12)
+    b_ub = dists
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.all(res.x >= -1e-7):
+            r = np.maximum(res.x, 0.0)
+            s = -res.fun
+            
+            # Dual variables for gradient computation
+            lams = np.zeros(N_PAIRS)
+            if hasattr(res, 'ineqlin') and res.ineqlin is not None:
+                lams = np.abs(res.ineqlin.marginals)
+            
+            # Gradient: d(sum_r)/d(x_i) = sum_j lambda_ij * (x_i - x_j) / dist_ij
+            grad = np.zeros((n, 2))
+            safe_dists = np.where(dists > 1e-9, dists, 1.0)
+            factors = lams / safe_dists
+            
+            np.add.at(grad, TRIU_I, diff * factors[:, None])
+            np.add.at(grad, TRIU_J, -diff * factors[:, None])
+            
+            return r, s, lams, grad
+    except Exception:
+        pass
+    return np.full(n, 1e-9), 0.0, np.zeros(N_PAIRS), np.zeros((n, 2))
+
+def obj_slsqp(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2 * N_CIRCLES:])
+
+def cons_slsqp(v):
+    """Inequality constraints >= 0 for SLSQP."""
+    n = N_CIRCLES
+    x = v[:n]
+    y = v[n:2 * n]
+    r = v[2 * n:]
+    
+    c1 = x - r
+    c2 = 1.0 - x - r
+    c3 = y - r
+    c4 = 1.0 - y - r
+    
+    dx = x[TRIU_I] - x[TRIU_J]
+    dy = y[TRIU_I] - y[TRIU_J]
+    dr = r[TRIU_I] + r[TRIU_J]
+    c5 = dx**2 + dy**2 - dr**2
+    
+    return np.concatenate([c1, c2, c3, c4, c5])
+
+def generate_hex(row_counts, r0):
+    """Generates a hexagonal lattice configuration with specified row counts."""
+    n = N_CIRCLES
+    pts = []
+    y = r0
+    for i, cnt in enumerate(row_counts):
+        shift = r0 if i % 2 == 1 else 0.0
+        width = (cnt - 1) * 2 * r0
+        x_start = 0.5 - width / 2.0 + shift
+        for k in range(cnt):
+            if len(pts) >= n:
+                break
+            pts.append([x_start + k * 2 * r0, y])
+        y += np.sqrt(3) * r0
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    rng = np.random.default_rng(42)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Diverse hexagonal patterns summing to 26
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [5, 5, 6, 5, 5], [4, 6, 6, 6, 4],
+        [6, 6, 5, 5, 4], [6, 5, 4, 6, 5], [5, 4, 6, 6, 5], [7, 5, 5, 5, 4],
+        [5, 6, 6, 5, 4], [5, 5, 5, 5, 6], [4, 5, 7, 5, 5], [5, 7, 5, 4, 5]
+    ]
+    
+    starts = []
+    for pat in patterns:
+        if sum(pat) != n:
+            continue
+        pts = generate_hex(pat, 0.10)
+        starts.append(pts)
+        for _ in range(3):
+            p = pts + rng.uniform(-0.02, 0.02, pts.shape)
+            starts.append(np.clip(p, 0.05, 0.95))
+            
+    # Random dense starts to break symmetry
+    for _ in range(12):
+        starts.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    bounds_vars = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+    constraint_dict = {'type': 'ineq', 'fun': cons_slsqp}
+    
+    # Phase 1: Joint SLSQP Optimization
+    for cfg in starts:
+        r_init = np.full(n, 0.04)
+        x0 = np.zeros(3 * n)
+        x0[:n] = cfg[:, 0]
+        x0[n:2 * n] = cfg[:, 1]
+        x0[2 * n:] = r_init
+        
+        try:
+            res = minimize(obj_slsqp, x0, method='SLSQP', bounds=bounds_vars,
+                           constraints=constraint_dict,
+                           options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+            if np.isfinite(res.fun):
+                cx = res.x[:n]
+                cy = res.x[n:2 * n]
+                c_mat = np.column_stack((cx, cy))
+                r_lp, s_lp, _, _ = solve_lp(c_mat)
+                if s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = c_mat.copy()
+                    best_radii = r_lp.copy()
+        except Exception:
+            pass
+
+    # Phase 2: LP Gradient Ascent Refinement
+    if best_centers is not None:
+        c_curr = best_centers.copy()
+        r_curr, s_curr, _, _ = solve_lp(c_curr)
+        best_sum = s_curr
+        best_centers = c_curr
+        best_radii = r_curr
+        
+        step = 0.015
+        for it in range(2500):
+            r, s, lams, grad = solve_lp(c_curr)
+            if r is None:
+                break
+                
+            g_norm = np.linalg.norm(grad)
+            if g_norm < 1e-5:
+                # Escape flat regions
+                c_curr += rng.uniform(-0.008, 0.008, c_curr.shape)
+                c_curr = np.clip(c_curr, 0.02, 0.98)
+                step = 0.015
+                continue
+                
+            dir_ = grad / g_norm
+            c_new = c_curr + step * dir_
+            c_new = np.clip(c_new, 1e-4, 1.0 - 1e-4)
+            
+            r_new, s_new, _, _ = solve_lp(c_new)
+            if s_new > s + 1e-8:
+                c_curr = c_new
+                r_curr = r_new
+                s_curr = s_new
+                step = min(step * 1.03, 0.04)
+            else:
+                step *= 0.85
+                if step < 0.002:
+                    c_curr += rng.uniform(-0.01, 0.01, c_curr.shape)
+                    c_curr = np.clip(c_curr, 0.05, 0.95)
+                    step = 0.015
+                    
+            if s_curr > best_sum:
+                best_sum = s_curr
+                best_centers = c_curr.copy()
+                best_radii = r_curr.copy()
+
+    # Phase 3: Coordinate-wise Hill Climbing for fine-tuning
+    if best_centers is not None:
+        c_curr = best_centers.copy()
+        r_curr, s_curr, _, _ = solve_lp(c_curr)
+        step = 0.005
+        for _ in range(4000):
+            idx = rng.integers(n)
+            old_pos = c_curr[idx].copy()
+            c_curr[idx] += rng.uniform(-step, step, 2)
+            c_curr[idx] = np.clip(c_curr[idx], 1e-4, 1.0 - 1e-4)
+            
+            r_new, s_new, _, _ = solve_lp(c_curr)
+            if s_new > s_curr + 1e-8:
+                s_curr = s_new
+                r_curr = r_new
+                step = min(step * 1.02, 0.01)
+            else:
+                c_curr[idx] = old_pos
+                step *= 0.998
+                
+            if s_curr > best_sum:
+                best_sum = s_curr
+                best_centers = c_curr.copy()
+                best_radii = r_curr.copy()
+
+    # Fallback configuration
+    if best_centers is None:
+        best_centers = generate_hex([6, 5, 6, 5, 4], 0.09)
+        best_radii, best_sum, _, _ = solve_lp(best_centers)
+
+    # Phase 4: Strict Safety Scaling to guarantee numerical validity
+    scale = 1.0
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    diff = best_centers[TRIU_I] - best_centers[TRIU_J]
+    dists = np.sqrt(np.sum(diff**2, axis=1))
+    rs = best_radii[TRIU_I] + best_radii[TRIU_J]
+    safe_rs = np.maximum(rs, 1e-12)
+    scale = min(scale, np.min(dists / safe_rs))
+        
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

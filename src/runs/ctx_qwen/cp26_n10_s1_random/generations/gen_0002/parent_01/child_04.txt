@@ -1,0 +1,170 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we leverage two key insights:
+1. **Hexagonal Lattice Structure**: The densest circle packing in 2D is hexagonal. Starting from a perturbed hexagonal grid gives a geometrically sound initial configuration.
+2. **Two-Phase Optimization**: 
+   - **Phase 1 (Center Layout)**: Optimize only the circle centers to maximize the minimum clearance to boundaries and other circles. We use a log-sum-exp smooth approximation of the min function, which turns the non-smooth max-min problem into a differentiable one solvable by L-BFGS-B.
+   - **Phase 2 (Radius Expansion)**: Fix the optimized centers as a starting point, initialize radii slightly smaller than half the minimum clearance, and use SLSQP with exact non-linear inequality constraints to maximize the sum of radii. This allows radii to vary and fine-tunes the packing to the theoretical limit.
+3. **Multiple Restarts**: We generate multiple perturbed hexagonal configurations and run the two-phase pipeline on each to escape local minima. A strict validation step ensures numerical stability before accepting a solution.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def get_constraints(vars, n):
+    """Inequality constraints >= 0 for valid packing."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    c = []
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Non-overlap constraints: squared distance >= (r_i + r_j)^2
+    # Using squared values avoids square roots and improves gradient behavior
+    x_mat = x[:, None] - x[None, :]
+    y_mat = y[:, None] - y[None, :]
+    dist_sq = x_mat**2 + y_mat**2
+    
+    r_mat = r[:, None] + r[None, :]
+    r_sq = r_mat**2
+    
+    iu, ju = np.triu_indices(n, k=1)
+    c.append(dist_sq[iu, ju] - r_sq[iu, ju])
+    
+    return np.concatenate(c)
+
+def smooth_min_clearance(centers, k=100.0):
+    """Smooth approximation of the minimum clearance using log-sum-exp."""
+    n = centers.shape[0]
+    b = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    vals = np.concatenate([b, dists[dists < np.inf] / 2.0])
+    max_v = np.max(vals)
+    return -np.log(np.sum(np.exp(-k * (vals - max_v)))) / k - max_v
+
+def clear_obj(params, n, k):
+    """Objective for center optimization: maximize smooth min clearance."""
+    return -smooth_min_clearance(params.reshape(n, 2), k)
+
+def run_packing():
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': get_constraints, 'args': (n,)}
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    np.random.seed(42)
+    
+    # Generate diverse initial hexagonal configurations
+    configs = []
+    r_init = 0.10
+    for trial in range(12):
+        pts = []
+        y = r_init
+        row = 0
+        while len(pts) < n:
+            shift = r_init if row % 2 == 1 else 0.0
+            x = r_init + shift
+            while x + r_init <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2.0 * r_init
+            y += r_init * np.sqrt(3)
+            row += 1
+        pts = np.array(pts[:n])
+        
+        if trial > 0:
+            pts += np.random.uniform(-0.04, 0.04, pts.shape)
+            pts = np.clip(pts, 0.05, 0.95)
+            
+        # Normalize to fill the unit square effectively
+        pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.85 + 0.075
+        configs.append(pts)
+        
+    for cfg in configs:
+        # Phase 1: Optimize centers for equal radii using smooth approximation
+        res_c = minimize(clear_obj, cfg.flatten(), args=(n, 100.0), method='L-BFGS-B',
+                         bounds=[(0.0, 1.0)]*(2*n),
+                         options={'maxiter': 3000, 'ftol': 1e-13})
+        
+        opt_centers = res_c.x.reshape(n, 2)
+        
+        # Phase 2: Initialize radii and run SLSQP for variable radii optimization
+        min_d = 1.0
+        for i in range(n):
+            d_wall = min(opt_centers[i,0], 1-opt_centers[i,0],
+                         opt_centers[i,1], 1-opt_centers[i,1])
+            for j in range(n):
+                if i != j:
+                    d_pair = np.linalg.norm(opt_centers[i] - opt_centers[j])
+                    if d_pair < min_d: min_d = d_pair
+            if d_wall < min_d: min_d = d_wall
+            
+        # Start slightly inside the feasible region to help SLSQP converge
+        init_r = np.full(n, min_d / 2.0 * 0.96)
+        
+        v0 = np.zeros(3*n)
+        v0[0::3] = opt_centers[:, 0]
+        v0[1::3] = opt_centers[:, 1]
+        v0[2::3] = init_r
+        
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-13})
+            
+            if res.success or res.fun < -2.6:
+                c_opt = np.column_stack((res.x[0::3], res.x[1::3]))
+                r_opt = res.x[2::3]
+                
+                # Strict validation check
+                valid = True
+                for i in range(n):
+                    x, y = c_opt[i]
+                    r = r_opt[i]
+                    if x < r or x > 1-r or y < r or y > 1-r:
+                        valid = False; break
+                if valid:
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            if np.linalg.norm(c_opt[i]-c_opt[j]) < r_opt[i]+r_opt[j] - 1e-9:
+                                valid = False; break
+                        if not valid: break
+                        
+                if valid:
+                    s = np.sum(r_opt)
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = c_opt.copy()
+                        best_radii = r_opt.copy()
+        except Exception:
+            continue
+
+    # Fallback configuration
+    if best_centers is None:
+        best_centers = configs[0]
+        best_radii = np.full(n, 0.09)
+        best_sum = np.sum(best_radii)
+        
+    # Apply microscopic scaling to guarantee strict compliance with 1e-12 validator tolerance
+    best_radii *= 0.9999999
+    best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, best_sum
+```

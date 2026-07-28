@@ -1,0 +1,261 @@
+
+
+<strategy>
+To improve the packing of 26 circles beyond the current sum of radii (~2.627), I will employ a multi-phase optimization strategy that combines physics-based relaxation, constrained nonlinear optimization, and exact linear programming:
+
+1. **Parameterization for Automatic Boundary Satisfaction**: Instead of optimizing `(x, y, r)` directly, I parameterize centers as `x = r + (1 - 2r)u` and `y = r + (1 - 2r)v` where `u, v ∈ [0, 1]`. This guarantees `r ≤ x ≤ 1-r` and `r ≤ y ≤ 1-r`, automatically satisfying boundary constraints and significantly simplifying the optimization landscape for SLSQP.
+
+2. **Force-Directed Pre-optimization**: I will generate multiple random and structured starting configurations and run a force-directed simulation. This phase expands radii uniformly while repelling overlapping circles and pushing them away from boundaries. This efficiently finds tight, jammed configurations that serve as excellent starting points for gradient-based methods.
+
+3. **SLSQP Constrained Optimization**: Using the force-directed results, I map them to the `(r, u, v)` parameter space and run `SLSQP` to maximize the sum of radii subject to pairwise non-overlap constraints `(dx² + dy²) ≥ (r_i + r_j)²`. The squared formulation avoids `sqrt` derivative issues.
+
+4. **Exact LP Refinement**: For any fixed centers, the maximum feasible radii form a linear program: maximize `Σr_i` subject to `r_i ≤ dist_to_walls` and `r_i + r_j ≤ dist(i, j)`. I solve this exactly using `scipy.optimize.linprog` after each SLSQP run to extract every bit of slack.
+
+5. **Hill-Climbing Center Search**: I perform a derivative-free hill-climbing phase where I randomly perturb individual circle centers and evaluate the improvement via the LP. This helps escape local minima that gradient methods might miss.
+
+6. **Polishing & Safety Scaling**: A final SLSQP pass on the best hill-climbing result refines the layout. Finally, a strict safety scaling ensures all constraints satisfy the `1e-12` tolerance of the validator.
+
+This pipeline systematically explores the configuration space, leverages exact solvers for radius extraction, and avoids common pitfalls like boundary violations or gradient singularities.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+
+def decode_params(params, n):
+    """Decodes parameters to centers and radii using automatic boundary parameterization."""
+    r = params[:n]
+    u = params[n:2*n]
+    v = params[2*n:3*n]
+    factor = 1.0 - 2.0 * r
+    x = r + factor * u
+    y = r + factor * v
+    return np.column_stack((x, y)), r
+
+def compute_constraints_slsqp(params, n):
+    """Computes pairwise non-overlap constraints >= 0 for SLSQP."""
+    centers, r = decode_params(params, n)
+    dx = centers[:, 0:1] - centers[:, 0:1].T
+    dy = centers[:, 1:2] - centers[:, 1:2].T
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    return d2[mask] - r_sum_sq[mask]
+
+def objective_slsqp(params, n):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    _, r = decode_params(params, n)
+    return -np.sum(r)
+
+def solve_radii_lp(centers, n):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    lim = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                     np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    lim = np.maximum(lim, 1e-9)
+    
+    c_obj = -np.ones(n)
+    bounds = [(0.0, lim[i]) for i in range(n)]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, 1e9)
+    
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def force_directed(centers, radii, n, steps=2000):
+    """Force-directed relaxation to find tight initial packings."""
+    centers = centers.copy()
+    radii = radii.copy()
+    for step in range(steps):
+        radii += 2e-5
+        forces = np.zeros_like(centers)
+        
+        # Boundary repulsion
+        for d in range(2):
+            viol1 = np.maximum(0, radii - centers[:, d])
+            viol2 = np.maximum(0, centers[:, d] + radii - 1.0)
+            forces[:, d] += (viol2 - viol1) * 150.0
+            
+        # Pairwise repulsion
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                min_d = radii[i] + radii[j]
+                if dist < min_d and dist > 1e-7:
+                    overlap = min_d - dist
+                    dir_ = diff / dist
+                    f = overlap * 300.0
+                    forces[i] += dir_ * f
+                    forces[j] -= dir_ * f
+                    
+        centers += forces * 0.004
+        centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+    return centers, radii
+
+def run_packing():
+    n = N_CIRCLES
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Bounds for [r, u, v]
+    bounds_vars = [(1e-4, 0.4)] * n + [(0.0, 1.0)] * n + [(0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': compute_constraints_slsqp, 'args': (n,)}
+    
+    rng = np.random.default_rng(42)
+    starts = []
+    
+    # 1. Force-Directed Diverse Starts
+    for _ in range(15):
+        c_fd = rng.uniform(0.2, 0.8, (n, 2))
+        r_fd = np.full(n, 0.02)
+        c_fd, r_fd = force_directed(c_fd, r_fd, n, steps=2000)
+        denom = 1.0 - 2.0 * r_fd
+        u = (c_fd[:, 0] - r_fd) / denom
+        v = (c_fd[:, 1] - r_fd) / denom
+        u = np.clip(u, 0.0, 1.0)
+        v = np.clip(v, 0.0, 1.0)
+        starts.append(np.concatenate([r_fd, u, v]))
+        
+    # 2. Hexagonal Lattice Starts
+    for _ in range(5):
+        r0 = np.full(n, 0.08 + rng.uniform(-0.005, 0.005, n))
+        centers_hex = np.zeros((n, 2))
+        idx = 0
+        y = 0.08
+        row = 0
+        while idx < n and y < 0.92:
+            shift = 0.04 if row % 2 == 1 else 0.0
+            x = 0.08 + shift
+            while x < 0.92 and idx < n:
+                centers_hex[idx] = [x, y]
+                x += 0.16
+                idx += 1
+            y += 0.14
+            row += 1
+        denom = 1.0 - 2.0 * r0
+        u = (centers_hex[:, 0] - r0) / denom
+        v = (centers_hex[:, 1] - r0) / denom
+        u = np.clip(u, 0.0, 1.0)
+        v = np.clip(v, 0.0, 1.0)
+        starts.append(np.concatenate([r0, u, v]))
+        
+    # 3. Structured Grid Starts
+    for _ in range(5):
+        r0 = np.full(n, 0.09)
+        gs = rng.uniform(0.1, 0.9, (n, 2))
+        denom = 1.0 - 2.0 * r0
+        u = (gs[:, 0] - r0) / denom
+        v = (gs[:, 1] - r0) / denom
+        u = np.clip(u, 0.0, 1.0)
+        v = np.clip(v, 0.0, 1.0)
+        starts.append(np.concatenate([r0, u, v]))
+        
+    # Phase 1: SLSQP Optimization + LP Refinement
+    for start in starts:
+        try:
+            res = minimize(objective_slsqp, start, args=(n,), method='SLSQP', bounds=bounds_vars,
+                          constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12})
+            if np.isfinite(res.fun):
+                centers_opt, r_opt = decode_params(res.x, n)
+                r_lp, s_lp = solve_radii_lp(centers_opt, n)
+                if s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = centers_opt.copy()
+                    best_radii = r_lp.copy()
+        except Exception:
+            pass
+            
+    if best_centers is None:
+        best_centers = rng.uniform(0.2, 0.8, (n, 2))
+        best_radii, best_sum = solve_radii_lp(best_centers, n)
+        
+    # Phase 2: Hill-Climbing on Centers evaluated by LP
+    rng_hc = np.random.default_rng(123)
+    current_c = best_centers.copy()
+    current_r, current_s = best_radii, best_sum
+    
+    step = 0.015
+    for _ in range(2500):
+        i = rng_hc.integers(n)
+        trial_c = current_c.copy()
+        trial_c[i] += rng_hc.normal(0, step, 2)
+        trial_c[i] = np.clip(trial_c[i], 1e-4, 1.0 - 1e-4)
+        
+        r_tr, s_tr = solve_radii_lp(trial_c, n)
+        if s_tr > current_s + 1e-7:
+            current_c = trial_c
+            current_r = r_tr
+            current_s = s_tr
+        step *= 0.9992
+        
+    if current_s > best_sum:
+        best_sum = current_s
+        best_centers = current_c.copy()
+        best_radii = current_r.copy()
+        
+    # Phase 3: Polish with SLSQP on best found centers
+    try:
+        r0 = np.full(n, 0.09)
+        denom = 1.0 - 2.0 * r0
+        u = (best_centers[:, 0] - r0) / denom
+        v = (best_centers[:, 1] - r0) / denom
+        u = np.clip(u, 0.0, 1.0)
+        v = np.clip(v, 0.0, 1.0)
+        start_polish = np.concatenate([r0, u, v])
+        
+        res_p = minimize(objective_slsqp, start_polish, args=(n,), method='SLSQP', bounds=bounds_vars,
+                         constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12})
+        if np.isfinite(res_p.fun):
+            c_p, r_p = decode_params(res_p.x, n)
+            r_lp_p, s_lp_p = solve_radii_lp(c_p, n)
+            if s_lp_p > best_sum:
+                best_sum = s_lp_p
+                best_centers = c_p.copy()
+                best_radii = r_lp_p.copy()
+    except Exception:
+        pass
+
+    # Phase 4: Final safety scaling to strictly satisfy 1e-12 validator tolerance
+    scale = 1.0
+    c = best_centers
+    r = best_radii
+    for i in range(n):
+        if r[i] > 1e-12:
+            scale = min(scale, c[i,0]/r[i], (1.0-c[i,0])/r[i], c[i,1]/r[i], (1.0-c[i,1])/r[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(c[i]-c[j])
+            r_sum = r[i] + r[j]
+            if r_sum > 1e-12:
+                scale = min(scale, d / r_sum)
+                
+    r *= scale * 0.9999995
+    best_sum = float(np.sum(r))
+    best_radii = r
+    
+    return best_centers, best_radii, best_sum
+```

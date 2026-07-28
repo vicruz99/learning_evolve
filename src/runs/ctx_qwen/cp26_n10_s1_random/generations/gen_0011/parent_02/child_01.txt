@@ -1,0 +1,232 @@
+
+
+<strategy>
+To push the sum of radii closer to the theoretical optimum (~2.636 for 26 circles), we need a more robust optimization pipeline that escapes local minima and precisely resolves constraint tightness.
+
+1. **Equal-Radius Basin Finding**: The optimal packing for 26 circles is known to be nearly equal-radius. We first run SLSQP to maximize a common radius `t` subject to `dist(i,j) >= 2t` and boundary constraints. This quickly finds high-quality geometric basins.
+2. **LP Oracle Refinement**: Once good centers are found, we allow radii to vary. For fixed centers, maximizing the sum of radii is a Linear Program. We use this LP as an exact objective function.
+3. **Coordinate Ascent with Adaptive Step**: We iteratively perturb one circle at a time, evaluate the LP sum, and accept improvements. The step size decays over epochs to fine-tune positions.
+4. **Derivative-Free Global Search**: We run Nelder-Mead and Powell optimization directly on the LP-sum objective to polish the configuration. Multiple random restarts from the best known state help escape subtle local traps.
+5. **Strict Safety Scaling**: Finally, we compute the exact minimum clearance to boundaries and between circles, scaling radii down by a factor of `0.9999999` to guarantee strict compliance with the `1e-12` numerical tolerance in the validator.
+
+All helper functions are defined at the top level to avoid closures. The LP matrix construction is optimized for speed, allowing thousands of evaluations within reasonable time.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def solve_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    m_b = 4 * n
+    m_p = n * (n - 1) // 2
+    A = np.zeros((m_b + m_p, n))
+    b = np.zeros(m_b + m_p)
+    idx = 0
+    
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        x, y = centers[i]
+        lims = (x, 1.0 - x, y, 1.0 - y)
+        for lim in lims:
+            A[idx, i] = 1.0
+            b[idx] = lim
+            idx += 1
+            
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = d
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback to geometrically valid radii if LP unexpectedly fails
+    lims = np.min(np.stack([centers[:,0], 1.0-centers[:,0], centers[:,1], 1.0-centers[:,1]], axis=1), axis=1)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_d = np.min(dists, axis=1) / 2.0
+    r_fall = np.minimum(lims, min_d) * 0.9
+    return r_fall, np.sum(r_fall)
+
+def obj_eq(v, n):
+    """Objective for equal-radius optimization: minimize negative shared radius t."""
+    return -v[-1]
+
+def cons_eq(v, n):
+    """Inequality constraints >= 0 for equal-radius packing."""
+    t = v[-1]
+    cx = v[:n]
+    cy = v[n:2*n]
+    
+    # Boundary constraints
+    c = np.concatenate([cx - t, 1.0 - cx - t, cy - t, 1.0 - cy - t])
+    
+    # Pairwise non-overlap: dist(i,j) >= 2t
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(d, np.inf)
+    triu_idx = np.triu_indices(n, k=1)
+    return np.concatenate([c, d[triu_idx] - 2.0 * t])
+
+def obj_centers_lp(c_flat, n):
+    """Objective for center optimization: minimize negative LP sum of radii."""
+    c = c_flat.reshape(n, 2)
+    c = np.clip(c, 1e-4, 1.0 - 1e-4)
+    _, s = solve_lp(c, n)
+    return -s
+
+def run_packing():
+    n = 26
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    rng = np.random.default_rng(42)
+
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. Hexagonal lattice patterns
+    for _ in range(5):
+        r0 = rng.uniform(0.09, 0.11)
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < n:
+            shift = r0 if row % 2 == 1 else 0.0
+            x = r0 + shift
+            while x + r0 <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        configs.append(np.array(pts[:n]))
+
+    # 2. Random uniform starts
+    for _ in range(5):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+
+    # Phase 1: Optimize for equal radius to find high-quality basins
+    for cfg in configs:
+        x0 = np.concatenate([cfg.flatten(), [0.095]])
+        try:
+            res = minimize(obj_eq, x0, args=(n,), method='SLSQP', 
+                           bounds=[(0, 1)] * (2 * n) + [(0.05, 0.15)],
+                           constraints={'type': 'ineq', 'fun': cons_eq, 'args': (n,)},
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if res.success:
+                c_eq = res.x[:2 * n].reshape(n, 2)
+                r_eq, s_eq = solve_lp(c_eq, n)
+                if s_eq > best_sum:
+                    best_sum = s_eq
+                    best_c = c_eq.copy()
+                    best_r = r_eq.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Coordinate Ascent with LP Oracle
+    if best_c is not None:
+        curr_c = best_c.copy()
+        step = 0.05
+        for epoch in range(6):
+            no_imp = 0
+            base_sum = get_current_lp_sum(curr_c, n)
+            
+            for i in range(2500):
+                idx = rng.integers(n)
+                old = curr_c[idx].copy()
+                best_trial = old
+                best_val = base_sum
+                
+                # Local sampling
+                for _ in range(6):
+                    trial = old + rng.uniform(-step, step, 2)
+                    trial = np.clip(trial, 1e-4, 1.0 - 1e-4)
+                    curr_c[idx] = trial
+                    val = get_current_lp_sum(curr_c, n)
+                    if val > best_val:
+                        best_val = val
+                        best_trial = trial.copy()
+                        
+                curr_c[idx] = best_trial
+                if best_val > base_sum + 1e-9:
+                    base_sum = best_val
+                    if best_val > best_sum:
+                        best_sum = best_val
+                        best_c = curr_c.copy()
+                        _, best_r = solve_lp(best_c, n)
+                        no_imp = 0
+                else:
+                    no_imp += 1
+                    
+                step *= 0.998
+                if no_imp > 400:
+                    break
+            step = max(step, 0.025)
+
+    # Phase 3: Derivative-free global refinement (Nelder-Mead & Powell)
+    for _ in range(4):
+        c_start = best_c + rng.uniform(-0.008, 0.008, (n, 2))
+        c_start = np.clip(c_start, 0.05, 0.95)
+        
+        try:
+            res_nm = minimize(obj_centers_lp, c_start.flatten(), args=(n,), 
+                              method='Nelder-Mead', options={'maxiter': 4000, 'xatol': 1e-9, 'fatol': 1e-11})
+            c_nm = res_nm.x.reshape(n, 2)
+            r_nm, s_nm = solve_lp(c_nm, n)
+            if s_nm > best_sum:
+                best_c = c_nm.copy()
+                best_r = r_nm.copy()
+                best_sum = s_nm
+        except Exception:
+            pass
+
+        try:
+            res_pw = minimize(obj_centers_lp, best_c.flatten(), args=(n,), 
+                              method='Powell', options={'maxiter': 2000, 'ftol': 1e-12})
+            c_pw = res_pw.x.reshape(n, 2)
+            r_pw, s_pw = solve_lp(c_pw, n)
+            if s_pw > best_sum:
+                best_c = c_pw.copy()
+                best_r = r_pw.copy()
+                best_sum = s_pw
+        except Exception:
+            pass
+
+    # Fallback safety net
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp(best_c, n)
+        
+    # Phase 4: Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x / r, (1.0 - x) / r, y / r, (1.0 - y) / r)
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d / rs)
+                
+    best_r *= scale * 0.9999999
+    return best_c, best_r, float(np.sum(best_r))
+
+def get_current_lp_sum(centers, n):
+    """Helper to quickly evaluate LP sum during coordinate ascent."""
+    _, s = solve_lp(centers, n)
+    return s
+```

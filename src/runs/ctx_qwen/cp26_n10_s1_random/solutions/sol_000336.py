@@ -1,0 +1,168 @@
+# sol_000336 | problem=circle_packing_26 entrypoint=run_packing
+# generation=14 parent=sol_000152 (state 06e8663d) state=4089f9db sum of radii=2.207738 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def objective_equal(v, n):
+    """Objective for equal-radius optimization: maximize t => minimize -t."""
+    return -v[-1]
+
+def constraints_equal(v, n):
+    """Returns inequality constraints >= 0 for equal-radius valid packing."""
+    cx = v[:n]
+    cy = v[n:2*n]
+    t = v[2*n]
+    
+    # Boundary constraints
+    bc = np.concatenate([cx - t, 1.0 - cx - t, cy - t, 1.0 - cy - t])
+    
+    # Pairwise non-overlap: dist^2 >= (2t)^2
+    dx = cx[:, np.newaxis] - cx[np.newaxis, :]
+    dy = cy[:, np.newaxis] - cy[np.newaxis, :]
+    d2 = dx**2 + dy**2
+    idx = np.triu_indices(n, k=1)
+    pc = d2[idx] - 4.0 * t**2
+    
+    return np.concatenate([bc, pc])
+
+def solve_lp_radii(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    limits = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                        np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    limits = np.maximum(limits, 1e-9)
+    bounds = [(0.0, lim) for lim in limits]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = dists[i, j]
+            k += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse hexagonal initial configurations
+    configs = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], 
+        [5, 5, 6, 5, 5], [4, 6, 6, 6, 4], [5, 6, 4, 6, 5],
+        [6, 4, 5, 6, 5], [5, 7, 4, 5, 5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: 
+            continue
+        pts = []
+        r0 = 0.09
+        y = r0
+        for idx, cnt in enumerate(pat):
+            shift = r0 if idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: 
+                    break
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3) * r0
+        pts = np.array(pts[:n])
+        
+        # Normalize to center in square comfortably
+        mn = pts.min(axis=0)
+        mx = pts.max(axis=0)
+        span = mx - mn
+        if span[0] > 1e-5: pts[:, 0] = (pts[:, 0] - mn[0]) / span[0] * 0.85 + 0.075
+        if span[1] > 1e-5: pts[:, 1] = (pts[:, 1] - mn[1]) / span[1] * 0.85 + 0.075
+        configs.append(pts)
+        
+        # Add perturbations to break symmetry
+        for _ in range(2):
+            p = pts + rng.uniform(-0.02, 0.02, pts.shape)
+            configs.append(np.clip(p, 0.05, 0.95))
+            
+    # Random dense starts
+    for _ in range(4):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+
+    bounds_eq = [(0.0, 1.0)] * (2*n) + [(0.08, 0.11)]
+    
+    # Phase 1: Optimize equal radius using SLSQP from multiple starts
+    for cfg in configs:
+        v0 = np.concatenate([cfg[:, 0], cfg[:, 1], [0.095]])
+        try:
+            res = minimize(objective_equal, v0, args=(n,), method='SLSQP', bounds=bounds_eq,
+                          constraints={'type': 'ineq', 'fun': constraints_equal, 'args': (n,)},
+                          options={'maxiter': 12000, 'ftol': 1e-13, 'disp': False})
+            
+            if np.isfinite(res.fun) and res.x[-1] > 0.10:
+                c_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+                c_opt = np.clip(c_opt, 1e-6, 1.0 - 1e-6)
+                
+                # Exact LP refinement to allow variable radii and extract maximum sum
+                r_lp, s_lp = solve_lp_radii(c_opt)
+                if s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = c_opt.copy()
+                    best_radii = r_lp.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Local center refinement around best configuration
+    if best_centers is not None:
+        for _ in range(8):
+            pert = best_centers + rng.uniform(-0.003, 0.003, best_centers.shape)
+            pert = np.clip(pert, 0.02, 0.98)
+            r_try, s_try = solve_lp_radii(pert)
+            if s_try > best_sum:
+                best_sum = s_try
+                best_centers = pert.copy()
+                best_radii = r_try.copy()
+
+    # Fallback safety net
+    if best_centers is None:
+        best_centers = configs[0]
+        best_radii, best_sum = solve_lp_radii(best_centers)
+
+    # Strict safety scaling to guarantee numerical validity against 1e-12 tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+            rs = best_radii[i] + best_radii[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_radii *= scale * 0.9999995
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum

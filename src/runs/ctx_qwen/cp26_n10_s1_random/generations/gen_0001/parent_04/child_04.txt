@@ -1,0 +1,156 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that efficiently handles non-convex constraints and avoids getting trapped in poor local optima.
+
+Key improvements over past attempts:
+1. **Parametrization for Boundary Constraints**: Instead of explicitly enforcing boundary constraints $x-r \ge 0$, etc., we parameterize centers as $x = r + (1-2r)u$ and $y = r + (1-2r)v$ with $u, v \in [0,1]$. This mathematically guarantees that every circle stays within the unit square for any valid $r \le 0.5$, drastically reducing the constraint count and improving numerical stability.
+2. **Vectorized Constraints**: We compute pairwise non-overlap constraints using precomputed triangle indices and vectorized NumPy operations. This avoids slow Python loops inside the constraint function, making each optimizer iteration significantly faster.
+3. **Multi-Phase Optimization**:
+   - **Random Restarts**: We start with 10 random initial configurations to explore the global landscape.
+   - **Iterated Local Search**: We take the best found solution, perturb its positions and radii slightly, and re-optimize. This helps escape shallow local minima and fine-tune the packing density.
+4. **Efficient Repair Step**: After optimization, we run a fast vectorized validity check. If tiny numerical overlaps exist (due to floating-point tolerance), we uniformly scale down the radii just enough to satisfy the strict $10^{-11}$ tolerance required by the validator.
+
+This approach combines mathematical guarantee of boundary satisfaction, computational efficiency, and strategic exploration to push the sum of radii closer to the theoretical optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+# Constants for the optimization
+N_CIRCLES = 26
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def evaluate_packing(vars_arr):
+    """Decodes optimization variables into centers and radii."""
+    n = N_CIRCLES
+    r = vars_arr[0::3]
+    u = vars_arr[1::3]
+    v = vars_arr[2::3]
+    x = r + (1 - 2 * r) * u
+    y = r + (1 - 2 * r) * v
+    centers = np.column_stack((x, y))
+    return centers, r, np.sum(r)
+
+def constraints(vars_arr):
+    """Computes pairwise non-overlap constraints: dist^2 - (r_i + r_j)^2 >= 0."""
+    r = vars_arr[0::3]
+    u = vars_arr[1::3]
+    v = vars_arr[2::3]
+    x = r + (1 - 2 * r) * u
+    y = r + (1 - 2 * r) * v
+    
+    dx = x[TRIU_IDX[0]] - x[TRIU_IDX[1]]
+    dy = y[TRIU_IDX[0]] - y[TRIU_IDX[1]]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[TRIU_IDX[0]] + r[TRIU_IDX[1]]
+    return dist_sq - r_sum**2
+
+def objective(vars_arr):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_arr[0::3])
+
+def run_packing():
+    n = N_CIRCLES
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    np.random.seed(42)
+    
+    # Bounds for [r, u, v]
+    # r in [1e-5, 0.49] ensures 1-2r > 0, maintaining valid parametrization
+    bounds = [(1e-5, 0.49) for _ in range(n)] + \
+             [(0.0, 1.0) for _ in range(n)] + \
+             [(0.0, 1.0) for _ in range(n)]
+             
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    # Phase 1: Random restarts to explore global landscape
+    for _ in range(10):
+        r_init = np.full(n, 0.09)
+        u_init = np.random.uniform(0.1, 0.9, n)
+        v_init = np.random.uniform(0.1, 0.9, n)
+        x0 = np.zeros(3*n)
+        x0[0::3] = r_init
+        x0[1::3] = u_init
+        x0[2::3] = v_init
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 1500, 'ftol': 1e-13, 'disp': False})
+            if res.success or np.sum(res.x[0::3]) > best_sum:
+                centers, radii, s = evaluate_packing(res.x)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = centers.copy()
+                    best_radii = radii.copy()
+        except Exception:
+            pass
+                
+    # Phase 2: Iterated local search to refine and escape local minima
+    if best_centers is not None:
+        for _ in range(15):
+            # Perturb radii
+            r_pert = best_radii + np.random.uniform(-0.005, 0.005, n)
+            r_pert = np.clip(r_pert, 0.05, 0.4)
+            
+            # Convert best centers back to u, v space
+            u_best = (best_centers[:, 0] - best_radii) / (1 - 2 * best_radii)
+            v_best = (best_centers[:, 1] - best_radii) / (1 - 2 * best_radii)
+            
+            # Perturb u, v
+            u_pert = np.clip(u_best + np.random.uniform(-0.05, 0.05, n), 0, 1)
+            v_pert = np.clip(v_best + np.random.uniform(-0.05, 0.05, n), 0, 1)
+            
+            x0 = np.zeros(3*n)
+            x0[0::3] = r_pert
+            x0[1::3] = u_pert
+            x0[2::3] = v_pert
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                               constraints=cons, options={'maxiter': 1500, 'ftol': 1e-13, 'disp': False})
+                if res.success or np.sum(res.x[0::3]) > best_sum:
+                    centers, radii, s = evaluate_packing(res.x)
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = centers.copy()
+                        best_radii = radii.copy()
+            except Exception:
+                pass
+                    
+    # Fallback to a safe, valid configuration if optimization fails
+    if best_centers is None:
+        r = 0.08
+        cx = np.tile(np.linspace(0.1, 0.9, 5), 6)[:26]
+        cy = np.repeat(np.linspace(0.1, 0.9, 5), 6)[:26]
+        for i in range(26):
+            if i // 5 % 2 == 1:
+                cx[i] += 0.09
+        cx = np.clip(cx, r, 1-r)
+        cy = np.clip(cy, r, 1-r)
+        best_centers = np.column_stack((cx, cy))
+        best_radii = np.full(26, r)
+        best_sum = np.sum(best_radii)
+        
+    # Ensure strict validity by repairing any tiny numerical overlaps
+    for _ in range(100):
+        dx = best_centers[:, 0, None] - best_centers[None, :, 0]
+        dy = best_centers[:, 1, None] - best_centers[None, :, 1]
+        dists = np.sqrt(dx**2 + dy**2)
+        r_sums = best_radii[:, None] + best_radii[None, :]
+        np.fill_diagonal(dists, np.inf)
+        np.fill_diagonal(r_sums, -np.inf)
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        violations = r_sums[mask] - dists[mask]
+        max_viol = np.max(violations)
+        
+        if max_viol <= 1e-11:
+            break
+        best_radii *= 0.9995
+            
+    best_sum = np.sum(best_radii)
+    return best_centers, best_radii, best_sum
+```

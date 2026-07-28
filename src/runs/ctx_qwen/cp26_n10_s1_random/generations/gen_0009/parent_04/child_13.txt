@@ -1,0 +1,162 @@
+
+
+<strategy>
+To improve the packing of 26 circles and maximize the sum of radii, I will employ a multi-stage optimization strategy that combines global search, structured initializations, and local refinement. The key insight is that for fixed centers, the optimal radii can be found exactly and efficiently via Linear Programming (LP). This decouples the non-convex geometric placement problem from the radius sizing problem.
+
+1. **LP-based Radius Optimization**: For any set of centers, the maximum sum of radii is solved as an LP: maximize $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and boundary constraints. This is fast and exact.
+2. **Structured Hexagonal Starts**: Dense packings naturally follow hexagonal lattice patterns. I will generate multiple row-distribution patterns (e.g., 6-5-6-5-4), scale/shift them, and run local optimizations from each.
+3. **Differential Evolution**: A derivative-free global optimizer will search the 52-dimensional center space to escape local minima that gradient-based or hex-based starts might miss.
+4. **Coordinate-wise Perturbation Search**: After global search, a coordinate-wise random perturbation (basin-hopping style) will fine-tune centers. Moving one circle at a time is highly effective for packing problems as it isolates local bottlenecks.
+5. **Powell Refinement**: A final derivative-free local optimization polishes the best configuration to machine precision.
+6. **Strict Validation Scaling**: A final safety margin is applied to guarantee numerical validity against the validator's $10^{-12}$ tolerance.
+
+This approach systematically explores the configuration space while leveraging the exact LP solution for radii at every step, ensuring we push the sum of radii as high as possible.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+def solve_lp(centers, n, i_idx, j_idx):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(l, 0.0)) for l in lims]
+    
+    dx = centers[i_idx, 0] - centers[j_idx, 0]
+    dy = centers[i_idx, 1] - centers[j_idx, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    m = len(i_idx)
+    A = np.zeros((m, n))
+    A[np.arange(m), i_idx] = 1.0
+    A[np.arange(m), j_idx] = 1.0
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=dists, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.zeros(n)
+
+def objective(x, n, i_idx, j_idx):
+    """Objective function for optimization: minimize negative sum of radii."""
+    centers = x.reshape(n, 2)
+    s, _ = solve_lp(centers, n, i_idx, j_idx)
+    return -s
+
+def generate_hex(n, row_counts, r0):
+    """Generates initial positions on a hexagonal lattice."""
+    pts = []
+    y = r0
+    for idx, cnt in enumerate(row_counts):
+        shift = r0 if idx % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            if len(pts) >= n:
+                break
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:n])
+
+def run_packing():
+    n = 26
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    rng = np.random.default_rng(42)
+    
+    # 1. Structured Hexagonal Starts
+    row_patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [5, 5, 6, 5, 5], 
+        [6, 6, 5, 5, 4], [4, 6, 6, 6, 4], [5, 7, 5, 5, 4],
+        [5, 6, 4, 6, 5], [6, 5, 5, 6, 4], [7, 5, 6, 5, 3]
+    ]
+    
+    for pat in row_patterns:
+        for r0 in [0.085, 0.095, 0.105]:
+            pts = generate_hex(n, pat, r0)
+            mn = pts.min(axis=0)
+            mx = pts.max(axis=0)
+            scale = 0.85 / np.max(mx - mn)
+            pts = (pts - mn) * scale + 0.5 * (1.0 - scale)
+            pts += rng.uniform(-0.03, 0.03, pts.shape)
+            pts = np.clip(pts, 0.02, 0.98)
+            
+            res = minimize(objective, pts.flatten(), args=(n, i_idx, j_idx), method='Nelder-Mead',
+                           options={'maxiter': 2000, 'xatol': 1e-8, 'fatol': 1e-10})
+            if np.isfinite(res.fun):
+                s, r = solve_lp(res.x.reshape(n, 2), n, i_idx, j_idx)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = res.x.reshape(n, 2).copy()
+                    best_radii = r.copy()
+                    
+    # 2. Differential Evolution for Global Search
+    bounds_de = [(0.0, 1.0)] * (2 * n)
+    try:
+        res_de = differential_evolution(objective, args=(n, i_idx, j_idx), bounds=bounds_de, 
+                                        popsize=10, maxiter=80, tol=1e-8, seed=42, workers=1)
+        if np.isfinite(res_de.fun):
+            s, r = solve_lp(res_de.x.reshape(n, 2), n, i_idx, j_idx)
+            if s > best_sum:
+                best_sum = s
+                best_centers = res_de.x.reshape(n, 2).copy()
+                best_radii = r.copy()
+    except Exception:
+        pass
+        
+    # 3. Coordinate-wise Perturbation Search (Basin Hopping)
+    curr_s = best_sum
+    step = 0.04
+    for _ in range(15000):
+        idx = rng.integers(n)
+        old_pos = best_centers[idx].copy()
+        best_centers[idx] += rng.uniform(-step, step, 2)
+        best_centers[idx] = np.clip(best_centers[idx], 0.0, 1.0)
+        
+        s_new, r_new = solve_lp(best_centers, n, i_idx, j_idx)
+        if s_new > curr_s + 1e-7:
+            curr_s = s_new
+            best_radii = r_new
+        else:
+            best_centers[idx] = old_pos
+            
+        step *= 0.9993
+        
+    # 4. Final Powell Polish
+    res_polish = minimize(objective, best_centers.flatten(), args=(n, i_idx, j_idx), method='Powell',
+                          options={'maxiter': 1500, 'xatol': 1e-9})
+    s_final, r_final = solve_lp(res_polish.x.reshape(n, 2), n, i_idx, j_idx)
+    if s_final > best_sum:
+        best_sum = s_final
+        best_centers = res_polish.x.reshape(n, 2)
+        best_radii = r_final
+        
+    # 5. Safety Scaling for Strict Numerical Validity
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    dx = best_centers[i_idx, 0] - best_centers[j_idx, 0]
+    dy = best_centers[i_idx, 1] - best_centers[j_idx, 1]
+    d = np.sqrt(dx**2 + dy**2)
+    rs = best_radii[i_idx] + best_radii[j_idx]
+    mask = rs > 1e-12
+    if np.any(mask):
+        scale = min(scale, np.min(d[mask] / rs[mask]))
+        
+    best_radii *= scale * 0.9999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

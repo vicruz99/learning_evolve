@@ -1,0 +1,245 @@
+
+
+<strategy>
+To bridge the tiny gap of 0.000020 and push the sum of radii past 2.636, we need a highly robust multi-phase optimization strategy that combines global exploration with precise local refinement. Circle packing in a square is a non-convex problem with many local minima. The following approach is designed to systematically escape them:
+
+1. **Diverse Initialization**: Generate multiple hexagonal lattice patterns with different row distributions and random perturbations. This ensures coverage of promising regions in the configuration space.
+2. **LP-Driven Center Optimization**: Use the optimal value of a Linear Program (which computes maximal radii for fixed centers) as the objective function for center optimization. The LP is solved efficiently using `scipy.optimize.linprog` with the `highs` method.
+3. **Powell Optimization**: Apply derivative-free Powell optimization on centers using the LP objective. Powell's method handles high-dimensional, non-smooth landscapes well and quickly converges to strong local optima.
+4. **Simulated Annealing (SA)**: Run a custom SA loop on centers. This allows occasional uphill moves to escape local traps that Powell might get stuck in. The temperature and step size decay over time.
+5. **Force-Directed Relaxation**: After finding a good configuration, fix the radii and apply a repulsion force between overlapping circles while pushing them away from boundaries violations. This "relaxes" the packing, often increasing clearances enough to allow larger radii upon re-solving the LP.
+6. **Nelder-Mead Local Polish**: Follow force relaxation with Nelder-Mead to fine-tune centers around the newly relaxed positions.
+7. **Joint SLSQP Refinement**: Finally, use SLSQP to jointly optimize centers and radii with explicit inequality constraints. This catches any remaining gradient-based improvements.
+8. **Strict Safety Scaling**: Apply a deterministic scaling factor to guarantee the configuration strictly satisfies the validator's `1e-12` tolerance without reducing the sum unnecessarily.
+
+This pipeline leverages the strengths of each method: LP for exact radius calculation, Powell/SA for robust center search, force relaxation for geometric intuition, and SLSQP for final constraint-aware polishing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def get_pairwise_indices(n):
+    """Returns indices for upper triangle of distance matrix."""
+    return np.triu_indices(n, k=1)
+
+def build_lp_matrix(n, idx_i, idx_j):
+    """Constructs the constraint matrix A for the LP: r_i + r_j <= dist_ij."""
+    m = len(idx_i)
+    A = np.zeros((m, n))
+    A[np.arange(m), idx_i] = 1.0
+    A[np.arange(m), idx_j] = 1.0
+    return A
+
+def solve_lp(centers, n, A, idx_i, idx_j):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    wall = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    bounds = [(0.0, max(w, 1e-12)) for w in wall]
+    
+    # Pairwise constraints: r_i + r_j <= dist(i,j)
+    diff = centers[idx_i] - centers[idx_j]
+    b_ub = np.sqrt(np.sum(diff**2, axis=1))
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            r = np.maximum(res.x, 0.0)
+            return r, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def lp_objective(x, n, A, idx_i, idx_j):
+    """Objective for center optimization: minimize negative sum of LP radii."""
+    centers = x.reshape(n, 2)
+    _, s = solve_lp(centers, n, A, idx_i, idx_j)
+    return -s
+
+def joint_objective(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def joint_constraints(v, n, idx_i, idx_j):
+    """Inequality constraints >= 0 for SLSQP joint optimization."""
+    cx, cy, r = v[:n], v[n:2*n], v[2*n:]
+    # Boundary constraints
+    con = [cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r]
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    con.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(con)
+
+def force_relaxation(centers, radii, n, steps=50, strength=0.05):
+    """Pushes overlapping circles apart to increase clearances."""
+    c = centers.copy()
+    r = radii.copy()
+    for _ in range(steps):
+        forces = np.zeros_like(c)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = c[i] - c[j]
+                dist = np.linalg.norm(diff)
+                if dist < 1e-12:
+                    dist = 1e-12
+                    diff = np.array([1e-6, 1e-6])
+                req = r[i] + r[j]
+                if dist < req:
+                    overlap = req - dist
+                    f = overlap / dist * strength
+                    forces[i] += diff * f
+                    forces[j] -= diff * f
+        c += forces
+        c = np.clip(c, 1e-4, 1.0 - 1e-4)
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(1234)
+    idx_i, idx_j = get_pairwise_indices(n)
+    A = build_lp_matrix(n, idx_i, idx_j)
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Initialize with diverse hexagonal patterns
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,5,5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.10
+        for i, cnt in enumerate(pat):
+            shift = 0.10 if i % 2 == 1 else 0.0
+            x = 0.10 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.20
+            y += 0.10 * np.sqrt(3)
+        c = np.array(pts[:n])
+        configs.append(c)
+        
+    # Add perturbed variants to break symmetry
+    for base in configs[:2]:
+        for _ in range(3):
+            cp = base + rng.uniform(-0.02, 0.02, base.shape)
+            configs.append(np.clip(cp, 0.05, 0.95))
+            
+    # Phase 1: Powell optimization on centers using LP objective
+    for cfg in configs:
+        try:
+            res = minimize(lp_objective, cfg.flatten(), args=(n, A, idx_i, idx_j), 
+                           method='Powell', options={'maxiter': 2000, 'ftol': 1e-12})
+            c_opt = np.clip(res.x.reshape(n, 2), 0.01, 0.99)
+            r_opt, s_opt = solve_lp(c_opt, n, A, idx_i, idx_j)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Simulated Annealing / Hill Climbing on centers
+    curr_c = best_c.copy()
+    curr_r = best_r.copy()
+    curr_s = best_sum
+    temp = 0.005
+    
+    for it in range(3000):
+        scale = temp * (0.995 ** (it / 100.0))
+        k = rng.choice([1, 2, 3], p=[0.7, 0.2, 0.1])
+        idx = rng.choice(n, size=k, replace=False)
+        old = curr_c[idx].copy()
+        
+        curr_c[idx] += rng.normal(0, scale, (k, 2))
+        curr_c[idx] = np.clip(curr_c[idx], 1e-4, 1.0 - 1e-4)
+        
+        r_new, s_new = solve_lp(curr_c, n, A, idx_i, idx_j)
+        delta = s_new - curr_s
+        
+        # Metropolis criterion
+        if delta > 0 or rng.random() < np.exp(delta / (0.001 + 1e-6)):
+            curr_s = s_new
+            curr_r = r_new.copy()
+            if s_new > best_sum:
+                best_sum = s_new
+                best_c = curr_c.copy()
+                best_r = curr_r.copy()
+        else:
+            curr_c[idx] = old
+            
+    # Phase 3: Force relaxation to increase clearances, followed by local polish
+    for _ in range(5):
+        rel_c = force_relaxation(best_c, best_r, n, steps=100, strength=0.02)
+        r_rel, s_rel = solve_lp(rel_c, n, A, idx_i, idx_j)
+        if s_rel > best_sum:
+            best_c = rel_c.copy()
+            best_r = r_rel.copy()
+            best_sum = s_rel
+            
+        # Local Nelder-Mead polish to settle the relaxation
+        try:
+            res_loc = minimize(lp_objective, best_c.flatten(), args=(n, A, idx_i, idx_j),
+                               method='Nelder-Mead', options={'maxiter': 1000, 'xatol': 1e-9, 'fatol': 1e-12})
+            c_loc = np.clip(res_loc.x.reshape(n, 2), 0.01, 0.99)
+            r_loc, s_loc = solve_lp(c_loc, n, A, idx_i, idx_j)
+            if s_loc > best_sum:
+                best_c = c_loc.copy()
+                best_r = r_loc.copy()
+                best_sum = s_loc
+        except Exception:
+            pass
+
+    # Phase 4: Joint SLSQP polish to fine-tune both centers and radii simultaneously
+    bounds_v = [(0.0, 1.0)]*(2*n) + [(1e-6, 0.5)]*n
+    x0 = np.concatenate([best_c[:,0], best_c[:,1], best_r * 0.98])
+    
+    try:
+        res_slqp = minimize(joint_objective, x0, args=(n,), method='SLSQP',
+                            bounds=bounds_v,
+                            constraints={'type': 'ineq', 'fun': joint_constraints, 'args': (n, idx_i, idx_j)},
+                            options={'maxiter': 4000, 'ftol': 1e-13})
+        if np.isfinite(res_slqp.fun):
+            c_s = np.column_stack((res_slqp.x[:n], res_slqp.x[n:2*n]))
+            r_s, s_s = solve_lp(c_s, n, A, idx_i, idx_j)
+            if s_s > best_sum:
+                best_c = c_s.copy()
+                best_r = r_s.copy()
+                best_sum = s_s
+    except Exception:
+        pass
+
+    # Phase 5: Strict Numerical Safety Scaling to guarantee validator compliance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = best_r[:, None] + best_r[None, :]
+    min_ratio = np.min(dists[idx_i, idx_j] / np.maximum(r_pair[idx_i, idx_j], 1e-12))
+    scale = min(scale, min_ratio)
+    
+    best_r *= scale * 0.999999
+    best_sum = float(np.sum(best_r))
+    
+    # Fallback safety net
+    if best_c is None:
+        best_c = configs[0]
+        best_r = np.full(n, 0.09)
+        best_sum = float(np.sum(best_r))
+        
+    return best_c, best_r, best_sum
+```

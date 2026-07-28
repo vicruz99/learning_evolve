@@ -1,0 +1,194 @@
+# sol_000138 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000067 (state 3fcdd2a7) state=e5c080bc sum of radii=2.621887 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_fn(vars_array, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars_array[2*n:])
+
+def constraint_fn(vars_array, n, idx_i, idx_j):
+    """Constraints: boundary and pairwise non-overlap."""
+    cx = vars_array[:n]
+    cy = vars_array[n:2*n]
+    r = vars_array[2*n:]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    b_cons = np.concatenate([
+        cx - r,
+        1.0 - cx - r,
+        cy - r,
+        1.0 - cy - r
+    ])
+    
+    # Pairwise non-overlap: dist >= r_i + r_j
+    dx = cx[:, np.newaxis] - cx[np.newaxis, :]
+    dy = cy[:, np.newaxis] - cy[np.newaxis, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    p_cons = dist[idx_i, idx_j] - r_sum[idx_i, idx_j]
+    
+    return np.concatenate([b_cons, p_cons])
+
+def force_relax_init(n, rng_seed):
+    """Generates a valid initial configuration using force-directed relaxation."""
+    rng = np.random.default_rng(rng_seed)
+    centers = rng.uniform(0.1, 0.9, (n, 2))
+    radii = np.full(n, 0.12)
+    
+    # Repulsion simulation to resolve overlaps and position circles tightly
+    dt = 0.05
+    repulsion_k = 5.0
+    for step in range(300):
+        forces = np.zeros_like(centers)
+        current_r = radii.copy()
+        
+        for i in range(n):
+            # Boundary repulsion
+            for dim in range(2):
+                if centers[i, dim] < current_r[i]:
+                    forces[i, dim] += repulsion_k * (current_r[i] - centers[i, dim])
+                elif centers[i, dim] > 1.0 - current_r[i]:
+                    forces[i, dim] -= repulsion_k * (centers[i, dim] - (1.0 - current_r[i]))
+                    
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                d = np.linalg.norm(diff)
+                min_d = current_r[i] + current_r[j]
+                if d < min_d and d > 1e-9:
+                    f_mag = repulsion_k * (min_d - d) / d
+                    forces[i] += diff * f_mag
+                    forces[j] -= diff * f_mag
+                    
+        centers += forces * dt
+        centers = np.clip(centers, 0.01, 0.99)
+        
+        # Slowly shrink radii to guarantee convergence to a valid state if stuck
+        if step % 50 == 0 and step > 0:
+            radii *= 0.98
+            
+    return centers, radii
+
+def make_valid(centers, radii, n):
+    """Uniformly scales radii down until configuration is strictly valid."""
+    scale = 1.0
+    for _ in range(200):
+        valid = True
+        for i in range(n):
+            if centers[i, 0] - radii[i]*scale < -1e-12 or centers[i, 0] + radii[i]*scale > 1.0 + 1e-12:
+                valid = False; break
+            if centers[i, 1] - radii[i]*scale < -1e-12 or centers[i, 1] + radii[i]*scale > 1.0 + 1e-12:
+                valid = False; break
+        if not valid:
+            scale *= 0.98; continue
+            
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                if d < (radii[i] + radii[j]) * scale - 1e-12:
+                    valid = False; break
+            if not valid: break
+        if valid: break
+        scale *= 0.97
+        
+    return centers, radii * scale
+
+def run_packing():
+    n = 26
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_fn, 'args': (n, idx_i, idx_j)}
+    
+    best_sum = -np.inf
+    best_vars = None
+    rng = np.random.default_rng(42)
+    
+    configs = []
+    
+    # 1. Hexagonal lattice starts with various shifts and densities
+    for base_r in [0.09, 0.095, 0.10]:
+        for shift in [0.0, 0.04, 0.08]:
+            pts = []
+            y = base_r
+            row = 0
+            while len(pts) < n:
+                x = base_r + shift + (row % 2) * base_r
+                while x + base_r <= 1.0 and len(pts) < n:
+                    pts.append([x, y])
+                    x += 2.0 * base_r
+                y += np.sqrt(3) * base_r
+                row += 1
+            pts = np.array(pts[:n])
+            c, r = make_valid(pts, np.full(n, base_r), n)
+            configs.append(np.concatenate([c.flatten(), r]))
+            
+    # 2. Force-relaxed random starts
+    for seed in range(40):
+        c, r = force_relax_init(n, 1000 + seed)
+        c, r = make_valid(c, r, n)
+        configs.append(np.concatenate([c.flatten(), r]))
+        
+    # Phase 1: Optimize from initial configs
+    for x0 in configs:
+        try:
+            res = minimize(objective_fn, x0, args=(n,), method='SLSQP', bounds=bounds,
+                          constraints=cons, options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+            if np.isfinite(res.fun):
+                c_vals = constraint_fn(res.x, n, idx_i, idx_j)
+                if np.min(c_vals) >= -1e-8:
+                    s = np.sum(res.x[2*n:])
+                    if s > best_sum:
+                        best_sum = s
+                        best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Iterative perturbation to escape local minima
+    if best_vars is not None:
+        for iter in range(20):
+            pert_scale = 0.008 * (1.0 - iter/20.0)
+            pert = best_vars.copy()
+            pert[0:2*n] += rng.normal(0, pert_scale, 2*n)
+            pert[0:2*n] = np.clip(pert[0:2*n], 0.02, 0.98)
+            pert[2*n:] += rng.normal(0, pert_scale/2, n)
+            pert[2*n:] = np.clip(pert[2*n:], 1e-5, 0.5)
+            
+            try:
+                res = minimize(objective_fn, pert, args=(n,), method='SLSQP', bounds=bounds,
+                              constraints=cons, options={'maxiter': 6000, 'ftol': 1e-13, 'disp': False})
+                if np.isfinite(res.fun):
+                    c_vals = constraint_fn(res.x, n, idx_i, idx_j)
+                    if np.min(c_vals) >= -1e-8:
+                        s = np.sum(res.x[2*n:])
+                        if s > best_sum:
+                            best_sum = s
+                            best_vars = res.x.copy()
+            except Exception:
+                pass
+
+    # Extract final solution
+    cx = best_vars[:n]
+    cy = best_vars[n:2*n]
+    r = best_vars[2*n:]
+    centers = np.column_stack((cx, cy))
+    
+    # Final strict safety scaling
+    scale = 1.0
+    for i in range(n):
+        if r[i] < 1e-12: continue
+        scale = min(scale, cx[i]/r[i], (1.0-cx[i])/r[i], cy[i]/r[i], (1.0-cy[i])/r[i])
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(centers[i]-centers[j])
+            if r[i]+r[j] < 1e-12: continue
+            scale = min(scale, d/(r[i]+r[j]))
+            
+    # Apply scale with a tiny margin for numerical robustness
+    safe_scale = max(scale * 0.999999, 0.0)
+    radii = r * safe_scale
+    
+    return centers, radii, float(np.sum(radii))

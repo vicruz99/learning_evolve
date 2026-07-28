@@ -1,0 +1,238 @@
+
+
+<strategy>
+To improve the sum of radii from ~2.631 to the target of 2.636, I will employ a more robust alternating optimization strategy combined with iterative expansion and high-precision polishing:
+
+1. **Iterative Expansion + Relaxation**: Instead of just optimizing centers for fixed radii, I will periodically scale the radii up by a small factor (e.g., 1.0025x), forcing the system into an "overpacked" state. A gradient-based relaxation (`L-BFGS-B`) will then minimize a quadratic penalty function of overlaps and boundary violations. This encourages circles to flow into gaps and reorganize efficiently. After relaxation, an exact LP solver recomputes the maximum feasible radii for the new centers. If the sum increases, we accept the configuration.
+
+2. **Diverse High-Quality Initializations**: I will generate multiple hexagonal lattice patterns with varied row distributions, center them properly, and add controlled noise. This ensures the optimizer explores different topological arrangements rather than getting stuck in one local geometry.
+
+3. **Escape Local Minima**: If expansion stalls, I will inject controlled random perturbations to shake circles out of symmetric traps, then resume expansion.
+
+4. **SLSQP Joint Polish**: After the iterative expansion phase finds a strong local optimum, I will run a final joint optimization of centers and radii using `SLSQP` with explicit inequality constraints. This tightly binds the solution to the feasible boundary.
+
+5. **Strict Numerical Safety**: A final scaling step guarantees all constraints are satisfied within the validator's `1e-12` tolerance, preventing false positives due to floating-point drift.
+
+All helper functions are defined at the top level without closures or lambdas to comply with restrictions.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def solve_lp(centers, n):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    m_b = 4 * n
+    m_p = n * (n - 1) // 2
+    A = np.zeros((m_b + m_p, n))
+    b = np.zeros(m_b + m_p)
+    idx = 0
+    
+    for i in range(n):
+        x, y = centers[i]
+        lims = (x, 1.0 - x, y, 1.0 - y)
+        for lim in lims:
+            A[idx, i] = 1.0
+            b[idx] = lim
+            idx += 1
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = d
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+        if res.success and np.isfinite(res.fun):
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback to geometrically valid radii if LP unexpectedly fails
+    lims = np.min(np.stack([centers[:,0], 1.0-centers[:,0], centers[:,1], 1.0-centers[:,1]], axis=1), axis=1)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_d = np.min(dists, axis=1) / 2.0
+    r_fall = np.minimum(np.maximum(lims, 1e-9), np.maximum(min_d, 1e-9)) * 0.9
+    return r_fall, np.sum(r_fall)
+
+def penalty_func(centers_flat, radii, n):
+    """Smooth quadratic penalty for overlaps and boundary violations."""
+    centers = centers_flat.reshape(n, 2)
+    pen = 0.0
+    x, y = centers[:, 0], centers[:, 1]
+    pen += np.sum(np.maximum(0.0, radii - x)**2)
+    pen += np.sum(np.maximum(0.0, radii - (1.0 - x))**2)
+    pen += np.sum(np.maximum(0.0, radii - y)**2)
+    pen += np.sum(np.maximum(0.0, radii - (1.0 - y))**2)
+    
+    dx = centers[:, 0, None] - centers[None, :, 0]
+    dy = centers[:, 1, None] - centers[None, :, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    r_sum = radii[:, None] + radii[None, :]
+    overlaps = np.maximum(0.0, r_sum - dists)
+    pen += np.sum(overlaps**2)
+    return pen
+
+def relax_centers(centers, radii, n):
+    """Minimize penalty function to resolve overlaps for given radii."""
+    bounds = [(0.0, 1.0)] * (2 * n)
+    try:
+        res = minimize(penalty_func, centers.flatten(), args=(radii, n),
+                       method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 3000, 'ftol': 1e-15, 'gtol': 1e-12})
+        return np.clip(res.x.reshape(n, 2), 1e-9, 1.0 - 1e-9)
+    except Exception:
+        return centers
+
+def s_obj(v, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def s_cons(v, n, ii, jj):
+    """Inequality constraints >= 0 for SLSQP joint optimization."""
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    dx = x[ii] - x[jj]
+    dy = y[ii] - y[jj]
+    dr = r[ii] + r[jj]
+    c = np.concatenate([c, dx**2 + dy**2 - dr**2])
+    return c
+
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    
+    # 1. Hexagonal lattice patterns with varied row distributions
+    row_dists = [
+        [6,5,6,5,4], [5,6,5,6,4], [7,6,6,7], [8,6,6,6], 
+        [9,5,6,6], [6,6,5,5,4], [5,5,6,5,5], [4,6,6,6,4],
+        [6,5,5,5,5], [5,5,5,5,6], [10,8,8], [9,9,8], 
+        [5,5,5,5,5,1], [6,6,6,5,3], [7,7,6,6], [8,8,6,4]
+    ]
+    
+    for rd in row_dists:
+        if sum(rd) < n: continue
+        for _ in range(2):
+            r0 = rng.uniform(0.085, 0.105)
+            pts = []
+            y = r0
+            for idx, cnt in enumerate(rd):
+                shift = r0 if idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(pts) >= n: break
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3) * r0
+            cfg = np.array(pts[:n])
+            mn, mx = cfg.min(axis=0), cfg.max(axis=0)
+            span = mx - mn
+            if span[0] > 0: cfg[:, 0] = (cfg[:, 0] - mn[0]) / span[0] * 0.8 + 0.1
+            if span[1] > 0: cfg[:, 1] = (cfg[:, 1] - mn[1]) / span[1] * 0.8 + 0.1
+            cfg += rng.uniform(-0.01, 0.01, cfg.shape)
+            cfg = np.clip(cfg, 0.03, 0.97)
+            inits.append(cfg)
+            
+    # 2. Random uniform starts to ensure diversity
+    for _ in range(8):
+        inits.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # Phase 1: Iterative Expansion + Relaxation
+    for cfg in inits:
+        c = cfg.copy()
+        r, s = solve_lp(c, n)
+        if s > best_sum:
+            best_sum = s
+            best_c = c.copy()
+            best_r = r.copy()
+            
+        curr_c = c
+        curr_r = r
+        curr_s = s
+        
+        # Iteratively expand radii to force reorganization, then relax centers
+        for expansion in range(100):
+            r_exp = curr_r * 1.0025
+            curr_c = relax_centers(curr_c, r_exp, n)
+            
+            # Resolve exact maximum radii via LP
+            r_new, s_new = solve_lp(curr_c, n)
+            
+            if s_new > curr_s + 1e-8:
+                curr_s = s_new
+                curr_r = r_new
+                if s_new > best_sum:
+                    best_sum = s_new
+                    best_c = curr_c.copy()
+                    best_r = curr_r.copy()
+            else:
+                # If expansion stalls, try random perturbation to escape local minima
+                if rng.random() < 0.35:
+                    idx = rng.integers(n)
+                    curr_c[idx] += rng.uniform(-0.02, 0.02, 2)
+                    curr_c[idx] = np.clip(curr_c[idx], 0.01, 0.99)
+                    r_try, s_try = solve_lp(curr_c, n)
+                    if s_try > curr_s:
+                        curr_s = s_try
+                        curr_r = r_try
+                    else:
+                        curr_c[idx] = best_c[idx]
+                else:
+                    break
+                    
+    # Phase 2: SLSQP Joint Optimization Polish
+    if best_c is not None:
+        v0 = np.concatenate([best_c[:,0], best_c[:,1], best_r])
+        bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+        ii, jj = np.triu_indices(n, k=1)
+        
+        try:
+            res = minimize(s_obj, v0, args=(n,), method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': s_cons, 'args': (n, ii, jj)},
+                           options={'maxiter': 5000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                c_pol = np.column_stack((res.x[:n], res.x[n:2*n]))
+                r_pol, s_pol = solve_lp(c_pol, n)
+                if s_pol > best_sum:
+                    best_sum = s_pol
+                    best_c = c_pol.copy()
+                    best_r = r_pol.copy()
+        except Exception:
+            pass
+
+    # Fallback safety net
+    if best_c is None:
+        best_c = inits[0]
+        best_r, best_sum = solve_lp(best_c, n)
+        
+    # Phase 3: Strict numerical safety scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r_val = best_c[i,0], best_c[i,1], best_r[i]
+        if r_val > 1e-12:
+            scale = min(scale, x/r_val, (1-x)/r_val, y/r_val, (1-y)/r_val)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-12:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999999
+    return best_c, best_r, float(np.sum(best_r))
+```

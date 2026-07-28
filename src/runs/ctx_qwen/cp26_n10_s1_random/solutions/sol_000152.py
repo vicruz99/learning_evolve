@@ -1,0 +1,167 @@
+# sol_000152 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000123 (state 90e3970d) state=06e8663d sum of radii=2.621952 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def objective(vars_arr, n):
+    """Minimize negative sum of radii => Maximize sum of radii"""
+    return -np.sum(vars_arr[2*n:])
+
+def constraint_func(vars_arr, n):
+    """Computes inequality constraints >= 0 for valid packing"""
+    cx, cy, r = vars_arr[:n], vars_arr[n:2*n], vars_arr[2*n:]
+    c = np.empty(4*n + n*(n-1)//2)
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c[:n] = cx - r
+    c[n:2*n] = 1.0 - cx - r
+    c[2*n:3*n] = cy - r
+    c[3*n:4*n] = 1.0 - cy - r
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    idx = 4*n
+    for i in range(n):
+        for j in range(i + 1, n):
+            c[idx] = (cx[i] - cx[j])**2 + (cy[i] - cy[j])**2 - (r[i] + r[j])**2
+            idx += 1
+    return c
+
+def solve_lp_radii(centers):
+    """Solves the LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(max_r, 1e-9)))
+        
+    A_ub = np.zeros((n*(n-1)//2, n))
+    b_ub = np.zeros(n*(n-1)//2)
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = d
+            idx += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def generate_hex_init(row_counts, n, scale=0.90):
+    """Generates a hexagonal lattice configuration for N circles"""
+    r0 = 0.09
+    dy = np.sqrt(3) * r0
+    y = r0
+    pts = []
+    for idx, cnt in enumerate(row_counts):
+        shift = r0 if idx % 2 == 1 else 0.0
+        row_width = (cnt - 1) * 2 * r0
+        x_start = (1.0 - row_width) / 2.0 + shift
+        for _ in range(cnt):
+            pts.append([x_start, y])
+            x_start += 2 * r0
+        y += dy
+        
+    pts = np.array(pts[:n])
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = mx - mn
+    max_span = max(span[0], span[1])
+    if max_span > 1e-8:
+        pts = (pts - mn) / max_span * scale + (1.0 - scale) / 2.0
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func, 'args': (n,)}
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    rng = np.random.default_rng(42)
+    
+    # Diverse row distributions for 26 circles
+    row_configs = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 6, 4],
+        [4, 6, 6, 5, 5], [6, 6, 5, 5, 4], [5, 6, 5, 5, 5]
+    ]
+    
+    inits = []
+    for rc in row_configs:
+        if sum(rc) >= n:
+            pts = generate_hex_init(rc, n, 0.88)
+            inits.append(pts)
+            pts_pert = pts + rng.uniform(-0.03, 0.03, pts.shape)
+            inits.append(np.clip(pts_pert, 0.05, 0.95))
+            
+    # Regular grid + center
+    grid = np.array([(0.1 + 0.18*i, 0.1 + 0.18*j) for j in range(5) for i in range(5)])
+    grid = np.vstack([grid, [0.5, 0.5]])
+    inits.append(grid)
+    
+    # Phase 1: SLSQP Optimization
+    for init_cfg in inits:
+        x0 = np.zeros(3 * n)
+        x0[:n] = init_cfg[:, 0]
+        x0[n:2*n] = init_cfg[:, 1]
+        x0[2*n:] = 0.095
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', args=(n,),
+                           bounds=bounds, constraints=cons,
+                           options={'maxiter': 6000, 'ftol': 1e-13})
+            
+            if np.isfinite(res.fun):
+                c_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+                c_opt = np.clip(c_opt, 1e-6, 1.0 - 1e-6)
+                
+                lp_r, lp_sum = solve_lp_radii(c_opt)
+                if lp_r is not None:
+                    lp_r *= 0.9999995
+                    s = np.sum(lp_r)
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = c_opt.copy()
+                        best_radii = lp_r.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local refinement around best configuration
+    if best_centers is not None:
+        curr_c, curr_r, curr_s = best_centers, best_radii, best_sum
+        for _ in range(15):
+            pert = curr_c + rng.uniform(-0.004, 0.004, curr_c.shape)
+            pert = np.clip(pert, 0.03, 0.97)
+            lp_r, lp_s = solve_lp_radii(pert)
+            if lp_r is not None:
+                lp_r *= 0.9999995
+                s = np.sum(lp_r)
+                if s > curr_s:
+                    curr_s = s
+                    curr_c = pert.copy()
+                    curr_r = lp_r.copy()
+        best_centers, best_radii, best_sum = curr_c, curr_r, curr_s
+        
+    # Fallback safety
+    if best_centers is None:
+        r_f = 0.085
+        best_centers = np.array([(r_f + 0.18*i, r_f + 0.18*j) for j in range(5) for i in range(5)] + [[0.5, 0.5]])
+        best_radii, best_sum = solve_lp_radii(best_centers)
+        best_radii *= 0.9999995
+        
+    return best_centers, best_radii, float(best_sum)

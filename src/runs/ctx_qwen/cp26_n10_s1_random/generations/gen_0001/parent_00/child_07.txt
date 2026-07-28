@@ -1,0 +1,145 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that escapes local minima and carefully handles the non-convex overlap constraints. 
+
+1. **Initialization**: Instead of a simple grid, we initialize circle centers on a perturbed hexagonal lattice. Hexagonal packing achieves higher density than square grids, providing a superior starting point for the optimizer. We generate multiple random perturbations of this base layout to explore different configurations.
+
+2. **Optimization Formulation**: We frame the problem as maximizing $\sum r_i$ subject to:
+   - Boundary constraints: $r_i \le x_i, 1-x_i, y_i, 1-y_i$
+   - Non-overlap constraints: $(x_i-x_j)^2 + (y_i-y_j)^2 \ge (r_i+r_j)^2$
+   We use `scipy.optimize.minimize` with the `SLSQP` solver, which handles inequality constraints effectively. Variables are packed as `[x_0,...,x_25, y_0,...,y_25, r_0,...,r_25]`.
+
+3. **Multi-Restart Strategy**: Running the optimizer multiple times (5-8 trials) from different perturbed initial states significantly increases the chance of finding a global or near-global optimum. Each trial starts with small, feasible radii to ensure the initial point satisfies constraints.
+
+4. **Post-Processing & Safety**: Numerical optimizers may return solutions with tiny constraint violations. We compute a strict safety scaling factor $k$ based on boundary distances and pairwise circle distances, then scale radii by $k \cdot 0.99995$ to guarantee the solution passes the strict `validate_packing` check with margin.
+
+5. **Structure Compliance**: All helper functions are defined at the top level without closures. The solution uses efficient preallocation for constraints and avoids lambda functions to strictly follow guidelines.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(vars, n):
+    """Objective function: maximize sum of radii => minimize negative sum."""
+    return -np.sum(vars[2*n:3*n])
+
+def compute_constraints(vars, n):
+    """
+    Computes constraint values. All must be >= 0 for a valid packing.
+    Layout: vars[0:n] = x, vars[n:2n] = y, vars[2n:3n] = r
+    """
+    cx = vars[:n]
+    cy = vars[n:2*n]
+    r = vars[2*n:3*n]
+    
+    # Preallocate constraint array
+    n_constraints = n * 4 + n * (n - 1) // 2
+    cons = np.empty(n_constraints)
+    idx = 0
+    
+    # Boundary constraints
+    for i in range(n):
+        cons[idx] = cx[i] - r[i]; idx += 1          # x >= r
+        cons[idx] = 1.0 - cx[i] - r[i]; idx += 1   # 1-x >= r
+        cons[idx] = cy[i] - r[i]; idx += 1          # y >= r
+        cons[idx] = 1.0 - cy[i] - r[i]; idx += 1   # 1-y >= r
+        
+    # Pairwise non-overlap constraints
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = cx[i] - cx[j]
+            dy = cy[i] - cy[j]
+            dist_sq = dx*dx + dy*dy
+            r_sum = r[i] + r[j]
+            cons[idx] = dist_sq - r_sum*r_sum
+            idx += 1
+            
+    return cons
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # Bounds: x,y in [0,1], r in [1e-6, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+    cons_dict = {'type': 'ineq', 'fun': compute_constraints, 'args': (n,)}
+    
+    # 1. Generate base hexagonal lattice initialization
+    base_pts = []
+    # Hex rows with staggered columns
+    for row in range(6):
+        y = 0.08 + row * 0.18
+        shift = 0.12 if row % 2 == 1 else 0.0
+        x = 0.08 + shift
+        while x < 0.92:
+            if len(base_pts) < n:
+                base_pts.append([x, y])
+            x += 0.24
+    # Fallback filler if hex logic falls short
+    while len(base_pts) < n:
+        base_pts.append([0.5, 0.5])
+    base_centers = np.array(base_pts[:n])
+    
+    best_sum = -np.inf
+    best_vars = None
+    rng = np.random.RandomState(42)
+    
+    # 2. Multi-restart optimization
+    for trial in range(6):
+        # Perturb centers to break symmetry and explore landscape
+        pert = rng.uniform(-0.025, 0.025, size=(n, 2))
+        centers = np.clip(base_centers + pert, 0.06, 0.94)
+        
+        # Start with small feasible radii
+        r_init = np.full(n, 0.065 + rng.uniform(0, 0.015, n))
+        
+        x0 = np.concatenate([centers.flatten(), r_init])
+        
+        try:
+            res = minimize(
+                compute_objective, x0, args=(n,), method='SLSQP',
+                bounds=bounds, constraints=cons_dict,
+                options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False}
+            )
+            
+            if res.success:
+                # Verify constraints are met within tolerance
+                cons_vals = compute_constraints(res.x, n)
+                if np.all(cons_vals >= -1e-7):
+                    s = np.sum(res.x[2*n:3*n])
+                    if s > best_sum:
+                        best_sum = s
+                        best_vars = res.x
+        except Exception:
+            continue
+            
+    # Fallback if optimization fails unexpectedly
+    if best_vars is None:
+        best_vars = np.concatenate([base_centers.flatten(), np.full(n, 0.065)])
+        
+    final_centers = best_vars[:2*n].reshape(n, 2)
+    final_radii = best_vars[2*n:3*n]
+    
+    # 3. Strict post-processing to guarantee validity
+    # Compute maximum safe scaling factor k
+    k = 1.0
+    for i in range(n):
+        x, y = final_centers[i]
+        r = final_radii[i]
+        if r < 1e-9: continue
+        k = min(k, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+        
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(final_centers[i,0]-final_centers[j,0], 
+                         final_centers[i,1]-final_centers[j,1])
+            rs = final_radii[i] + final_radii[j]
+            if rs > 1e-9:
+                k = min(k, d / rs)
+                
+    # Apply scaling with slight margin for numerical safety
+    final_radii *= k * 0.99995
+    
+    return final_centers, final_radii, float(np.sum(final_radii))
+```

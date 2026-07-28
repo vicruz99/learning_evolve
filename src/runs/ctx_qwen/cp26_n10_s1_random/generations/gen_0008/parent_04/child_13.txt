@@ -1,0 +1,188 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a strategy that combines strong initial configurations, precise constraint-based optimization, and local refinement. The key insights are:
+1. **Parameterization**: We parameterize centers as `x = r + (1-2r)u` and `y = r + (1-2r)v` with `u, v ∈ [0, 1]`. This automatically satisfies boundary constraints (`r ≤ x ≤ 1-r`, etc.), reducing the constraint burden on the optimizer.
+2. **Joint Optimization**: We use `SLSQP` to jointly optimize radii and normalized centers, maximizing `sum(r)` subject to non-overlap constraints `(dist_ij)^2 ≥ (r_i + r_j)^2`.
+3. **Diverse Initialization**: We generate multiple hexagonal lattice patterns (known to be near-optimal for dense packing) with various row distributions summing to 26, plus random perturbations to escape symmetry traps.
+4. **LP Refinement & Local Search**: After finding a good joint configuration, we fix centers and solve an exact Linear Program to optimally scale radii. We then perform a greedy local search: randomly perturb one center, re-solve the LP, and accept if the sum of radii improves. This hybrid approach efficiently navigates the non-convex landscape.
+5. **Safety Scaling**: Finally, we apply a rigorous numerical safety margin to guarantee strict satisfaction of the `1e-12` validation tolerance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def compute_constraints(vars_array, n, triu_i, triu_j):
+    """
+    Computes pairwise non-overlap constraints.
+    Parameterization guarantees boundary constraints automatically.
+    """
+    r = vars_array[:n]
+    u = vars_array[n:2*n]
+    v = vars_array[2*n:3*n]
+    
+    denom = 1.0 - 2.0 * r
+    x = r + denom * u
+    y = r + denom * v
+    
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    return dist_sq[triu_i, triu_j] - r_sum[triu_i, triu_j]**2
+
+def objective_func(vars_array):
+    """Objective: minimize negative sum of radii => Maximize sum of radii"""
+    return -np.sum(vars_array[:26])
+
+def solve_lp_radii(centers):
+    """
+    Solves the LP to maximize sum of radii for fixed centers.
+    Constraints: r_i + r_j <= dist(i,j), 0 <= r_i <= min_dist_to_boundary
+    """
+    n = centers.shape[0]
+    c = -np.ones(n)
+    bounds = []
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        bounds.append((0.0, max(lim, 1e-9)))
+        
+    idx_i, idx_j = np.triu_indices(n, 1)
+    m = len(idx_i)
+    A = np.zeros((m, n))
+    A[np.arange(m), idx_i] = 1.0
+    A[np.arange(m), idx_j] = 1.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b = dists[idx_i, idx_j]
+    
+    try:
+        res = linprog(c, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    triu_i, triu_j = np.triu_indices(n, 1)
+    
+    # Bounds: r in [1e-6, 0.45], u in [0, 1], v in [0, 1]
+    bounds_vars = [(1e-6, 0.45)] * n + [(0.0, 1.0)] * n + [(0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': compute_constraints, 'args': (n, triu_i, triu_j)}
+    
+    best_sum = -1.0
+    best_vars = None
+    rng = np.random.default_rng(42)
+    
+    starts = []
+    # Row patterns summing to 26, optimized for square packing
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [4, 6, 6, 6, 4], 
+        [6, 6, 4, 6, 4], [5, 5, 6, 5, 5], [6, 4, 6, 5, 5], 
+        [5, 6, 6, 5, 4], [4, 5, 6, 5, 6], [6, 5, 4, 6, 5]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) != 26: continue
+        pts = []
+        y = 0.092
+        for row_idx, cnt in enumerate(pat):
+            shift = 0.092 if row_idx % 2 else 0.0
+            x = 0.092 + shift
+            for _ in range(cnt):
+                if len(pts) >= 26: break
+                pts.append([x, y])
+                x += 0.184
+            y += 0.092 * 1.7320508075688772
+        pts = np.array(pts[:26])
+        
+        r0 = np.full(n, 0.092)
+        u = (pts[:, 0] - r0) / (1.0 - 2.0 * r0)
+        v = (pts[:, 1] - r0) / (1.0 - 2.0 * r0)
+        starts.append(np.concatenate([r0, np.clip(u, 0, 1), np.clip(v, 0, 1)]))
+        
+        # Perturbed hex starts to break symmetry
+        pts_p = pts + rng.normal(0, 0.012, pts.shape)
+        pts_p = np.clip(pts_p, 0.06, 0.94)
+        u_p = (pts_p[:, 0] - r0) / (1.0 - 2.0 * r0)
+        v_p = (pts_p[:, 1] - r0) / (1.0 - 2.0 * r0)
+        starts.append(np.concatenate([r0, np.clip(u_p, 0, 1), np.clip(v_p, 0, 1)]))
+
+    # Diverse random starts
+    for _ in range(6):
+        c_rand = rng.uniform(0.15, 0.85, (n, 2))
+        r0 = np.full(n, 0.09)
+        u = (c_rand[:, 0] - r0) / (1.0 - 2.0 * r0)
+        v = (c_rand[:, 1] - r0) / (1.0 - 2.0 * r0)
+        starts.append(np.concatenate([r0, np.clip(u, 0, 1), np.clip(v, 0, 1)]))
+
+    # Phase 1: Joint optimization of centers and radii using SLSQP
+    for x0 in starts:
+        try:
+            res = minimize(objective_func, x0, method='SLSQP', bounds=bounds_vars, constraints=cons,
+                           options={'maxiter': 12000, 'ftol': 1e-13})
+            if np.isfinite(res.fun):
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+
+    if best_vars is None:
+        best_vars = starts[0]
+
+    # Decode SLSQP results back to physical coordinates
+    r = best_vars[:n]
+    u = best_vars[n:2*n]
+    v = best_vars[2*n:3*n]
+    denom = 1.0 - 2.0 * r
+    centers = np.column_stack((r + denom * u, r + denom * v))
+    radii = r.copy()
+    
+    # Phase 2: Greedy local search alternating center perturbation and LP radius optimization
+    for step in range(400):
+        i = rng.integers(n)
+        old_c = centers[i].copy()
+        step_size = 0.03 * (0.96 ** step)
+        centers[i] = old_c + rng.uniform(-step_size, step_size, 2)
+        centers[i] = np.clip(centers[i], 1e-4, 1.0 - 1e-4)
+        
+        r_new, s_new = solve_lp_radii(centers)
+        if r_new is not None and s_new > best_sum:
+            radii = r_new
+            best_sum = s_new
+        else:
+            centers[i] = old_c
+            
+    # Phase 3: Final exact LP refinement on the best found centers
+    r_final, s_final = solve_lp_radii(centers)
+    if r_final is not None:
+        radii = r_final
+        best_sum = s_final
+        
+    # Phase 4: Strict numerical safety scaling to guarantee validation tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y = centers[i]
+        lim = min(x, 1.0 - x, y, 1.0 - y)
+        if lim > 1e-9:
+            scale = min(scale, lim / (radii[i] + 1e-12))
+            
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            rs = radii[i] + radii[j]
+            if rs > 1e-9:
+                scale = min(scale, d / (rs + 1e-12))
+                
+    radii *= scale * 0.999999
+    best_sum = float(np.sum(radii))
+    
+    return centers, radii, best_sum
+```

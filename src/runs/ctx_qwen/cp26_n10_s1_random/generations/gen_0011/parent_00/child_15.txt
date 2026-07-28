@@ -1,0 +1,227 @@
+
+
+<strategy>
+To bridge the tiny gap to 2.636, I will implement a multi-phase optimization strategy that focuses on high-precision local refinement and robust center positioning:
+
+1. **Diverse Initialization**: Generate hexagonal lattice patterns with varying row counts, plus random perturbations and uniform random starts to cover the configuration space.
+2. **Clearance Maximization**: Use Nelder-Mead to maximize the minimum clearance (proxy for equal-radius packing), which quickly finds dense arrangements.
+3. **SLSQP Joint Polish**: Optimize centers and radii simultaneously using SLSQP with tight tolerances to escape symmetry traps and refine boundary contacts.
+4. **Coordinate Descent on Centers**: Iteratively optimize each circle's position individually to maximize the LP-computed sum of radii. This is highly effective for fine-tuning dense packings because it directly optimizes the true objective function (sum of radii) over 2D subspaces.
+5. **Fine-Grained Hill Climbing**: Perform adaptive random perturbations of 1-2 circles at a time with decaying step sizes to squeeze out the last bits of performance.
+6. **Strict Safety Scaling**: Compute the exact feasible scaling factor to guarantee numerical validity within the `1e-12` tolerance, then apply a minimal shrinkage factor to ensure strict compliance.
+
+All helper functions are defined at the top level without closures. The LP solver uses `scipy.optimize.linprog` with the `highs` method for speed and reliability.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+def get_pairwise_indices(n):
+    return np.triu_indices(n, k=1)
+
+def build_lp_matrix(n, idx_i, idx_j):
+    m = len(idx_i)
+    A = np.zeros((m, n))
+    A[np.arange(m), idx_i] = 1.0
+    A[np.arange(m), idx_j] = 1.0
+    return A
+
+def solve_lp(centers, A, idx_i, idx_j):
+    n = centers.shape[0]
+    wall = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                      np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    bounds = [(0.0, max(w, 1e-12)) for w in wall]
+    
+    diff = centers[idx_i] - centers[idx_j]
+    b_ub = np.sqrt(np.sum(diff**2, axis=1))
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.isfinite(res.fun):
+            r = np.maximum(res.x, 0.0)
+            return r, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-6), 0.0
+
+def obj_clearance(x_flat, n):
+    c = x_flat.reshape(n, 2)
+    d_wall = np.minimum(np.minimum(c[:,0], 1.0 - c[:,0]), 
+                        np.minimum(c[:,1], 1.0 - c[:,1]))
+    diff = c[:, None, :] - c[None, :, :]
+    d_pair = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(d_pair, np.inf)
+    min_d = np.min(np.concatenate([d_wall, d_pair.min(axis=1) / 2.0]))
+    return -min_d
+
+def obj_joint(v, n):
+    return -np.sum(v[2*n:])
+
+def cons_joint(v, n, idx_i, idx_j):
+    cx, cy, r = v[:n], v[n:2*n], v[2*n:]
+    con = [cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r]
+    dx = cx[idx_i] - cx[idx_j]
+    dy = cy[idx_i] - cy[idx_j]
+    dr = r[idx_i] + r[idx_j]
+    con.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(con)
+
+def obj_cd(xy, i, c_curr, A, idx_i, idx_j):
+    c_tmp = c_curr.copy()
+    c_tmp[i] = xy
+    _, s = solve_lp(c_tmp, A, idx_i, idx_j)
+    return -s
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+    idx_i, idx_j = get_pairwise_indices(n)
+    A = build_lp_matrix(n, idx_i, idx_j)
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # 1. Diverse Initial Configurations
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4], [5,5,6,5,5], 
+        [4,6,6,6,4], [7,5,5,5,4], [5,7,4,5,5], [6,4,6,5,5],
+        [5,5,5,5,5,1], [4,5,6,5,6]
+    ]
+    
+    for pat in patterns:
+        if sum(pat) < n: continue
+        pts = []
+        y = 0.10
+        for i, cnt in enumerate(pat):
+            shift = 0.10 if i % 2 == 1 else 0.0
+            x = 0.10 + shift
+            for _ in range(cnt):
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += 0.20
+            y += 0.10 * np.sqrt(3)
+        c = np.array(pts[:n])
+        configs.append(c)
+        for _ in range(3):
+            cp = c + rng.uniform(-0.03, 0.03, c.shape)
+            configs.append(np.clip(cp, 0.05, 0.95))
+            
+    for _ in range(8):
+        configs.append(rng.uniform(0.1, 0.9, (n, 2)))
+        
+    # 2. Phase 1: Clearance Maximization + LP
+    for cfg in configs:
+        try:
+            res_nm = minimize(obj_clearance, cfg.flatten(), args=(n,), method='Nelder-Mead', 
+                              options={'maxiter': 3000, 'xatol': 1e-10, 'fatol': 1e-12})
+            c_opt = np.clip(res_nm.x.reshape(n, 2), 0.005, 0.995)
+            r_lp, s_lp = solve_lp(c_opt, A, idx_i, idx_j)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_c = c_opt.copy()
+                best_r = r_lp.copy()
+        except Exception:
+            pass
+            
+    # 3. Phase 2: SLSQP Joint Polish
+    if best_c is not None:
+        bounds_v = [(0.0, 1.0)]*(2*n) + [(1e-5, 0.5)]*n
+        x0 = np.concatenate([best_c[:,0], best_c[:,1], best_r * 0.97])
+        
+        try:
+            res_slqp = minimize(obj_joint, x0, args=(n,), method='SLSQP',
+                                bounds=bounds_v,
+                                constraints={'type': 'ineq', 'fun': cons_joint, 'args': (n, idx_i, idx_j)},
+                                options={'maxiter': 5000, 'ftol': 1e-14})
+            if np.isfinite(res_slqp.fun):
+                c_s = np.column_stack((res_slqp.x[:n], res_slqp.x[n:2*n]))
+                r_s, s_s = solve_lp(c_s, A, idx_i, idx_j)
+                if r_s is not None and s_s > best_sum:
+                    best_sum = s_s
+                    best_c = c_s.copy()
+                    best_r = r_s.copy()
+        except Exception:
+            pass
+
+    # 4. Phase 3: Coordinate Descent on Centers
+    if best_c is not None:
+        c_cd = best_c.copy()
+        r_cd = best_r.copy()
+        s_cd = best_sum
+        for epoch in range(10):
+            improved = False
+            order = rng.permutation(n)
+            for i in order:
+                xy0 = c_cd[i]
+                res_cd = minimize(obj_cd, xy0, args=(i, c_cd, A, idx_i, idx_j), 
+                                  method='Nelder-Mead', options={'maxiter': 250, 'xatol': 1e-10, 'fatol': 1e-12})
+                if res_cd.success:
+                    new_s = -res_cd.fun
+                    if new_s > s_cd + 1e-8:
+                        c_cd[i] = res_cd.x
+                        _, s_new = solve_lp(c_cd, A, idx_i, idx_j)
+                        if s_new > s_cd + 1e-8:
+                            s_cd = s_new
+                            r_cd, _ = solve_lp(c_cd, A, idx_i, idx_j)
+                            improved = True
+            if not improved:
+                break
+        if s_cd > best_sum:
+            best_sum = s_cd
+            best_c = c_cd
+            best_r = r_cd
+            
+    # 5. Phase 4: Fine-Grained Random Perturbation Hill Climbing
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_r = best_r.copy()
+        curr_s = best_sum
+        
+        for it in range(2000):
+            scale = 0.008 * (1.0 - it / 2000.0)**0.5
+            num_pert = rng.choice([1, 2], p=[0.7, 0.3])
+            idx = rng.choice(n, size=num_pert, replace=False)
+            old = curr_c[idx].copy()
+            
+            curr_c[idx] += rng.uniform(-scale, scale, (num_pert, 2))
+            curr_c[idx] = np.clip(curr_c[idx], 1e-4, 1.0 - 1e-4)
+            
+            r_new, s_new = solve_lp(curr_c, A, idx_i, idx_j)
+            if s_new > curr_s + 1e-7:
+                curr_s = s_new
+                curr_r = r_new.copy()
+            else:
+                curr_c[idx] = old
+                
+        best_c = curr_c
+        best_r = curr_r
+        best_sum = curr_s
+
+    # 6. Strict Numerical Safety Scaling
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i,0], best_c[i,1], best_r[i]
+        if r > 1e-12:
+            scale = min(scale, x/r, (1.0 - x)/r, y/r, (1.0 - y)/r)
+            
+    diff = best_c[:, None, :] - best_c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = best_r[:, None] + best_r[None, :]
+    min_ratio = np.min(dists[idx_i, idx_j] / np.maximum(r_pair[idx_i, idx_j], 1e-12))
+    scale = min(scale, min_ratio)
+    
+    best_r *= scale * 0.9999995
+    best_sum = float(np.sum(best_r))
+    
+    if best_c is None:
+        best_c = configs[0]
+        best_r, best_sum = solve_lp(best_c, A, idx_i, idx_j)
+        
+    return best_c, best_r, best_sum
+```

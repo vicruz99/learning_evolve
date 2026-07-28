@@ -1,0 +1,158 @@
+
+
+<strategy>
+To improve the packing sum of radii from ~2.618 to the target ~2.636, we need to escape local minima that plague standard constrained optimizers for non-convex circle packing problems. 
+
+Key improvements in this solution:
+1. **Boundary-Guaranteeing Parameterization**: We parameterize centers as `x = r + (1-2r)u` and `y = r + (1-2r)v` with `u, v ∈ [0, 1]`. This mathematically guarantees `r ≤ x, y ≤ 1-r`, completely removing 4N boundary constraints and reducing the problem to only pairwise non-overlap constraints. This drastically improves solver stability.
+2. **Diverse Multi-Start Strategy**: Instead of 5 restarts, we generate 25 diverse initial configurations using perturbed hexagonal lattices (the theoretical densest structure). This covers more of the configuration space and increases the chance of finding the global optimum.
+3. **Robust SLSQP Setup**: We use `SLSQP` with strict tolerances (`ftol=1e-14`) and high iteration limits. The constraint function is fully vectorized for speed.
+4. **Numerical Safety & Scaling**: A post-optimization validation step checks for microscopic constraint violations caused by floating-point inaccuracies. If found, it applies a minimal uniform scaling to guarantee strict compliance with the `1e-12` validation tolerance without sacrificing meaningful radius sum.
+5. **Top-Level Helpers**: All helper functions are defined at module level with explicit arguments to strictly follow the prompt's rules and avoid closure-related overhead or state issues.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(vars_array, n):
+    """Objective: minimize negative sum of radii"""
+    return -np.sum(vars_array[:n])
+
+def compute_constraints(vars_array, n, triu_idx):
+    """Constraints: pairwise non-overlap dist_sq >= (r_i + r_j)^2"""
+    r = vars_array[:n]
+    u = vars_array[n:2*n]
+    v = vars_array[2*n:3*n]
+    
+    # Decode centers from parameterization (guarantees boundary satisfaction)
+    # x = r + (1 - 2r) * u  => if u in [0,1], then x in [r, 1-r]
+    denom = 1.0 - 2.0 * r
+    x = r + denom * u
+    y = r + denom * v
+    
+    # Vectorized pairwise squared distances
+    diff_x = x[:, np.newaxis] - x[np.newaxis, :]
+    diff_y = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = diff_x**2 + diff_y**2
+    
+    # Sum of radii squared
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Return only upper triangle constraints (i < j)
+    return dist_sq[triu_idx] - r_sum_sq[triu_idx]
+
+def run_packing():
+    n = 26
+    triu_idx = np.triu_indices(n, k=1)
+    
+    # Bounds: r in [1e-5, 0.5], u in [0, 1], v in [0, 1]
+    bounds = [(1e-5, 0.5)] * n + [(0.0, 1.0)] * n + [(0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': compute_constraints, 'args': (n, triu_idx)}
+    
+    best_vars = None
+    best_sum = -np.inf
+    rng = np.random.default_rng(42)
+    
+    def create_hex_config(r_init, seed=None):
+        dy = r_init * np.sqrt(3)
+        dx = 2.0 * r_init
+        pts = []
+        y = r_init
+        row = 0
+        while True:
+            shift = r_init if row % 2 == 1 else 0.0
+            x = r_init + shift
+            while x + r_init <= 1.0:
+                if len(pts) >= n: break
+                pts.append([x, y])
+                x += dx
+            if len(pts) >= n: break
+            y += dy
+            row += 1
+            
+        pts = np.array(pts[:n])
+        denom = 1.0 - 2.0 * r_init
+        u = (pts[:, 0] - r_init) / denom
+        v = (pts[:, 1] - r_init) / denom
+        
+        if seed is not None:
+            rng_temp = np.random.default_rng(seed)
+            u = np.clip(u + rng_temp.uniform(-0.1, 0.1, n), 0.0, 1.0)
+            v = np.clip(v + rng_temp.uniform(-0.1, 0.1, n), 0.0, 1.0)
+            
+        return np.concatenate([np.full(n, r_init), u, v])
+
+    # Generate diverse initial configurations
+    configs = []
+    configs.append(create_hex_config(0.09, seed=None)) # Exact hex
+    configs.append(create_hex_config(0.09, seed=1))
+    configs.append(create_hex_config(0.09, seed=2))
+    configs.append(create_hex_config(0.085, seed=3))
+    configs.append(create_hex_config(0.095, seed=4))
+    
+    # Add more randomized lattice shifts to thoroughly explore configuration space
+    for seed in range(10, 30):
+        cfg = create_hex_config(0.09, seed=seed)
+        configs.append(cfg)
+
+    # Optimization loop
+    for x0 in configs:
+        try:
+            res = minimize(
+                compute_objective,
+                x0,
+                args=(n,),
+                method='SLSQP',
+                bounds=bounds,
+                constraints=cons,
+                options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False}
+            )
+            
+            if np.isfinite(res.fun):
+                r_opt = res.x[:n]
+                c_vals = compute_constraints(res.x, n, triu_idx)
+                # Allow tiny numerical violation for acceptance, will fix later if needed
+                if np.min(c_vals) >= -1e-6:
+                    s = np.sum(r_opt)
+                    if s > best_sum:
+                        best_sum = s
+                        best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_vars is None:
+        best_vars = configs[0]
+        
+    # Decode final positions
+    r = best_vars[:n]
+    u = best_vars[n:2*n]
+    v = best_vars[2*n:3*n]
+    
+    denom = 1.0 - 2.0 * r
+    x = r + denom * u
+    y = r + denom * v
+    centers = np.column_stack((x, y))
+    
+    # Strict validity safeguard against numerical precision limits
+    c_vals = compute_constraints(best_vars, n, triu_idx)
+    if np.min(c_vals) < 0:
+        scale = 0.99995
+        for _ in range(20):
+            r_scaled = r * scale
+            denom_s = 1.0 - 2.0 * r_scaled
+            x_s = r_scaled + denom_s * u
+            y_s = r_scaled + denom_s * v
+            diff_x = x_s[:, np.newaxis] - x_s[np.newaxis, :]
+            diff_y = y_s[:, np.newaxis] - y_s[np.newaxis, :]
+            dist_sq = diff_x**2 + diff_y**2
+            r_sum_sq = (r_scaled[:, np.newaxis] + r_scaled[np.newaxis, :])**2
+            if np.all(dist_sq[triu_idx] >= r_sum_sq[triu_idx] - 1e-10):
+                r = r_scaled
+                centers = np.column_stack((x_s, y_s))
+                break
+            scale -= 0.0005
+            
+    return centers, r, float(np.sum(r))
+```

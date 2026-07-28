@@ -1,0 +1,194 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, I will employ a hybrid optimization strategy combining a penalty-based L-BFGS-B method with a continuation schedule, followed by a constrained SLSQP refinement. 
+
+1. **Initialization**: Generate multiple initial configurations based on hexagonal lattice patterns that sum to 26 circles (e.g., row counts [6,5,6,5,4], [5,6,5,6,4], etc.). These are scaled to fit within the unit square with a safety margin. Random perturbations are added to these patterns to help escape local minima.
+2. **Penalty Method with Continuation**: For each initialization, I will optimize the centers and radii simultaneously using L-BFGS-B. The objective minimizes the negative sum of radii plus a weighted penalty for boundary violations and circle overlaps. I will use a continuation approach, gradually increasing the penalty weight (`mu`) from 100 to 100,000. This allows the optimizer to first find a good configuration and then tightly enforce constraints.
+3. **SLSQP Refinement**: After the penalty method converges, I will take the best candidate and refine it using SLSQP with explicit inequality constraints. This step is crucial for pushing the solution to the theoretical boundary where constraints are active, maximizing the sum of radii precisely.
+4. **Safety Scaling & Validation**: Finally, I compute a strict safety scaling factor to guarantee all circles are within the unit square and non-overlapping within the validator's numerical tolerance (`1e-12`). The radii are scaled down slightly if necessary to ensure validity.
+5. **Structure**: All helper functions are defined at the top level without closures or lambdas, adhering to the constraints. The approach balances global exploration (multiple starts, perturbations) with local exploitation (continuation, SLSQP).
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_penalized_objective(vars, n, mu, triu_idx):
+    """
+    Objective function for L-BFGS-B: minimizes negative sum of radii plus penalty for constraint violations.
+    """
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    obj = -np.sum(r)
+    pen = 0.0
+    
+    # Boundary penalties: circles must stay within [0, 1]
+    # Left: x >= r  => r - x <= 0
+    v = r - x
+    pen += np.sum(np.maximum(0, v)**2)
+    # Right: 1 - x >= r => r + x - 1 <= 0
+    v = r + x - 1.0
+    pen += np.sum(np.maximum(0, v)**2)
+    # Bottom: y >= r
+    v = r - y
+    pen += np.sum(np.maximum(0, v)**2)
+    # Top: 1 - y >= r
+    v = r + y - 1.0
+    pen += np.sum(np.maximum(0, v)**2)
+    
+    # Overlap penalties: dist(i, j) >= r_i + r_j
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2 + 1e-12)
+    np.fill_diagonal(dist, 1.0)
+    
+    r_sum = r[:, None] + r[None, :]
+    viol = r_sum - dist
+    pen += np.sum(np.maximum(0, viol[triu_idx])**2)
+    
+    return obj + mu * pen
+
+def obj_slqp(vars, n):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def cons_slqp(vars, n):
+    """Inequality constraints for SLSQP: boundary and non-overlap."""
+    cx = vars[0::3]
+    cy = vars[1::3]
+    r = vars[2::3]
+    c = []
+    # Boundary constraints
+    c.extend(cx - r)
+    c.extend(1.0 - cx - r)
+    c.extend(cy - r)
+    c.extend(1.0 - cy - r)
+    
+    # Pairwise non-overlap constraints: dist(i,j) >= r_i + r_j
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)
+    r_sum = r[:, None] + r[None, :]
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    c.extend(dist[mask] - r_sum[mask])
+    return np.array(c)
+
+def make_hex(rows_pattern, r):
+    """Generates a hexagonal lattice pattern of circles."""
+    pts = []
+    y = r
+    dy = np.sqrt(3) * r
+    for idx, cnt in enumerate(rows_pattern):
+        shift = r if idx % 2 == 1 else 0.0
+        x = r + shift
+        for _ in range(cnt):
+            pts.append([x, y])
+            x += 2 * r
+        y += dy
+    return np.array(pts)
+
+def run_packing():
+    n = 26
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * n
+    triu_idx = np.triu_indices(n, k=1)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    r_init = 0.09
+    patterns = [
+        [6, 5, 6, 5, 4],
+        [5, 6, 5, 6, 4],
+        [7, 6, 6, 7],
+        [4, 6, 6, 6, 4]
+    ]
+    
+    inits = []
+    for p in patterns:
+        pts = make_hex(p, r_init)
+        pts -= pts.min(axis=0)
+        spread = pts.max(axis=0) - pts.min(axis=0)
+        pts /= spread
+        pts = pts * 0.9 + 0.05
+        inits.append(pts)
+        
+    np.random.seed(42)
+    for _ in range(8):
+        base = inits[0].copy()
+        base += np.random.uniform(-0.03, 0.03, base.shape)
+        base = np.clip(base, 0.05, 0.95)
+        inits.append(base)
+
+    for cfg in inits:
+        x0 = np.zeros(3 * n)
+        x0[0::3] = cfg[:, 0]
+        x0[1::3] = cfg[:, 1]
+        x0[2::3] = r_init
+        
+        x_curr = x0.copy()
+        mus = [100.0, 1000.0, 5000.0, 20000.0, 100000.0]
+        
+        # Continuation method with L-BFGS-B
+        for mu in mus:
+            try:
+                res = minimize(
+                    compute_penalized_objective,
+                    x_curr,
+                    args=(n, mu, triu_idx),
+                    method='L-BFGS-B',
+                    bounds=bounds,
+                    options={'maxiter': 8000, 'ftol': 1e-15, 'gtol': 1e-10}
+                )
+                x_curr = res.x
+            except Exception:
+                break
+                
+        cx = x_curr[0::3]
+        cy = x_curr[1::3]
+        r = x_curr[2::3]
+        centers = np.column_stack((cx, cy))
+        
+        # Refine with SLSQP for precise constraint handling
+        try:
+            res_s = minimize(obj_slqp, x_curr, method='SLSQP', bounds=bounds,
+                             constraints={'type': 'ineq', 'fun': cons_slqp, 'args': (n,)},
+                             options={'maxiter': 5000, 'ftol': 1e-14})
+            if np.isfinite(res_s.fun):
+                cx = res_s.x[0::3]
+                cy = res_s.x[1::3]
+                r = res_s.x[2::3]
+                centers = np.column_stack((cx, cy))
+        except Exception:
+            pass
+            
+        # Compute safety scaling factor to guarantee strict validity
+        k = 1.0
+        for i in range(n):
+            k = min(k, cx[i]/r[i], (1.0-cx[i])/r[i], cy[i]/r[i], (1.0-cy[i])/r[i])
+            for j in range(i+1, n):
+                d = np.sqrt((cx[i]-cx[j])**2 + (cy[i]-cy[j])**2)
+                if r[i] + r[j] > 1e-9:
+                    k = min(k, d / (r[i] + r[j]))
+                    
+        # Apply scaling with tiny margin for numerical stability
+        r_final = r * k * 0.99999999
+        s = np.sum(r_final)
+        
+        if s > best_sum:
+            best_sum = s
+            best_centers = centers.copy()
+            best_radii = r_final.copy()
+
+    # Fallback if optimization fails unexpectedly
+    if best_centers is None:
+        best_centers = inits[0]
+        best_radii = np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, float(best_sum)
+```

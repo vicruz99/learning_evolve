@@ -1,0 +1,188 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a hybrid optimization strategy that combines deterministic lattice initialization, simulated annealing on circle centers, exact linear programming for radius allocation, and joint non-linear refinement.
+
+1. **Initialization**: Generate multiple high-quality starting configurations using hexagonal lattices with varying densities, plus random perturbations and fully random placements. Hexagonal patterns naturally maximize packing density.
+2. **Simulated Annealing on Centers**: For each initial configuration, treat the center coordinates as variables and the sum of radii as the objective. Since radii depend on centers, we evaluate the objective by solving an LP that maximizes $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and boundary constraints. SA allows escaping local minima where centers get stuck in suboptimal symmetric arrangements.
+3. **Local Directional Search**: After SA converges, perform a targeted grid search around each circle's position to squeeze out additional slack. Small moves can significantly increase neighboring circles' allowable radii.
+4. **Joint SLSQP Refinement**: Use the SA result as a warm start for a smooth non-linear optimizer (`SLSQP`) that adjusts centers and radii simultaneously. This handles the non-convex squared-distance constraints gracefully near the optimum.
+5. **Exact LP Squeeze & Safety Scaling**: After all optimizations, run one final LP to extract the mathematically maximal radii for the converged centers. Apply a rigorous safety scaling factor to guarantee strict compliance with the $10^{-12}$ numerical tolerance in the validator.
+
+This pipeline leverages the speed of `scipy.optimize.linprog` (with pre-structured constraint matrices) for exact radius evaluation, while using stochastic and deterministic methods to navigate the complex center-position landscape.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def make_hex(n, r0):
+    """Generates a hexagonal lattice configuration of n circles."""
+    pts = []
+    y = r0
+    row = 0
+    while y + r0 < 1.0 and len(pts) < n:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x + r0 < 1.0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(pts) < n:
+        pts.append([0.5, 0.5])
+    return np.array(pts[:n])
+
+def solve_lp_radii(centers, n, A_ub):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    lims = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, max(l, 1e-9)) for l in lims]
+    
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    idx = np.triu_indices(n, k=1)
+    b_ub = np.concatenate([lims, dists[idx]])
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return np.maximum(res.x, 0.0), -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-8), 0.0
+
+def objective_joint(x, n):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(x[2*n:])
+
+def constraints_joint(x, n):
+    """Inequality constraints >= 0 for valid joint packing."""
+    cx, cy, r = x[:n], x[n:2*n], x[2*n:]
+    c = list(cx - r) + list(1.0 - cx - r) + list(cy - r) + list(1.0 - cy - r)
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    r_sum = r[:, None] + r[None, :]
+    idx = np.triu_indices(n, k=1)
+    c.extend(d2[idx] - r_sum[idx]**2)
+    return np.array(c)
+
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
+    
+    # Precompute LP constraint matrix structure (constant across iterations)
+    A_ub = np.zeros((n + n*(n-1)//2, n))
+    for i in range(n):
+        A_ub[i, i] = 1.0
+    k = n
+    for i in range(n):
+        for j in range(i+1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            k += 1
+            
+    # Diverse initial configurations
+    configs = [make_hex(n, r) for r in np.linspace(0.085, 0.11, 5)]
+    for cfg in configs:
+        configs.append(cfg + rng.uniform(-0.015, 0.015, (n, 2)))
+    for _ in range(3):
+        configs.append(rng.uniform(0.15, 0.85, (n, 2)))
+        
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Phase 1: Simulated Annealing on centers with LP objective
+    for cfg in configs:
+        c = np.clip(cfg, 1e-4, 1.0-1e-4)
+        r, s = solve_lp_radii(c, n, A_ub)
+        
+        temp = 0.025
+        for step in range(2000):
+            i = rng.integers(n)
+            old = c[i].copy()
+            move = rng.normal(0, temp, 2)
+            c[i] = np.clip(old + move, 1e-4, 1.0-1e-4)
+            
+            r_new, s_new = solve_lp_radii(c, n, A_ub)
+            delta = s_new - s
+            
+            if delta > 0 or rng.random() < np.exp(delta / max(temp, 1e-9)):
+                r, s = r_new, s_new
+            else:
+                c[i] = old
+                
+            if step % 150 == 0:
+                temp *= 0.94
+                
+        if s > best_sum:
+            best_sum = s
+            best_c = c.copy()
+            best_r = r.copy()
+            
+    # Phase 2: Local directional search to polish centers
+    for _ in range(50):
+        improved = False
+        for i in range(n):
+            old = best_c[i].copy()
+            best_sum_i = best_sum
+            for dx in [-0.005, 0.005]:
+                for dy in [-0.005, 0.005]:
+                    best_c[i] = np.clip(old + np.array([dx, dy]), 1e-4, 1.0-1e-4)
+                    r_try, s_try = solve_lp_radii(best_c, n, A_ub)
+                    if s_try > best_sum_i + 1e-9:
+                        best_sum_i = s_try
+                        best_r = r_try.copy()
+            if best_sum_i > best_sum:
+                best_sum = best_sum_i
+                improved = True
+            else:
+                best_c[i] = old
+        if not improved:
+            break
+            
+    # Phase 3: Joint SLSQP refinement
+    x0 = np.zeros(3*n)
+    x0[:n] = best_c[:, 0]
+    x0[n:2*n] = best_c[:, 1]
+    x0[2*n:] = best_r
+    
+    try:
+        res = minimize(objective_joint, x0, args=(n,), method='SLSQP',
+                      bounds=[(0,1)]*(2*n) + [(1e-6, 0.5)]*n,
+                      constraints={'type': 'ineq', 'fun': constraints_joint, 'args': (n,)},
+                      options={'maxiter': 5000, 'ftol': 1e-13})
+        if np.isfinite(res.fun):
+            c_slq = np.column_stack((res.x[:n], res.x[n:2*n]))
+            r_slq, s_slq = solve_lp_radii(c_slq, n, A_ub)
+            if s_slq > best_sum:
+                best_c, best_r, best_sum = c_slq, r_slq, s_slq
+    except Exception:
+        pass
+        
+    # Phase 4: Final exact LP squeeze
+    r_final, s_final = solve_lp_radii(best_c, n, A_ub)
+    if s_final > best_sum:
+        best_r, best_sum = r_final, s_final
+        
+    # Phase 5: Strict safety scaling for validator tolerance
+    scale = 1.0
+    for i in range(n):
+        x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+        if r > 1e-9:
+            scale = min(scale, x/r, (1-x)/r, y/r, (1-y)/r)
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+            rs = best_r[i] + best_r[j]
+            if rs > 1e-9:
+                scale = min(scale, d/rs)
+                
+    best_r *= scale * 0.9999999
+    best_sum = np.sum(best_r)
+    
+    return best_c, best_r, float(best_sum)
+```

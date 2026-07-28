@@ -1,0 +1,170 @@
+
+
+<strategy>
+To improve the packing sum of radii from ~2.624 to the target of 2.636, we need a more robust optimization strategy that escapes local minima and strictly enforces non-overlap and boundary constraints. 
+
+1. **Penalty Method with L-BFGS-B**: Instead of SLSQP which can struggle with hundreds of non-convex constraints, we use a squared penalty method for violations. L-BFGS-B efficiently handles box bounds and works well with penalty objectives. We iteratively increase the penalty weight `mu` to gradually tighten constraints while maximizing $\sum r_i$.
+2. **Diverse Initializations**: We generate multiple starting configurations:
+   - Hexagonal lattices with different row distributions and random perturbations (hexagonal packing is provably optimal for infinite planes and works well for finite squares).
+   - Corner-focused placement (4 circles at corners + hex fill) to exploit boundary geometry.
+   - Random placements to explore alternative topologies.
+3. **Multi-Phase Optimization**: Each initialization runs through an optimization schedule where `mu` increases geometrically. This allows the optimizer to first expand radii, then resolve overlaps, and finally fine-tune positions.
+4. **Refinement Loop**: After finding the best valid configuration, we perturb it slightly and re-optimize to escape shallow local minima.
+5. **Strict Validation & Safety Margin**: All candidates are rigorously checked against the validator's tolerances. A tiny uniform scaling factor (`0.999999`) guarantees numerical safety without sacrificing meaningful radius sum.
+6. **Top-Level Structure**: All helper functions are defined at the module level to comply with constraints, avoiding closures and nested functions.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def penalty_func(vars_flat, n, mu):
+    """Computes objective: negative sum of radii + penalty for constraint violations."""
+    c = vars_flat[:2*n].reshape(n, 2)
+    r = vars_flat[2*n:]
+    
+    pen = 0.0
+    # Boundary violations: circle must stay within [0, 1]
+    # x >= r
+    v = r - c[:, 0]
+    pen += np.sum(np.maximum(0.0, v)**2)
+    # x <= 1 - r  => r + x <= 1
+    v = r + c[:, 0] - 1.0
+    pen += np.sum(np.maximum(0.0, v)**2)
+    # y >= r
+    v = r - c[:, 1]
+    pen += np.sum(np.maximum(0.0, v)**2)
+    # y <= 1 - r => r + y <= 1
+    v = r + c[:, 1] - 1.0
+    pen += np.sum(np.maximum(0.0, v)**2)
+    
+    # Overlap violations: dist(i, j) >= r_i + r_j
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    v = r_sum - dists
+    pen += np.sum(np.maximum(0.0, v)**2)
+    
+    return -np.sum(r) + mu * pen
+
+def get_hex_config(n, seed):
+    """Generates an initial hexagonal lattice configuration scaled to fit in [0,1]^2."""
+    np.random.seed(seed)
+    r0 = 0.10
+    dy = np.sqrt(3) * r0
+    dx = 2.0 * r0
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < n + 10:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x + r0 <= 1.0:
+            pts.append([x, y])
+            x += dx
+        y += dy
+        row += 1
+    pts = np.array(pts[:n])
+    # Normalize to comfortably fit inside the unit square
+    pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.8 + 0.1
+    return pts
+
+def optimize_step(vars_flat, n, bounds, mu_start, cycles):
+    """Runs iterative penalty optimization with increasing penalty weight."""
+    mu = mu_start
+    for _ in range(cycles):
+        res = minimize(penalty_func, vars_flat, args=(n, mu),
+                       method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 10000, 'ftol': 1e-15})
+        vars_flat = res.x
+        mu *= 4.0
+    return vars_flat
+
+def is_valid(c, r, n):
+    """Checks if a configuration strictly satisfies validation tolerances."""
+    # Boundary checks
+    if np.any(c[:, 0] - r < -1e-7) or np.any(c[:, 0] + r > 1 + 1e-7):
+        return False
+    if np.any(c[:, 1] - r < -1e-7) or np.any(c[:, 1] + r > 1 + 1e-7):
+        return False
+    # Overlap checks
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    if np.any(dists < r_sum - 1e-7):
+        return False
+    return True
+
+def run_packing():
+    n = 26
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)] * n
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse initial configurations
+    inits = []
+    # 1. Hexagonal patterns with perturbations
+    for i in range(5):
+        pts = get_hex_config(n, i*42)
+        noise = np.random.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts + noise, 0.05, 0.95)
+        inits.append(np.concatenate([pts.flatten(), np.full(n, 0.09)]))
+        
+    # 2. Corner-focused initialization
+    pts_corner = np.array([[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]])
+    pts_hex = get_hex_config(n-4, 123)
+    pts_corner = np.vstack([pts_corner, pts_hex[:n-4]])
+    inits.append(np.concatenate([pts_corner.flatten(), np.full(n, 0.09)]))
+    
+    # 3. Random initialization
+    pts_rand = np.random.uniform(0.1, 0.9, (n, 2))
+    inits.append(np.concatenate([pts_rand.flatten(), np.full(n, 0.06)]))
+    
+    # Optimize each initialization
+    for init_v in inits:
+        vars_flat = optimize_step(init_v, n, bounds, mu_start=2000.0, cycles=8)
+        c_opt = vars_flat[:2*n].reshape(n, 2)
+        r_opt = vars_flat[2*n:]
+        
+        if is_valid(c_opt, r_opt, n):
+            s = np.sum(r_opt)
+            if s > best_sum:
+                best_sum = s
+                best_centers = c_opt.copy()
+                best_radii = r_opt.copy()
+                
+    # Refinement loop: perturb best known solution and re-optimize to escape local minima
+    if best_centers is not None:
+        for _ in range(4):
+            perturb = best_centers + np.random.uniform(-0.005, 0.005, best_centers.shape)
+            perturb = np.clip(perturb, 0.05, 0.95)
+            new_v = np.concatenate([perturb.flatten(), best_radii])
+            
+            vars_flat = optimize_step(new_v, n, bounds, mu_start=5000.0, cycles=6)
+            c_opt = vars_flat[:2*n].reshape(n, 2)
+            r_opt = vars_flat[2*n:]
+            
+            if is_valid(c_opt, r_opt, n):
+                s = np.sum(r_opt)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+
+    # Fallback if all optimizations fail unexpectedly
+    if best_centers is None:
+        best_centers = get_hex_config(n, 0)
+        best_radii = np.full(n, 0.08)
+        best_sum = np.sum(best_radii)
+        
+    # Apply strict safety margin to guarantee compliance with 1e-12 tolerance
+    best_radii *= 0.999999
+    best_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, best_sum
+```

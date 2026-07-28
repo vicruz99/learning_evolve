@@ -1,0 +1,126 @@
+
+
+<strategy>
+The core challenge in circle packing is handling the non-smooth `min` function and hard non-overlap constraints, which often cause gradient-based optimizers to get stuck or fail. To overcome this, we transform the problem into an unconstrained (bounded) optimization of centers using a **smooth minimum approximation (softmin)** combined with a **log-sum-exp** formulation.
+
+**Key Steps:**
+1. **Objective Transformation**: Instead of optimizing radii directly with hard constraints, we optimize only the 2D centers. For each circle, its "effective radius" is determined by the minimum distance to boundaries and half the distance to the nearest neighbor. We approximate this minimum using a smooth softmin function: `softmin(vals) ≈ -1/k * log(sum(exp(-k * (vals - max))))`. Summing these softmin values gives a differentiable objective that pushes circles apart and towards optimal spacing.
+2. **Robust Optimization**: We use `scipy.optimize.minimize` with the `L-BFGS-B` method. It efficiently handles bound constraints `[0, 1]` for coordinates and excels at smooth landscapes. A sharpness parameter `k=100` balances smoothness for gradients with accuracy near the true minimum.
+3. **Multiple Restarts**: Packing landscapes have many local minima. We generate diverse initial configurations: a base hexagonal lattice (known to be density-optimal), multiple random perturbations of it, and a few fully random starts. This dramatically increases the chance of finding the global optimum.
+4. **Exact Radius Extraction**: After optimization converges to the best center layout, we compute the exact maximum valid radius for each circle by taking the true minimum of boundary and pairwise clearances. This guarantees strict validity. A tiny safety factor (`0.999999`) is applied to pass the validator's `1e-12` tolerance without meaningfully reducing the sum.
+5. **Performance**: The N=26 size allows efficient O(N^2) distance calculations inside the objective function. The loop-based softmin is fast enough and numerically stable.
+
+This approach consistently outperforms penalty methods and hard-constraint SLSQP for packing problems by providing smooth, well-conditioned gradients that guide the solver directly to dense, valid configurations.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+SMOOTH_EPS = 100.0
+
+def compute_smooth_objective(centers):
+    """
+    Computes the negative smooth approximation of the sum of maximum feasible radii.
+    Minimizing this maximizes the packed radii sum.
+    """
+    n = centers.shape[0]
+    dx = centers[:, 0, np.newaxis] - centers[:, 0]
+    dy = centers[:, 1, np.newaxis] - centers[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    half_dists = dists * 0.5
+    
+    total_softmin = 0.0
+    for i in range(n):
+        # Distances to the four boundaries
+        b = np.array([centers[i, 0], 1.0 - centers[i, 0], 
+                      centers[i, 1], 1.0 - centers[i, 1]])
+        # Half distances to all other circles (exclude self-distance at index i)
+        p = np.concatenate([half_dists[i, :i], half_dists[i, i+1:]])
+        
+        vals = np.concatenate([b, p])
+        
+        # Stable softmin computation
+        max_val = np.max(vals)
+        exp_terms = np.exp(-SMOOTH_EPS * (vals - max_val))
+        softmin_val = -np.log(np.sum(exp_terms)) / SMOOTH_EPS + max_val
+        total_softmin += softmin_val
+        
+    return -total_softmin
+
+def generate_hex_config(n):
+    """Generates a dense hexagonal lattice initialization."""
+    pts = []
+    r = 0.10
+    y = r
+    row = 0
+    dy = np.sqrt(3) * r
+    while len(pts) < n + 10:
+        shift = r if row % 2 == 1 else 0.0
+        x = r + shift
+        while x <= 1.0 - r and len(pts) < n + 10:
+            pts.append([x, y])
+            x += 2.0 * r
+        y += dy
+        row += 1
+    return np.array(pts[:n])
+
+def compute_exact_radii(centers):
+    """Computes the exact maximum valid radius for each circle given fixed centers."""
+    n = centers.shape[0]
+    dx = centers[:, 0, np.newaxis] - centers[:, 0]
+    dy = centers[:, 1, np.newaxis] - centers[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    
+    radii = np.zeros(n)
+    for i in range(n):
+        min_boundary = min(centers[i, 0], 1.0 - centers[i, 0], 
+                           centers[i, 1], 1.0 - centers[i, 1])
+        min_pairwise = np.min(dists[i]) / 2.0
+        radii[i] = min(min_boundary, min_pairwise)
+    return radii
+
+def run_packing():
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES)
+    
+    best_sum = -1.0
+    best_centers = None
+    
+    # 1. Base hexagonal configuration
+    inits = [generate_hex_config(N_CIRCLES)]
+    
+    # 2. Perturbed hexagonal configurations to escape local minima
+    for _ in range(12):
+        c = generate_hex_config(N_CIRCLES).copy()
+        c += np.random.uniform(-0.025, 0.025, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        inits.append(c)
+        
+    # 3. Fully random configurations
+    for _ in range(4):
+        c = np.random.uniform(0.1, 0.9, (N_CIRCLES, 2))
+        inits.append(c)
+        
+    # Optimize from each configuration
+    for cfg in inits:
+        res = minimize(compute_smooth_objective, cfg.flatten(), 
+                       method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 40000, 'ftol': 1e-15, 'gtol': 1e-12})
+        
+        centers_opt = res.x.reshape(-1, 2)
+        radii_opt = compute_exact_radii(centers_opt)
+        s = np.sum(radii_opt)
+        
+        if s > best_sum:
+            best_sum = s
+            best_centers = centers_opt.copy()
+            
+    # Final strict radii computation with a microscopic safety margin for numerical tolerance
+    final_radii = compute_exact_radii(best_centers) * 0.999999
+    final_sum = float(np.sum(final_radii))
+    
+    return best_centers, final_radii, final_sum
+```
