@@ -1,0 +1,272 @@
+# sol_000056 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 67b9141d) state=ef82cfda sum of radii=1.113238 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import scipy.spatial
+
+def generate_hexagonal_centers(n, width=1.0, height=1.0):
+    """
+    Generate a set of centers arranged in a hexagonal lattice pattern.
+    """
+    # Estimate number of rows and cols
+    # Area per circle ~ 1/n. Radius ~ sqrt(1/(n*pi)). Diameter ~ 2*sqrt...
+    # Spacing ~ diameter.
+    # Rough estimate for grid size
+    cols = int(np.ceil(np.sqrt(n * 1.15))) # Hexagonal is denser, so fewer cols needed for same n? 
+    # Actually, let's just try to fit n points.
+    # A standard hex packing: rows shifted.
+    
+    # Let's try to fit n points by adjusting spacing until they fit in [0,1]x[0,1]
+    # But we want them spread out to allow larger radii.
+    # Let's just create a grid and let the optimizer move them.
+    
+    # A simple approach: place points on a grid that is slightly denser than needed,
+    # or just a uniform distribution?
+    # Hexagonal lattice is better.
+    
+    # Let's determine a spacing 's' such that we can fit roughly n points.
+    # Density of hex lattice is 2 / (sqrt(3) * s^2) points per unit area?
+    # Area per point = sqrt(3)/2 * s^2.
+    # 1/n = sqrt(3)/2 * s^2  => s = sqrt(2 / (n * sqrt(3)))
+    
+    s = np.sqrt(2.0 / (n * np.sqrt(3)))
+    
+    points = []
+    # Row height is s * sqrt(3) / 2
+    row_height = s * np.sqrt(3) / 2
+    
+    y = s # start with margin? Or 0? Let's center later.
+    row_idx = 0
+    
+    while len(points) < n:
+        # Determine shift for this row
+        x_shift = 0
+        if row_idx % 2 == 1:
+            x_shift = s / 2.0
+        
+        x = x_shift
+        while True:
+            # Check if point is within reasonable bounds before scaling
+            # We will scale/translate later.
+            # Just generate a lattice and then fit to [0,1]
+            points.append([x, y])
+            x += s
+            if x > width * 1.5: # heuristic bound
+                break
+        y += row_height
+        row_idx += 1
+        
+    centers = np.array(points[:n])
+    
+    # Normalize and center in [0, 1] x [0, 1]
+    # Find bounding box
+    min_x, min_y = np.min(centers, axis=0)
+    max_x, max_y = np.max(centers, axis=0)
+    
+    # Scale to fit in [0.05, 0.95] roughly to leave room for radii
+    # Or just scale to [0,1]
+    
+    # Let's scale such that the bounding box fits in [0.1, 0.9] to start with some margin
+    # Actually, better to just scale to [0,1] and let optimizer push to edges if needed.
+    # But for hex packing, centers should be away from edges by at least r.
+    
+    # Let's just scale to fit in [0, 1]
+    centers = (centers - min_x) / (max_x - min_x) * 0.9 + 0.05
+    centers[:, 1] = (centers[:, 1] - min_y) / (max_y - min_y) * 0.9 + 0.05
+    
+    # Ensure strict bounds [0, 1]
+    centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+    
+    return centers
+
+def get_max_sum_radii(centers):
+    """
+    Given fixed centers, solve LP to maximize sum of radii.
+    Returns sum_radii, radii_array.
+    """
+    n = centers.shape[0]
+    
+    # Variables: r_0, ..., r_{n-1}
+    # Objective: Maximize sum(r_i) <=> Minimize -sum(r_i)
+    c = -np.ones(n)
+    
+    # Constraints: A_ub * r <= b_ub
+    # 1. Boundary constraints:
+    # r_i <= x_i
+    # r_i <= 1 - x_i
+    # r_i <= y_i
+    # r_i <= 1 - y_i
+    
+    # 2. Overlap constraints:
+    # r_i + r_j <= dist(i, j)
+    
+    # We will construct A_ub and b_ub
+    # Number of constraints: 4*n (boundary) + n*(n-1)/2 (pairs)
+    
+    num_pairs = n * (n - 1) // 2
+    num_constraints = 4 * n + num_pairs
+    
+    A_ub = np.zeros((num_constraints, n))
+    b_ub = np.zeros(num_constraints)
+    
+    row_idx = 0
+    
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        
+        # r_i <= x
+        A_ub[row_idx, i] = 1.0
+        b_ub[row_idx] = x
+        row_idx += 1
+        
+        # r_i <= 1 - x
+        A_ub[row_idx, i] = 1.0
+        b_ub[row_idx] = 1.0 - x
+        row_idx += 1
+        
+        # r_i <= y
+        A_ub[row_idx, i] = 1.0
+        b_ub[row_idx] = y
+        row_idx += 1
+        
+        # r_i <= 1 - y
+        A_ub[row_idx, i] = 1.0
+        b_ub[row_idx] = 1.0 - y
+        row_idx += 1
+        
+    # Pairwise constraints
+    dists = scipy.spatial.distance.pdist(centers, 'euclidean')
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Index in dists array
+            # pdist ordering: (0,1), (0,2)...(0,n-1), (1,2)...
+            # Formula for index: i*n - i*(i+1)/2 + j - 1 - i
+            # Or just compute directly or use loop counter
+            pass
+            
+    # Let's reconstruct indices properly
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+            A_ub[row_idx, i] = 1.0
+            A_ub[row_idx, j] = 1.0
+            b_ub[row_idx] = d
+            row_idx += 1
+            
+    # Bounds for r: [0, 1] (radius cannot be negative, and max 0.5 theoretically but 1 is safe)
+    bounds = [(0, 1.0) for _ in range(n)]
+    
+    try:
+        res = opt.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            radii = res.x
+            return -res.fun, radii
+        else:
+            # Fallback: small radii
+            # If LP fails, return a valid small radius solution?
+            # But usually it shouldn't fail if constraints are consistent.
+            # Maybe infeasible? (e.g. centers too close such that dist < 0 impossible, but dist >= 0)
+            # Infeasible only if x < 0 etc, but x in [0,1].
+            # Or if dist < 0 impossible.
+            # Wait, if centers are identical, dist=0, then r_i + r_j <= 0 => r=0.
+            # Feasible with r=0.
+            return 0.0, np.zeros(n)
+    except Exception:
+        return 0.0, np.zeros(n)
+
+def objective_function(centers_flat, bounds_tuple):
+    """
+    Objective function for optimizing centers.
+    Maximizes sum of radii (minimizes negative sum).
+    """
+    n = 26
+    centers = centers_flat.reshape((n, 2))
+    
+    # Clip centers to valid range [epsilon, 1-epsilon] to avoid boundary issues in LP?
+    # LP handles boundaries, but centers at 0 might make r=0 forced.
+    # Let's allow centers anywhere, LP handles it.
+    
+    sum_r, _ = get_max_sum_radii(centers)
+    return -sum_r
+
+def run_packing():
+    n = 26
+    
+    # 1. Generate initial centers
+    # Try a few different initializations and pick the best
+    best_sum = 0
+    best_centers = None
+    best_radii = None
+    
+    # Initialization 1: Hexagonal grid
+    centers_init = generate_hexagonal_centers(n)
+    
+    # Initialization 2: Random perturbation of grid
+    centers_init2 = centers_init + np.random.normal(0, 0.02, size=centers_init.shape)
+    centers_init2 = np.clip(centers_init2, 0.01, 0.99)
+    
+    initial_sets = [centers_init, centers_init2]
+    
+    # Add a few random starts
+    for _ in range(3):
+        random_centers = np.random.uniform(0.05, 0.95, size=(n, 2))
+        initial_sets.append(random_centers)
+        
+    for init_centers in initial_sets:
+        # Optimize centers
+        # Use Powell method, it's derivative free and good for local optima
+        # Bounds for centers: [0, 1] for x, [0, 1] for y
+        x0 = init_centers.flatten()
+        bounds_opt = [(0, 1) for _ in range(n * 2)]
+        
+        try:
+            # Using basinhopping might be too slow, try Powell first
+            res = opt.minimize(objective_function, x0, method='Powell', 
+                               bounds=bounds_opt, 
+                               options={'maxiter': 100, 'ftol': 1e-9, 'xtol': 1e-9})
+            
+            current_sum = -res.fun
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = res.x.reshape((n, 2))
+        except Exception:
+            pass
+
+    # 2. Solve LP one last time for the best centers found
+    if best_centers is not None:
+        final_sum, final_radii = get_max_sum_radii(best_centers)
+        # Sometimes LP might return slightly different radii than implied by objective
+        # if objective used cached or different logic, but here it's consistent.
+        # However, best_sum comes from objective which calls get_max_sum_radii.
+        # So final_sum should match best_sum.
+        # Just to be safe and get consistent radii vector.
+        sum_r, radii = get_max_sum_radii(best_centers)
+        
+        # Refine centers locally around best_centers?
+        # Maybe run a few more steps of optimization with the radii fixed?
+        # No, LP is exact for radii.
+        
+        # Let's do a quick refinement loop:
+        # Perturb centers slightly to see if sum increases
+        # This is basically what Powell does, but maybe it got stuck.
+        
+        # Let's just return the result from LP
+        return best_centers, radii, sum_r
+    else:
+        # Fallback
+        centers = np.random.uniform(0.2, 0.8, size=(n, 2))
+        _, radii = get_max_sum_radii(centers)
+        return centers, radii, np.sum(radii)
+
+# Note: The problem requires defining run_packing function.
+# The code above defines it.
+# We need to make sure imports are inside or available.
+# The prompt says "You can use scientific libraries...".
+# I will wrap the code in the required format.

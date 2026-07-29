@@ -1,161 +1,200 @@
 # sol_000207 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state cccf4974) state=2685d3a9 sum of radii=1.300000 correctness=1.0
+# generation=0 parent=seed (state c1389c4d) state=711bd9d0 sum of radii=0.208509 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 
-N_CIRCLES = 26
-VAR_PER_CIRCLE = 3
-TOTAL_VARS = N_CIRCLES * VAR_PER_CIRCLE
-
-def objective(z):
-    """Objective function: negative sum of radii."""
-    return -np.sum(z[2::3])
-
-def objective_jac(z):
-    """Gradient of the objective function."""
-    jac = np.zeros_like(z)
-    jac[2::3] = -1.0
-    return jac
-
-def constraints_fun_and_jac(z):
-    """Computes constraint values and Jacobian matrix."""
-    n_con = 4 * N_CIRCLES + N_CIRCLES * (N_CIRCLES - 1) // 2
-    vals = np.zeros(n_con)
-    jac = np.zeros((n_con, TOTAL_VARS))
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
     
-    idx = 0
-    # Boundary constraints
-    for i in range(N_CIRCLES):
-        base = 3 * i
-        xi, yi, ri = z[base], z[base+1], z[base+2]
-        
-        # x - r >= 0
-        vals[idx] = xi - ri
-        jac[idx, base] = 1.0
-        jac[idx, base+2] = -1.0
-        idx += 1
-        
-        # y - r >= 0
-        vals[idx] = yi - ri
-        jac[idx, base+1] = 1.0
-        jac[idx, base+2] = -1.0
-        idx += 1
-        
-        # 1 - x - r >= 0
-        vals[idx] = 1.0 - xi - ri
-        jac[idx, base] = -1.0
-        jac[idx, base+2] = -1.0
-        idx += 1
-        
-        # 1 - y - r >= 0
-        vals[idx] = 1.0 - yi - ri
-        jac[idx, base+1] = -1.0
-        jac[idx, base+2] = -1.0
-        idx += 1
-        
-    # Pairwise non-overlap constraints
-    for i in range(N_CIRCLES):
-        for j in range(i + 1, N_CIRCLES):
-            base_i = 3 * i
-            base_j = 3 * j
-            dx = z[base_i] - z[base_j]
-            dy = z[base_i+1] - z[base_j+1]
-            dr = z[base_i+2] + z[base_j+2]
-            
-            vals[idx] = dx*dx + dy*dy - dr*dr
-            jac[idx, base_i] = 2.0 * dx
-            jac[idx, base_i+1] = 2.0 * dy
-            jac[idx, base_i+2] = -2.0 * dr
-            jac[idx, base_j] = -2.0 * dx
-            jac[idx, base_j+1] = -2.0 * dy
-            jac[idx, base_j+2] = -2.0 * dr
-            idx += 1
-            
-    return vals, jac
-
-def cons_fun(z):
-    return constraints_fun_and_jac(z)[0]
-
-def cons_jac(z):
-    return constraints_fun_and_jac(z)[1]
-
-CONS = {'type': 'ineq', 'fun': cons_fun, 'jac': cons_jac}
-BOUNDS = [(0.0, 1.0) if k % 3 < 2 else (0.0, 0.5) for k in range(TOTAL_VARS)]
-
-def run_packing():
-    best_sum_r = -np.inf
-    best_centers = None
-    best_radii = None
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n = 26
+    rng = np.random.default_rng(42)
     
-    # Run multiple restarts to find global optimum
-    for trial in range(10):
-        np.random.seed(42 + trial)
-        
-        # Generate initial hexagonal lattice points
-        pts = []
-        for row in range(6):
-            for col in range(5):
-                x = 0.15 + col * 0.18 + (0.09 if row % 2 else 0.0)
-                y = 0.15 + row * 0.16
-                if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
-                    pts.append([x, y])
-        
-        np.random.shuffle(pts)
-        init_centers = np.array(pts[:N_CIRCLES])
-        init_radii = np.full(N_CIRCLES, 0.05)
-        z0 = np.hstack([init_centers, init_radii[:, None]])
-        
-        try:
-            res = minimize(objective, z0, jac=objective_jac, bounds=BOUNDS, 
-                           constraints=CONS, method='SLSQP', 
-                           options={'maxiter': 1000, 'ftol': 1e-10, 'disp': False})
-            
-            if res.success:
-                curr_sum_r = -res.fun
-                if curr_sum_r > best_sum_r:
-                    best_sum_r = curr_sum_r
-                    best_centers = res.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
-                    best_radii = res.x[2*N_CIRCLES:]
-        except Exception:
-            continue
-            
-    # Fallback if optimization fails
-    if best_centers is None:
-        best_centers = np.random.uniform(0.2, 0.8, (N_CIRCLES, 2))
-        best_radii = np.full(N_CIRCLES, 0.05)
-        
-    # Ensure radii are non-negative
-    best_radii = np.maximum(best_radii, 0.0)
+    # --- 1. Initial Hexagonal Layout ---
+    # Hexagonal packing is denser than a square grid. 
+    # We generate a lattice and select points that fit in the square.
+    points = []
+    # Approximate row height and width for a dense initial guess
+    # We try a few rotations to see which fits best, but standard hex is usually a good start.
+    r_init = 0.095 # Starting radius guess
     
-    # Post-processing: resolve overlaps and enforce boundaries
-    for _ in range(100):
-        overlaps = False
-        for i in range(N_CIRCLES):
-            for j in range(i+1, N_CIRCLES):
-                dx = best_centers[i,0] - best_centers[j,0]
-                dy = best_centers[i,1] - best_centers[j,1]
-                dist_sq = dx*dx + dy*dy
-                min_dist = best_radii[i] + best_radii[j]
-                
-                if dist_sq < min_dist * min_dist:
-                    overlaps = True
-                    dist = np.sqrt(dist_sq)
-                    if dist < 1e-9: dist = 1e-9
-                    overlap = min_dist - dist
-                    nx, ny = dx/dist, dy/dist
-                    # Asymmetric push to avoid oscillation
-                    best_centers[i,0] += nx * overlap * 0.51
-                    best_centers[i,1] += ny * overlap * 0.51
-                    best_centers[j,0] -= nx * overlap * 0.49
-                    best_centers[j,1] -= ny * overlap * 0.49
-                    
-        if not overlaps: break
-        
-    # Final boundary clipping
-    best_centers = np.clip(best_centers, best_radii[:, None], 1.0 - best_radii[:, None])
+    # Generate hexagonal grid points
+    # Row spacing is r * sqrt(3), col spacing is 2 * r
+    rows = int(np.ceil(1 / (r_init * np.sqrt(3)))) + 2
+    cols = int(np.ceil(1 / (2 * r_init))) + 2
     
-    return best_centers, best_radii, np.sum(best_radii)
+    for i in range(rows):
+        for j in range(cols):
+            x = j * 2 * r_init + (0.5 * r_init if i % 2 == 1 else 0)
+            y = i * r_init * np.sqrt(3)
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                points.append([x, y])
+    
+    # If we have more points than needed, select the ones that seem best centered or just take first n
+    # For a better start, we can sort by distance to center to keep them inside
+    if len(points) > n:
+        points = np.array(points)
+        # Prefer points closer to the center of the square to avoid edge issues initially
+        dists = np.sum((points - 0.5)**2, axis=1)
+        indices = np.argsort(dists)[:n]
+        centers = points[indices]
+    else:
+        centers = np.array(points[:n])
+        
+    radii = np.full(n, r_init)
+
+    # --- 2. Simulated Annealing Optimization ---
+    # We will optimize centers and allow radii to adjust based on constraints.
+    # Actually, a common trick is to fix radii to a variable 'r' and maximize 'r' and centers,
+    # but since we want sum of radii, we can optimize radii directly or assume equal radii for simplicity first.
+    # Given the target 2.636, equal radii of ~0.101 is needed. 
+    # We will use a penalty-based optimization to push radii up and centers apart.
+    
+    # Parameters for SA
+    temp = 0.1
+    min_temp = 1e-7
+    decay = 0.995
+    
+    # Convert to optimization variables: [x1, y1, r1, x2, y2, r2, ...]
+    # To make it easier, we can just optimize centers and compute max possible radii, 
+    # but SA on positions is more robust for finding "void" space.
+    
+    # Let's optimize centers to maximize the minimum distance to boundary and other centers.
+    # This is equivalent to maximizing equal radii r.
+    # If sum of radii is the goal, and we find max equal r, we have a strong baseline.
+    # If unequal is better, it's harder to find, but let's stick to optimizing equal radii first as it's often near optimal.
+    # Actually, let's try to optimize the sum of radii directly by treating r_i as variables.
+    
+    # Optimization State: [x0, y0, x1, y1, ..., x25, y25]
+    # We will compute radii dynamically: r_i = min(dist_to_boundary, min(dist_to_others)/2)
+    # Then we want to maximize sum(r_i).
+    
+    current_centers = centers.copy()
+    current_sum_r = 0
+    
+    def calculate_sum_radii(cent):
+        # cent is (n, 2)
+        # Calculate max possible radius for each circle based on boundaries and neighbors
+        # This is an approximation for the sum, assuming we can shrink them all slightly to be valid.
+        # But to be valid, we need r_i + r_j <= dist_ij.
+        # If we set r_i = min(dist_ij / 2), it might not be consistent (triangle inequality issues).
+        # A safer metric for SA is the "minimum slack" or "bottleneck radius".
+        
+        # Let's compute the "bottleneck" radius for equal circles first, as it's a solid lower bound.
+        # dist to boundary
+        d_boundary = np.minimum(np.minimum(cent[:, 0], 1 - cent[:, 0]), 
+                                np.minimum(cent[:, 1], 1 - cent[:, 1]))
+        
+        # dist to others
+        # pairwise distances
+        diff = cent[:, np.newaxis, :] - cent[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, 1e9) # Ignore self
+        min_dist_to_others = np.min(dists, axis=1)
+        
+        # Max radius for circle i if all others were points (not true, but lower bound)
+        # For equal circles, r = min(min(d_boundary), min(min_dist_to_others)/2)
+        r_equal = np.min(np.minimum(d_boundary, min_dist_to_others / 2.0))
+        
+        # We want to maximize this r_equal.
+        return r_equal
+
+    # Actually, maximizing sum of radii allows unequal radii. 
+    # But let's first find the best equal radius configuration, then we can try to perturb.
+    # Let's use SA to maximize r_equal.
+    
+    best_r = calculate_sum_radii(current_centers)
+    
+    # If the initial grid is tight, we might need to perturb it to allow larger r.
+    # With 26 circles, a hexagonal lattice is better than grid.
+    
+    # Let's run SA to improve the equal-radius packing
+    for step in range(2000):
+        # Pick a random circle to move
+        idx = rng.integers(0, n)
+        
+        # Proposed move: random perturbation
+        noise = rng.normal(0, 0.02 * temp, 2)
+        proposed_centers = current_centers.copy()
+        proposed_centers[idx] += noise
+        
+        # Keep inside square
+        proposed_centers = np.clip(proposed_centers, 1e-4, 1-1e-4)
+        
+        proposed_r = calculate_sum_radii(proposed_centers)
+        
+        # Metropolis criterion
+        delta = proposed_r - best_r
+        if delta > 0 or rng.random() < np.exp(delta / temp):
+            current_centers = proposed_centers
+            best_r = proposed_r
+        
+        temp *= decay
+    
+    # After finding good centers for equal radii, let's compute the actual max radii.
+    # We can try to solve for unequal radii by a simple iterative relaxation.
+    # Initialize radii with best_r
+    final_radii = np.full(n, best_r)
+    final_centers = current_centers
+    
+    # Iterative radius update: 
+    # r_i = min( dist_to_boundary_i, min_j( dist_ij - r_j ) )
+    # This is a contraction mapping for radii.
+    
+    for _ in range(50):
+        # Update radii based on current centers and other radii
+        # Boundary constraint
+        r_bound = np.minimum(np.minimum(final_centers[:, 0], 1 - final_centers[:, 0]), 
+                             np.minimum(final_centers[:, 1], 1 - final_centers[:, 1]))
+        
+        # Pairwise constraints: r_i + r_j <= dist_ij => r_i <= dist_ij - r_j
+        # We want the tightest upper bound
+        dists = np.sqrt(np.sum((final_centers[:, np.newaxis, :] - final_centers[np.newaxis, :, :])**2, axis=2))
+        np.fill_diagonal(dists, 1e9)
+        
+        # r_i_new = min( r_bound_i, min_j( dist_ij - r_j ) )
+        # Note: dist_ij - r_j could be negative if overlap exists, so max with 0? 
+        # But we assume centers are valid.
+        
+        min_dist_minus_r = np.min(dists - final_radii[np.newaxis, :], axis=1)
+        
+        final_radii = np.minimum(r_bound, min_dist_minus_r)
+        final_radii = np.maximum(final_radii, 1e-9) # Ensure positive
+
+    # One final pass to ensure strict non-overlap and boundary compliance
+    # If any violation, shrink radii
+    # Check overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((final_centers[i] - final_centers[j])**2))
+            if dist < final_radii[i] + final_radii[j]:
+                # Scale down the two circles
+                scale = dist / (final_radii[i] + final_radii[j])
+                final_radii[i] *= scale
+                final_radii[j] *= scale
+
+    # Check boundaries
+    for i in range(n):
+        x, y = final_centers[i]
+        r = final_radii[i]
+        max_r = min(x, 1-x, y, 1-y)
+        if r > max_r:
+            final_radii[i] = max_r
+
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii
+
+# Validation helper (not part of the solution but for debugging)
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # Optional: call validate_packing if imported

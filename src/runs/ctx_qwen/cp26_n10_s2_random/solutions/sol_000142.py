@@ -1,0 +1,150 @@
+# sol_000142 | problem=circle_packing_26 entrypoint=run_packing
+# generation=7 parent=sol_000135 (state 032311e9) state=7423ae10 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, k=1)
+NUM_PAIRS = N * (N - 1) // 2
+
+# Precompute LP constraint matrix structure
+A_ub_pairs = np.zeros((NUM_PAIRS, N))
+for k, (i, j) in enumerate(zip(TRIU_I, TRIU_J)):
+    A_ub_pairs[k, i] = 1.0
+    A_ub_pairs[k, j] = 1.0
+
+def solve_lp_radii(centers):
+    """Solves LP to find maximum sum of radii for fixed centers."""
+    c = np.clip(centers, 1e-5, 1.0 - 1e-5)
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]),
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 0.0)
+
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    b_ub = np.empty(NUM_PAIRS + N)
+    b_ub[:NUM_PAIRS] = dists[TRIU_I, TRIU_J]
+    b_ub[NUM_PAIRS:] = ub
+
+    bounds_r = [(0.0, u) for u in ub]
+    try:
+        res = linprog(-np.ones(N), A_ub=A_ub_pairs, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.zeros(N)
+
+def obj_de(x):
+    """Objective for differential evolution: minimize negative sum of LP-optimal radii."""
+    return -solve_lp_radii(x.reshape(N, 2))[0]
+
+def obj_joint(v):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(v[2 * N:])
+
+def cons_joint(v):
+    """Computes boundary and non-overlap constraints (must be >= 0)."""
+    c = v[:2 * N].reshape(N, 2)
+    r = v[2 * N:]
+    cons = [c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r]
+    dx = c[TRIU_I, 0] - c[TRIU_J, 0]
+    dy = c[TRIU_I, 1] - c[TRIU_J, 1]
+    dr = r[TRIU_I] + r[TRIU_J]
+    cons.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(cons)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    # Phase 1: Differential Evolution on centers
+    bounds_de = [(0.02, 0.98)] * (2 * N)
+    try:
+        res_de = differential_evolution(obj_de, bounds_de, popsize=20, maxiter=100,
+                                        mutation=(0.5, 1.0), recombination=0.7, seed=42,
+                                        workers=1, tol=1e-6, polish=False, atol=1e-7)
+        best_centers = res_de.x.reshape(N, 2)
+    except Exception:
+        best_centers = np.random.uniform(0.1, 0.9, (N, 2))
+
+    # Phase 2: Powell refinement on LP objective
+    res_powell = minimize(obj_de, best_centers.flatten(), method='Powell',
+                          options={'maxiter': 2000, 'xtol': 1e-9, 'ftol': 1e-10})
+    best_centers = res_powell.x.reshape(N, 2)
+    best_sum, best_radii = solve_lp_radii(best_centers)
+
+    # Phase 3: Joint SLSQP polish
+    v0 = np.concatenate([best_centers.flatten(), best_radii * 0.95])
+    bounds_joint = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    
+    try:
+        res_sl = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_joint,
+                          constraints={'type': 'ineq', 'fun': cons_joint},
+                          options={'maxiter': 10000, 'ftol': 1e-13})
+        if np.min(cons_joint(res_sl.x)) >= -1e-8:
+            c_opt = res_sl.x[:2 * N].reshape(N, 2)
+            s_lp, r_lp = solve_lp_radii(c_opt)
+            if s_lp > best_sum:
+                best_centers = c_opt
+                best_radii = r_lp
+                best_sum = s_lp
+    except Exception:
+        pass
+
+    # Phase 4: Perturbation search to escape local minima
+    rng = np.random.default_rng(123)
+    for scale in [0.005, 0.002, 0.0005]:
+        for _ in range(150):
+            c_trial = best_centers + rng.normal(0, scale, best_centers.shape)
+            c_trial = np.clip(c_trial, 0.01, 0.99)
+            s_trial, _ = solve_lp_radii(c_trial)
+            if s_trial > best_sum + 1e-9:
+                best_sum = s_trial
+                best_centers = c_trial.copy()
+                best_radii, _ = solve_lp_radii(best_centers)
+
+    # Final SLSQP polish
+    v0 = np.concatenate([best_centers.flatten(), best_radii * 0.95])
+    try:
+        res_sl = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_joint,
+                          constraints={'type': 'ineq', 'fun': cons_joint},
+                          options={'maxiter': 15000, 'ftol': 1e-13})
+        if np.min(cons_joint(res_sl.x)) >= -1e-8:
+            c_opt = res_sl.x[:2 * N].reshape(N, 2)
+            s_lp, r_lp = solve_lp_radii(c_opt)
+            if s_lp > best_sum:
+                best_centers = c_opt
+                best_radii = r_lp
+                best_sum = s_lp
+    except Exception:
+        pass
+
+    # Phase 5: Strict numerical repair for validator compliance
+    centers = best_centers.copy()
+    radii = best_radii.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))

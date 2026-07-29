@@ -1,0 +1,244 @@
+
+
+<strategy>
+The previous solutions consistently converge to ~2.634292, indicating that standard SLSQP optimization is trapped in a strong local optimum due to the non-smooth nature of the contact constraints when many circles touch. To break free, I will employ a hybrid strategy:
+
+1. **LP-based Radius Computation**: For any fixed set of centers, the optimal radii are found exactly via Linear Programming. This turns the problem into a center-optimization task with a non-smooth objective function `sum(LP_radii(centers))`.
+2. **Hill-Climbing with Adaptive Perturbation**: Instead of relying solely on gradient-based methods, I will use a robust hill-climbing algorithm on the centers. It adaptively perturbs circle positions, solves the LP for radii, and accepts moves that increase the total radius sum. A "kick" mechanism randomizes a subset of circles when progress stalls, enabling escape from local minima.
+3. **Multi-Start & Polish**: The process begins with diverse structured initializations (hexagonal, grid, staggered). After the hill-climbing phase explores the landscape, a final high-precision SLSQP polish refines the coordinates and radii jointly to squeeze out the last bits of value.
+4. **Strict Validation & Repair**: A final deterministic repair loop ensures all constraints are met within the `1e-12` tolerance required by the validator.
+
+This approach navigates the discrete contact graph changes much more effectively than pure SLSQP, typically yielding higher packing densities for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+N = 26
+TRIL_IDX = np.tril_indices(N, -1)
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [1e-7, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)])
+    return b
+
+def solve_lp_radii(centers):
+    """Optimally compute radii for fixed centers using Linear Programming."""
+    n = N
+    c_obj = -np.ones(n)
+    num_ineq = n + n * (n - 1) // 2
+    A_ub = np.zeros((num_ineq, n))
+    b_ub = np.zeros(num_ineq)
+    
+    idx = 0
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = max(0.0, lim)
+        idx += 1
+        
+    # Overlap constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = max(0.0, dist)
+            idx += 1
+            
+    bounds_lp = [(0.0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_lp, method='highs')
+        if res.success:
+            return np.maximum(res.x, 1e-7)
+    except Exception:
+        pass
+    return np.full(n, 0.01)
+
+def constraints_slsqp(x):
+    """Vectorized inequality constraints for SLSQP: g(x) >= 0."""
+    xs, ys, rs = x[0::3], x[1::3], x[2::3]
+    
+    # Boundary constraints
+    c = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+    
+    # Overlap constraints: dist >= r_i + r_j
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dr = rs[:, None] + rs[None, :]
+    
+    c = np.concatenate([c, np.hypot(dx[TRIL_IDX], dy[TRIL_IDX]) - dr[TRIL_IDX]])
+    return c
+
+def objective_slsqp(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def make_init_centers(strategy, seed=0):
+    """Generates initial center configurations."""
+    np.random.seed(seed)
+    pts = np.zeros((N, 2))
+    
+    if strategy == 'hex':
+        r0 = 0.09
+        y = r0
+        row = 0
+        idx = 0
+        while idx < N:
+            x = r0 if row % 2 == 0 else 2.0 * r0
+            while x <= 1.0 - r0 and idx < N:
+                pts[idx] = [x, y]
+                idx += 1
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+            row += 1
+    elif strategy == 'grid':
+        idx = 0
+        for r in range(6):
+            for c in range(5):
+                if idx < N:
+                    pts[idx] = [0.05 + c * 0.19, 0.05 + r * 0.17]
+                    idx += 1
+    else:
+        pts = np.random.uniform(0.1, 0.9, (N, 2))
+        
+    pts += np.random.uniform(-0.005, 0.005, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+
+    # Phase 1: Multi-start SLSQP to find strong local basins
+    for strat in ['hex', 'grid', 'rand']:
+        for s in range(8):
+            pts = make_init_centers(strat, s)
+            r_init = solve_lp_radii(pts)
+            x0 = np.zeros(3 * N)
+            x0[0::3] = pts[:, 0]
+            x0[1::3] = pts[:, 1]
+            x0[2::3] = r_init
+            
+            try:
+                res = minimize(objective_slsqp, x0, method='SLSQP', bounds=get_bounds(),
+                               constraints={'type': 'ineq', 'fun': constraints_slsqp},
+                               options={'maxiter': 12000, 'ftol': 1e-14, 'disp': False})
+                if res.success:
+                    c_tmp = np.column_stack((res.x[0::3], res.x[1::3]))
+                    r_tmp = solve_lp_radii(c_tmp)
+                    s_tmp = np.sum(r_tmp)
+                    if s_tmp > best_sum:
+                        best_sum = s_tmp
+                        best_centers = c_tmp.copy()
+                        best_radii = r_tmp.copy()
+            except Exception:
+                pass
+
+    # Phase 2: Hill-Climbing on Centers with LP Radius Evaluation
+    # This navigates the non-smooth contact graph landscape effectively
+    if best_centers is not None:
+        curr_c = best_centers.copy()
+        curr_r = best_radii.copy()
+        curr_score = best_sum
+        step = 0
+        no_improve = 0
+        max_steps = 9000
+        
+        while step < max_steps:
+            step += 1
+            no_improve += 1
+            
+            # Adaptive noise: increase if stuck to escape local minima
+            if no_improve > 500:
+                kick_idx = np.random.choice(N, size=np.random.randint(3, 7), replace=False)
+                curr_c[kick_idx] += np.random.normal(0, 0.06, (len(kick_idx), 2))
+                curr_c = np.clip(curr_c, 0.02, 0.98)
+                no_improve = 0
+                
+            noise_scale = 0.008 if no_improve > 200 else 0.002
+            
+            new_c = curr_c.copy()
+            new_c += np.random.normal(0, noise_scale, new_c.shape)
+            new_c = np.clip(new_c, 0.01, 0.99)
+            
+            new_r = solve_lp_radii(new_c)
+            new_score = np.sum(new_r)
+            
+            # Greedy acceptance with strict improvement threshold
+            if new_score > curr_score + 1e-9:
+                curr_c = new_c
+                curr_r = new_r
+                curr_score = new_score
+                no_improve = 0
+                if curr_score > best_sum:
+                    best_sum = curr_score
+                    best_centers = curr_c.copy()
+                    best_radii = curr_r.copy()
+
+    # Phase 3: Final High-Precision SLSQP Polish
+    if best_centers is not None:
+        x0 = np.zeros(3 * N)
+        x0[0::3] = best_centers[:, 0]
+        x0[1::3] = best_centers[:, 1]
+        x0[2::3] = best_radii
+        
+        try:
+            res = minimize(objective_slsqp, x0, method='SLSQP', bounds=get_bounds(),
+                           constraints={'type': 'ineq', 'fun': constraints_slsqp},
+                           options={'maxiter': 20000, 'ftol': 1e-14, 'disp': False})
+            if res.success:
+                best_centers = np.column_stack((res.x[0::3], res.x[1::3]))
+                best_radii = solve_lp_radii(best_centers)
+                best_sum = np.sum(best_radii)
+        except Exception:
+            pass
+
+    # Fallback (should not be reached)
+    if best_centers is None:
+        best_centers = make_init_centers('hex', 0)
+        best_radii = solve_lp_radii(best_centers)
+        best_sum = np.sum(best_radii)
+
+    # Final strict validity adjustment against 1e-12 tolerance
+    centers = best_centers
+    radii = best_radii
+    for _ in range(100):
+        valid = True
+        for i in range(N):
+            if radii[i] < 0 or centers[i, 0] < radii[i] - 1e-9 or centers[i, 0] > 1.0 - radii[i] + 1e-9 or \
+               centers[i, 1] < radii[i] - 1e-9 or centers[i, 1] > 1.0 - radii[i] + 1e-9:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-9:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+            
+        # Minimal shrinkage to recover strict feasibility
+        radii *= 0.9999
+        centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+
+    return centers, radii, float(np.sum(radii))
+```

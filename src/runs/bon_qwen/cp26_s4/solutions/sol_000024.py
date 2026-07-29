@@ -1,0 +1,225 @@
+# sol_000024 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 9233b6dc) state=2455738e sum of radii=1.164589 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    """
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Step 1: Initialize in a dense 5x5 grid (25 circles) with 1 extra in a gap
+    # Grid centers at (0.1, 0.1), (0.3, 0.1)...
+    # We need 26 circles. A 5x5 grid has 25.
+    # We'll place 25 in a grid and 1 slightly offset or in a corner gap.
+    
+    # Let's try a randomized dense initialization first to avoid grid locking
+    # Or a specific pattern. A perturbed grid is good.
+    
+    # Initialize 5x5 grid for 25 circles
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            if idx < n:
+                centers[idx] = [0.1 + 0.2 * i, 0.1 + 0.2 * j]
+                radii[idx] = 0.1
+                idx += 1
+    
+    # Place the 26th circle in a gap or random valid spot
+    # If we filled 25, the 26th needs to be placed.
+    # The grid (0.1, 0.1) to (0.9, 0.9) is full.
+    # Let's place the last one randomly in a small radius to start optimization
+    if idx < n:
+        centers[idx] = [0.2, 0.2] # Overlaps initially, optimizer will fix
+        radii[idx] = 0.01
+    
+    # Randomize slightly to break symmetry
+    centers += np.random.uniform(-0.01, 0.01, size=centers.shape)
+    # Ensure centers are inside
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    # Step 2: Optimization Loop
+    # We want to maximize sum(radii). 
+    # This is equivalent to finding a valid configuration where radii are as large as possible.
+    # We can simulate a process where circles try to expand and push each other apart.
+    
+    learning_rate = 0.05
+    cooling_rate = 0.995
+    min_lr = 1e-7
+    
+    # Precompute pairs for efficiency
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs.append((i, j))
+            
+    num_iterations = 2000
+    
+    for step in range(num_iterations):
+        lr = learning_rate * (cooling_rate ** step)
+        if lr < min_lr:
+            lr = min_lr
+            
+        # Calculate forces
+        forces = np.zeros_like(centers)
+        radius_growth = np.zeros(n)
+        
+        # 1. Boundary forces (push away from walls)
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            # Distance to boundaries
+            dist_left = x - r
+            dist_right = 1 - (x + r)
+            dist_down = y - r
+            dist_up = 1 - (y + r)
+            
+            # If too close or outside, push back. 
+            # We want to encourage expansion, so we don't strictly penalize valid positions,
+            # but we must enforce constraints.
+            # A simple force: if dist < 0, push. 
+            # But for optimization, we can just clamp or push hard.
+            
+            # Let's use a repulsion from walls to keep them inside
+            # Actually, simpler: just project back inside if needed.
+            # But for gradient-like movement:
+            if dist_left < 0: forces[i, 0] += -dist_left * 100
+            if dist_right < 0: forces[i, 0] += -dist_right * 100
+            if dist_down < 0: forces[i, 1] += -dist_down * 100
+            if dist_up < 0: forces[i, 1] += -dist_up * 100
+            
+        # 2. Inter-circle repulsion
+        for i, j in pairs:
+            vec = centers[i] - centers[j]
+            dist = np.linalg.norm(vec)
+            sum_r = radii[i] + radii[j]
+            
+            if dist < sum_r:
+                # Overlap! Push apart.
+                # Force proportional to overlap
+                overlap = sum_r - dist
+                if dist > 1e-9:
+                    force_mag = overlap * 50.0 # Strong repulsion
+                    force_vec = (vec / dist) * force_mag
+                else:
+                    # Random push if on top of each other
+                    force_vec = np.random.uniform(-1, 1, 2) * 10
+                
+                forces[i] += force_vec
+                forces[j] -= force_vec
+            else:
+                # No overlap. 
+                # To maximize radii, we want to increase radii.
+                # But we are constrained by the tightest neighbor.
+                # We can try to grow radii if there is slack.
+                # Slack = dist - sum_r.
+                slack = dist - sum_r
+                # Grow radii proportional to slack?
+                # This is tricky because growing one affects others.
+                # Let's just apply a small repulsion to keep them from clumping 
+                # and allow the global radius update to work.
+                pass
+
+        # 3. Update positions
+        centers += lr * forces
+        
+        # Clamp centers to valid range [r, 1-r] is not possible yet as r changes.
+        # Clamp to [0, 1] strictly.
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # 4. Update radii
+        # For each circle, max radius is min(dist to boundary, 0.5 * dist to nearest neighbor)
+        # We can greedily update radii to the maximum possible.
+        # But doing this synchronously might cause issues.
+        # Let's compute max possible radius for each.
+        
+        new_radii = np.zeros(n)
+        for i in range(n):
+            # Boundary constraints
+            r_boundary = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            
+            # Neighbor constraints
+            r_neighbors = np.inf
+            for j in range(n):
+                if i == j: continue
+                dist = np.linalg.norm(centers[i] - centers[j])
+                # Circle i and j must not overlap: r_i + r_j <= dist => r_i <= dist - r_j
+                # Since r_j is current radius
+                limit = dist - radii[j]
+                if limit < r_neighbors:
+                    r_neighbors = limit
+            
+            # New radius is min of boundary and neighbor limits
+            # Also ensure non-negative
+            candidate_r = min(r_boundary, r_neighbors)
+            if candidate_r < 0: candidate_r = 0.0
+            
+            # Smooth update? Or just set?
+            # Setting directly is aggressive but fast.
+            # To avoid oscillation, maybe average?
+            # But max radius is well defined.
+            new_radii[i] = candidate_r
+        
+        radii = new_radii
+
+    # Final validation and cleanup
+    # Ensure strict non-overlap and inside bounds with a small buffer
+    # Re-run a few steps of relaxation with small lr to fix any numerical drift
+    for _ in range(100):
+        forces = np.zeros_like(centers)
+        for i, j in pairs:
+            vec = centers[i] - centers[j]
+            dist = np.linalg.norm(vec)
+            sum_r = radii[i] + radii[j]
+            if dist < sum_r:
+                overlap = sum_r - dist
+                if dist > 1e-9:
+                    force = (vec / dist) * overlap * 10
+                else:
+                    force = np.random.uniform(-0.01, 0.01, 2)
+                forces[i] += force
+                forces[j] -= force
+        
+        # Boundary push
+        for i in range(n):
+            r = radii[i]
+            x, y = centers[i]
+            if x - r < 0: centers[i, 0] = r
+            if x + r > 1: centers[i, 0] = 1 - r
+            if y - r < 0: centers[i, 1] = r
+            if y + r > 1: centers[i, 1] = 1 - r
+            
+        centers += 0.01 * forces
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Update radii to max possible
+        for i in range(n):
+            r_boundary = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            r_neighbors = np.inf
+            for j in range(n):
+                if i != j:
+                    dist = np.linalg.norm(centers[i] - centers[j])
+                    limit = dist - radii[j]
+                    if limit < r_neighbors:
+                        r_neighbors = limit
+            radii[i] = max(0.0, min(r_boundary, r_neighbors))
+
+    # Sum of radii
+    total_sum = np.sum(radii)
+    
+    return centers, radii, float(total_sum)
+
+# Helper to verify locally if needed (not part of submission but good for thought)
+# def validate_packing(centers, radii): ... (provided in prompt)
+
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # print(validate_packing(centers, radii))

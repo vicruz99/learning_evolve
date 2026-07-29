@@ -1,0 +1,244 @@
+# sol_000190 | problem=circle_packing_26 entrypoint=run_packing
+# generation=9 parent=sol_000143 (state c665f9c9) state=6791819a sum of radii=2.621304 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+
+# Precompute LP constraint matrix structure globally
+A_ub_pre = np.zeros((N*(N-1)//2 + 4*N, N))
+pair_indices = []
+idx = 0
+for i in range(N):
+    for j in range(i+1, N):
+        A_ub_pre[idx, i] = 1.0
+        A_ub_pre[idx, j] = 1.0
+        pair_indices.append((i, j))
+        idx += 1
+for i in range(N):
+    for k in range(4):
+        A_ub_pre[idx, i] = 1.0
+        idx += 1
+
+# Convert to array for fast numpy indexing
+PAIR_ARR = np.array(pair_indices, dtype=int)
+NUM_PAIRS = len(pair_indices)
+
+def solve_lp_and_grad(centers):
+    """Solves LP for optimal radii given fixed centers and computes gradient of sum of radii."""
+    dx = centers[:, 0, None] - centers[None, :, 0]
+    dy = centers[:, 1, None] - centers[None, :, 1]
+    dists = np.sqrt(dx*dx + dy*dy)
+    
+    b_ub = np.zeros(A_ub_pre.shape[0])
+    b_ub[:NUM_PAIRS] = dists[PAIR_ARR[:, 0], PAIR_ARR[:, 1]]
+    
+    off = NUM_PAIRS
+    for i in range(N):
+        b_ub[off + 4*i] = centers[i, 0]
+        b_ub[off + 4*i + 1] = 1.0 - centers[i, 0]
+        b_ub[off + 4*i + 2] = centers[i, 1]
+        b_ub[off + 4*i + 3] = 1.0 - centers[i, 1]
+        
+    ub_r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub_r = np.maximum(ub_r, 1e-9)
+    
+    bounds_r = [(0.0, u) for u in ub_r]
+    res = linprog(-np.ones(N), A_ub=A_ub_pre, b_ub=b_ub, bounds=bounds_r, method='highs')
+    
+    if not res.success:
+        return None, -1.0, np.zeros_like(centers)
+        
+    radii = res.x
+    duals = res.ineqlin.marginals
+    
+    grad = np.zeros_like(centers)
+    for k in range(NUM_PAIRS):
+        lam = duals[k]
+        if lam > 1e-8:
+            i, j = PAIR_ARR[k]
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+                
+    for i in range(N):
+        grad[i, 0] += duals[off + 4*i] - duals[off + 4*i + 1]
+        grad[i, 1] += duals[off + 4*i + 2] - duals[off + 4*i + 3]
+        
+    return radii, np.sum(radii), grad
+
+def gradient_ascent(c0, rng, max_iter=2000, init_step=0.008):
+    """Runs gradient ascent on centers to maximize sum of radii."""
+    c = c0.copy()
+    r, s, g = solve_lp_and_grad(c)
+    if r is None:
+        return c, -1.0
+    best_c, best_s = c.copy(), s
+    step = init_step
+    
+    for k in range(max_iter):
+        gn = np.linalg.norm(g)
+        if gn < 1e-10:
+            break
+            
+        c_new = c + step * g / gn
+        c_new = np.clip(c_new, 0.005, 0.995)
+        r_new, s_new, g_new = solve_lp_and_grad(c_new)
+        if r_new is None:
+            break
+            
+        if s_new > s:
+            c, s, g = c_new, s_new, g_new
+            if s > best_s:
+                best_c, best_s = c.copy(), s
+            step = min(step * 1.15, 0.025)
+        else:
+            step *= 0.85
+            
+        if step < 1e-7:
+            break
+            
+        # Periodic jitter to escape local minima
+        if k > 0 and k % 250 == 0:
+            noise_scale = 0.003 * (0.7 ** (k // 250))
+            c += rng.normal(0, noise_scale, c.shape)
+            c = np.clip(c, 0.005, 0.995)
+            r, s, g = solve_lp_and_grad(c)
+            
+    return best_c, best_s
+
+def generate_inits(rng):
+    """Generates diverse initial configurations."""
+    inits = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [5, 5, 6, 5, 5],
+        [6, 6, 5, 5, 4], [4, 6, 6, 6, 4], [5, 5, 5, 5, 6],
+        [7, 5, 6, 5, 3], [6, 4, 6, 6, 4], [5, 6, 6, 4, 5],
+        [5, 5, 5, 6, 5], [6, 5, 5, 6, 4]
+    ]
+    
+    for pat in patterns:
+        for r0 in [0.088, 0.092, 0.096, 0.100, 0.105]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+            inits.append(c)
+            
+    for _ in range(15):
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    for _ in range(10):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        c[:4] = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        inits.append(c)
+        
+    return inits
+
+def obj_joint(v):
+    return -np.sum(v[2*N:])
+
+def cons_joint(v):
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = [c[:,0]-r, 1.0-c[:,0]-r, c[:,1]-r, 1.0-c[:,1]-r]
+    idx = np.triu_indices(N, 1)
+    d = np.linalg.norm(c[idx[0]] - c[idx[1]], axis=1)
+    con.append(d - (r[idx[0]] + r[idx[1]]))
+    return np.concatenate(con)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Packs 26 circles in a unit square to maximize sum of radii."""
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    best_c = None
+    best_s = -1.0
+    inits = generate_inits(rng)
+    
+    # Phase 1: Multi-start Gradient Ascent
+    for c0 in inits:
+        c_opt, s_opt = gradient_ascent(c0, rng, max_iter=2500, init_step=0.007)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # Phase 2: Iterative Perturbation Refinement
+    if best_c is not None:
+        c_curr = best_c.copy()
+        for step in range(50):
+            noise = 0.005 * (0.9 ** step)
+            c_try = c_curr + rng.normal(0, noise, c_curr.shape)
+            c_try = np.clip(c_try, 0.02, 0.98)
+            r_try, s_try, _ = solve_lp_and_grad(c_try)
+            if r_try is not None and s_try > best_s + 1e-8:
+                best_s = s_try
+                best_c = c_try.copy()
+                c_curr = c_try.copy()
+                
+        # Final gradient ascent on refined center
+        c_opt, s_opt = gradient_ascent(best_c, rng, max_iter=3000, init_step=0.005)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # Phase 3: SLSQP Joint Polish
+    r_lp, _, _ = solve_lp_and_grad(best_c)
+    if r_lp is None:
+        r_lp = np.full(N, 0.05)
+        
+    v0 = np.concatenate([best_c.flatten(), r_lp])
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    
+    try:
+        res = minimize(obj_joint, v0, method='SLSQP', bounds=bounds,
+                       constraints={'type': 'ineq', 'fun': cons_joint},
+                       options={'maxiter': 15000, 'ftol': 1e-14})
+        if np.sum(res.x[2*N:]) > best_s:
+            best_c = res.x[:2*N].reshape(N, 2)
+            r_lp = res.x[2*N:]
+            best_s = np.sum(r_lp)
+    except Exception:
+        pass
+        
+    centers = best_c.copy()
+    radii = r_lp.copy()
+    
+    # Phase 4: Strict Numerical Repair
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))

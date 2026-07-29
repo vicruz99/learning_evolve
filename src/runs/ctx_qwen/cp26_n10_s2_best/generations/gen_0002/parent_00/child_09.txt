@@ -1,0 +1,192 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square, we address several limitations of standard multi-start approaches:
+
+1. **Squared Distance Constraints**: Using `dist^2 >= (r_i + r_j)^2` instead of `dist >= r_i + r_j` removes square roots from the constraint evaluation. This significantly improves numerical stability, gradient accuracy, and solver speed for SLSQP.
+2. **Strict Feasible Initialization**: SLSQP converges much faster and avoids infeasible regions when started from a strictly feasible point. We implement a `make_feasible` helper that iteratively shrinks radii to satisfy all boundary and pairwise constraints with a small tolerance buffer before optimization begins.
+3. **Diverse Structured Initializations**: Hexagonal lattices are optimal for area packing. We generate multiple rotated and shifted hexagonal configurations, alongside grid and random patterns, to cover different symmetry basins that might align better with the square boundaries.
+4. **Annealing Local Search**: After finding a good solution, we perform a targeted local search. We progressively perturb the centers while slightly shrinking the radii to maintain feasibility, then re-optimize. The perturbation magnitude anneals over steps, allowing the solver to escape shallow local minima and settle into a deeper one.
+5. **Tight Tolerances & Iterations**: We set `maxiter` higher and `ftol` lower (`1e-13`) to allow the solver to converge as close as possible to the true optimum within each basin. Post-processing strictly enforces constraints to guarantee validator compliance.
+
+These changes systematically explore the feasible space more thoroughly and guide the gradient-based optimizer toward configurations with higher total radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: Minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Compute inequality constraints: boundaries and non-overlap."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    # Using squared distances improves numerical stability and gradient computation
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[PAIR_I] + r[PAIR_J]
+    c_pair = dist_sq - r_sum**2
+    
+    return np.concatenate([c, c_pair])
+
+def make_feasible(centers, radii, tol=1e-8):
+    """Adjusts radii to guarantee the configuration satisfies all constraints strictly."""
+    r = radii.copy()
+    
+    # Enforce boundary constraints
+    for i in range(N):
+        mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        r[i] = min(r[i], mr)
+        
+    # Enforce non-overlap constraints iteratively
+    for _ in range(5):
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if r[i] + r[j] > d + tol:
+                    shrink = (r[i] + r[j] - d - tol) / 2.0
+                    r[i] = max(0.0, r[i] - shrink)
+                    r[j] = max(0.0, r[j] - shrink)
+                    
+    return r
+
+def get_initial_configs():
+    """Generates diverse initial configurations including rotated hex lattices."""
+    configs = []
+    
+    # 1. Hexagonal lattices with various rotations
+    for rot in [0.0, 0.1, 0.2, 0.3, 0.4, np.pi/2 - 0.15]:
+        pts = []
+        r0 = 0.09
+        y = r0
+        row = 0
+        while len(pts) < N + 15:
+            x = r0 + (row % 2) * r0
+            while x <= 1 - r0 and len(pts) < N + 15:
+                pts.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        pts = np.array(pts[:N])
+        
+        if rot != 0.0:
+            cx, cy = pts.mean(axis=0)
+            pts -= [cx, cy]
+            pts = pts @ np.array([[np.cos(rot), -np.sin(rot)], [np.sin(rot), np.cos(rot)]])
+            pts += [cx, cy]
+            
+        valid = np.all((pts >= 0.02) & (pts <= 0.98), axis=1)
+        if np.sum(valid) >= N:
+            configs.append(pts[valid][:N])
+            
+    # 2. Grid patterns with shifts
+    for s in [0.0, 0.02, -0.02]:
+        pts = []
+        for i in range(6):
+            for j in range(5):
+                if len(pts) < N:
+                    pts.append([0.08 + i*0.16 + s, 0.08 + j*0.20 + s])
+        configs.append(np.array(pts[:N]))
+        
+    # 3. Random scatter
+    for seed in range(15):
+        np.random.seed(seed)
+        configs.append(np.random.uniform(0.1, 0.9, (N, 2)))
+        
+    return configs
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    inits = get_initial_configs()
+    
+    # Phase 1: Multi-start optimization from diverse feasible initializations
+    for cfg in inits:
+        for _ in range(4):
+            np.random.seed(np.random.randint(0, 100000))
+            c_pert = cfg + np.random.uniform(-0.015, 0.015, size=cfg.shape)
+            c_pert = np.clip(c_pert, 0.03, 0.97)
+            
+            # Start from a strictly feasible point to guide SLSQP
+            r_init = make_feasible(c_pert, np.full(N, 0.07))
+            x0 = np.concatenate([c_pert.flatten(), r_init])
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+                if -res.fun > best_sum:
+                    c_val = constraints(res.x)
+                    if np.min(c_val) >= -1e-6:
+                        best_sum = -res.fun
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    # Phase 2: Annealing local search to escape local minima
+    if best_v is not None:
+        current_v = best_v
+        for step in range(15):
+            np.random.seed(step + 1000)
+            # Gradually reduce perturbation magnitude and radius scale
+            scale = 0.985 - step * 0.004
+            pert_mag = 0.008 * (1.0 - step * 0.05)
+            
+            c = current_v[:2*N].reshape(N, 2) + np.random.uniform(-pert_mag, pert_mag, (N, 2))
+            c = np.clip(c, 0.03, 0.97)
+            
+            r = current_v[2*N:] * scale
+            r = make_feasible(c, r)
+            x0 = np.concatenate([c.flatten(), r])
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+                if -res.fun > best_sum:
+                    c_val = constraints(res.x)
+                    if np.min(c_val) >= -1e-6:
+                        best_sum = -res.fun
+                        best_v = res.x.copy()
+                        current_v = best_v
+            except Exception:
+                pass
+                
+    # Fallback safety
+    if best_v is None:
+        centers = np.random.uniform(0.1, 0.9, (N, 2))
+        radii = make_feasible(centers, np.full(N, 0.04))
+        return centers, radii, float(np.sum(radii))
+        
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:]
+    
+    # Final strict enforcement to guarantee validator compliance
+    radii = make_feasible(centers, radii, tol=1e-9)
+    
+    return centers, radii, float(np.sum(radii))
+```

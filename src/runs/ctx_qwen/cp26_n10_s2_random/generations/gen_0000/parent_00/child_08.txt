@@ -1,0 +1,151 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat this as a non-linear optimization problem. We define a continuous objective function (minimizing the negative sum of radii) subject to non-convex constraints (non-overlap and boundary conditions). 
+
+1. **Modeling**: We define 78 variables (coordinates and radii) and constraints ensuring the Euclidean distance between centers is at least the sum of radii ($d_{ij} \ge r_i + r_j$) and circles stay within $[0,1]^2$.
+2. **Optimization Method**: We use `scipy.optimize.minimize` with the SLSQP method. To ensure the solver evaluates constraints efficiently, we use vectorized operations with NumPy broadcasting to compute all 325 pairwise distance constraints and 104 boundary constraints in a single pass.
+3. **Initialization**: To avoid local optima where circles remain small, we initialize the centers in a dense hexagonal-like grid and start with a relatively large radius (0.1). This forces the optimizer to push circles apart and potentially increase radii.
+4. **Robustness**: We include a post-optimization validation check. If the SLSQP solution has overlaps due to numerical error or convergence issues, we perform a final "relaxation" step to nudge centers apart.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    """
+    n = 26
+    
+    # 1. Initialization: Dense hexagonal-like grid
+    # We aim to place 26 circles. 5x5 is 25. We'll shift rows to be hexagonal.
+    centers = np.zeros((n, 2))
+    idx = 0
+    
+    # Configuration: 5 rows. Lengths: 6, 5, 6, 5, 4 (Total 26)
+    # Row 0 (6): x spacing ~0.18, y=0.2
+    # Row 1 (5): x shift ~0.09, y=0.37 (sqrt(3)/2 * 0.2)
+    # etc.
+    
+    # Approximation for dense packing start
+    row_lengths = [6, 5, 6, 5, 4]
+    current_y = 0.15
+    y_spacing = 0.21 # Approx sqrt(3)/2 * diameter
+    
+    for r_len in row_lengths:
+        row_x_spacing = (1.0 - 0.3) / (r_len - 1) if r_len > 1 else 0.5
+        # Centering the row
+        row_width = (r_len - 1) * row_x_spacing
+        start_x = 0.15
+        for c in range(r_len):
+            if idx < n:
+                centers[idx] = [start_x + c * row_x_spacing, current_y]
+                idx += 1
+        current_y += y_spacing
+
+    # Initialize radii
+    radii = np.ones(n) * 0.10
+    
+    # 2. Define Variables: [x1, y1, ..., x26, y26, r1, ..., r26]
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    # 3. Objective: Maximize sum of radii -> Minimize -sum(radii)
+    def objective(x):
+        r = x[2*n:]
+        return -np.sum(r)
+    
+    # 4. Vectorized Constraints
+    def compute_constraint_violations(x):
+        centers = x[:2*n].reshape(n, 2)
+        radii = x[2*n:]
+        
+        # Boundary constraints: r <= x <= 1-r and r <= y <= 1-r
+        # Returns values that must be >= 0
+        bnd_x_lower = centers[:, 0] - radii
+        bnd_x_upper = 1.0 - centers[:, 0] - radii
+        bnd_y_lower = centers[:, 1] - radii
+        bnd_y_upper = 1.0 - centers[:, 1] - radii
+        
+        # Overlap constraints: dist^2 >= (ri + rj)^2
+        # Using broadcasting for (n, n) matrix
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :] # (n, n, 2)
+        dist_sq = np.sum(diff**2, axis=2) # (n, n)
+        
+        r_sum = radii[:, np.newaxis] + radii[np.newaxis, :] # (n, n)
+        r_sum_sq = r_sum**2
+        
+        overlap_vals = dist_sq - r_sum_sq
+        
+        # Extract upper triangle (i < j) for unique pairs
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        overlaps = overlap_vals[mask]
+        
+        return np.concatenate([overlaps, bnd_x_lower, bnd_x_upper, bnd_y_lower, bnd_y_upper])
+
+    constraint_dict = {'type': 'ineq', 'fun': compute_constraint_violations}
+    
+    # 5. Bounds
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # xi
+        bounds.append((0.0, 1.0)) # yi
+    for i in range(n):
+        bounds.append((0.0, 0.5)) # ri (cannot exceed 0.5)
+
+    # 6. Optimization
+    # Using SLSQP. High maxiter to ensure convergence.
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                   constraints=[constraint_dict], 
+                   options={'ftol': 1e-10, 'maxiter': 2000, 'disp': False})
+    
+    best_centers = res.x[:2*n].reshape(n, 2)
+    best_radii = res.x[2*n:]
+    
+    # 7. Post-optimization relaxation to handle numerical overlaps
+    # SLSQP might stop with tiny violations. We perform a few steps of repulsion.
+    # This ensures the validation function passes strictly.
+    
+    # If there are significant violations, nudge points apart
+    for _ in range(100):
+        needs_adjustment = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                r_sum = best_radii[i] + best_radii[j]
+                p1 = best_centers[i]
+                p2 = best_centers[j]
+                diff = p2 - p1
+                dist = np.linalg.norm(diff)
+                
+                if dist < r_sum - 1e-7: # Overlap
+                    if dist < 1e-9:
+                        # Prevent division by zero
+                        p1 += np.random.rand(2) * 0.001
+                        p2 -= np.random.rand(2) * 0.001
+                    else:
+                        direction = diff / dist
+                        push = (r_sum - dist) * 0.5 + 1e-6
+                        best_centers[i] -= push * direction
+                        best_centers[j] += push * direction
+                        needs_adjustment = True
+
+        # Boundary adjustments
+        for i in range(n):
+            r = best_radii[i]
+            if best_centers[i, 0] < r: best_centers[i, 0] = r + 1e-6
+            if best_centers[i, 0] > 1 - r: best_centers[i, 0] = 1 - r - 1e-6
+            if best_centers[i, 1] < r: best_centers[i, 1] = r + 1e-6
+            if best_centers[i, 1] > 1 - r: best_centers[i, 1] = 1 - r - 1e-6
+            
+        if not needs_adjustment:
+            break
+
+    # Final calculation
+    sum_radii = np.sum(best_radii)
+    
+    # Ensure non-negative radii
+    best_radii = np.maximum(best_radii, 0)
+    
+    return best_centers, best_radii, sum_radii
+```

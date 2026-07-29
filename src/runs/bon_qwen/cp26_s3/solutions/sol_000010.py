@@ -1,0 +1,208 @@
+# sol_000010 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1907b6e7) state=e738885f sum of radii=2.447226 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize
+import random
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses an iterative approach: LP for radii, heuristic forces for centers.
+    """
+    n_circles = 26
+    best_sum_radii = 0.0
+    best_centers = None
+    best_radii = None
+
+    # Helper to solve LP for radii given centers
+    def solve_radii(centers):
+        # Variables: r_0, ..., r_{n-1}
+        # Maximize sum(r_i) => Minimize -sum(r_i)
+        c_obj = -np.ones(n_circles)
+        
+        # Constraints:
+        # 1. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+        #    => r_i - x_i <= 0, etc.
+        # 2. Non-overlap: r_i + r_j <= dist_ij
+        
+        # We will construct A_ub and b_ub for inequality constraints A_ub @ x <= b_ub
+        
+        n_constraints = 0
+        # Pre-calculate sizes
+        # Boundary: 4 per circle
+        # Pairs: n*(n-1)/2
+        total_constraints = 4 * n_circles + n_circles * (n_circles - 1) // 2
+        
+        A_ub = np.zeros((total_constraints, n_circles))
+        b_ub = np.zeros(total_constraints)
+        
+        idx = 0
+        for i in range(n_circles):
+            x, y = centers[i]
+            
+            # r_i <= x  =>  r_i - x <= 0  =>  1*r_i <= x
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = x
+            idx += 1
+            
+            # r_i <= 1-x  =>  1*r_i <= 1-x
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = 1.0 - x
+            idx += 1
+            
+            # r_i <= y
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = y
+            idx += 1
+            
+            # r_i <= 1-y
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = 1.0 - y
+            idx += 1
+            
+            # Pairwise constraints
+            for j in range(i + 1, n_circles):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                # r_i + r_j <= dist  =>  1*r_i + 1*r_j <= dist
+                A_ub[idx, i] = 1.0
+                A_ub[idx, j] = 1.0
+                b_ub[idx] = dist
+                idx += 1
+        
+        # Bounds for r_i >= 0
+        bounds = [(0, None) for _ in range(n_circles)]
+        
+        # Solve LP
+        # Using 'highs' method if available, otherwise default
+        try:
+            res = scipy.optimize.linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        except ValueError:
+            res = scipy.optimize.linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds)
+            
+        if res.success:
+            return res.x
+        else:
+            # Fallback or error handling
+            return np.zeros(n_circles)
+
+    # Helper to initialize centers with repulsion
+    def init_centers():
+        centers = np.random.rand(n_circles, 2)
+        # Simple repulsion to avoid overlaps initially
+        for _ in range(100):
+            for i in range(n_circles):
+                for j in range(i + 1, n_circles):
+                    diff = centers[i] - centers[j]
+                    dist = np.linalg.norm(diff)
+                    if dist < 0.1 and dist > 1e-6:
+                        force = diff / (dist**2 + 1e-6) * 0.01
+                        centers[i] += force
+                        centers[j] -= force
+        # Clip to boundaries
+        centers = np.clip(centers, 0.01, 0.99)
+        return centers
+
+    # Optimization loop for one run
+    def optimize_run(seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+        
+        centers = init_centers()
+        
+        # Optimization parameters
+        max_iter = 200
+        step_size = 0.05
+        decay = 0.995
+        
+        for step in range(max_iter):
+            # 1. Solve for optimal radii
+            radii = solve_radii(centers)
+            
+            # Check validity (radii should be non-negative)
+            if np.any(radii < -1e-9):
+                radii = np.maximum(radii, 0)
+                
+            current_sum = np.sum(radii)
+            
+            # 2. Compute forces to move centers
+            # If r_i + r_j is close to distance, they are touching.
+            # We want to increase distance, so push them apart.
+            # Force magnitude proportional to how "tight" the constraint is.
+            # However, in LP, we don't have duals easily accessible in a robust way across versions.
+            # Heuristic: if r_i + r_j >= distance - epsilon, push apart.
+            
+            forces = np.zeros_like(centers)
+            threshold = 1e-4 # Tolerance for "touching"
+            
+            for i in range(n_circles):
+                # Boundary forces
+                # If r_i is limited by boundary, push center away from boundary
+                x, y = centers[i]
+                r = radii[i]
+                
+                # Left boundary x=0: r <= x. If r approx x, push right.
+                if x - r < threshold and r > 1e-5:
+                    forces[i, 0] += 1.0
+                # Right boundary x=1: r <= 1-x. If r approx 1-x, push left.
+                if (1.0 - x) - r < threshold and r > 1e-5:
+                    forces[i, 0] -= 1.0
+                # Bottom boundary y=0
+                if y - r < threshold and r > 1e-5:
+                    forces[i, 1] += 1.0
+                # Top boundary y=1
+                if (1.0 - y) - r < threshold and r > 1e-5:
+                    forces[i, 1] -= 1.0
+                
+                # Pairwise forces
+                for j in range(i + 1, n_circles):
+                    dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                    sum_r = radii[i] + radii[j]
+                    
+                    # If touching, repel
+                    # The force should be along the line connecting centers
+                    if sum_r >= dist - threshold and dist > 1e-6:
+                        direction = (centers[i] - centers[j]) / dist
+                        # Force magnitude could be scaled by radii or just constant
+                        forces[i] += direction * (radii[i] + radii[j]) # Scale by size?
+                        forces[j] -= direction * (radii[i] + radii[j])
+
+            # Normalize forces to avoid exploding updates
+            # Simple clipping
+            max_force = np.max(np.abs(forces))
+            if max_force > 0:
+                forces = forces / max_force * step_size
+            
+            # Update centers
+            centers += forces
+            
+            # Clip centers to stay inside
+            centers = np.clip(centers, 1e-4, 1 - 1e-4)
+            
+            # Decay step size
+            step_size *= decay
+
+        return centers, radii, np.sum(radii)
+
+    # Run multiple times with different seeds to find global optimum
+    # We can try a few seeds
+    seeds = [42, 123, 456, 789, 101, 202, 303, 404, 505, 606]
+    
+    for seed in seeds:
+        c, r, s = optimize_run(seed)
+        # Validate result locally just in case
+        # (The LP ensures validity for fixed centers, but center updates might slightly violate if not careful, 
+        # though clipping and small steps usually help. Re-solving radii at end ensures validity.)
+        r_final = solve_radii(c)
+        s_final = np.sum(r_final)
+        
+        if s_final > best_sum_radii:
+            best_sum_radii = s_final
+            best_centers = c
+            best_radii = r_final
+            
+    return best_centers, best_radii, best_sum_radii

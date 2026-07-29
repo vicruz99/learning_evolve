@@ -1,0 +1,180 @@
+# sol_000119 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state e52471dd) state=31714ee0 sum of radii=1.923833 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+def get_initial_hex_grid(n, width=1.0, height=1.0):
+    # Approximate hexagonal packing initialization
+    centers = []
+    r_init = 0.09 # Starting guess, will be optimized
+    rows = 5
+    cols = 6 # 5*6 = 30, we pick 26 best spots
+    
+    # Simple grid then shift for hex pattern
+    # We will just generate a set of points and run optimization
+    pts = []
+    for r in range(rows):
+        for c in range(cols):
+            x = (c + 0.5) * (width / cols)
+            y = (r + 0.5) * (height / rows)
+            if r % 2 == 1:
+                x += width / (2 * cols)
+            pts.append([x, y])
+    
+    # Select 26 points
+    # We want to maximize sum of radii, so we prefer points that allow larger radii
+    # For now, just take the first 26
+    return np.array(pts[:n]), np.full(n, 0.08)
+
+def expand_packing(centers, radii, n=26, steps=10000, step_size=0.0001):
+    # Local optimization to expand radii and move centers
+    # Objective: maximize sum(radii)
+    # Constraints: non-overlap and boundary
+    
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    temp = centers.copy()
+    curr_radii = radii.copy()
+    
+    for _ in range(steps):
+        improved = False
+        # Try to expand each radius
+        for i in range(n):
+            # Calculate max possible radius for circle i based on constraints
+            r_max = 1.0
+            # Boundary constraints
+            r_max = min(r_max, temp[i, 0], 1.0 - temp[i, 0], temp[i, 1], 1.0 - temp[i, 1])
+            
+            # Neighbor constraints
+            for j in range(n):
+                if i == j: continue
+                dist = np.sqrt(np.sum((temp[i] - temp[j]) ** 2))
+                if dist > 0:
+                    r_max = min(r_max, (dist - curr_radii[j]))
+            
+            # We allow a small tolerance to allow movement
+            if r_max > curr_radii[i] + 1e-6:
+                curr_radii[i] = r_max
+                improved = True
+                best_sum = np.sum(curr_radii)
+        
+        # If radii are constrained by neighbors, try to move centers
+        if not improved:
+            for i in range(n):
+                for axis in range(2):
+                    # Try moving center to create space
+                    for direction in [-1, 1]:
+                        new_centers = temp.copy()
+                        new_centers[i, axis] += direction * step_size
+                        if 0 <= new_centers[i, axis] <= 1:
+                            # Check overlaps
+                            valid = True
+                            for j in range(n):
+                                if i == j: continue
+                                dist = np.sqrt(np.sum((new_centers[i] - temp[j]) ** 2))
+                                if dist < curr_radii[i] + curr_radii[j]:
+                                    valid = False
+                                    break
+                            if valid:
+                                temp = new_centers
+                                improved = True
+                                best_sum = np.sum(curr_radii)
+                                # Re-evaluate radii after move
+                                for k in range(n):
+                                    r_lim = 1.0
+                                    r_lim = min(r_lim, temp[k, 0], 1.0 - temp[k, 0], temp[k, 1], 1.0 - temp[k, 1])
+                                    for l in range(n):
+                                        if k == l: continue
+                                        d = np.sqrt(np.sum((temp[k] - temp[l]) ** 2))
+                                        if d > 0:
+                                            r_lim = min(r_lim, d - curr_radii[l])
+                                    curr_radii[k] = max(0, r_lim)
+                                best_sum = np.sum(curr_radii)
+                                break # move successful, break direction loop
+                        if improved: break
+                if improved: break
+        if not improved:
+            break
+
+    return temp, curr_radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    # Initialize with a shifted hexagonal pattern
+    centers = []
+    rows = 5
+    # Try to fit 26 circles in 5 rows: 5, 6, 5, 6, 4?
+    # Let's just distribute them in a grid-like fashion first
+    
+    # Create a dense grid of potential centers
+    # 5 rows, 6 columns = 30 spots
+    pts = []
+    for r in range(rows):
+        for c in range(6):
+            # Hexagonal shift
+            x = (c + 0.5) * (1.0 / 6)
+            if r % 2 == 1:
+                x += (1.0 / 12)
+            y = (r + 0.5) * (1.0 / 5)
+            pts.append([x, y])
+    
+    # Select 26 points. To maximize radius, we might want to keep the most central ones
+    # or just a contiguous block. Let's take the first 26.
+    init_centers = np.array(pts[:n])
+    init_radii = np.full(n, 0.08) # Safe initial radius
+    
+    # Run optimization
+    final_centers, final_radii = expand_packing(init_centers, init_radii, n=n, steps=5000, step_size=0.0005)
+    
+    # Final validation and clamping
+    if not validate_packing(final_centers, final_radii):
+        # Fallback to a known safe packing if optimization fails
+        # 5x5 grid of 0.09 + 1 small one
+        grid_r = 0.09
+        fc = []
+        fr = []
+        for i in range(5):
+            for j in range(5):
+                fc.append([grid_r + j * 2 * grid_r, grid_r + i * 2 * grid_r])
+                fr.append(grid_r)
+        fc.append([0.5, 0.5])
+        fr.append(0.01) # Tiny circle
+        final_centers = np.array(fc[:n])
+        final_radii = np.array(fr[:n])
+
+    total_sum = np.sum(final_radii)
+    return final_centers, final_radii, total_sum
+
+# Example usage for validation
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Valid: {validate_packing(centers, radii)}")
+    print(centers)
+    print(radii)

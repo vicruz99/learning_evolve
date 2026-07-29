@@ -1,161 +1,93 @@
 # sol_000072 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state dfef56bb) state=544f15f4 sum of radii=1.580000 correctness=1.0
+# generation=0 parent=seed (state 3353d097) state=d39e9f4e sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import linprog, minimize
+from scipy.optimize import minimize
 
-def compute_forces(centers, radii):
-    n = len(centers)
-    forces = np.zeros_like(centers)
-    
-    for i in range(n):
-        # Wall repulsion
-        for dim in range(2):
-            if centers[i, dim] < radii[i]:
-                forces[i, dim] += (radii[i] - centers[i, dim]) ** 2
-            elif centers[i, dim] > 1.0 - radii[i]:
-                forces[i, dim] -= (centers[i, dim] - (1.0 - radii[i])) ** 2
+N_CIRCLES = 26
 
-        # Pairwise repulsion
-        for j in range(i + 1, n):
-            diff = centers[i] - centers[j]
-            dist = np.linalg.norm(diff)
-            min_dist = radii[i] + radii[j]
-            
-            if dist < min_dist:
-                overlap = min_dist - dist
-                if dist > 1e-8:
-                    force_vec = (overlap ** 2) * (diff / dist)
-                else:
-                    # Avoid division by zero with random direction
-                    force_vec = overlap ** 2 * np.random.rand(2)
-                forces[i] += force_vec
-                forces[j] -= force_vec
-                
-    return forces
+def objective_func(v):
+    """Objective: maximize sum of radii (minimize negative sum)"""
+    return -np.sum(v[2::3])
 
-def solve_radii_lp(centers):
-    n = len(centers)
-    # Objective: maximize sum(radii) => minimize -sum(radii)
-    c_obj = -np.ones(n)
+def constraints_func(v):
+    """Returns array of inequality constraints >= 0"""
+    n = N_CIRCLES
+    c = v[:2*n].reshape(n, 2)
+    r = v[2*n:]
     
-    A_ub = []
-    b_ub = []
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    cons = [
+        c[:, 0] - r,          # x - r >= 0
+        1.0 - c[:, 0] - r,    # 1 - x - r >= 0
+        c[:, 1] - r,          # y - r >= 0
+        1.0 - c[:, 1] - r     # 1 - y - r >= 0
+    ]
     
-    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-    for i in range(n):
-        for d in range(2):
-            row = np.zeros(n)
-            row[i] = 1.0
-            A_ub.append(row)
-            b_ub.append(centers[i, d])
-            
-            A_ub.append(row)
-            b_ub.append(1.0 - centers[i, d])
-            
-    # Pairwise constraints: r_i + r_j <= distance(i,j)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.linalg.norm(centers[i] - centers[j])
-            row = np.zeros(n)
-            row[i] = 1.0
-            row[j] = 1.0
-            A_ub.append(row)
-            b_ub.append(dist)
-            
-    A_ub = np.array(A_ub)
-    b_ub = np.array(b_ub)
-    bounds = [(0.0, None) for _ in range(n)]
+    # Pairwise non-overlap constraints: dist^2 - (r_i + r_j)^2 >= 0
+    diff = c[:, None, :] - c[None, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    r_sum_sq = (r[:, None] + r[None, :])**2
     
-    try:
-        # Use HiGHS solver if available, otherwise fallback
-        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        if res.success:
-            return res.x, -res.fun
-    except Exception:
-        pass
-        
-    try:
-        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='interior-point')
-        if res.success:
-            return res.x, -res.fun
-    except Exception:
-        pass
-        
-    # Fallback: safe small radii
-    r = np.full(n, 0.01)
-    return r, np.sum(r)
-
-def objective_function(x, n, radii):
-    c = x.reshape(n, 2)
-    energy = 0.0
+    idx = np.triu_indices(n, k=1)
+    cons.append(dist_sq[idx] - r_sum_sq[idx])
     
-    for i in range(n):
-        for d in range(2):
-            if c[i, d] < radii[i]:
-                energy += (radii[i] - c[i, d]) ** 2
-            if c[i, d] > 1.0 - radii[i]:
-                energy += (c[i, d] - (1.0 - radii[i])) ** 2
-                
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = np.linalg.norm(c[i] - c[j])
-            if d < radii[i] + radii[j]:
-                energy += (radii[i] + radii[j] - d) ** 2
-                
-    return energy
+    return np.concatenate(cons)
 
 def run_packing():
-    np.random.seed(42)
-    n = 26
+    n = N_CIRCLES
+    r_init = 0.09
+    centers = []
+    # Hexagonal arrangement counts to get exactly 26 circles
+    row_counts = [5, 4, 5, 4, 5, 3]
     
-    # 1. Initialize centers in a hexagonal-like grid
-    centers = np.zeros((n, 2))
-    idx = 0
-    for row in range(5):
-        for col in range(6):
-            if idx == n:
-                break
-            x = 0.12 + col * 0.14
-            y = 0.12 + row * 0.18 + (0.07 if row % 2 == 1 else 0.0)
-            centers[idx] = [x, y]
-            idx += 1
+    for row, count in enumerate(row_counts):
+        y = r_init + row * r_init * np.sqrt(3)
+        for col in range(count):
+            x = r_init + col * 2 * r_init + (row % 2) * r_init
+            centers.append([x, y])
             
-    # Initial radii estimate
-    radii, _ = solve_radii_lp(centers)
+    centers = np.array(centers)
+    radii = np.full(n, r_init)
     
-    # 2. Force-directed simulation to spread centers
-    dt = 0.4
-    for step in range(2500):
-        forces = compute_forces(centers, radii)
-        centers += forces * dt
-        # Keep centers strictly inside to avoid numerical issues in LP
-        centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+    # Flatten initial guess: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
         
-        # Periodically update radii via LP to guide forces
-        if step % 50 == 0:
-            radii, _ = solve_radii_lp(centers)
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 1.0)] * n
+    cons_dict = {'type': 'ineq', 'fun': constraints_func}
+    
+    # Run optimization
+    res = minimize(objective_func, x0, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                   options={'ftol': 1e-14, 'maxiter': 5000, 'disp': False})
+                   
+    c_opt = res.x[:2*n].reshape(n, 2)
+    r_opt = res.x[2*n:]
+    r_opt = np.maximum(r_opt, 1e-9)
+    
+    # Robust post-processing to guarantee strict feasibility
+    alpha = 1.0
+    for i in range(n):
+        x, y, r = c_opt[i, 0], c_opt[i, 1], r_opt[i]
+        if r > 1e-12:
+            alpha = min(alpha, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
             
-    # 3. Alternating local optimization
-    # Fixes centers -> optimizes radii (LP) -> fixes radii -> optimizes centers (Gradient)
-    for _ in range(15):
-        radii, _ = solve_radii_lp(centers)
-        
-        bounds_opt = [(0.0, 1.0) for _ in range(2 * n)]
-        res = minimize(
-            objective_function, 
-            centers.flatten(), 
-            args=(n, radii),
-            method='L-BFGS-B',
-            bounds=bounds_opt,
-            options={'maxiter': 1000, 'ftol': 1e-12}
-        )
-        centers = res.x.reshape(n, 2)
-        
-    # Final precise radius calculation
-    radii, total_sum = solve_radii_lp(centers)
-    
-    return centers, radii, total_sum
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.sqrt((c_opt[i,0]-c_opt[j,0])**2 + (c_opt[i,1]-c_opt[j,1])**2)
+            rs = r_opt[i] + r_opt[j]
+            if rs > 1e-12:
+                alpha = min(alpha, d / rs)
+                
+    if alpha < 1.0:
+        r_opt *= alpha
+        for i in range(n):
+            r_opt[i] = min(r_opt[i], c_opt[i,0], 1.0-c_opt[i,0], c_opt[i,1], 1.0-c_opt[i,1])
+            
+    return c_opt, r_opt, np.sum(r_opt)

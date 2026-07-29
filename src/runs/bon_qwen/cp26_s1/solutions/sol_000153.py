@@ -1,5 +1,5 @@
 # sol_000153 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 39a6f529) state=4c2b1ad2 sum of radii=1.919920 correctness=1.0
+# generation=0 parent=seed (state 2bb08abb) state=ab0fe566 sum of radii=2.361441 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,111 +7,162 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def compute_penalty(centers, radii, n):
-    """Compute penalty for boundary violations and overlaps."""
-    pen = 0.0
-    # Boundary penalties
-    for i in range(n):
-        r = radii[i]
-        x, y = centers[i]
-        pen += max(0.0, r - x) ** 2
-        pen += max(0.0, r - (1.0 - x)) ** 2
-        pen += max(0.0, r - y) ** 2
-        pen += max(0.0, r - (1.0 - y)) ** 2
+# Constants
+N_CIRCLES = 26
+PENALTY_WEIGHT = 10000.0
+
+def objective_function(params, n, weight):
+    """
+    Objective function to minimize:
+    - Sum of radii (to maximize sum)
+    + Penalty for boundary violations
+    + Penalty for overlap violations
+    """
+    # Extract variables
+    # params layout: [x0...xn-1, y0...yn-1, r0...rn-1]
+    x = params[:n]
+    y = params[n:2*n]
+    r = params[2*n:3*n]
     
-    # Overlap penalties
-    for i in range(n):
-        for j in range(i + 1, n):
-            dx = centers[i, 0] - centers[j, 0]
-            dy = centers[i, 1] - centers[j, 1]
-            dist = np.sqrt(dx * dx + dy * dy)
-            overlap = radii[i] + radii[j] - dist
-            if overlap > 0.0:
-                pen += overlap ** 2
-    return pen
-
-def objective(vars, n):
-    """Objective function: minimize -sum(radii) + penalty."""
-    centers = vars[:2 * n].reshape(n, 2)
-    radii = vars[2 * n:]
-    pen = compute_penalty(centers, radii, n)
-    return -np.sum(radii) + 100000.0 * pen
-
-def check_validity(centers, radii, n, tol=1e-10):
-    """Check if packing is valid within tolerance."""
-    for i in range(n):
-        if radii[i] < 0:
-            return False
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -tol or x + r > 1.0 + tol:
-            return False
-        if y - r < -tol or y + r > 1.0 + tol:
-            return False
-    for i in range(n):
-        for j in range(i + 1, n):
-            dx = centers[i, 0] - centers[j, 0]
-            dy = centers[i, 1] - centers[j, 1]
-            dist = np.sqrt(dx * dx + dy * dy)
-            if dist < radii[i] + radii[j] - tol:
-                return False
-    return True
-
-def run_packing():
-    """Pack 26 circles in a unit square to maximize sum of radii."""
-    n = 26
-    best_sum = -1.0
-    best_centers = None
-    best_radii = None
+    # 1. Primary Objective: Maximize sum of radii => Minimize -sum(r)
+    obj = -np.sum(r)
     
-    # Bounds: centers in [0,1], radii in [0, 0.5]
+    # 2. Boundary Penalties
+    # Constraint: r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+    dist_left = x
+    dist_right = 1.0 - x
+    dist_bottom = y
+    dist_top = 1.0 - y
+    
+    dist_to_boundary = np.minimum(np.minimum(dist_left, dist_right), 
+                                  np.minimum(dist_bottom, dist_top))
+    
+    # Violation is how much r exceeds distance to boundary
+    boundary_violation = np.maximum(0.0, r - dist_to_boundary)
+    boundary_penalty = np.sum(boundary_violation**2)
+    
+    # 3. Overlap Penalties
+    # Constraint: ||ci - cj|| >= r_i + r_j
+    # Violation is how much (r_i + r_j) exceeds distance
+    coords = np.column_stack((x, y))
+    # Compute pairwise distance matrix
+    # diff shape (n, n, 2)
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Ignore self-distance
+    np.fill_diagonal(dists, np.inf)
+    
+    radii_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    violation = radii_sum - dists
+    violation = np.maximum(0.0, violation)
+    
+    # Sum of squared violations (divide by 2 to account for symmetry)
+    overlap_penalty = np.sum(violation**2) / 2.0
+    
+    return obj + weight * (boundary_penalty + overlap_penalty)
+
+def generate_initial_guess(seed, n):
+    """
+    Generates an initial guess based on a perturbed grid.
+    """
+    rng = np.random.RandomState(seed)
+    
+    # Create a grid of points (6x5 = 30 points)
+    x_coords = np.linspace(0.1, 0.9, 6)
+    y_coords = np.linspace(0.1, 0.9, 5)
+    
+    grid_x, grid_y = np.meshgrid(x_coords, y_coords)
+    all_x = grid_x.ravel()
+    all_y = grid_y.ravel()
+    
+    # Select n points randomly to break symmetry
+    indices = rng.choice(len(all_x), size=n, replace=False)
+    cx = all_x[indices]
+    cy = all_y[indices]
+    
+    # Add small random perturbation
+    cx += rng.uniform(-0.02, 0.02, size=n)
+    cy += rng.uniform(-0.02, 0.02, size=n)
+    
+    # Clip to valid range [0, 1]
+    cx = np.clip(cx, 0.0, 1.0)
+    cy = np.clip(cy, 0.0, 1.0)
+    
+    # Initial radii
+    r = np.ones(n) * 0.05
+    
+    return np.concatenate([cx, cy, r])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Main function to solve the circle packing problem.
+    Returns centers (n, 2), radii (n,), and sum_radii.
+    """
+    n = N_CIRCLES
+    weight = PENALTY_WEIGHT
+    
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
     bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
     
-    # Try multiple initial configurations
-    for seed in range(5):
-        rng = np.random.default_rng(seed)
-        centers = np.zeros((n, 2))
-        idx = 0
+    best_params = None
+    min_obj = np.inf
+    num_trials = 20
+    
+    # Run optimization multiple times with different seeds
+    for i in range(num_trials):
+        x0 = generate_initial_guess(seed=i, n=n)
         
-        # Hexagonal-ish initial layout
-        for row in range(6):
-            y = 0.1 + row * 0.15
-            x_start = 0.1 + (0.0 if row % 2 == 0 else 0.075)
-            for col in range(5):
-                if idx < n:
-                    centers[idx] = [x_start + col * 0.15, y]
-                    idx += 1
-                    
-        # Perturb to break symmetry and avoid flat minima
-        centers += rng.uniform(-0.02, 0.02, size=centers.shape)
-        centers = np.clip(centers, 0.05, 0.95)
-        radii = np.full(n, 0.05)
-        
-        x0 = np.concatenate([centers.flatten(), radii])
-        
-        res = minimize(
-            objective, 
-            x0, 
-            args=(n,), 
-            method='L-BFGS-B', 
-            bounds=bounds,
-            options={'maxiter': 10000, 'ftol': 1e-14, 'gtol': 1e-14}
-        )
-        
-        c_ = res.x[:2 * n].reshape(n, 2)
-        r_ = res.x[2 * n:]
-        current_sum = np.sum(r_)
-        
-        if current_sum > best_sum:
-            best_sum = current_sum
-            best_centers = c_.copy()
-            best_radii = r_.copy()
+        try:
+            # L-BFGS-B is suitable for bound-constrained optimization
+            res = minimize(objective_function, x0, args=(n, weight), method='L-BFGS-B', 
+                           bounds=bounds, options={'maxiter': 5000, 'ftol': 1e-10, 'gtol': 1e-8})
             
-    # Post-processing: ensure strict validity for the validator
-    while not check_validity(best_centers, best_radii, n, tol=1e-9):
-        best_radii *= 0.999
-        if np.sum(best_radii) < 0.1:
-            break
+            if res.fun < min_obj:
+                min_obj = res.fun
+                best_params = res.x
+        except Exception:
+            continue
+
+    if best_params is not None:
+        x = best_params[:n]
+        y = best_params[n:2*n]
+        r = best_params[2*n:3*n]
+        
+        # Post-processing: Scale radii to ensure strict validity
+        # This handles any tiny numerical violations from the optimizer
+        
+        coords = np.column_stack((x, y))
+        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, np.inf)
+        radii_sum = r[:, np.newaxis] + r[np.newaxis, :]
+        
+        # Calculate scaling factor k for pair constraints
+        # We need k * (r_i + r_j) <= dist_ij
+        ratio_pair = np.where(radii_sum > 1e-12, dists / radii_sum, np.inf)
+        k_pair = np.min(ratio_pair)
+        
+        # Calculate scaling factor k for boundary constraints
+        # We need k * r_i <= dist_to_boundary
+        dists_to_boundary = np.minimum(np.minimum(x, 1-x), np.minimum(y, 1-y))
+        ratio_bound = np.where(r > 1e-12, dists_to_boundary / r, np.inf)
+        k_bound = np.min(ratio_bound)
+        
+        k = min(k_pair, k_bound, 1.0)
+        
+        # Safety floor
+        if k < 1e-9:
+            k = 1e-9
             
-    final_sum = np.sum(best_radii)
-    return best_centers, best_radii, final_sum
+        final_radii = r * k
+        final_centers = np.column_stack((x, y))
+        
+        best_total_radius = np.sum(final_radii)
+        return final_centers, final_radii, best_total_radius
+    else:
+        # Fallback in case optimization fails completely
+        centers = np.random.rand(n, 2)
+        radii = np.ones(n) * 0.01
+        return centers, radii, np.sum(radii)

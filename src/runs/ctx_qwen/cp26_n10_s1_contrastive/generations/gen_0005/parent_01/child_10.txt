@@ -1,0 +1,213 @@
+
+
+<strategy>
+To improve the circle packing for 26 circles in a unit square, I will employ a robust joint optimization strategy using a parameterization that automatically satisfies boundary constraints. This reduces the constraint count and improves solver stability.
+
+Key improvements over past attempts:
+1. **Boundary-Safe Parameterization**: Use $(r, u, v)$ where $x_i = r_i + u_i(1-2r_i)$ and $y_i = r_i + v_i(1-2r_i)$ with $u_i, v_i \in [0,1]$. This guarantees $r_i \le x_i, y_i \le 1-r_i$, eliminating 4N boundary constraints and leaving only pairwise non-overlap constraints.
+2. **Diverse, Geometry-Aware Initializations**: Combine hexagonal lattice variations (with random rotations/scales), force-directed repulsion layouts (to naturally space points), and perturbed grids. Each is mapped to a strictly feasible $(r, u, v)$ starting point.
+3. **Iterative Refinement Loop**: After a broad search, apply targeted local perturbations to the best solution to escape shallow local minima, followed by high-precision polishing.
+4. **Robust Constraint Handling**: Use squared-distance constraints to avoid square roots, and enforce strict feasibility checks with numerical tolerances. Multiple restarts and perturbation steps ensure thorough exploration of the landscape.
+
+This approach systematically tightens the packing by leveraging the smoothness of the parameterized space and aggressive local search, pushing the sum of radii beyond previous records.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(z):
+    """Minimize negative sum of radii."""
+    return -np.sum(z[:N])
+
+def constraints(z):
+    """
+    Computes pairwise non-overlap constraints g(z) >= 0.
+    Boundary constraints are implicitly satisfied by the (r, u, v) parameterization.
+    """
+    r = z[:N]
+    u = z[N:2*N]
+    v = z[2*N:3*N]
+    
+    # Map normalized coordinates to physical space
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Vectorized pairwise squared distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx**2 + dy**2
+    
+    # Squared sum of radii
+    rs = r[:, None] + r[None, :]
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2
+
+def get_init_z(centers, safety=0.85):
+    """Converts physical centers to a strictly feasible (r, u, v) optimization vector."""
+    r = np.zeros(N)
+    for i in range(N):
+        # Distance to boundaries
+        db = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+        # Distance to nearest neighbor
+        dists = np.linalg.norm(centers[i] - centers, axis=1)
+        dists[i] = np.inf
+        dp = np.min(dists)
+        # Apply safety margin to ensure strict interior feasibility
+        r[i] = safety * min(db, dp / 2.0)
+        
+    r = np.clip(r, 1e-5, 0.4)
+    denom = 1.0 - 2.0 * r
+    denom = np.clip(denom, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / denom, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def generate_hex_centers(rot, scale, jitter):
+    """Generates a hexagonal lattice configuration with transformations."""
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        x_start = r_est if row % 2 == 0 else 2.0 * r_est
+        x = x_start
+        while x <= 1.0 - r_est and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+        
+    pts = np.array(pts[:N])
+    # Center and scale
+    pts -= 0.5
+    pts *= scale
+    pts += 0.5
+    
+    # Rotate
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        R = np.array([[c, -s], [s, c]])
+        pts = pts @ R.T
+        
+    # Jitter
+    pts += np.random.uniform(-jitter, jitter, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def force_spread(pts, steps=80):
+    """Spreads points using a simple repulsion simulation."""
+    for _ in range(steps):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2)) + 1e-8
+        # Repulsion force ~ 1/d^2
+        forces = np.sum(diff / dists**3, axis=1)
+        pts += 0.005 * forces
+        pts = np.clip(pts, 0.02, 0.98)
+    return pts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds = [(1e-5, 0.4)] * N + [(0.0, 1.0)] * N + [(0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_z = None
+    best_sum = -np.inf
+    
+    inits = []
+    # 1. Hexagonal lattice variations (covers dense packings)
+    for i in range(30):
+        rot = np.random.uniform(-0.4, 0.4)
+        scale = np.random.uniform(0.85, 1.15)
+        jit = np.random.uniform(0.01, 0.04)
+        pts = generate_hex_centers(rot, scale, jit)
+        inits.append(get_init_z(pts, safety=0.85))
+        
+    # 2. Force-spread random layouts (covers non-lattice optimal topologies)
+    for i in range(25):
+        pts = np.random.rand(N, 2)
+        pts = force_spread(pts, steps=100)
+        inits.append(get_init_z(pts, safety=0.8))
+        
+    # 3. Perturbed structured layouts
+    for i in range(15):
+        pts = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)] + [[0.5, 0.5]])
+        pts += np.random.uniform(-0.035, 0.035, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        inits.append(get_init_z(pts, safety=0.8))
+
+    # Phase 1: Broad global search
+    for z0 in inits:
+        try:
+            res = minimize(objective, z0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-12, 'disp': False})
+            if res.success:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    s_val = np.sum(res.x[:N])
+                    if s_val > best_sum:
+                        best_sum = s_val
+                        best_z = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Local perturbation refinement to escape local minima
+    if best_z is not None:
+        for k in range(60):
+            z0 = best_z.copy()
+            # Perturb radii slightly, positions more aggressively
+            z0[:N] += np.random.uniform(-0.0015, 0.0015, N)
+            z0[N:] += np.random.uniform(-0.02, 0.02, 2 * N)
+            z0[:N] = np.clip(z0[:N], 1e-5, 0.4)
+            z0[N:] = np.clip(z0[N:], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, z0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+                if res.success:
+                    c_val = constraints(res.x)
+                    if np.min(c_val) >= -1e-7:
+                        s_val = np.sum(res.x[:N])
+                        if s_val > best_sum:
+                            best_sum = s_val
+                            best_z = res.x.copy()
+            except Exception:
+                continue
+                
+        # Phase 3: High-precision polish
+        for _ in range(3):
+            try:
+                res = minimize(objective, best_z, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+                if np.min(constraints(res.x)) >= -1e-8:
+                    best_z = res.x
+                    best_sum = np.sum(res.x[:N])
+            except Exception:
+                pass
+
+    # Fallback configuration (should rarely be reached)
+    if best_z is None:
+        centers = np.zeros((N, 2))
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                centers[idx] = [0.1 + 0.2 * i, 0.1 + 0.2 * j]
+                idx += 1
+        centers[25] = [0.5, 0.5]
+        radii = np.full(N, 0.05)
+        return centers, radii, float(np.sum(radii))
+        
+    # Reconstruct physical centers from optimized parameters
+    r_opt = best_z[:N]
+    u_opt = best_z[N:2*N]
+    v_opt = best_z[2*N:3*N]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    radii = np.maximum(r_opt, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

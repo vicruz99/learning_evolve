@@ -1,0 +1,205 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.626, we need a more robust global search strategy combined with high-precision local optimization. The previous approaches used grid/random starts and SLSQP, but they likely got trapped in local optima due to symmetric initial configurations.
+
+Key improvements:
+1. **Rotated Hexagonal Initializations**: Hexagonal packing is the densest 2D arrangement. By generating hexagonal lattices, rotating them by various angles (0° to 45°), and adding controlled noise, we break symmetry and explore configurations that align better with the square boundaries.
+2. **Feasible Initialization Guarantee**: Each initial guess computes the exact minimum distance to walls and other circles, then sets radii to 95% of that minimum. This guarantees strict feasibility before optimization starts, preventing SLSQP from failing early.
+3. **Multi-Start & Refinement Loop**: We run SLSQP across 105 diverse initial configurations (7 angles × 15 seeds). After finding the best, we run a refinement loop with slight perturbations to escape shallow local minima.
+4. **Constraint & Objective Formulation**: Constraints are combined into a single vector function returning all inequality values `>= 0`. This avoids Python closure overhead and matches scipy's expected interface cleanly. Squared distance constraints `dx² + dy² - (r₁+r₂)² >= 0` maintain smooth gradients.
+5. **Numerical Safety**: A final validation loop slightly shrinks radii (by 0.1%) if floating-point tolerance issues cause micro-overlaps, ensuring the returned packing strictly passes the provided `validate_packing` function.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def compute_objective(vars, n):
+    """Objective to minimize: negative sum of radii."""
+    s = 0.0
+    for i in range(n):
+        s += vars[3 * i + 2]
+    return -s
+
+def compute_constraints(vars, n):
+    """Returns array of constraint values. All must be >= 0."""
+    cons = []
+    for i in range(n):
+        xi = vars[3 * i]
+        yi = vars[3 * i + 1]
+        ri = vars[3 * i + 2]
+        # Wall constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+        cons.append(xi - ri)
+        cons.append(1.0 - xi - ri)
+        cons.append(yi - ri)
+        cons.append(1.0 - yi - ri)
+        
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    for i in range(n):
+        xi = vars[3 * i]
+        yi = vars[3 * i + 1]
+        ri = vars[3 * i + 2]
+        for j in range(i + 1, n):
+            xj = vars[3 * j]
+            yj = vars[3 * j + 1]
+            rj = vars[3 * j + 2]
+            dx = xi - xj
+            dy = yi - yj
+            dr = ri + rj
+            cons.append(dx * dx + dy * dy - dr * dr)
+    return np.array(cons)
+
+def create_initial_guess(n, angle_deg, seed, r_target):
+    """Generates a feasible initial configuration using rotated hexagonal grid."""
+    np.random.seed(seed)
+    pts = []
+    dx = 2.0 * r_target
+    dy = math.sqrt(3.0) * r_target
+    
+    # Generate hexagonal points
+    for row in range(10):
+        y = r_target + row * dy
+        if y + r_target > 1.0:
+            break
+        shift = 0.0 if row % 2 == 0 else dx / 2.0
+        for col in range(10):
+            x = r_target + col * dx + shift
+            if x + r_target > 1.0:
+                break
+            pts.append([x, y])
+            
+    # Pad if necessary
+    while len(pts) < n:
+        pts.append([np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)])
+        
+    pts = np.array(pts[:n])
+    
+    # Rotate points around center
+    rad = math.radians(angle_deg)
+    cx, cy = 0.5, 0.5
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    rotated = np.zeros_like(pts)
+    for i in range(n):
+        ddx = pts[i, 0] - cx
+        ddy = pts[i, 1] - cy
+        rotated[i, 0] = ddx * cos_a - ddy * sin_a + cx
+        rotated[i, 1] = ddx * sin_a + ddy * cos_a + cy
+        
+    # Add small noise to break exact symmetry
+    rotated += np.random.normal(0, 0.005, size=rotated.shape)
+    rotated = np.clip(rotated, 0.05, 0.95)
+    
+    # Calculate strictly feasible initial radii
+    min_dist = 1.0
+    for i in range(n):
+        x, y = rotated[i]
+        d_wall = min(x, 1.0 - x, y, 1.0 - y)
+        min_dist = min(min_dist, d_wall)
+        for j in range(i + 1, n):
+            dx = rotated[i, 0] - rotated[j, 0]
+            dy = rotated[i, 1] - rotated[j, 1]
+            d_pair = math.hypot(dx, dy)
+            min_dist = min(min_dist, d_pair / 2.0)
+            
+    r_init = min_dist * 0.95
+    if r_init < 0.01:
+        r_init = 0.01
+        
+    vars = np.zeros(3 * n)
+    for i in range(n):
+        vars[3 * i] = rotated[i, 0]
+        vars[3 * i + 1] = rotated[i, 1]
+        vars[3 * i + 2] = r_init
+        
+    return vars
+
+def run_packing():
+    n = 26
+    bounds = []
+    for _ in range(n):
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 0.5))
+        
+    constraints = {'type': 'ineq', 'fun': compute_constraints, 'args': (n,)}
+    
+    best_sum = -1.0
+    best_vars = None
+    
+    # Explore configuration space with rotated hexagonal grids
+    angles = [0, 5, 10, 15, 20, 25, 30, 45]
+    seeds = list(range(15))
+    
+    for angle in angles:
+        for seed in seeds:
+            x0 = create_initial_guess(n, angle, seed, 0.1)
+            try:
+                res = minimize(compute_objective, x0, args=(n,), method='SLSQP', 
+                              bounds=bounds, constraints=constraints, 
+                              options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # Local refinement to escape shallow minima
+    if best_vars is not None:
+        for _ in range(5):
+            noisy = best_vars + np.random.normal(0, 1e-4, size=best_vars.shape)
+            try:
+                res = minimize(compute_objective, noisy, args=(n,), method='SLSQP',
+                              bounds=bounds, constraints=constraints,
+                              options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_vars = res.x.copy()
+            except Exception:
+                break
+                
+    # Extract results
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    if best_vars is not None:
+        for i in range(n):
+            centers[i, 0] = best_vars[3 * i]
+            centers[i, 1] = best_vars[3 * i + 1]
+            radii[i] = max(0.0, best_vars[3 * i + 2])
+    else:
+        # Fallback valid configuration
+        idx = 0
+        for r_idx in range(5):
+            for c_idx in range(5):
+                if idx < n:
+                    centers[idx] = [0.1 + c_idx * 0.2, 0.1 + r_idx * 0.2]
+                    radii[idx] = 0.1
+                    idx += 1
+        if idx < n:
+            centers[idx] = [0.5, 0.5]
+            radii[idx] = 0.04
+            
+    # Final numerical safety check
+    for _ in range(10):
+        valid = True
+        for i in range(n):
+            xi, yi, ri = centers[i, 0], centers[i, 1], radii[i]
+            if xi - ri < -1e-12 or xi + ri > 1 + 1e-12 or yi - ri < -1e-12 or yi + ri > 1 + 1e-12:
+                valid = False
+                break
+            for j in range(i + 1, n):
+                dx = xi - centers[j, 0]
+                dy = yi - centers[j, 1]
+                dist = math.hypot(dx, dy)
+                if dist < ri + radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            break
+        radii *= 0.999
+        
+    return centers, radii, float(np.sum(radii))
+```

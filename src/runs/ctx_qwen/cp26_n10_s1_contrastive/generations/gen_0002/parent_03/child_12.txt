@@ -1,0 +1,171 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need an optimization strategy that efficiently handles constraints and escapes local minima. 
+
+Key improvements over previous attempts:
+1. **Implicit Boundary Constraints**: Instead of explicitly enforcing $r \le x \le 1-r$ and $r \le y \le 1-r$, we parameterize the centers as $x = r + u(1-2r)$ and $y = r + v(1-2r)$ with $u, v \in [0,1]$. This mathematically guarantees that every circle stays within the square for any valid $r$, removing 104 boundary constraints from the optimizer and drastically reducing computational overhead.
+2. **Reduced Constraint Set**: The optimizer now only needs to satisfy $\binom{26}{2} = 325$ pairwise non-overlap constraints, making SLSQP much faster and more stable.
+3. **Diverse Structured Initializations**: We generate initial configurations using hexagonal lattices, square grids, and random placements, each with controlled perturbations to break symmetry and avoid degenerate starts.
+4. **Multi-Start with High-Precision Refinement**: We run 50 independent optimization starts. The best valid configuration found is then passed through a final high-precision refinement pass (`ftol=1e-14`, `maxiter=10000`) to squeeze out the last bits of potential sum.
+5. **Robust Fallback**: A safe fallback ensures a valid packing is always returned even if optimization encounters numerical issues.
+
+This approach focuses on numerical stability, constraint reduction, and thorough exploration of the configuration space to consistently exceed previous best scores.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars_vec):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Computes inequality constraints: pairwise non-overlap.
+    Boundary constraints are satisfied by construction via parameterization.
+    """
+    n = N_CIRCLES
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization ensures r <= x <= 1-r and r <= y <= 1-r
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Upper triangular indices for i < j
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[i_idx, j_idx] - r_sum_sq[i_idx, j_idx]
+
+def get_init_config(seed, config_type):
+    """Generates a strictly feasible initial configuration."""
+    n = N_CIRCLES
+    np.random.seed(seed)
+    r0 = 0.08 + 0.02 * np.random.rand()
+    
+    positions = np.zeros((n, 2))
+    idx = 0
+    
+    if config_type == 0:  # Hexagonal lattice
+        y_pos = r0
+        row = 0
+        while idx < n:
+            x_pos = r0 + (row % 2) * r0 * 1.05
+            while x_pos <= 1.0 - r0 and idx < n:
+                positions[idx] = [x_pos, y_pos]
+                idx += 1
+                x_pos += 2.0 * r0 * 1.05
+            y_pos += np.sqrt(3.0) * r0 * 1.05
+            row += 1
+    elif config_type == 1:  # Grid layout
+        cols, rows = 5, 6
+        step_x = (1.0 - 2.0 * r0) / (cols - 1)
+        step_y = (1.0 - 2.0 * r0) / (rows - 1)
+        for i in range(rows):
+            for j in range(cols):
+                if idx < n:
+                    positions[idx] = [r0 + j * step_x, r0 + i * step_y]
+                    idx += 1
+    else:  # Random placement
+        positions = np.random.uniform(r0, 1.0 - r0, (n, 2))
+        idx = n
+        
+    # Ensure all positions are filled
+    if idx < n:
+        positions[idx:] = np.random.uniform(r0, 1.0 - r0, (n - idx, 2))
+        idx = n
+        
+    # Convert to normalized u, v coordinates
+    denom = 1.0 - 2.0 * r0
+    u_init = (positions[:, 0] - r0) / denom
+    v_init = (positions[:, 1] - r0) / denom
+    
+    # Add controlled perturbation to escape symmetry
+    u_init += np.random.uniform(-0.05, 0.05, n)
+    v_init += np.random.uniform(-0.05, 0.05, n)
+    u_init = np.clip(u_init, 0.0, 1.0)
+    v_init = np.clip(v_init, 0.0, 1.0)
+    
+    vars0 = np.empty(n * 3)
+    vars0[0::3] = r0
+    vars0[1::3] = u_init
+    vars0[2::3] = v_init
+    return vars0
+
+def run_packing():
+    n = N_CIRCLES
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sol = None
+    best_val = -np.inf
+    
+    n_restarts = 50
+    
+    for seed in range(n_restarts):
+        config_type = seed % 3
+        vars0 = get_init_config(seed, config_type)
+        
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-13, 'iprint': -1})
+            
+            # Verify constraint satisfaction within tolerance
+            c_val = constraint_func(res.x)
+            if np.min(c_val) >= -1e-7:
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_sol = res.x.copy()
+        except Exception:
+            continue
+            
+    # High-precision refinement on the best configuration found
+    if best_sol is not None:
+        try:
+            res_ref = minimize(objective, best_sol, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 10000, 'ftol': 1e-14, 'iprint': -1})
+            c_val = constraint_func(res_ref.x)
+            if np.min(c_val) >= -1e-7:
+                val = -res_ref.fun
+                if val > best_val:
+                    best_val = val
+                    best_sol = res_ref.x
+        except Exception:
+            pass
+    else:
+        # Fallback to a valid configuration if optimization fails
+        r_f = 0.05
+        centers = np.random.rand(n, 2)
+        centers = np.clip(centers, r_f, 1.0 - r_f)
+        best_sol = np.zeros(n * 3)
+        best_sol[0::3] = r_f
+        best_sol[1::3] = (centers[:, 0] - r_f) / (1.0 - 2.0 * r_f)
+        best_sol[2::3] = (centers[:, 1] - r_f) / (1.0 - 2.0 * r_f)
+        best_val = np.sum(r_f)
+        
+    # Reconstruct centers from optimized parameters
+    r_opt = best_sol[0::3]
+    u_opt = best_sol[1::3]
+    v_opt = best_sol[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    
+    return centers, r_opt, float(np.sum(r_opt))
+```

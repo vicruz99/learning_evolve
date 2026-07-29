@@ -1,0 +1,257 @@
+# sol_000380 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 7a0a6c4a) state=16698488 sum of radii=2.506359 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def solve_radii_lp(centers):
+    """
+    Solves the Linear Programming problem to find radii that maximize the sum
+    given fixed centers.
+    
+    Constraints:
+    1. r_i + r_j <= distance(c_i, c_j)
+    2. r_i <= x_i
+    3. r_i <= 1 - x_i
+    4. r_i <= y_i
+    5. r_i <= 1 - y_i
+    6. r_i >= 0
+    """
+    n = len(centers)
+    
+    # Objective: Maximize sum(r) => Minimize sum(-r)
+    c_obj = np.ones(n) * -1.0
+    
+    # Inequality constraints A_ub * r <= b_ub
+    A_ub = []
+    b_ub = []
+    
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dist)
+            
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        
+        # r_i <= x
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(x)
+        
+        # r_i <= 1 - x
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(1.0 - x)
+        
+        # r_i <= y
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(y)
+        
+        # r_i <= 1 - y
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(1.0 - y)
+
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    # Bounds for r_i: [0, None]
+    bounds = [(0, None)] * n
+    
+    # Solve LP
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+        else:
+            # Fallback if LP fails (should rarely happen with valid centers)
+            return np.zeros(n), 0.0
+    except Exception:
+        return np.zeros(n), 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    centers = np.zeros((n, 2))
+    
+    # 1. Initialization: Grid layout
+    # We need 26 points. A 5x5 grid has 25 points.
+    # We'll use a subset of a 6x6 grid or just distribute them.
+    # Let's create a 5x5 grid with spacing 0.2, centered.
+    # Points: 0.1, 0.3, 0.5, 0.7, 0.9
+    grid_x = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    grid_y = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    
+    idx = 0
+    for y in grid_y:
+        for x in grid_x:
+            if idx < n:
+                centers[idx] = [x, y]
+                idx += 1
+            else:
+                break
+        if idx >= n:
+            break
+            
+    # Add the 26th point slightly perturbed from center or in a gap?
+    # The loop above fills 25 points. 
+    # Let's place the 26th point at (0.5, 0.5) perturbed? 
+    # Actually, the grid fills (0.5, 0.5). 
+    # Let's just use the first 26 points of a denser grid or random jitter.
+    # Let's restart with a proper 26-point layout.
+    
+    # Better Init: 5 rows. 
+    # Row 0: 6 circles? 
+    # Let's just use the grid and jitter.
+    # Reset centers to first 26 of a 6x5 grid?
+    # 6 cols, 5 rows = 30 points.
+    # Spacing 1/5 = 0.2. x in [0.1, ..., 1.0]? No, 1.0 is boundary.
+    # x in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6] -> 6 points.
+    # y in [0.2, 0.4, 0.6, 0.8] -> 4 points. Total 24.
+    # Let's use random initialization with some structure.
+    
+    np.random.seed(42)
+    # Create a hexagonal-ish lattice
+    # Row spacing sqrt(3)/2 * d
+    d = 0.25 # approximate diameter
+    centers = []
+    row = 0
+    y = 0.1
+    while len(centers) < n:
+        col = 0
+        x = 0.1
+        offset = 0 if row % 2 == 0 else d/2
+        while x <= 0.9 and len(centers) < n:
+            centers.append([x + offset, y])
+            x += d
+            col += 1
+        y += d * np.sqrt(3) / 2
+        row += 1
+        
+    # Take first n
+    centers = np.array(centers[:n])
+    
+    # Small random perturbation to break symmetry
+    centers += np.random.uniform(-0.01, 0.01, size=centers.shape)
+    centers = np.clip(centers, 0.01, 0.99) # Keep inside safely
+
+    radii = np.zeros(n)
+    max_sum_r = 0.0
+    
+    # Parameters for optimization
+    num_iterations = 300
+    step_size = 0.05
+    noise_scale = 0.02
+    
+    for it in range(num_iterations):
+        # 1. Solve for radii
+        radii, current_sum = solve_radii_lp(centers)
+        
+        if current_sum > max_sum_r:
+            max_sum_r = current_sum
+        
+        # 2. Calculate forces to move centers
+        forces = np.zeros_like(centers)
+        
+        # Threshold for active constraints
+        tol = 1e-4
+        
+        # Pairwise repulsion
+        # If r_i + r_j is close to distance, push apart
+        # We iterate pairs
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                sum_r = radii[i] + radii[j]
+                
+                # Slack
+                slack = dist - sum_r
+                
+                # If constraint is active or close, apply force
+                # Force magnitude proportional to "pressure"
+                # We use a simple heuristic: if slack is small, strong repulsion
+                if slack < 0.1: # Consider interaction range
+                    # Avoid division by zero
+                    if dist < 1e-6:
+                        dist = 1e-6
+                    
+                    # Direction from j to i
+                    direction = (centers[i] - centers[j]) / dist
+                    
+                    # Force strength
+                    # Stronger if tighter
+                    strength = 1.0 / (slack + 0.01) 
+                    
+                    # Scale by radii? Maybe not needed.
+                    forces[i] += strength * direction
+                    forces[j] -= strength * direction
+        
+        # Boundary forces
+        # Push away from walls if constrained
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left wall
+            slack_x_left = x - r
+            if slack_x_left < 0.1:
+                forces[i, 0] += 1.0 / (slack_x_left + 0.01)
+            
+            # Right wall
+            slack_x_right = (1.0 - x) - r
+            if slack_x_right < 0.1:
+                forces[i, 0] -= 1.0 / (slack_x_right + 0.01)
+                
+            # Bottom wall
+            slack_y_bottom = y - r
+            if slack_y_bottom < 0.1:
+                forces[i, 1] += 1.0 / (slack_y_bottom + 0.01)
+            
+            # Top wall
+            slack_y_top = (1.0 - y) - r
+            if slack_y_top < 0.1:
+                forces[i, 1] -= 1.0 / (slack_y_top + 0.01)
+        
+        # Normalize forces to prevent explosion
+        # Scale forces so max magnitude is 1?
+        max_f = np.max(np.abs(forces))
+        if max_f > 0:
+            forces = forces / max_f
+        
+        # Add noise to escape local minima
+        noise = np.random.uniform(-noise_scale, noise_scale, size=centers.shape)
+        
+        # Update centers
+        # Adaptive step size: decrease over time
+        current_step = step_size * (1.0 - it / num_iterations)
+        
+        centers = centers + current_step * (forces + noise)
+        
+        # Clip to valid range [0, 1]
+        # Keep some margin to avoid numerical issues with LP?
+        # LP handles boundaries, but centers at 0 might be tricky if r>0.
+        # However, LP constraint r <= x handles it.
+        # But to be safe, clip to [epsilon, 1-epsilon]
+        centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+
+    # Final solve to ensure radii are optimal for final centers
+    radii, final_sum = solve_radii_lp(centers)
+    
+    return centers, radii, final_sum
+
+# Validation check (not part of solution, just for thought process)
+# def validate_packing(centers, radii): ...

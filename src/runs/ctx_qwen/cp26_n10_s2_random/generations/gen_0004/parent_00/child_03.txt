@@ -1,0 +1,223 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.634 and target > 2.636, we need a more robust global search combined with precise local refinement. The previous approaches relied heavily on SLSQP with heuristic initializations, which can get trapped in local optima.
+
+Key improvements in this strategy:
+1. **Global Search with Differential Evolution**: We first optimize only the center coordinates (52 dimensions) using `differential_evolution`. This efficiently explores the configuration space without gradient issues, finding promising basin locations for circle centers.
+2. **Diverse Structured Initializations**: We supplement DE with hexagonal lattices, random dense packs, and perturbed grids to cover non-lattice optimal structures.
+3. **Two-Stage Optimization**: 
+   - Stage 1: DE finds good center arrangements. We compute maximal feasible radii for these centers.
+   - Stage 2: We use SLSQP to jointly optimize centers and radii (78 variables) from each candidate. This refines both positions and sizes simultaneously, respecting all non-convex constraints.
+4. **Perturbation & Homotopy Growth**: Around each local optimum found by SLSQP, we perform small random perturbations and re-optimize to escape shallow local maxima. We also run a homotopy step that gradually inflates radii and re-optimizes centers to push the packing density higher.
+5. **Robust Repair & Validation**: A strict iterative repair function ensures final outputs satisfy all constraints within the validator's tolerance, shrinking radii only minimally if needed.
+
+This combination of global exploration, gradient-based polishing, and controlled expansion typically pushes circle packing sums past local barriers.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+PAIR_COUNT = len(I_IDX)
+
+def compute_max_radii(centers):
+    """Computes the maximal valid radius for each circle given fixed centers."""
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def obj_centers(centers_flat):
+    """Objective for center-only optimization: maximize sum of radii."""
+    centers = centers_flat.reshape(N, 2)
+    radii = compute_max_radii(centers)
+    return -np.sum(radii)
+
+def obj_full(p):
+    """Objective for full optimization: minimize negative sum of radii."""
+    return -np.sum(p[2::3])
+
+def cons_full(p):
+    """Computes all boundary and non-overlap constraints."""
+    x, y, r = p[0::3], p[1::3], p[2::3]
+    c = np.empty(4 * N + PAIR_COUNT)
+    idx = 0
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c[idx:idx+N] = x - r; idx += N
+    c[idx:idx+N] = 1.0 - x - r; idx += N
+    c[idx:idx+N] = y - r; idx += N
+    c[idx:idx+N] = 1.0 - y - r; idx += N
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[I_IDX] - x[J_IDX]
+    dy = y[I_IDX] - y[J_IDX]
+    dr = r[I_IDX] + r[J_IDX]
+    c[idx:] = dx*dx + dy*dy - dr*dr
+    return c
+
+def repair(centers, radii):
+    """Iteratively shrinks radii to resolve overlaps and clamp to boundaries."""
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            max_r = min(centers[i, 0], 1.0 - centers[i, 0], 
+                        centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > max_r - 1e-9:
+                radii[i] = max_r
+                changed = True
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    ov = radii[i] + radii[j] - d
+                    radii[i] -= ov * 0.5
+                    radii[j] -= ov * 0.5
+                    changed = True
+        if not changed:
+            break
+    return radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    candidates = []
+    
+    # Phase 1: Differential Evolution on centers for global exploration
+    bounds_centers = [(0.05, 0.95)] * (2 * N)
+    try:
+        de_res = differential_evolution(obj_centers, bounds_centers, popsize=10, maxiter=150, 
+                                        mutation=(0.5, 1.0), recombination=0.8, seed=42, tol=1e-5)
+        c_de = de_res.x.reshape(N, 2)
+        r_de = compute_max_radii(c_de)
+        candidates.append((c_de, r_de))
+    except Exception:
+        pass
+        
+    # Phase 2: Diverse structured initial configurations
+    starts = []
+    # Hexagonal grids with varying offsets
+    for seed in range(5):
+        np.random.seed(seed)
+        c = []
+        y = 0.1
+        r = 0.09
+        row = 0
+        while len(c) < N:
+            x = r if row % 2 == 0 else 2*r
+            while x <= 1.0 - r and len(c) < N:
+                c.append([x, y])
+                x += 2*r
+            y += np.sqrt(3)*r
+            row += 1
+        c = np.array(c[:N]) + np.random.normal(0, 0.005, (N, 2))
+        c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+        
+    # Random dense configurations
+    for _ in range(15):
+        starts.append(np.random.rand(N, 2) * 0.8 + 0.1)
+        
+    for c in starts:
+        r = compute_max_radii(c)
+        candidates.append((c, r))
+        
+    # Phase 3: SLSQP Refinement on (centers, radii)
+    best_sum = -np.inf
+    best_centers = None
+    best_radii = None
+    
+    cons = {'type': 'ineq', 'fun': cons_full}
+    bounds = [(0.0, 1.0)]*(2*N) + [(1e-6, 0.5)]*N
+    
+    for init_c, init_r in candidates:
+        p0 = np.concatenate([init_c.flatten(), init_r])
+        p0 += np.random.normal(0, 1e-4, p0.shape)
+        p0[2::3] = np.maximum(p0[2::3], 1e-6)
+        
+        try:
+            res = minimize(obj_full, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12})
+            
+            curr_c = res.x[:2*N].reshape(N, 2)
+            curr_r = res.x[2*N:]
+            curr_r = repair(curr_c, curr_r)
+            curr_sum = np.sum(curr_r)
+            
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = curr_c
+                best_radii = curr_r
+                
+            # Perturbation search around local optimum to escape shallow basins
+            for _ in range(2):
+                p_pert = res.x + np.random.normal(0, 0.0015, len(res.x))
+                p_pert[2::3] = np.maximum(p_pert[2::3], 1e-6)
+                try:
+                    res2 = minimize(obj_full, p_pert, method='SLSQP', bounds=bounds,
+                                    constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+                    curr_c2 = res2.x[:2*N].reshape(N, 2)
+                    curr_r2 = res2.x[2*N:]
+                    curr_r2 = repair(curr_c2, curr_r2)
+                    s2 = np.sum(curr_r2)
+                    if s2 > best_sum:
+                        best_sum = s2
+                        best_centers = curr_c2
+                        best_radii = curr_r2
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    # Phase 4: Homotopy Growth to push density limits
+    for step in range(8):
+        curr_r = best_radii * (1.0 + 0.004)
+        curr_c = best_centers + np.random.normal(0, 0.0008, best_centers.shape)
+        curr_c = np.clip(curr_c, 0.02, 0.98)
+        p0 = np.concatenate([curr_c.flatten(), curr_r])
+        
+        try:
+            res = minimize(obj_full, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12})
+            curr_c = res.x[:2*N].reshape(N, 2)
+            curr_r = res.x[2*N:]
+            curr_r = repair(curr_c, curr_r)
+            s = np.sum(curr_r)
+            if s > best_sum:
+                best_sum = s
+                best_centers = curr_c
+                best_radii = curr_r
+        except Exception:
+            pass
+
+    best_radii = repair(best_centers, best_radii)
+    
+    # Strict validation shrink to guarantee checker tolerance
+    for _ in range(5):
+        valid = True
+        for i in range(N):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                valid = False; break
+        if not valid: break
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+                if d < best_radii[i] + best_radii[j] - 1e-12:
+                    valid = False; break
+            if not valid: break
+        if valid: break
+        best_radii *= 0.99995
+        
+    best_radii = np.maximum(best_radii, 0.0)
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

@@ -1,0 +1,201 @@
+# sol_000128 | problem=circle_packing_26 entrypoint=run_packing
+# generation=6 parent=sol_000071 (state 95b12ad0) state=f173301c sum of radii=1.966709 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def compute_max_radii_sum(centers):
+    """Computes the sum of maximum valid radii for fixed centers using independent caps."""
+    r_bound = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                         np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    dists[np.arange(N), np.arange(N)] = np.inf
+    r_pair = 0.5 * np.min(dists, axis=1)
+    return np.sum(np.minimum(r_bound, r_pair))
+
+def obj_func(centers_flat):
+    """Objective for center optimization: minimize negative sum of radii."""
+    return -compute_max_radii_sum(centers_flat.reshape(N, 2))
+
+def generate_hex_config(rows, r, rot=0.0):
+    """Generates a hexagonal lattice configuration scaled to the unit square."""
+    pts = []
+    y = r
+    for r_idx, count in enumerate(rows):
+        shift_x = (r_idx % 2) * r
+        for c in range(count):
+            x = r + c * 2 * r + shift_x
+            pts.append([x, y])
+        y += r * np.sqrt(3)
+    pts = np.array(pts[:N])
+    if rot != 0:
+        c, s = np.cos(rot), np.sin(rot)
+        pts = pts @ np.array([[c, -s], [s, c]])
+    # Normalize and add margin
+    pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0))
+    pts = pts * 0.8 + 0.1
+    return np.clip(pts, 0.01, 0.99)
+
+def force_directed_init(seed):
+    """Generates a repulsion-based initial configuration."""
+    rng = np.random.default_rng(seed)
+    c = rng.uniform(0.1, 0.9, (N, 2))
+    for _ in range(150):
+        forces = np.zeros_like(c)
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(c[i] - c[j])
+                if d < 0.15:
+                    f = (0.15 - d) * 10.0 / d
+                    diff = c[i] - c[j]
+                    forces[i] += diff * f
+                    forces[j] -= diff * f
+        c += forces * 0.001
+        c = np.clip(c, 0.01, 0.99)
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    global N
+    best_centers = None
+    best_val = -np.inf
+    rng = np.random.default_rng(42)
+    
+    candidates = []
+    
+    # 1. Diverse hexagonal lattice patterns with various scales and rotations
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5], [6,6,5,5,4], 
+        [4,6,6,6,4], [5,5,5,5,6], [5,4,6,5,6], [6,5,5,5,5]
+    ]
+    for pat in patterns:
+        for r in [0.09, 0.10, 0.11, 0.12]:
+            for rot in [0.0, 0.1, 0.2, 0.3, 0.4]:
+                candidates.append(generate_hex_config(pat, r, rot))
+                
+    # 2. Force-directed repulsion starts
+    for i in range(8):
+        candidates.append(force_directed_init(i))
+        
+    # 3. Dense random starts
+    for _ in range(10):
+        candidates.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    bounds = [(0.0, 1.0)] * (2 * N)
+    
+    # Phase 1: Powell optimization on centers
+    for c_init in candidates:
+        try:
+            res = minimize(obj_func, c_init.flatten(), method='Powell', bounds=bounds,
+                           options={'maxiter': 15000, 'ftol': 1e-15, 'xtol': 1e-15})
+            if -res.fun > best_val:
+                best_val = -res.fun
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            pass
+            
+    if best_centers is None:
+        best_centers = candidates[0]
+        best_val = compute_max_radii_sum(best_centers)
+        
+    # Phase 2: Local search refinement to escape shallow local minima
+    c = best_centers.copy()
+    step = 0.008
+    for epoch in range(120):
+        improved = False
+        current_val = compute_max_radii_sum(c)
+        for i in range(N):
+            best_local = current_val
+            best_pos = c[i].copy()
+            # Try multiple random perturbations per circle
+            for _ in range(30):
+                direction = rng.normal(0, 1, 2) * step
+                nc = c.copy()
+                nc[i] = np.clip(c[i] + direction, 0.001, 0.999)
+                v = compute_max_radii_sum(nc)
+                if v > best_local:
+                    best_local = v
+                    best_pos = nc[i].copy()
+            if best_local > current_val + 1e-9:
+                c[i] = best_pos
+                improved = True
+        if not improved:
+            step *= 0.85
+        else:
+            current_val = best_local
+    best_centers = c
+    best_val = compute_max_radii_sum(c)
+    
+    # Phase 3: Final Powell polish for precision
+    try:
+        res = minimize(obj_func, best_centers.flatten(), method='Powell', bounds=bounds,
+                       options={'maxiter': 20000, 'ftol': 1e-15, 'xtol': 1e-15})
+        best_centers = res.x.reshape(N, 2)
+        best_val = -res.fun
+    except Exception:
+        pass
+        
+    # Phase 4: Exact LP resolution for radii given optimized centers
+    diff = best_centers[:, np.newaxis, :] - best_centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    dists[np.arange(N), np.arange(N)] = np.inf
+    
+    ub = np.minimum(np.minimum(best_centers[:, 0], 1.0 - best_centers[:, 0]),
+                    np.minimum(best_centers[:, 1], 1.0 - best_centers[:, 1]))
+    
+    A_ub = []
+    b_ub = []
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    for i in range(N):
+        for j in range(i + 1, N):
+            row = np.zeros(N)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dists[i, j])
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(N):
+        row = np.zeros(N)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(ub[i])
+        
+    res_lp = linprog(-np.ones(N), A_ub=np.array(A_ub), b_ub=np.array(b_ub), 
+                     bounds=[(0, None)] * N, method='highs')
+    if res_lp.success:
+        radii = res_lp.x
+    else:
+        # Fallback to analytical caps if LP fails
+        radii = np.minimum(ub, 0.5 * np.min(dists, axis=1))
+        
+    # Phase 5: Strict numerical safety repair for validator tolerance
+    for _ in range(30):
+        changed = False
+        # Clamp to boundaries
+        for i in range(N):
+            x, y = best_centers[i]
+            mr = min(x, 1.0 - x, y, 1.0 - y)
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr - 1e-11
+                changed = True
+        # Resolve pairwise overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(best_centers[i] - best_centers[j])
+                if radii[i] + radii[j] > d - 1e-11:
+                    shrink = (radii[i] + radii[j] - d) * 0.5 + 1e-11
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    
+    return best_centers, radii, final_sum

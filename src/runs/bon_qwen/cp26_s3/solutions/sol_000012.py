@@ -1,0 +1,93 @@
+# sol_000012 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4ccca180) state=9969816b sum of radii=2.625600 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import itertools
+from functools import partial
+
+def constraint_fun(vars, N, i_idx, j_idx):
+    """Compute constraint values for packing problem. Returns array of constraint violations (>=0 required)."""
+    centers = vars[:2*N].reshape(N, 2)
+    r = vars[2*N:]
+    
+    con = []
+    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0, r >= 0
+    con.extend(centers[:, 0] - r)
+    con.extend(1.0 - centers[:, 0] - r)
+    con.extend(centers[:, 1] - r)
+    con.extend(1.0 - centers[:, 1] - r)
+    con.extend(r)
+    
+    # Overlap constraints: dist^2 - (r1 + r2)^2 >= 0
+    ci, cj = centers[i_idx], centers[j_idx]
+    ri, rj = r[i_idx], r[j_idx]
+    dx = ci[:, 0] - cj[:, 0]
+    dy = ci[:, 1] - cj[:, 1]
+    dist_sq = dx**2 + dy**2
+    sum_r = ri + rj
+    con.extend(dist_sq - sum_r**2)
+    
+    return np.array(con)
+
+def objective_func(vars, N):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2*N:])
+
+def run_packing():
+    N = 26
+    # Precompute pair indices for overlap constraints
+    pairs = list(itertools.combinations(range(N), 2))
+    i_idx = np.array([p[0] for p in pairs])
+    j_idx = np.array([p[1] for p in pairs])
+    
+    # Bind constants to avoid closures
+    cons_fun = partial(constraint_fun, N=N, i_idx=i_idx, j_idx=j_idx)
+    obj_fun = partial(objective_func, N=N)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Multiple restarts to escape local minima
+    for trial in range(5):
+        rng = np.random.default_rng(trial * 100 + 42)
+        
+        # Initialize centers safely inside the square and radii small enough to satisfy constraints initially
+        centers = rng.uniform(0.2, 0.8, size=(N, 2))
+        radii = np.full(N, 0.05)
+        vars = np.concatenate([centers.flatten(), radii])
+        
+        # Variable bounds
+        bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+        cons = {'type': 'ineq', 'fun': cons_fun}
+        
+        try:
+            res = minimize(obj_fun, vars, method='SLSQP', bounds=bounds, constraints=cons, 
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            
+            cur_sum = -res.fun
+            if cur_sum > best_sum:
+                best_sum = cur_sum
+                best_centers = res.x[:2*N].reshape(N, 2)
+                best_radii = res.x[2*N:]
+        except Exception:
+            continue
+            
+    # Post-processing to strictly satisfy constraints numerically
+    if best_centers is not None:
+        best_radii = np.maximum(best_radii, 1e-10)
+        for i in range(N):
+            r = best_radii[i]
+            best_centers[i, 0] = np.clip(best_centers[i, 0], r, 1.0 - r)
+            best_centers[i, 1] = np.clip(best_centers[i, 1], r, 1.0 - r)
+        final_sum = np.sum(best_radii)
+    else:
+        final_sum = 0.0
+        best_centers = np.zeros((N, 2))
+        best_radii = np.zeros(N)
+        
+    return best_centers, best_radii, final_sum

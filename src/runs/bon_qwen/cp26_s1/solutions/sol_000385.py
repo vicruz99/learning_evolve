@@ -1,0 +1,164 @@
+# sol_000385 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 916b0b30) state=c10575a6 sum of radii=2.100000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    """
+    n_circles = 26
+    np.random.seed(42)
+
+    # 1. Generate Initial Hexagonal Grid Configuration
+    # We arrange circles in rows with a specific count to approximate a square shape.
+    # Pattern: 5, 6, 6, 6, 5, 4 (Total 26) -> Adjusted for better centering
+    # A more balanced pattern for 26 is 5 rows: 6, 5, 6, 5, 4? 
+    # Let's try a 5x5 square grid perturbed into hexagonal or just a dense hex packing.
+    # A standard hexagonal packing of 26 circles usually fits well in 5 rows.
+    # Let's generate a grid and select points or just place them.
+    
+    # Using a hexagonal grid generator
+    centers = []
+    # Row configuration to get 26 circles. 
+    # 5 rows. Counts: 6, 5, 6, 5, 4 = 26.
+    row_counts = [6, 5, 6, 5, 4]
+    
+    # We define the points on a lattice first, then normalize/fit
+    # Lattice spacing: horizontal 1, vertical sqrt(3)/2. 
+    # Offset alternate rows by 0.5 horizontally.
+    
+    # To make it fit better, we can start with a rough placement in [0,1]
+    # But optimization will move them.
+    
+    # Let's create a dense set of points
+    y_pos = 0
+    row_idx = 0
+    for count in row_counts:
+        # Calculate x positions for this row
+        # If row index is even, start at 0. If odd, start at 0.5 (relative to spacing)
+        # But we want them centered.
+        # Let's just place them in a line, optimization will center them.
+        
+        # Horizontal spacing 1.0
+        # Start x offset for centering: (max_width - (count-1)) / 2
+        # Max width approx 5 (from row with 6 items, indices 0..5)
+        # Actually, let's just place them linearly and let optimizer fix it.
+        
+        base_x = 0.0
+        if row_idx % 2 == 1:
+            base_x = 0.5
+            
+        for i in range(count):
+            x = base_x + i
+            centers.append([x, y_pos])
+            
+        y_pos += np.sqrt(3) / 2
+        row_idx += 1
+
+    centers = np.array(centers)
+    
+    # Normalize to [0,1] roughly
+    x_min, y_min = centers.min(axis=0)
+    x_max, y_max = centers.max(axis=0)
+    w = x_max - x_min
+    h = y_max - y_min
+    scale = 1.0 / max(w, h)
+    
+    centers = (centers - np.array([x_min, y_min])) * scale
+    
+    # Center in square
+    centers += (1.0 - scale * np.array([w, h])) / 2.0
+
+    # 2. Define Objective Function
+    # We want to maximize the minimum distance between any two centers (divided by 2)
+    # and the distance from centers to the boundary.
+    # Let d_min be min(dist(i,j)/2, dist(i, boundary)).
+    # We want to maximize d_min.
+    # Equivalently, minimize -d_min.
+    # d_min is non-smooth (min function), but L-BFGS-B can handle it reasonably well 
+    # or we can use a smooth approximation. 
+    # However, for global structure, minimizing the inverse of the min distance is often used,
+    # or simply maximizing the min distance.
+    # Let's use a simple max-min formulation.
+    
+    def objective(x_flat):
+        coords = x_flat.reshape(-1, 2)
+        
+        # Distance to boundaries
+        # x >= r, x <= 1-r => r <= x, r <= 1-x
+        # y >= r, y <= 1-r => r <= y, r <= 1-y
+        dists_to_boundary = np.minimum(np.minimum(coords[:, 0], 1 - coords[:, 0]), 
+                                       np.minimum(coords[:, 1], 1 - coords[:, 1]))
+        min_dist_boundary = np.min(dists_to_boundary)
+        
+        # Distance between circles
+        # dist(i, j) >= 2r => r <= dist(i, j) / 2
+        # Compute all pairwise distances
+        diffs = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        # Ignore diagonal (self)
+        np.fill_diagonal(dists, np.inf)
+        min_dist_pair = np.min(dists) / 2.0
+        
+        # The feasible radius is limited by both
+        r_feasible = np.minimum(min_dist_boundary, min_dist_pair)
+        
+        # We want to maximize r_feasible, so minimize negative
+        return -r_feasible
+
+    # 3. Optimization
+    x0 = centers.flatten()
+    
+    # Bounds: centers must be in [0, 1]
+    bounds = [(0, 1) for _ in range(n_circles * 2)]
+    
+    # Use L-BFGS-B for bound constrained optimization
+    # Note: The objective has discontinuities in gradient (min function), 
+    # but usually works for packing.
+    res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds, 
+                   options={'maxiter': 5000, 'ftol': 1e-12})
+    
+    optimal_centers = res.x.reshape(-1, 2)
+    
+    # 4. Calculate Radii
+    # With optimized centers, we calculate the max possible equal radius
+    # But the problem allows unequal radii. However, equal radii is a valid solution.
+    # To strictly maximize SUM of radii, unequal might be slightly better, 
+    # but equal is a strong baseline. 
+    # Let's compute the valid radius for each circle based on neighbors.
+    # Actually, if we optimized for the "bottleneck" radius, all circles can have that radius.
+    # To potentially improve sum, we could expand circles that have more space.
+    # But simple equal radii is safer and likely close to optimal.
+    # Let's compute the radius constrained by all neighbors for each circle?
+    # r_i = min(min(dist(i,j)/2), min(dist(i, wall)))
+    
+    # Re-evaluate constraints to set radii
+    r_boundaries = np.minimum(np.minimum(optimal_centers[:, 0], 1 - optimal_centers[:, 0]), 
+                              np.minimum(optimal_centers[:, 1], 1 - optimal_centers[:, 1]))
+    
+    pairwise_dists = np.sqrt(np.sum((optimal_centers[:, np.newaxis, :] - optimal_centers[np.newaxis, :, :])**2, axis=2))
+    np.fill_diagonal(pairwise_dists, np.inf)
+    
+    min_pair_dists = np.min(pairwise_dists, axis=1) / 2.0
+    
+    radii = np.minimum(r_boundaries, min_pair_dists)
+    
+    # Ensure non-negative (should be)
+    radii = np.maximum(radii, 0)
+    
+    # Validate and return
+    sum_radii = np.sum(radii)
+    
+    return optimal_centers, radii, sum_radii
+
+# For testing locally
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # print(centers)
+    # print(radii)

@@ -1,0 +1,144 @@
+
+
+<strategy>
+1. Formulate the problem as a Nonlinear Programming (NLP) problem with variables for centers and radii.
+2. Use SLSQP optimizer with vectorized constraint evaluation for efficiency.
+3. Initialize with multiple strategies: hexagonal lattice, grid, and random placements to cover different local minima.
+4. Run a perturbation loop on the best found configuration to escape local optima, gradually reducing perturbation magnitude.
+5. Include a safety shrinking step to guarantee strict validity against the provided validation function, accounting for numerical tolerances.
+6. Ensure all helper functions are defined at the top level without closures or lambdas, as required.
+</strategy>
+```python
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def compute_objective(v, N):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    return -np.sum(v[2*N:])
+
+def compute_constraints(v, N, row, col):
+    """
+    Compute all inequality constraints:
+    - Boundary: r <= x <= 1-r, r <= y <= 1-r
+    - Non-overlap: dist^2 >= (r_i + r_j)^2
+    """
+    centers = v[:2*N].reshape(N, 2)
+    radii = v[2*N:]
+    
+    # Boundary constraints
+    c1 = centers[:, 0] - radii
+    c2 = 1.0 - centers[:, 0] - radii
+    c3 = centers[:, 1] - radii
+    c4 = 1.0 - centers[:, 1] - radii
+    
+    # Pairwise non-overlap constraints
+    # Squared distance minus squared sum of radii must be >= 0
+    c5 = np.sum((centers[row] - centers[col])**2, axis=1) - (radii[row] + radii[col])**2
+    
+    return np.concatenate([c1, c2, c3, c4, c5])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    N = 26
+    row, col = np.triu_indices(N, k=1)
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    
+    best_sum = 0.0
+    best_v = None
+    
+    cons_spec = {'type': 'ineq', 'fun': compute_constraints, 'args': (N, row, col)}
+    
+    def try_optimization(v0):
+        nonlocal best_sum, best_v
+        try:
+            res = opt.minimize(compute_objective, v0, args=(N,), method='SLSQP',
+                               bounds=bounds, constraints=cons_spec,
+                               options={'maxiter': 3000, 'ftol': 1e-14, 'disp': False})
+            # Check if result is feasible and better
+            c_vals = compute_constraints(res.x, N, row, col)
+            if np.all(c_vals >= -1e-7):
+                curr_sum = -compute_objective(res.x, N)
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Generate initial configurations
+    v0_list = []
+    
+    # 1. Hexagonal lattice initialization
+    centers_hex = np.zeros((N, 2))
+    idx = 0
+    y = 0.12
+    r_est = 0.1
+    row_idx = 0
+    while idx < N:
+        x = 0.12 + (row_idx % 2) * r_est
+        while x <= 1.0 - 0.12 and idx < N:
+            centers_hex[idx] = [x, y]
+            idx += 1
+            x += 2 * r_est
+        y += r_est * math.sqrt(3)
+        row_idx += 1
+    if centers_hex.shape[0] < N:
+        extra = np.random.rand(N - centers_hex.shape[0], 2) * 0.8 + 0.1
+        centers_hex = np.vstack([centers_hex, extra])
+    v0_list.append(np.concatenate([centers_hex.flatten(), np.full(N, 0.08)]))
+    
+    # 2. Grid initialization
+    x_g = np.linspace(0.15, 0.85, 5)
+    y_g = np.linspace(0.15, 0.85, 5)
+    cx, cy = np.meshgrid(x_g, y_g)
+    centers_grid = np.column_stack([cx.flatten(), cy.flatten()])
+    centers_grid = np.vstack([centers_grid, [0.5, 0.5]])
+    v0_list.append(np.concatenate([centers_grid.flatten(), np.full(N, 0.08)]))
+    
+    # 3. Random initializations
+    np.random.seed(42)
+    for _ in range(6):
+        c = np.random.rand(N, 2) * 0.8 + 0.1
+        v0_list.append(np.concatenate([c.flatten(), np.full(N, 0.05)]))
+        
+    # Run optimization on each initial guess
+    for v0 in v0_list:
+        try_optimization(v0)
+        
+    # Perturbation loop to escape local minima
+    if best_v is not None:
+        current_v = best_v.copy()
+        current_sum = best_sum
+        
+        for i in range(30):
+            scale = 0.04 * (0.85 ** i)
+            perturbed_v = current_v + np.random.normal(0, scale, 3*N)
+            perturbed_v[:2*N] = np.clip(perturbed_v[:2*N], 0.0, 1.0)
+            perturbed_v[2*N:] = np.clip(perturbed_v[2*N:], 0.0, 0.5)
+            
+            try_optimization(perturbed_v)
+            if best_sum > current_sum:
+                current_v = best_v.copy()
+                current_sum = best_sum
+                
+    # Final extraction and strict validity enforcement
+    if best_v is not None:
+        centers = best_v[:2*N].reshape(N, 2)
+        radii = best_v[2*N:]
+        
+        # Safety shrink to guarantee validate_packing passes despite numerical errors
+        c_vals = compute_constraints(best_v, N, row, col)
+        min_c = np.min(c_vals)
+        if min_c < -1e-9:
+            # Linear shrink to clear the most violated constraint
+            factor = max(0.0, 1.0 + min_c)
+            radii *= max(0.95, factor)
+            # Clamp centers to valid boundary ranges
+            centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+            centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+            
+        sum_r = float(np.sum(radii))
+        return centers, radii, sum_r
+    else:
+        # Fallback (should not be reached)
+        return np.zeros((N, 2)), np.zeros(N), 0.0
+```

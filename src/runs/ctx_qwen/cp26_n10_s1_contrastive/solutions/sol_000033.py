@@ -1,0 +1,160 @@
+# sol_000033 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000006 (state 1103014d) state=cdbd795c sum of radii=2.621344 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars_vec):
+    """
+    Objective function: Maximize sum of radii <=> Minimize negative sum.
+    vars_vec layout: [x0, y0, r0, x1, y1, r1, ...]
+    """
+    return -np.sum(vars_vec[2::3])
+
+def constraint_func(vars_vec):
+    """
+    Returns a 1D array of inequality constraint values (must be >= 0).
+    Includes boundary containment and pairwise non-overlap constraints.
+    """
+    n = len(vars_vec) // 3
+    x = vars_vec[0::3]
+    y = vars_vec[1::3]
+    r = vars_vec[2::3]
+    
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c_boundary = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints: dist^2 >= (ri + rj)^2
+    # Vectorized distance squared computation
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, None] + r[None, :]
+    r_sum_sq = r_sum**2
+    
+    # Extract upper triangular part (i < j) to avoid duplicates and self-comparison
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    c_pairwise = dist_sq[mask] - r_sum_sq[mask]
+    
+    return np.concatenate([c_boundary, c_pairwise])
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    best_sum = -np.inf
+    best_vars = None
+    
+    # --- 1. Generate Diverse Initial Configurations ---
+    inits = []
+    
+    # Layout 1: Hexagonal Lattice (optimal density arrangement)
+    pts1 = []
+    r_base = 0.080  # Start safely inside bounds
+    dy = np.sqrt(3.0) * r_base
+    y = r_base
+    row = 0
+    while len(pts1) < n:
+        x = r_base
+        if row % 2 == 1:
+            x += r_base
+        while x <= 1.0 - r_base and len(pts1) < n:
+            pts1.append([x, y])
+            x += 2.0 * r_base
+        y += dy
+        row += 1
+    inits.append(np.array(pts1[:n]).flatten())
+    
+    # Layout 2: 5x5 Grid + 1 Center (structured alternative)
+    pts2 = []
+    for i in range(5):
+        for j in range(5):
+            pts2.append([0.1 + i*0.2, 0.1 + j*0.2])
+    pts2.append([0.5, 0.5])
+    inits.append(np.array(pts2[:n]).flatten())
+    
+    # Layout 3: Corner & Edge biased (exploits boundary space)
+    pts3 = []
+    # Corners
+    pts3.extend([[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]])
+    # Edges
+    for k in np.linspace(0.3, 0.7, 5):
+        pts3.extend([[k, 0.1], [k, 0.9], [0.1, k], [0.9, k]])
+    # Fill rest randomly but validly
+    np.random.seed(0)
+    while len(pts3) < n:
+        cx, cy = np.random.uniform(0.1, 0.9, 2)
+        if all(np.hypot(cx - p[0], cy - p[1]) > 0.15 for p in pts3):
+            pts3.append([cx, cy])
+    inits.append(np.array(pts3[:n]).flatten())
+    
+    # --- 2. Optimization Setup ---
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    # --- 3. Multi-Restart Search ---
+    for seed in range(15):
+        np.random.seed(seed)
+        for init_centers in inits:
+            vars0 = np.zeros(3 * n)
+            vars0[0::3] = init_centers[0::2]
+            vars0[1::3] = init_centers[1::2]
+            vars0[2::3] = 0.080
+            
+            # Controlled perturbation to escape symmetry
+            vars0 += np.random.uniform(-0.01, 0.01, 3 * n)
+            vars0[2::3] = np.clip(vars0[2::3], 0.05, 0.4)
+            vars0[0::3] = np.clip(vars0[0::3], 0.02, 0.98)
+            vars0[1::3] = np.clip(vars0[1::3], 0.02, 0.98)
+            
+            try:
+                res = minimize(
+                    objective, vars0, method='SLSQP', bounds=bounds,
+                    constraints=cons, options={'maxiter': 2500, 'ftol': 1e-9}
+                )
+                
+                # Evaluate feasibility and objective
+                slacks = constraint_func(res.x)
+                current_sum = -res.fun
+                
+                # Accept if constraints are satisfied (within numerical tolerance) and improves best
+                if np.min(slacks) >= -1e-6 and current_sum > best_sum:
+                    best_sum = current_sum
+                    best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # Fallback safety if optimization somehow yields nothing
+    if best_vars is None:
+        best_vars = np.zeros(3 * n)
+        best_vars[0::3] = inits[0][0::2]
+        best_vars[1::3] = inits[0][1::2]
+        best_vars[2::3] = 0.085
+        
+    # --- 4. High-Precision Refinement ---
+    try:
+        res_final = minimize(
+            objective, best_vars, method='SLSQP', bounds=bounds,
+            constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12}
+        )
+        if np.min(constraint_func(res_final.x)) >= -1e-6:
+            best_vars = res_final.x
+    except Exception:
+        pass
+        
+    # --- 5. Extract & Validate Results ---
+    radii = np.maximum(best_vars[2::3], 0.0)  # Ensure non-negative
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    
+    return centers, radii, float(np.sum(radii))

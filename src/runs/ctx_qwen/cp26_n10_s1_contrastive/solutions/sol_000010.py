@@ -1,0 +1,203 @@
+# sol_000010 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 92133c71) state=128d4b44 sum of radii=1.293043 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize
+import time
+
+def get_max_radii_sum(centers):
+    """
+    Given a set of centers, solves the LP to find radii that maximize sum(r_i).
+    Constraints:
+    1. r_i >= 0
+    2. r_i <= distance to boundaries
+    3. r_i + r_j <= distance(centers[i], centers[j])
+    """
+    n = centers.shape[0]
+    c = -np.ones(n) # Minimize -sum(r_i) is equivalent to maximizing sum(r_i)
+
+    A_ub = []
+    b_ub = []
+
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+    # r_i - x_i <= 0  => 1*r_i <= x_i
+    # r_i - (1-x_i) <= 0 => 1*r_i <= 1-x_i
+    # Similarly for y
+    for i in range(n):
+        x, y = centers[i]
+        dist_x_min = x
+        dist_x_max = 1 - x
+        dist_y_min = y
+        dist_y_max = 1 - y
+        
+        bounds_list = [dist_x_min, dist_x_max, dist_y_min, dist_y_max]
+        
+        for bound_val in bounds_list:
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(bound_val)
+
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    # Compute distance matrix
+    # Using numpy broadcasting for efficiency
+    # centers shape (n, 2)
+    # diff shape (n, n, 2)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Only need upper triangular part
+    for i in range(n):
+        for j in range(i + 1, n):
+            d_ij = dists[i, j]
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(d_ij)
+
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+
+    # Bounds for r_i: r_i >= 0
+    bounds = [(0, None) for _ in range(n)]
+
+    try:
+        res = scipy.optimize.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.fun * -1, res.x
+        else:
+            # Fallback if LP fails, return small radii
+            return 0.0, np.zeros(n)
+    except Exception:
+        return 0.0, np.zeros(n)
+
+def run_packing():
+    n = 26
+    np.random.seed(42)
+
+    # 1. Initialization: Force-directed layout to spread points
+    centers = np.random.rand(n, 2)
+    
+    # Parameters for force simulation
+    repulsion_strength = 1.0
+    wall_strength = 10.0
+    steps = 500
+    damping = 0.9
+
+    for step in range(steps):
+        forces = np.zeros_like(centers)
+        
+        # Repulsion between points
+        # O(N^2) is fine for N=26
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                if dist < 1e-5:
+                    dist = 1e-5
+                    diff = np.random.rand(2) * 1e-5 # Random nudge
+                
+                # Force magnitude proportional to 1/d^2 (Coulomb-like)
+                # Or just 1/d to be softer? 1/d^2 is standard repulsion.
+                # To prevent explosion, maybe cap force or use softer potential.
+                # Let's use 1/d^2 but normalized by vector direction.
+                f_mag = repulsion_strength / (dist**2)
+                force_vec = (diff / dist) * f_mag
+                
+                forces[i] += force_vec
+                forces[j] -= force_vec
+        
+        # Repulsion from walls
+        for i in range(n):
+            x, y = centers[i]
+            if x < 0.1: forces[i, 0] += wall_strength * (0.1 - x)
+            if x > 0.9: forces[i, 0] -= wall_strength * (x - 0.9)
+            if y < 0.1: forces[i, 1] += wall_strength * (0.1 - y)
+            if y > 0.9: forces[i, 1] -= wall_strength * (y - 0.9)
+            
+            # Actually, strict boundary repulsion
+            # If close to wall, push away.
+            # Margin 0.05
+            margin = 0.05
+            if x < margin: forces[i, 0] += wall_strength * (margin - x)
+            elif x > 1 - margin: forces[i, 0] -= wall_strength * (x - (1 - margin))
+            if y < margin: forces[i, 1] += wall_strength * (margin - y)
+            elif y > 1 - margin: forces[i, 1] -= wall_strength * (y - (1 - margin))
+
+        centers += forces * 0.01 # Small step size
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Decrease step size / strength?
+        # Not strictly necessary for rough init
+
+    # 2. Refine using Hill Climbing on centers
+    # Objective: Maximize sum of radii
+    best_sum, best_radii = get_max_radii_sum(centers)
+    
+    # Random restart local search
+    current_centers = centers.copy()
+    current_sum = best_sum
+    
+    # Try to improve
+    improvement_count = 0
+    max_iters = 2000
+    step_size = 0.05
+    
+    for _ in range(max_iters):
+        # Pick a random circle to move
+        idx = np.random.randint(0, n)
+        # Random direction
+        direction = np.random.randn(2)
+        direction /= np.linalg.norm(direction)
+        
+        new_center = current_centers[idx] + direction * step_size
+        new_center = np.clip(new_center, 0.0, 1.0)
+        
+        # Check if this move improves sum of radii
+        # We only update one center, re-evaluate LP
+        temp_centers = current_centers.copy()
+        temp_centers[idx] = new_center
+        
+        new_sum, new_radii = get_max_radii_sum(temp_centers)
+        
+        if new_sum > current_sum:
+            current_centers = temp_centers
+            current_sum = new_sum
+            if new_sum > best_sum:
+                best_sum = new_sum
+                best_radii = new_radii
+                # Reduce step size occasionally to fine tune
+                if improvement_count > 50:
+                    step_size *= 0.9
+                    improvement_count = 0
+            improvement_count += 1
+        else:
+            # If no improvement, maybe reduce step size?
+            # Or just keep trying
+            pass
+            
+    # Final check
+    # Ensure radii are consistent with best_centers
+    # The best_radii variable holds radii for some configuration, 
+    # but we need to return radii corresponding to best_centers (which is current_centers if last move accepted)
+    # Actually, we tracked best_sum and best_radii.
+    # But wait, best_radii corresponds to the state when best_sum was updated.
+    # If we moved centers and sum didn't increase, best_radii might be stale relative to current_centers.
+    # However, we want to return a valid packing.
+    # Let's re-solve LP for the current_centers which should be the best found.
+    # Actually, in the loop, if new_sum > current_sum, we update current_sum and best_sum.
+    # So best_sum corresponds to current_centers.
+    # But best_radii is stored. It should match.
+    # Let's just recompute to be safe.
+    
+    final_sum, final_radii = get_max_radii_sum(current_centers)
+    
+    # Double check validity
+    # The LP guarantees constraints are met (within numerical tolerance).
+    # But let's ensure radii are valid.
+    
+    return current_centers, final_radii, final_sum

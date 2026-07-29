@@ -1,0 +1,192 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.629, I will employ a multi-phase optimization strategy:
+1. **Diverse High-Quality Initializations**: Generate multiple starting configurations using perturbed hexagonal lattices (optimal for dense packing) and random placements. The hexagonal pattern with row counts [5, 6, 5, 6, 4] naturally sums to 26 and provides an excellent baseline.
+2. **Joint SLSQP Optimization**: Optimize centers and radii simultaneously using SLSQP. This method handles nonlinear inequality constraints effectively. Constraints enforce boundary containment (`r <= x <= 1-r`, etc.) and non-overlap (`dist(i,j) >= r_i + r_j`).
+3. **Iterative Growth & Perturbation**: After finding a locally optimal packing, iteratively scale all radii up by a small factor (~0.15%), add small random noise to centers to escape local minima, and re-run SLSQP. This "pressure" forces the optimizer to discover tighter, higher-density configurations.
+4. **Strict Post-Processing Repair**: Apply a deterministic shrinkage routine to resolve any numerical drift and guarantee the solution passes the validation function's `1e-12` tolerance checks.
+5. **Vectorization & Efficiency**: Precompute constraint indices and use fully vectorized numpy operations in the constraint function to allow deeper and faster optimization loops.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+# Precompute pair indices for overlap constraints to speed up evaluation
+_MASK_I, _MASK_J = np.triu_indices(N, k=1)
+
+def compute_constraints(vars):
+    """
+    Computes inequality constraints for SLSQP.
+    Returns array where each element must be >= 0 for a valid configuration.
+    """
+    c = vars[:2*N].reshape(N, 2)
+    r = vars[2*N:]
+    
+    # Boundary constraints: x >= r, x + r <= 1, y >= r, y + r <= 1
+    cons = np.concatenate([
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ])
+    
+    # Overlap constraints: dist(i, j) >= r_i + r_j
+    # Vectorized distance calculation
+    dx = c[:, 0, np.newaxis] - c[:, 0]
+    dy = c[:, 1, np.newaxis] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    # Append pairwise separation constraints using precomputed masks
+    cons = np.concatenate([cons, dists[_MASK_I, _MASK_J] - (r[_MASK_I] + r[_MASK_J])])
+    return cons
+
+def objective(vars):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    return -np.sum(vars[2*N:])
+
+def get_bounds():
+    """Variable bounds: centers in [0,1], radii in [1e-5, 0.5]."""
+    return [(0.0, 1.0)] * (2*N) + [(1e-5, 0.5)] * N
+
+def generate_hex_init(r_guess, noise_scale=0.0):
+    """Generates a perturbed hexagonal lattice configuration."""
+    centers = []
+    rows = [5, 6, 5, 6, 4]  # Sums to 26
+    y = r_guess
+    dy = np.sqrt(3.0) * r_guess
+    dx = 2.0 * r_guess
+    
+    for i, cnt in enumerate(rows):
+        offset = (dx / 2.0) if (i % 2 == 1) else 0.0
+        x = r_guess + offset
+        for _ in range(cnt):
+            centers.append([x, y])
+            x += dx
+        y += dy
+        
+    centers = np.array(centers[:N])
+    if noise_scale > 0:
+        centers += np.random.normal(0, noise_scale, centers.shape)
+    return np.clip(centers, 0.05, 0.95)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses multi-start SLSQP with iterative growth refinement.
+    """
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_val = -np.inf
+    best_vars = None
+    
+    # ---------------------------------------------------------
+    # Phase 1: Generate Diverse Initial Configurations
+    # ---------------------------------------------------------
+    starts = []
+    
+    # Hexagonal lattice variations with different base radii and noise
+    for r_init in [0.09, 0.095, 0.10, 0.105, 0.11]:
+        for noise in [0.0, 0.005, 0.01]:
+            c = generate_hex_init(r_init, noise)
+            r = np.full(N, r_init * 0.92)  # Start slightly feasible
+            starts.append(np.concatenate([c.flatten(), r]))
+            
+    # Square grid + center fill variation
+    grid_r = 0.095
+    gx = np.linspace(grid_r, 1-grid_r, 5)
+    gy = np.linspace(grid_r, 1-grid_r, 5)
+    grid_centers = np.array(np.meshgrid(gx, gy)).T.reshape(-1, 2)
+    grid_centers = np.vstack([grid_centers, [0.5, 0.5]])
+    for _ in range(5):
+        c = grid_centers + rng.normal(0, 0.01, grid_centers.shape)
+        c = np.clip(c, 0.05, 0.95)
+        r = np.full(N, grid_r * 0.9)
+        starts.append(np.concatenate([c.flatten(), r]))
+        
+    # Dense random starts
+    for _ in range(10):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        r = np.full(N, 0.05)
+        starts.append(np.concatenate([c.flatten(), r]))
+        
+    # ---------------------------------------------------------
+    # Phase 2: Multi-Start Local Optimization
+    # ---------------------------------------------------------
+    for x0 in starts:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 8000, 'ftol': 1e-14})
+            if np.all(compute_constraints(res.x) >= -1e-9):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_vars is None:
+        best_vars = starts[0]
+        
+    # ---------------------------------------------------------
+    # Phase 3: Iterative Growth & Perturbation Refinement
+    # Forces the solver to push past local maxima by scaling radii
+    # up and re-optimizing positions.
+    # ---------------------------------------------------------
+    curr = best_vars.copy()
+    for step in range(60):
+        # Slightly increase radii to create "pressure"
+        curr[2*N:] *= 1.0012
+        # Add noise to centers to escape local minima
+        curr[:2*N] += rng.normal(0, 0.0008 * np.exp(-step/10.0), 2*N)
+        curr[:2*N] = np.clip(curr[:2*N], 0.02, 0.98)
+        
+        try:
+            res = minimize(objective, curr, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 4000, 'ftol': 1e-14})
+            if np.all(compute_constraints(res.x) >= -1e-9):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # ---------------------------------------------------------
+    # Phase 4: Deterministic Repair for Strict Validation
+    # ---------------------------------------------------------
+    centers = best_vars[:2*N].reshape(N, 2)
+    radii = best_vars[2*N:].copy()
+    
+    for _ in range(30):
+        changed = False
+        # Resolve overlaps by proportional shrinking
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    ov = radii[i] + radii[j] - d
+                    radii[i] -= ov / 2.0
+                    radii[j] -= ov / 2.0
+                    changed = True
+                    
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+                
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

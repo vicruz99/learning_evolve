@@ -1,0 +1,317 @@
+
+
+<strategy>
+To improve the packing from 2.633 to >2.636, we need a more robust global search combined with precise local refinement. The current approach relies heavily on LP gradient ascent, which can get trapped in symmetric or suboptimal basins. 
+
+Key improvements:
+1. **Hybrid Simulated Annealing + Gradient Ascent**: SA explores the configuration space broadly, accepting worse moves to escape local minima, while gradient ascent fine-tunes once in a promising basin. This combination is highly effective for non-convex circle packing.
+2. **Diverse Initializations**: Generate starts from hexagonal lattices, corner-biased layouts, edge-aligned patterns, and force-directed repulsion. This ensures we sample different topological arrangements (e.g., 5-6-5-6-4 rows vs corner-heavy clusters).
+3. **Position Swapping Perturbation**: Occasionally swapping the positions of two circles breaks symmetry traps that pure gradient methods cannot escape.
+4. **Adaptive Step Sizing**: Gradient steps scale with the iteration count and temperature, ensuring aggressive exploration early and precise convergence late.
+5. **Robust LP Gradient**: Properly extract dual marginals across scipy versions and compute exact repulsion forces. Add boundary-awareness implicitly by clipping and relying on SLSQP for final boundary optimization.
+6. **Strict Repair & SLSQP Polish**: Final phase uses joint optimization of centers and radii to squeeze out the last bits of radius sum, followed by a deterministic repair to guarantee validator compliance.
+
+The implementation orchestrates multiple restarts, each running the hybrid optimizer, keeping the global best, and polishing it thoroughly.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+
+# Precompute constant LP constraint matrix structure: r_i + r_j <= dist(i,j)
+PAIR_INDICES = []
+A_LP = np.zeros((N * (N - 1) // 2, N))
+_lp_row = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_LP[_lp_row, i] = 1.0
+        A_LP[_lp_row, j] = 1.0
+        PAIR_INDICES.append((i, j))
+        _lp_row += 1
+
+def solve_lp_and_grad(centers):
+    """
+    Solves LP to maximize sum of radii for fixed centers.
+    Returns radii, sum_radii, and gradient of the objective w.r.t centers.
+    """
+    n = centers.shape[0]
+    
+    # Upper bounds from boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    ub = np.minimum(
+        np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    )
+    ub = np.maximum(ub, 1e-9)
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 0.0)
+    
+    b_ub = dists[np.triu_indices(n, k=1)]
+    
+    # Solve LP: max sum(r) s.t. A r <= b, 0 <= r <= ub
+    try:
+        res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b_ub, 
+                      bounds=[(0.0, u) for u in ub], method='highs')
+        if not res.success:
+            return np.zeros(n), 0.0, np.zeros_like(centers)
+            
+        radii = res.x
+        # Safely extract dual marginals across scipy versions
+        if hasattr(res, 'marginals') and res.marginals is not None:
+            duals = res.marginals.ineqlin
+        elif hasattr(res, 'ineqlin') and res.ineqlin is not None:
+            duals = res.ineqlin.marginals
+        else:
+            duals = np.zeros_like(b_ub)
+    except Exception:
+        return np.zeros(n), 0.0, np.zeros_like(centers)
+        
+    # Compute gradient using dual variables (repulsion forces)
+    # grad[i] = sum_j lambda_ij * (c_i - c_j) / ||c_i - c_j||
+    dual_mat = np.zeros((n, n))
+    idx = 0
+    for i, j in PAIR_INDICES:
+        val = duals[idx]
+        if val > 1e-10:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                dual_mat[i, j] = val
+                dual_mat[j, i] = -val
+        idx += 1
+        
+    unit_diff = diff / np.maximum(dists, 1e-9)[..., np.newaxis]
+    grad = np.einsum('ij,ijk->ik', dual_mat, unit_diff)
+    
+    return radii, np.sum(radii), grad
+
+def generate_inits(rng):
+    """Generates diverse starting configurations."""
+    configs = []
+    
+    # 1. Hexagonal lattice patterns with varying densities
+    patterns = [
+        [5, 5, 5, 5, 6], [5, 6, 5, 6, 4], [6, 5, 6, 5, 4],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 5, 6, 5, 5],
+        [4, 5, 6, 5, 6], [6, 5, 5, 5, 5]
+    ]
+    for pat in patterns:
+        for r0 in [0.092, 0.098, 0.104]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            while len(c) < N:
+                c.append(rng.uniform(0.1, 0.9, 2))
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.04, 0.96)
+            configs.append(c)
+            
+    # 2. Corner and edge biased starts
+    corners = np.array([[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]])
+    edges = np.array([[0.5, 0.1], [0.1, 0.5], [0.9, 0.5], [0.5, 0.9]])
+    for _ in range(6):
+        c = np.vstack([corners, edges])
+        c = np.vstack([c, rng.uniform(0.25, 0.75, (N-8, 2))])
+        c += rng.normal(0, 0.01, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        configs.append(c)
+        
+    # 3. Force-directed repulsion starts
+    for _ in range(8):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(500):
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d_vec = c[i] - c[j]
+                    dist = np.linalg.norm(d_vec)
+                    if 0.0 < dist < 0.14:
+                        push = (0.14 - dist) * 0.05
+                        c[i] += d_vec / dist * push
+                        c[j] -= d_vec / dist * push
+            c = np.clip(c, 0.05, 0.95)
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+        configs.append(c)
+        
+    # 4. Pure random starts
+    for _ in range(5):
+        configs.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    return configs
+
+def sa_and_ga_optimizer(c0, rng, max_iter=2500):
+    """Hybrid Simulated Annealing and Gradient Ascent optimizer."""
+    c = c0.copy()
+    best_c = c.copy()
+    best_r, best_sum, _ = solve_lp_and_grad(best_c)
+    
+    temp = 0.006
+    alpha = 0.996
+    
+    for k in range(max_iter):
+        # Mode selection: more SA early, more GA later
+        use_sa = rng.random() < 0.4 * max(0.1, 1.0 - k/max_iter)
+        
+        if use_sa:
+            # SA perturbation
+            sigma = temp * (1.0 + 2.0 * rng.random())
+            delta = rng.normal(0, sigma, c.shape)
+            new_c = np.clip(c + delta, 0.005, 0.995)
+            
+            # Occasional full swap to break symmetry
+            if rng.random() < 0.02:
+                idx = rng.choice(N, 2, replace=False)
+                new_c[idx] = new_c[idx[::-1]]
+        else:
+            # Gradient ascent
+            _, _, grad = solve_lp_and_grad(c)
+            gn = np.linalg.norm(grad)
+            if gn > 1e-8:
+                step = 0.003 / (1.0 + k/600)
+                new_c = np.clip(c + step * grad / gn, 0.005, 0.995)
+            else:
+                new_c = c.copy()
+                
+        new_r, new_sum, _ = solve_lp_and_grad(new_c)
+        
+        if new_sum > best_sum:
+            best_c = new_c.copy()
+            best_r = new_r.copy()
+            best_sum = new_sum
+            
+        # Acceptance criterion
+        if new_sum >= best_sum:
+            c = new_c
+        else:
+            prob = np.exp((new_sum - best_sum) / max(temp, 1e-8))
+            if rng.random() < prob * 0.6:
+                c = new_c
+                
+        temp *= alpha
+        
+    return best_c, best_r, best_sum
+
+def joint_slsqp_polish(centers, radii, rng):
+    """Refines centers and radii simultaneously using SLSQP."""
+    n = centers.shape[0]
+    v0 = np.concatenate([centers.flatten(), radii])
+    
+    def obj(v):
+        return -np.sum(v[2 * n:])
+        
+    def cons(v):
+        cc = v[:2 * n].reshape(n, 2)
+        rr = v[2 * n:]
+        c_list = [
+            cc[:, 0] - rr,
+            1.0 - cc[:, 0] - rr,
+            cc[:, 1] - rr,
+            1.0 - cc[:, 1] - rr
+        ]
+        idx = np.triu_indices(n, 1)
+        d = np.linalg.norm(cc[idx[0]] - cc[idx[1]], axis=1)
+        c_list.append(d - (rr[idx[0]] + rr[idx[1]]))
+        return np.concatenate(c_list)
+        
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    
+    try:
+        res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                       constraints={'type': 'ineq', 'fun': cons},
+                       options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+        if np.min(cons(res.x)) >= -1e-9:
+            return res.x[:2 * n].reshape(n, 2), res.x[2 * n:], np.sum(res.x[2 * n:])
+    except Exception:
+        pass
+    return centers, radii, np.sum(radii)
+
+def repair_packing(centers, radii):
+    """Deterministically shrinks radii to guarantee strict validation compliance."""
+    radii = radii.copy()
+    n = centers.shape[0]
+    
+    for _ in range(40):
+        changed = False
+        # Boundary clamp
+        for i in range(n):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], 
+                     centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+                
+        # Pairwise overlap resolution
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    configs = generate_inits(rng)
+    
+    # Phase 1: Hybrid SA+GA optimization from diverse starts
+    for i, c0 in enumerate(configs):
+        c_opt, r_opt, s_opt = sa_and_ga_optimizer(c0, rng, max_iter=2200)
+        
+        # Phase 2: SLSQP Polish on the improved config
+        c_pol, r_pol, s_pol = joint_slsqp_polish(c_opt, r_opt, rng)
+        if s_pol > s_opt:
+            s_opt = s_pol
+            c_opt = c_pol
+            r_opt = r_pol
+            
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_centers = c_opt.copy()
+            best_radii = r_opt.copy()
+            
+        # Phase 3: Local perturbation around current best to escape remaining traps
+        if i == len(configs) - 1 or s_opt > best_sum * 0.995:
+            for _ in range(5):
+                c_p = best_centers + rng.normal(0, 0.004, best_centers.shape)
+                c_p = np.clip(c_p, 0.02, 0.98)
+                c_r, r_r, s_r = sa_and_ga_optimizer(c_p, rng, max_iter=800)
+                c_pp, r_pp, s_pp = joint_slsqp_polish(c_r, r_r, rng)
+                if s_pp > best_sum:
+                    best_sum = s_pp
+                    best_centers = c_pp.copy()
+                    best_radii = r_pp.copy()
+                    
+    # Fallback safety
+    if best_centers is None:
+        best_centers = rng.uniform(0.1, 0.9, (N, 2))
+        best_radii = np.full(N, 0.05)
+        best_sum = np.sum(best_radii)
+        
+    # Final strict repair to guarantee validator passes
+    best_radii = repair_packing(best_centers, best_radii)
+    final_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, final_sum
+```

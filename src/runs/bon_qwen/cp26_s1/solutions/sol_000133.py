@@ -1,157 +1,152 @@
 # sol_000133 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 0b92a944) state=93f1d0a6 sum of radii=2.541421 correctness=1.0
+# generation=0 parent=seed (state 5da4630c) state=52c4fc2f sum of radii=2.006950 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import minimize
 
-def get_optimal_radii(centers):
+def compute_smooth_bottleneck(centers_flat, k):
     """
-    Solves the Linear Programming problem to maximize sum of radii 
-    given fixed centers.
-    Constraints: r_i + r_j <= distance(i, j) and r_i <= boundary distance.
+    Computes the negative smooth approximation of the minimum distance.
+    We minimize this to maximize the bottleneck distance.
     """
-    n = centers.shape[0]
-    # Objective: maximize sum(r) <=> minimize -sum(r)
-    c = -np.ones(n)
+    centers = centers_flat.reshape(26, 2)
+    n = 26
     
-    rows = []
-    b_vals = []
+    # Collect all distance constraints
+    dists = []
     
+    # Boundary distances: min(x, 1-x, y, 1-y)
     for i in range(n):
-        xi, yi = centers[i]
+        x, y = centers[i]
+        dists.append(x)
+        dists.append(1 - x)
+        dists.append(y)
+        dists.append(1 - y)
         
-        # Boundary constraints: r_i <= xi, r_i <= 1-xi, r_i <= yi, r_i <= 1-yi
-        # r_i <= xi
-        row = np.zeros(n)
-        row[i] = 1
-        rows.append(row)
-        b_vals.append(xi)
-        
-        # r_i <= 1 - xi
-        row = np.zeros(n)
-        row[i] = 1
-        rows.append(row)
-        b_vals.append(1 - xi)
-        
-        # r_i <= yi
-        row = np.zeros(n)
-        row[i] = 1
-        rows.append(row)
-        b_vals.append(yi)
-        
-        # r_i <= 1 - yi
-        row = np.zeros(n)
-        row[i] = 1
-        rows.append(row)
-        b_vals.append(1 - yi)
-        
-        # Pairwise constraints: r_i + r_j <= dist(i, j)
-        # Optimization: only add constraint if dist < 1.0, because max(r_i) + max(r_j) <= 1.0
+    # Inter-circle distances
+    for i in range(n):
         for j in range(i + 1, n):
-            dist = np.sqrt((xi - centers[j,0])**2 + (yi - centers[j,1])**2)
-            if dist < 1.0: 
-                row = np.zeros(n)
-                row[i] = 1
-                row[j] = 1
-                rows.append(row)
-                b_vals.append(dist)
+            d = np.linalg.norm(centers[i] - centers[j])
+            dists.append(d)
             
-    if len(rows) == 0:
-        return np.zeros(n), 0.0
-
-    A_ub = np.array(rows)
-    b_ub = np.array(b_vals)
-    
-    bounds = [(0, None) for _ in range(n)]
-    
-    try:
-        # Solve LP
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds)
-        if res.success:
-            return res.x, -res.fun
-    except:
-        pass
-        
-    return np.zeros(n), 0.0
+    dists = np.array(dists)
+    # Smooth minimum approximation
+    # We use log-sum-exp to approximate -min(d_i)
+    # Objective: (1/k) * log(sum(exp(-k * d_i)))
+    # Minimizing this pushes all d_i up
+    return (1.0 / k) * np.log(np.sum(np.exp(-k * dists)))
 
 def run_packing():
-    n = 26
-    best_sum = 0.0
-    best_centers = None
-    best_radii = None
+    # 1. Initialization: Hexagonal grid perturbed
+    np.random.seed(42)
+    centers = np.zeros((26, 2))
     
-    # List of initial configurations to try
-    configs = []
+    # Create a dense 6x5 grid and remove 4 to get 26
+    # This provides good initial spacing
+    x_vals = np.linspace(0.15, 0.85, 6)
+    y_vals = np.linspace(0.15, 0.85, 5)
     
-    # 1. Random initialization
-    configs.append(np.random.rand(n, 2))
+    idx = 0
+    for i in range(6):
+        for j in range(5):
+            if idx >= 26:
+                break
+            centers[idx, 0] = x_vals[i]
+            centers[idx, 1] = y_vals[j]
+            idx += 1
+        if idx >= 26:
+            break
+            
+    # Add small random noise to break symmetry
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
     
-    # 2. Grid 5x5 (25 circles) + 1 circle in a gap
-    # This is a strong starting point with sum ~ 2.54
-    grid_centers = []
-    coords = [0.1, 0.3, 0.5, 0.7, 0.9]
-    for x in coords:
-        for y in coords:
-            grid_centers.append([x, y])
-    # Place 26th circle in a gap, e.g., (0.2, 0.2)
-    grid_centers.append([0.2, 0.2])
-    configs.append(np.array(grid_centers))
+    # 2. Repulsion Dynamics (Jiggle)
+    # This phase rapidly resolves overlaps and pushes circles into optimal relative positions
+    current_r = 0.08
+    step_size = 0.05
+    alpha = 0.9995  # Cooling factor for step size
     
-    # 3. Another random configuration with points slightly inset
-    configs.append(np.random.rand(n, 2) * 0.8 + 0.1)
-
-    for start_centers in configs:
-        centers = start_centers.copy()
+    for _ in range(15000):
+        forces = np.zeros_like(centers)
+        overlap_sum = 0.0
         
-        # Get initial radii and sum
-        current_radii, current_sum = get_optimal_radii(centers)
+        n = 26
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                target_dist = 2.0 * current_r
+                if dist < target_dist and dist > 1e-8:
+                    # Repulsive force proportional to overlap
+                    f_mag = (target_dist - dist) / dist
+                    forces[i] += diff * f_mag
+                    forces[j] -= diff * f_mag
+                    overlap_sum += (target_dist - dist)
+                    
+            # Boundary forces
+            x, y = centers[i]
+            if x < current_r:
+                forces[i, 0] += (current_r - x) * 10.0
+            if x > 1.0 - current_r:
+                forces[i, 0] -= (x - (1.0 - current_r)) * 10.0
+            if y < current_r:
+                forces[i, 1] += (current_r - y) * 10.0
+            if y > 1.0 - current_r:
+                forces[i, 1] -= (y - (1.0 - current_r)) * 10.0
+                
+        # Normalize and apply forces
+        norms = np.linalg.norm(forces, axis=1)
+        norms[norms < 1e-9] = 1.0
+        forces_normalized = forces / norms[:, np.newaxis]
         
-        # Hill climbing optimization
-        step = 0.05
-        for it in range(600):
-            # Perturb centers
-            new_centers = centers + np.random.normal(0, step, size=centers.shape)
-            new_centers = np.clip(new_centers, 0, 1)
-            
-            new_radii, new_sum = get_optimal_radii(new_centers)
-            
-            if new_sum > current_sum:
-                centers = new_centers
-                current_radii = new_radii
-                current_sum = new_sum
-                step *= 0.98  # Reduce step size on success
-            else:
-                step *= 0.995 # Reduce step size slowly on failure
+        centers += step_size * forces_normalized
+        centers = np.clip(centers, 0.0, 1.0)
         
-        if current_sum > best_sum:
-            best_sum = current_sum
-            best_centers = centers
-            best_radii = current_radii
+        # Adaptive radius control
+        if overlap_sum < 1e-5:
+            current_r *= 1.0002
+        else:
+            current_r *= 0.999
             
-    # Refinement phase with smaller steps
-    if best_centers is not None:
-        current_centers = best_centers
-        current_radii, current_sum = get_optimal_radii(current_centers)
-        step = 0.01
-        for it in range(1000):
-            new_centers = current_centers + np.random.normal(0, step, size=current_centers.shape)
-            new_centers = np.clip(new_centers, 0, 1)
-            
-            new_radii, new_sum = get_optimal_radii(new_centers)
-            
-            if new_sum > current_sum:
-                current_centers = new_centers
-                current_radii = new_radii
-                current_sum = new_sum
-                step *= 0.999
-            else:
-                step *= 0.9995
+        step_size *= alpha
         
-        best_centers = current_centers
-        best_radii = current_radii
-        best_sum = current_sum
-
-    return best_centers, best_radii, best_sum
+    # 3. Gradient-based Refinement
+    # Use L-BFGS-B to optimize the smooth bottleneck objective
+    # This polishes the configuration to a local optimum
+    k_val = 80.0  # Smoothing parameter
+    bounds = [(0.0, 1.0) for _ in range(52)]
+    
+    res = minimize(
+        fun=compute_smooth_bottleneck,
+        x0=centers.flatten(),
+        args=(k_val,),
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'maxiter': 2000, 'ftol': 1e-12, 'gtol': 1e-9}
+    )
+    
+    optimal_centers = res.x.reshape(26, 2)
+    
+    # 4. Compute final true bottleneck radius
+    min_dist = 1.0
+    
+    # Check boundaries
+    d_x = np.minimum(optimal_centers[:, 0], 1.0 - optimal_centers[:, 0])
+    d_y = np.minimum(optimal_centers[:, 1], 1.0 - optimal_centers[:, 1])
+    min_dist = min(min_dist, np.min(d_x), np.min(d_y))
+    
+    # Check inter-circle distances
+    for i in range(26):
+        for j in range(i + 1, 26):
+            d = np.linalg.norm(optimal_centers[i] - optimal_centers[j])
+            if d < min_dist:
+                min_dist = d
+                
+    final_radius = min_dist / 2.0
+    radii = np.full(26, final_radius)
+    sum_radii = 26 * final_radius
+    
+    return optimal_centers, radii, sum_radii

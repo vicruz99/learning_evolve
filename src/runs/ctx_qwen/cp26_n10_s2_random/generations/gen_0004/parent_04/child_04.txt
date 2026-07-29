@@ -1,0 +1,188 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.6272) and approach the target (2.636), we shift from optimizing `(x, y, r)` with inequality constraints to optimizing **centers only** `(x, y)` with a non-smooth but analytically computable objective. This reduces the dimensionality from 78 to 52 and removes the heavy constraint overhead that often traps SLSQP in local minima.
+
+Key improvements:
+1. **Center-Only Optimization**: Radii are computed exactly as `r_i = min(dist_to_boundary, 0.5 * min_dist_to_neighbors)`. This automatically satisfies all constraints and turns the problem into a box-constrained optimization.
+2. **Derivative-Free Solvers**: Use `Powell` and `Nelder-Mead`, which handle the non-smooth piecewise objective better than gradient-based methods.
+3. **Multi-Start & Iterative Escape**: Generate diverse initial configurations (hexagonal lattices, grids, random, corner-biased). Run local optimization on each, then iteratively perturb the best configuration with decaying noise and re-optimize to escape shallow local maxima.
+4. **Strict Validation Repair**: After optimization, a deterministic pairwise shrinking pass ensures the solution strictly passes the `1e-12` tolerance checker, guaranteeing validity without sacrificing much score.
+5. **Vectorized Computation**: All distance and radius calculations are fully vectorized for speed, allowing many more restarts and refinement steps within the time limit.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_radii(centers):
+    """Computes the maximum valid radius for each circle given fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    # Distance to boundaries: min(x, 1-x, y, 1-y)
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances (vectorized)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)  # Ignore self-distances
+    
+    # Radius limited by half the distance to the nearest neighbor
+    r_pair = 0.5 * np.min(dist, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(v):
+    """Objective function: minimize negative sum of radii."""
+    centers = v.reshape(N, 2)
+    return -np.sum(compute_radii(centers))
+
+def make_bounds():
+    """Box bounds keeping centers strictly inside the square."""
+    return [(1e-6, 1.0 - 1e-6)] * (2 * N)
+
+def generate_starts():
+    """Generates a diverse set of initial center configurations."""
+    starts = []
+    np.random.seed(42)
+    
+    # 1. Hexagonal lattices with varying densities
+    for r0 in np.linspace(0.085, 0.108, 6):
+        c = []
+        y = r0
+        row = 0
+        while len(c) < N:
+            x = r0 + (row % 2) * r0
+            while x <= 1.0 - r0 and len(c) < N:
+                c.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3.0) * r0
+            row += 1
+        starts.append(np.array(c[:N]))
+        
+    # 2. Square grids with varying aspect ratios
+    for sx in range(4, 7):
+        sy = (N + sx - 1) // sx
+        c = np.zeros((N, 2))
+        idx = 0
+        for i in range(sy):
+            for j in range(sx):
+                if idx < N:
+                    c[idx] = [0.05 + j * 0.9 / (sx - 1), 0.05 + i * 0.9 / (sy - 1)]
+                    idx += 1
+        starts.append(c)
+        
+    # 3. Dense random configurations
+    for _ in range(25):
+        starts.append(np.random.rand(N, 2))
+        
+    # 4. Corner-focused configurations (helps fill boundaries efficiently)
+    for _ in range(10):
+        c = np.random.rand(N, 2) * 0.6 + 0.2
+        corners = np.array([[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]])
+        c[:4] = corners
+        starts.append(c)
+        
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses center-only optimization with multi-start Powell/Nelder-Mead and iterative refinement.
+    """
+    bounds = make_bounds()
+    starts = generate_starts()
+    
+    best_sum = -np.inf
+    best_centers = None
+    
+    # ---------------------------------------------------------
+    # Phase 1: Local Optimization on Diverse Starts
+    # ---------------------------------------------------------
+    for init_c in starts:
+        # Run multiple perturbed variants of each start
+        for _ in range(2):
+            c_pert = init_c + np.random.normal(0, 0.003, init_c.shape)
+            c_pert = np.clip(c_pert, 1e-5, 1.0 - 1e-5)
+            
+            # Powell method (robust for non-smooth box-constrained problems)
+            try:
+                res = minimize(objective, c_pert.flatten(), method='Powell', bounds=bounds,
+                               options={'maxiter': 8000, 'ftol': 1e-16, 'xtol': 1e-16})
+                curr = -res.fun
+                if curr > best_sum:
+                    best_sum = curr
+                    best_centers = res.x.reshape(N, 2)
+            except Exception:
+                pass
+                
+            # Nelder-Mead variant (often escapes flat regions better)
+            try:
+                res_nm = minimize(objective, c_pert.flatten(), method='Nelder-Mead',
+                                  options={'maxiter': 12000, 'fatol': 1e-16, 'xatol': 1e-16})
+                curr_nm = -res_nm.fun
+                if curr_nm > best_sum:
+                    best_sum = curr_nm
+                    best_centers = res_nm.x.reshape(N, 2)
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------
+    # Phase 2: Iterative Perturbation & Refinement
+    # Escapes local minima by adding controlled noise and re-optimizing
+    # ---------------------------------------------------------
+    if best_centers is not None:
+        for step in range(60):
+            noise_scale = 0.0015 * np.exp(-step / 20.0)
+            pert = best_centers + np.random.normal(0, noise_scale, best_centers.shape)
+            pert = np.clip(pert, 1e-5, 1.0 - 1e-5)
+            
+            try:
+                res = minimize(objective, pert.flatten(), method='Powell', bounds=bounds,
+                               options={'maxiter': 3000, 'ftol': 1e-15})
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_centers = res.x.reshape(N, 2)
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------
+    # Phase 3: Final Radius Computation & Safety Repair
+    # Ensures strict validity against the 1e-12 tolerance checker
+    # ---------------------------------------------------------
+    radii = compute_radii(best_centers)
+    
+    # Iterative overlap resolution
+    for _ in range(30):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i,0] - best_centers[j,0], best_centers[i,1] - best_centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    ov = radii[i] + radii[j] - d
+                    # Shrink proportionally to preserve relative sizing
+                    total = radii[i] + radii[j]
+                    if total > 1e-12:
+                        radii[i] -= ov * (radii[i] / total)
+                        radii[j] -= ov * (radii[j] / total)
+                    else:
+                        radii[i] -= ov / 2.0
+                        radii[j] -= ov / 2.0
+                    changed = True
+                    
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(best_centers[i,0], 1.0 - best_centers[i,0], 
+                     best_centers[i,1], 1.0 - best_centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+                
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return best_centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,206 @@
+# sol_000228 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2fe8b400) state=6c34eee1 sum of radii=2.551013 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+from scipy.optimize import linprog
+from scipy.spatial.distance import pdist, squareform
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square to maximize sum of radii.
+    
+    Strategy:
+    1. Initialize centers in a dense hexagonal-like pattern.
+    2. Iteratively optimize:
+       a. Solve LP to find optimal radii for fixed centers.
+       b. Compute forces to move centers apart based on active constraints.
+       c. Update centers.
+    3. Return final centers, radii, and sum.
+    """
+    n = 26
+    
+    # --- Initialization ---
+    # Create a hexagonal packing initialization
+    # Estimate radius for 26 circles. 5x5 grid is 25 circles r=0.1. 
+    # 26 circles will be slightly smaller, maybe 0.09-0.10.
+    # We start with a bit smaller to allow growth.
+    r_init = 0.09
+    centers = np.zeros((n, 2))
+    
+    # Generate hexagonal grid points
+    idx = 0
+    row = 0
+    # Approximate width and height
+    # We can fit about 5-6 circles per row
+    # Let's try to fit them in the square
+    y = r_init
+    while idx < n:
+        # Determine number of circles in this row
+        # If row is even (0, 2...), start at x = r_init, spacing 2*r_init
+        # If row is odd (1, 3...), start at x = 2*r_init (shifted), spacing 2*r_init
+        
+        shift = r_init if (row % 2 == 1) else 0
+        x = r_init + shift
+        
+        while x + r_init <= 1.0 + 1e-9 and idx < n:
+            centers[idx, 0] = x
+            centers[idx, 1] = y
+            idx += 1
+            x += 2 * r_init
+        
+        y += math.sqrt(3) * r_init
+        row += 1
+        
+    # If we didn't fill 26, add random valid points? 
+    # The loop above should cover it if r_init is small enough.
+    # With r=0.09, 2r=0.18.
+    # Row 0: 0.09, 0.27, 0.45, 0.63, 0.81 (5 circles). x_max=0.9 <= 1.
+    # Row 1: 0.18, 0.36, 0.54, 0.72, 0.90 (5 circles). x_max=0.99 <= 1.
+    # Row 2: 5 circles.
+    # Row 3: 5 circles.
+    # Row 4: 5 circles.
+    # Row 5: 1 circle.
+    # Total 26. 
+    # Height: y starts 0.09. After 6 rows (0..5), y = 0.09 + 5 * sqrt(3)*0.09 = 0.09 + 0.779 = 0.869.
+    # Last row center y=0.869. Top edge 0.869+0.09 = 0.959 <= 1.
+    # Fits well.
+
+    # Add small random noise to break symmetry
+    centers += np.random.uniform(-0.001, 0.001, centers.shape)
+    centers = np.clip(centers, r_init, 1-r_init) # Ensure valid bounds initially
+
+    # --- Optimization Loop ---
+    
+    # Parameters
+    max_iter = 500
+    step_size = 0.01
+    decay = 0.98
+    
+    best_sum = -1.0
+    best_centers = centers.copy()
+    best_radii = np.zeros(n)
+
+    for iteration in range(max_iter):
+        
+        # 1. Solve LP for optimal radii given centers
+        # Variables: r_0, ..., r_25
+        # Maximize sum(r_i) => Minimize -sum(r_i)
+        c_obj = -np.ones(n)
+        
+        # Constraints: A_ub @ r <= b_ub
+        # 1. Boundary constraints: r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+        # 2. Pairwise constraints: r_i + r_j <= dist(i, j)
+        
+        # Prepare A_ub and b_ub
+        # Boundary constraints: n constraints
+        A_ub = []
+        b_ub = []
+        
+        for i in range(n):
+            x, y = centers[i]
+            r_max = min(x, 1-x, y, 1-y)
+            # r_i <= r_max
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(r_max)
+            
+        # Pairwise constraints: n*(n-1)/2 constraints
+        # r_i + r_j <= dist_ij
+        dist_matrix = squareform(pdist(centers))
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(dist_matrix[i, j])
+                
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        # Bounds for r: r >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                current_radii = res.x
+                current_sum = -res.fun
+                
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = centers.copy()
+                    best_radii = current_radii.copy()
+                    
+                # 2. Compute Forces to move centers
+                # We want to increase radii. Radii are constrained by active inequalities.
+                # If r_i + r_j approx dist(i,j), pushing i and j apart helps.
+                # If r_i approx boundary, moving i away from wall helps.
+                
+                forces = np.zeros_like(centers)
+                force_scale = step_size
+                
+                # Identify active constraints (within tolerance)
+                tol = 1e-4
+                
+                # Boundary forces
+                for i in range(n):
+                    x, y = centers[i]
+                    r = current_radii[i]
+                    
+                    # Check walls
+                    if abs(x - r) < tol: # Left wall
+                        forces[i, 0] += force_scale
+                    if abs((1-x) - r) < tol: # Right wall
+                        forces[i, 0] -= force_scale
+                    if abs(y - r) < tol: # Bottom wall
+                        forces[i, 1] += force_scale
+                    if abs((1-y) - r) < tol: # Top wall
+                        forces[i, 1] -= force_scale
+                        
+                # Pairwise forces
+                # If r_i + r_j approx dist, apply repulsion
+                # We only need to check pairs that are close or active
+                # Checking all pairs is O(N^2), N=26 is small (325 pairs)
+                
+                active_pairs_count = 0
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        d = dist_matrix[i, j]
+                        r_sum = current_radii[i] + current_radii[j]
+                        
+                        if abs(d - r_sum) < tol:
+                            # Active constraint: circles touching
+                            # Repulsive force
+                            if d > 1e-9:
+                                vec = centers[i] - centers[j]
+                                norm = np.linalg.norm(vec)
+                                if norm > 0:
+                                    direction = vec / norm
+                                    forces[i] += direction * force_scale
+                                    forces[j] -= direction * force_scale
+                            active_pairs_count += 1
+                
+                # Apply forces
+                centers += forces
+                
+                # Keep centers within [r_small, 1-r_small] to avoid immediate violation
+                # Use a small safety margin
+                safety = 0.001
+                centers = np.clip(centers, safety, 1 - safety)
+                
+                # Decay step size
+                step_size *= decay
+                
+        except Exception as e:
+            # If LP fails, reduce step size and continue
+            step_size *= 0.5
+            continue
+            
+    return best_centers, best_radii, best_sum

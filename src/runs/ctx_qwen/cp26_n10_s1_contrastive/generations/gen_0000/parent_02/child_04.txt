@@ -1,0 +1,377 @@
+
+
+<strategy>
+To solve the problem of packing 26 circles in a unit square to maximize the sum of radii, we will employ a computational approach using Linear Programming (LP) and numerical optimization.
+
+1.  **Problem Formulation**: The problem is to maximize $\sum_{i=1}^{26} r_i$ subject to geometric constraints. This is a non-convex problem. We can decouple it into an outer optimization of centers and an inner optimization of radii.
+2.  **Inner Optimization (Radii)**: For any fixed set of circle centers $\mathbf{c} = \{c_1, \dots, c_{26}\}$, the problem of finding the optimal radii $\{r_i\}$ becomes a Linear Programming (LP) problem.
+    *   **Objective**: Maximize $\sum r_i$.
+    *   **Constraints**:
+        *   Non-overlap: $r_i + r_j \le \|c_i - c_j\|$ for all pairs $(i, j)$.
+        *   Boundary containment: $r_i \le x_i$, $r_i \le 1-x_i$, $r_i \le y_i$, $r_i \le 1-y_i$.
+        *   Non-negativity: $r_i \ge 0$.
+    This LP can be solved very efficiently using `scipy.optimize.linprog`.
+3.  **Outer Optimization (Centers)**: We need to find the optimal positions for the 26 centers. Since the objective function (max sum of radii) is defined via the LP solution, it is non-smooth. We will use a derivative-free optimization method like **Differential Evolution** or **Basin Hopping** from `scipy.optimize` to search the 52-dimensional space of center coordinates.
+4.  **Initialization**: We will initialize the search with a hexagonal lattice packing, which is known to be dense and provides a good starting point.
+5.  **Refinement**: The optimization will iteratively adjust center positions to allow the LP to find larger radii, effectively "jiggling" the circles into a denser arrangement.
+
+This strategy is robust, mathematically sound, and leverages high-performance solvers to navigate the complex constraint landscape.
+</strategy>
+
+```python
+import numpy as np
+import scipy.optimize as opt
+import itertools
+import sys
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a nested optimization approach:
+    1. Optimize centers using a global optimizer (Basin Hopping / Differential Evolution).
+    2. For fixed centers, solve a Linear Program to find optimal radii.
+    """
+    n = 26
+    
+    # Helper function to compute distances and boundaries
+    def get_constraints_data(centers):
+        # centers shape (n, 2)
+        n_c = centers.shape[0]
+        # Pairwise distances
+        dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+        # Upper triangular indices
+        pairs = [(i, j) for i in range(n_c) for j in range(i + 1, n_c)]
+        
+        # Distance to boundaries for each circle
+        # r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+        # We can condense this to r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+        # But for LP, we need explicit constraints r_i <= b_i
+        # Actually, min constraint is r_i <= b_i. 
+        # However, LP handles linear constraints. r_i <= x_i is linear.
+        # We can just use the tightest bound per circle for efficiency?
+        # No, let's just use the min distance to any wall.
+        bounds_vals = np.minimum(np.minimum(centers[:, 0], 1 - centers[:, 0]), 
+                                 np.minimum(centers[:, 1], 1 - centers[:, 1]))
+        
+        return dists, pairs, bounds_vals
+
+    # Objective function for the outer optimizer (centers)
+    # It returns negative sum of radii (for minimization)
+    def objective(centers_flat):
+        centers = centers_flat.reshape((n, 2))
+        
+        # Check for valid centers (inside square roughly)
+        # If centers are outside, radii will be forced to 0 or negative by LP bounds logic 
+        # if we don't handle it, but LP bounds r_i >= 0 handle it.
+        # However, if center is at -0.1, distance to wall is negative? 
+        # Distance to wall constraint: r_i <= x_i. If x_i = -0.1, r_i <= -0.1. 
+        # Since r_i >= 0, feasible region is empty? 
+        # Linprog might return infeasible.
+        # We should penalize or clamp centers.
+        
+        # Simple penalty for centers outside [0,1] to keep search in range
+        # But bounds in optimizer handle this.
+        
+        dists, pairs, bounds_vals = get_constraints_data(centers)
+        
+        # Setup LP: Maximize sum(r)  => Minimize -sum(r)
+        # Variables: r_0, ..., r_{n-1}
+        
+        # Objective coefficients
+        c = -np.ones(n)
+        
+        # Constraints A_ub * r <= b_ub
+        # 1. Pairwise: r_i + r_j <= dist_ij
+        # 2. Boundary: r_i <= bounds_vals[i] (implicitly 1*r_i <= val)
+        
+        n_pairs = len(pairs)
+        A_ub = np.zeros((n_pairs + n, n))
+        b_ub = np.zeros(n_pairs + n)
+        
+        # Pairwise constraints
+        idx = 0
+        for i, j in pairs:
+            # r_i + r_j <= dist
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+        # Boundary constraints
+        # r_i <= bounds_vals[i]
+        for i in range(n):
+            A_ub[idx, i] = 1.0
+            b_ub[idx] = bounds_vals[i]
+            idx += 1
+            
+        # Bounds for r_i: 0 <= r_i <= inf
+        r_bounds = [(0, None)] * n
+        
+        try:
+            res = opt.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=r_bounds, method='highs')
+            if res.success:
+                return -res.fun # Return sum of radii
+            else:
+                return 0.0 # Infeasible, return 0
+        except Exception:
+            return 0.0
+
+    # Initial configuration: Hexagonal packing
+    # We want to fit 26 circles. 
+    # Try a grid first then perturb?
+    # Hexagonal grid generation
+    centers_init = np.zeros((n, 2))
+    
+    # Let's try to arrange them in rows
+    # Approx radius 0.1. Diameter 0.2.
+    # 5 circles per row takes 1.0 width.
+    # 6 rows would take height.
+    # Let's just fill a square grid 5x5 = 25, add 1 in middle?
+    # Or 6x5 grid scaled down.
+    
+    # Better: Hexagonal lattice
+    # Spacing dx = 2r, dy = sqrt(3)r
+    # Let's guess r=0.1. dx=0.2, dy=0.1732
+    # Rows of 5, 5, 5, 5, 5, 1? 
+    # Let's just generate a dense packing and let optimizer fix it.
+    
+    # Simple rectangular grid 6x5 (30 circles) scaled to fit, then remove 4?
+    # Or 5x6.
+    # Let's use a heuristic placement.
+    
+    # Place in a rough hexagonal pattern
+    row_counts = [5, 5, 5, 5, 5, 1] # Sum 26? No, 26.
+    # 5+5+5+5+5 = 25. Need 1 more.
+    # Let's do 5, 5, 5, 5, 5, 1 is awkward.
+    # Maybe 6, 5, 5, 5, 5? Sum 26.
+    # Row 1: 6 circles.
+    # Row 2: 5 circles (shifted)
+    # ...
+    
+    # Let's just place them in a 5x6 grid (30) and remove 4 random ones?
+    # Or place 26 in a 5x5 grid + 1.
+    
+    # Let's try to fit 26 in a 6x5 grid compressed.
+    # 6 columns, 5 rows?
+    # x coords: 0.1, 0.3, 0.5, 0.7, 0.9 (5 cols) -> 5 circles
+    # To fit 6, x: 0.08, 0.26...
+    
+    # Let's use a systematic placement.
+    # 5 rows of 5 = 25.
+    # Add 1 at center (0.5, 0.5).
+    
+    idx = 0
+    x_coords = np.linspace(0.1, 0.9, 5)
+    y_coords = np.linspace(0.1, 0.9, 5)
+    
+    for y in y_coords:
+        for x in x_coords:
+            if idx < n:
+                centers_init[idx] = [x, y]
+                idx += 1
+            else:
+                break
+        if idx >= n:
+            break
+            
+    # If we need more, add to middle?
+    # With 5x5 we have 25. We need 26.
+    # The loop above puts 25 circles.
+    # We need to place the 26th.
+    # Let's perturb the 25th and insert a 26th?
+    # Or just use a random scatter + grid mix.
+    
+    # Let's use a better initialization:
+    # 6 rows.
+    # Row 0: 5 circles
+    # Row 1: 5 circles
+    # ...
+    # Actually, let's just use random perturbation of a grid.
+    
+    # Re-init with 26 points in a grid 5x6 (30) subset?
+    # 30 points grid:
+    # x in 0..1, 6 points. y in 0..1, 5 points.
+    # x = 0.08, 0.26, 0.44, 0.62, 0.80, 0.98? No.
+    # Even spacing.
+    
+    # Let's just use the 5x5 grid + 1 point at (0.5, 0.5) but shifted slightly?
+    # (0.5, 0.5) is occupied by center of grid.
+    # If we have grid 0.1, 0.3, 0.5, 0.7, 0.9.
+    # (0.5, 0.5) is a center.
+    # So 5x5 grid occupies all intersection points.
+    # Where to put 26th?
+    # Maybe shrink grid and add one.
+    
+    # Let's create a 6x5 grid of 30 points, pick 26.
+    # This gives good coverage.
+    
+    rng = np.random.default_rng(42)
+    # Generate a dense grid
+    x_grid = np.linspace(0.1, 0.9, 6)
+    y_grid = np.linspace(0.1, 0.9, 6)
+    # 6x6 = 36 points.
+    points = []
+    for x in x_grid:
+        for y in y_grid:
+            points.append([x, y])
+    
+    # Pick 26 points. Maybe center ones?
+    # Sort by distance from center (0.5, 0.5) and pick closest 26?
+    # That clusters them in middle, leaving corners empty.
+    # Better to pick a subset that covers area?
+    # Just random subset of a good grid.
+    
+    # Let's try 5 rows of 5 (25) + 1.
+    # Shift the 25 slightly to make room?
+    # Optimization will handle it.
+    
+    # Let's initialize with a hexagonal pattern for 26.
+    # Rows: 5, 5, 5, 5, 5, 1? No.
+    # Rows: 5, 6, 5, 6, 4?
+    # Let's just place them in a grid 5x5 and add one at (0.5, 0.95)?
+    
+    # Simple init: 5x5 grid scaled by 0.9 to leave margin, then random jitter.
+    centers_init = np.zeros((n, 2))
+    x_vals = np.linspace(0.05, 0.95, 5)
+    y_vals = np.linspace(0.05, 0.95, 5)
+    
+    count = 0
+    for y in y_vals:
+        for x in x_vals:
+            if count < n:
+                centers_init[count] = [x, y]
+                count += 1
+            else:
+                break
+        if count >= n: break
+    
+    # We have 25. Need 1 more.
+    # Place at center of a cell?
+    # Grid cells are 0.2 x 0.2.
+    # Center of (0.1, 0.1) to (0.3, 0.3) is (0.2, 0.2).
+    # But (0.2, 0.2) is close to (0.1, 0.1) and (0.3, 0.1) etc.
+    # Let's just add a point at (0.5, 0.5) if not present? 
+    # (0.5, 0.5) is in grid.
+    # Add at (0.45, 0.55)?
+    
+    # Just add a point slightly offset from center.
+    # Actually, with 26 circles, a 6x5 grid (30 circles) subset is better.
+    # Let's generate 30 circles in a grid and pick 26.
+    
+    # Grid 6x5
+    x_6 = np.linspace(0.05, 0.95, 6) # 6 points
+    y_5 = np.linspace(0.05, 0.95, 5) # 5 points
+    points = []
+    for x in x_6:
+        for y in y_5:
+            points.append([x, y])
+    # 30 points.
+    # Select 26.
+    # Remove 4 points that are far from center? Or just last 4?
+    # Removing corners might be bad?
+    # Let's just take first 26.
+    centers_init = np.array(points[:n])
+    
+    # Add some noise to avoid symmetry traps
+    centers_init += rng.uniform(-0.01, 0.01, size=centers_init.shape)
+    # Clip to [0.01, 0.99]
+    centers_init = np.clip(centers_init, 0.01, 0.99)
+    
+    # Bounds for centers: [0, 1]
+    bounds = [(0.0, 1.0)] * (2 * n)
+    
+    # Use Differential Evolution for robust global search
+    # But it can be slow. 
+    # Let's use Basin Hopping with Nelder-Mead inside.
+    # Or just minimize with multiple restarts.
+    
+    # Given the constraints and dimension (52), DE might be too slow for a single run 
+    # if time limit is tight, but let's try a few iterations.
+    # Actually, Basin Hopping is good.
+    
+    def wrapper(x):
+        return objective(x)
+        
+    # Try a local optimization first from init
+    # Nelder-Mead
+    try:
+        res_local = opt.minimize(wrapper, centers_init.flatten(), method='Nelder-Mead', 
+                                 options={'maxiter': 1000, 'xatol': 1e-6, 'fatol': 1e-6})
+        best_centers = res_local.x.reshape((n, 2))
+        best_sum = -res_local.fun
+    except Exception:
+        best_centers = centers_init
+        best_sum = 0
+
+    # Try a few random restarts to improve
+    # Since we want to maximize sum, we want to escape local minima.
+    
+    # Let's run a simple random search with local refinement
+    current_best_centers = best_centers
+    current_best_val = best_sum
+    
+    for restart in range(5): # 5 restarts
+        # Generate random centers
+        rng = np.random.default_rng(restart + 100)
+        rand_centers = rng.uniform(0.1, 0.9, (n, 2))
+        # Maybe force some structure? No, random is fine for search.
+        
+        try:
+            res_rand = opt.minimize(wrapper, rand_centers.flatten(), method='Nelder-Mead',
+                                    options={'maxiter': 2000, 'xatol': 1e-7, 'fatol': 1e-7})
+            if -res_rand.fun > current_best_val:
+                current_best_val = -res_rand.fun
+                current_best_centers = res_rand.x.reshape((n, 2))
+        except:
+            pass
+
+    # Recover radii for the best centers
+    # Re-run LP to get exact radii
+    dists, pairs, bounds_vals = get_constraints_data(current_best_centers)
+    c = -np.ones(n)
+    n_pairs = len(pairs)
+    A_ub = np.zeros((n_pairs + n, n))
+    b_ub = np.zeros(n_pairs + n)
+    
+    idx = 0
+    for i, j in pairs:
+        A_ub[idx, i] = 1.0
+        A_ub[idx, j] = 1.0
+        b_ub[idx] = dists[i, j]
+        idx += 1
+    for i in range(n):
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = bounds_vals[i]
+        idx += 1
+        
+    r_bounds = [(0, None)] * n
+    res_lp = opt.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=r_bounds, method='highs')
+    
+    radii = np.zeros(n)
+    if res_lp.success:
+        radii = res_lp.x
+        final_sum = -res_lp.fun
+    else:
+        # Fallback: equal small radii
+        radii = np.full(n, 0.05)
+        final_sum = np.sum(radii)
+        
+    # Validate just in case
+    # Note: The LP guarantees constraints, but floating point might be tight.
+    # We trust the LP.
+    
+    return current_best_centers, radii, final_sum
+
+if __name__ == "__main__":
+    centers, radii, total_sum = run_packing()
+    print(f"Total sum of radii: {total_sum}")
+    print(f"Min radius: {np.min(radii)}, Max radius: {np.max(radii)}")
+    
+    # Run validation
+    # Assuming validate_packing is available in environment
+    # try:
+    #    is_valid = validate_packing(centers, radii)
+    #    print(f"Valid: {is_valid}")
+    # except:
+    #    pass
+```

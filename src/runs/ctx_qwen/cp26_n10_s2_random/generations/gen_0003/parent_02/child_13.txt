@@ -1,0 +1,389 @@
+
+
+Looking at this problem, I need to push the sum of radii from 2.623858 toward 2.636. The key insights are:
+
+1. **Equal circles limit**: For 26 equal circles, optimal r ≈ 0.1008, sum ≈ 2.621. We need unequal circles to exceed this significantly.
+2. **Corner/edge exploitation**: Circles near corners can be larger since they're constrained by only 2 boundaries instead of being surrounded.
+3. **Multi-phase optimization**: Need global exploration (SA/diverse starts) + local refinement (SLSQP/gradient) + iterative expansion.
+
+<strategy>
+My strategy focuses on:
+1. **Diverse initialization**: Hexagonal patterns with various row counts and noise levels, corner-pushed configurations, and rejection-sampled random configs
+2. **LP-based exact radii computation**: Use linear programming to find truly optimal radii for any fixed centers (exact, not heuristic)
+3. **Gradient ascent guided by LP duals**: Dual variables tell us how moving centers increases the sum of radii
+4. **SLSQP joint optimization**: Optimize centers and radii together with proper constraints
+5. **Iterative growth refinement**: Gradually expand radii and re-optimize positions to escape local minima
+6. **Many restarts with perturbation**: Explore different basins of attraction
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def solve_radii_lp(centers):
+    """Solve LP to find optimal radii for fixed centers. Returns (radii, sum, marginals)."""
+    n_pairs = N * (N - 1) // 2
+    n_bnd = 4 * N
+    
+    triu_i, triu_j = np.triu_indices(N, k=1)
+    diffs = centers[triu_i] - centers[triu_j]
+    dists = np.sqrt(np.sum(diffs**2, axis=1))
+    
+    A_ub = np.zeros((n_pairs + n_bnd, N))
+    b_ub = np.zeros(n_pairs + n_bnd)
+    
+    # Pairwise: r_i + r_j <= d_ij
+    for k in range(n_pairs):
+        A_ub[k, triu_i[k]] = 1.0
+        A_ub[k, triu_j[k]] = 1.0
+        b_ub[k] = dists[k]
+    
+    # Boundary: r_i <= x_i, 1-x_i, y_i, 1-y_i
+    for i in range(N):
+        b_ub[n_pairs + 4*i] = centers[i, 0]
+        b_ub[n_pairs + 4*i + 1] = 1.0 - centers[i, 0]
+        b_ub[n_pairs + 4*i + 2] = centers[i, 1]
+        b_ub[n_pairs + 4*i + 3] = 1.0 - centers[i, 1]
+        A_ub[n_pairs + 4*i:n_pairs + 4*i + 4, i] = 1.0
+    
+    res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=(0, None), method='highs')
+    if res.success and hasattr(res, 'ineqlin') and res.ineqlin is not None:
+        return res.x, -res.fun, res.ineqlin.marginals
+    return np.full(N, 0.08), 2.08, np.zeros(n_pairs + n_bnd)
+
+
+def gradient_ascent(centers0, max_iter=400):
+    """Gradient ascent on centers using LP dual variables."""
+    centers = centers0.copy()
+    best_sum = -1.0
+    best_centers = centers.copy()
+    best_radii = None
+    best_marg = None
+    
+    n_pairs = N * (N - 1) // 2
+    triu_i, triu_j = np.triu_indices(N, k=1)
+    
+    for t in range(max_iter):
+        radii, current_sum, marginals = solve_radii_lp(centers)
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            best_marg = marginals.copy()
+        
+        # Gradient from LP duals
+        grad = np.zeros((N, 2))
+        
+        for k in range(n_pairs):
+            lam = marginals[k]
+            if lam > 1e-10:
+                i, j = triu_i[k], triu_j[k]
+                diff = centers[i] - centers[j]
+                d = np.sqrt(np.sum(diff**2))
+                if d > 1e-10:
+                    u = diff / d
+                    grad[i] += lam * u
+                    grad[j] -= lam * u
+        
+        for i in range(N):
+            mu_L = marginals[n_pairs + 4*i]
+            mu_R = marginals[n_pairs + 4*i + 1]
+            mu_B = marginals[n_pairs + 4*i + 2]
+            mu_T = marginals[n_pairs + 4*i + 3]
+            grad[i, 0] += mu_L - mu_R
+            grad[i, 1] += mu_B - mu_T
+        
+        step = 0.02 / (1 + 0.004 * t)
+        centers = centers + step * grad
+        centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+    
+    # Final solve
+    final_radii, final_sum, _ = solve_radii_lp(best_centers)
+    return best_centers, final_radii, final_sum
+
+
+def fast_sum_radii(centers):
+    """Fast heuristic: r_i = min(dist_to_boundary, 0.5 * min_dist_to_neighbor)."""
+    b = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    d = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(d, np.inf)
+    p = 0.5 * np.min(d, axis=1)
+    return np.sum(np.minimum(b, p))
+
+
+def obj_slsqp(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+
+def cons_slsqp(v):
+    """Constraints for SLSQP (all must be >= 0)."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    out = [c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r]
+    mask = np.triu_indices(N, k=1)
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    out.append(dists[mask] - (r[mask[0]] + r[mask[1]]))
+    return np.concatenate(out)
+
+
+def hex_init(r=0.105, pattern=None, noise=0.0):
+    """Hexagonal lattice initialization with given pattern."""
+    if pattern is None:
+        pattern = [5, 6, 5, 6, 4]
+    centers = []
+    y = r
+    for i, cnt in enumerate(pattern):
+        shift = r if i % 2 == 1 else 0.0
+        x = r + shift
+        for _ in range(cnt):
+            cx = x + np.random.normal(0, noise)
+            cy = y + np.random.normal(0, noise)
+            centers.append([cx, cy])
+            x += 2 * r
+        y += r * np.sqrt(3)
+    centers = np.array(centers[:N])
+    return np.clip(centers, 0.02, 0.98)
+
+
+def corner_edge_init():
+    """Place circles strategically in corners and along edges."""
+    centers = []
+    rng = np.random.default_rng(np.random.randint(0, 2**31))
+    
+    # 4 corners
+    for cx, cy in [(0.09, 0.09), (0.91, 0.09), (0.09, 0.91), (0.91, 0.91)]:
+        centers.append([cx + rng.normal(0, 0.015), cy + rng.normal(0, 0.015)])
+    
+    # Along each edge, 3 circles each
+    for t in np.linspace(0.22, 0.78, 3):
+        centers.append([t + rng.normal(0, 0.01), 0.09])  # bottom
+        centers.append([t + rng.normal(0, 0.01), 0.91])  # top
+        centers.append([0.09, t + rng.normal(0, 0.01)])  # left
+        centers.append([0.91, t + rng.normal(0, 0.01)])  # right
+    
+    # Fill center
+    while len(centers) < N:
+        centers.append(rng.uniform(0.25, 0.75, 2))
+    
+    return np.clip(np.array(centers[:N]), 0.03, 0.97)
+
+
+def spaced_random_init(min_dist=0.10):
+    """Random placement with minimum distance constraint."""
+    centers = []
+    rng = np.random.default_rng(np.random.randint(0, 2**31))
+    attempts = 0
+    while len(centers) < N and attempts < 200000:
+        pt = rng.uniform(0.05, 0.95, 2)
+        ok = True
+        for c in centers:
+            if np.hypot(pt[0] - c[0], pt[1] - c[1]) < min_dist:
+                ok = False
+                break
+        if ok:
+            centers.append(pt)
+        attempts += 1
+    
+    while len(centers) < N:
+        centers.append(rng.uniform(0.1, 0.9, 2))
+    return np.array(centers)
+
+
+def sa_optimize(centers0, max_iter=15000):
+    """Simulated annealing on centers."""
+    centers = centers0.copy()
+    curr_sum = fast_sum_radii(centers)
+    
+    best_sum = curr_sum
+    best_centers = centers.copy()
+    
+    temp = 0.015
+    step = 0.012
+    
+    for i in range(max_iter):
+        idx = np.random.randint(N)
+        new_c = centers.copy()
+        new_c[idx] += np.random.uniform(-step, step, 2)
+        new_c[idx] = np.clip(new_c[idx], 1e-4, 1.0 - 1e-4)
+        
+        new_sum = fast_sum_radii(new_c)
+        delta = new_sum - curr_sum
+        
+        if delta > 0 or np.random.rand() < np.exp(delta / max(temp, 1e-8)):
+            centers = new_c
+            curr_sum = new_sum
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = centers.copy()
+        
+        temp *= 0.9997
+        step *= 0.9999
+    
+    return best_centers
+
+
+def run_packing():
+    np.random.seed(42)
+    
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    # Phase 1: Generate diverse initial configurations
+    configs = []
+    
+    # Multiple hexagonal patterns with various noise levels
+    patterns = [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+                [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 6, 6, 5, 4],
+                [6, 4, 6, 6, 4], [4, 6, 5, 6, 5]]
+    for pat in patterns:
+        for noise in [0.0, 0.003, 0.008, 0.015, 0.025, 0.04]:
+            configs.append(hex_init(0.105, pattern=pat, noise=noise))
+    
+    # Corner-focused configurations
+    for _ in range(12):
+        configs.append(corner_edge_init())
+    
+    # Spaced random configurations
+    for seed in range(25):
+        np.random.seed(42 + seed * 7)
+        configs.append(spaced_random_init(min_dist=0.10))
+    
+    # Phase 2: Optimize each configuration using SA + gradient ascent + SLSQP
+    for c0 in configs:
+        # Simulated annealing
+        c_sa = sa_optimize(c0, max_iter=8000)
+        
+        # Gradient ascent from SA result
+        c_ga, r_ga, s_ga = gradient_ascent(c_sa, max_iter=300)
+        if s_ga > best_sum:
+            best_sum = s_ga
+            best_centers = c_ga.copy()
+            best_radii = r_ga.copy()
+        
+        # Also try gradient ascent from original
+        c_ga2, r_ga2, s_ga2 = gradient_ascent(c0, max_iter=200)
+        if s_ga2 > best_sum:
+            best_sum = s_ga2
+            best_centers = c_ga2.copy()
+            best_radii = r_ga2.copy()
+    
+    if best_centers is None:
+        best_centers = hex_init(0.105)
+        best_radii, best_sum, _ = solve_radii_lp(best_centers)
+    
+    # Phase 3: SLSQP joint optimization (centers + radii)
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    
+    # Try SLSQP from the best LP result
+    x0 = np.concatenate([best_centers.flatten(), best_radii])
+    
+    for restart in range(10):
+        x0_pert = x0.copy()
+        x0_pert[:2*N] += np.random.normal(0, 0.002, 2*N)
+        x0_pert[:2*N] = np.clip(x0_pert[:2*N], 0.02, 0.98)
+        x0_pert[2*N:] *= 0.98  # Slightly shrink radii for feasibility
+        
+        try:
+            res = minimize(obj_slsqp, x0_pert, method='SLSQP', bounds=bounds,
+                          constraints={'type': 'ineq', 'fun': cons_slsqp},
+                          options={'maxiter': 10000, 'ftol': 1e-14})
+            
+            # Check feasibility
+            cons_val = cons_slsqp(res.x)
+            if np.all(cons_val >= -1e-7):
+                c_opt = res.x[:2*N].reshape(N, 2)
+                r_opt = res.x[2*N:]
+                
+                # Verify with LP (exact radii)
+                r_lp, s_lp, _ = solve_radii_lp(c_opt)
+                s_sl = np.sum(r_opt)
+                s = min(s_sl, s_lp)
+                
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = np.minimum(r_opt, r_lp).copy()
+        except Exception:
+            pass
+    
+    # Phase 4: Iterative growth refinement
+    for phase in range(80):
+        c_pert = best_centers.copy()
+        r_pert = best_radii.copy()
+        
+        if phase % 3 == 0:
+            # Grow radii
+            r_pert *= 1.0015
+        elif phase % 3 == 1:
+            # Perturb centers
+            c_pert += np.random.normal(0, 0.0015, (N, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+        else:
+            # Mixed
+            r_pert *= 1.0008
+            c_pert += np.random.normal(0, 0.001, (N, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+        
+        x0 = np.concatenate([c_pert.flatten(), r_pert])
+        
+        try:
+            res = minimize(obj_slsqp, x0, method='SLSQP', bounds=bounds,
+                          constraints={'type': 'ineq', 'fun': cons_slsqp},
+                          options={'maxiter': 5000, 'ftol': 1e-13})
+            
+            if np.all(cons_slsqp(res.x) >= -1e-7):
+                c_opt = res.x[:2*N].reshape(N, 2)
+                r_opt = res.x[2*N:]
+                r_lp, s_lp, _ = solve_radii_lp(c_opt)
+                r_final = np.minimum(r_opt, r_lp)
+                
+                s = np.sum(r_final)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = r_final.copy()
+        except Exception:
+            pass
+    
+    # Phase 5: Additional gradient ascent from best
+    c_final, r_final, s_final = gradient_ascent(best_centers, max_iter=200)
+    if s_final > best_sum:
+        best_sum = s_final
+        best_centers = c_final.copy()
+        best_radii = r_final.copy()
+    
+    # Final safety shrink to guarantee validation tolerance
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i, 0] - best_centers[j, 0],
+                             best_centers[i, 1] - best_centers[j, 1])
+                if d < best_radii[i] + best_radii[j] - 1e-9:
+                    ov = best_radii[i] + best_radii[j] - d + 1e-10
+                    best_radii[i] -= ov / 2
+                    best_radii[j] -= ov / 2
+                    changed = True
+        
+        for i in range(N):
+            mx = min(best_centers[i, 0], 1.0 - best_centers[i, 0],
+                     best_centers[i, 1], 1.0 - best_centers[i, 1])
+            if best_radii[i] > mx + 1e-9:
+                best_radii[i] = mx
+                changed = True
+        
+        if not changed:
+            break
+    
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

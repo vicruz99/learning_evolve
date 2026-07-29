@@ -1,0 +1,160 @@
+
+
+<strategy>
+To improve the packing beyond the current sum of radii (~2.625), we need a more robust global search strategy to escape local minima. The current approach uses a single grid initialization with limited restarts. I will implement:
+1. **Diverse Initializations**: Generate multiple distinct starting configurations per restart: hexagonal lattice, uniform grid, purely random, and a corner/edge-focused layout. This covers different packing topologies (dense clusters vs boundary-hugging).
+2. **Multi-Restart Optimization**: Run SLSQP on ~48 distinct initial states (12 seeds × 4 layouts). SLSQP is used due to its efficiency with smooth nonlinear inequality constraints.
+3. **Robust Constraint Handling**: Formulate boundary and pairwise separation constraints explicitly as $g(\mathbf{v}) \ge 0$. Use vectorized distance calculations and `np.triu_indices` for efficiency.
+4. **No Closures/Top-Level Helpers**: Strictly adhere to the rule by placing all helper functions at module level, computing `n` from `len(vars)//3` inside the constraint function to avoid capturing outer scope variables.
+5. **Safety & Validation**: Ensure radii are non-negative, clip to bounds, and return the best valid configuration found across all runs. The optimizer starts with small feasible radii (0.05-0.06) and lets the solver grow them to the boundaries naturally.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars):
+    """Minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars):
+    """
+    Returns inequality constraints >= 0.
+    Enforces boundary containment and pairwise non-overlap.
+    """
+    n = len(vars) // 3
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    cons = np.empty(0)
+    # Boundary constraints
+    cons = np.concatenate([cons, x - r])
+    cons = np.concatenate([cons, 1.0 - x - r])
+    cons = np.concatenate([cons, y - r])
+    cons = np.concatenate([cons, 1.0 - y - r])
+    
+    # Pairwise separation constraints
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, None] + r[None, :]
+    r_sum_sq = r_sum**2
+    
+    i, j = np.triu_indices(n, k=1)
+    cons = np.concatenate([cons, dist_sq[i, j] - r_sum_sq[i, j]])
+    
+    return cons
+
+def generate_inits(n, seed):
+    """Generates diverse initial configurations for the optimizer."""
+    np.random.seed(seed)
+    inits = []
+    
+    # 1. Hexagonal Lattice
+    pts = []
+    r0 = 0.06
+    y = r0
+    row = 0
+    while len(pts) < n:
+        x = r0 if row % 2 == 0 else 2 * r0
+        while x <= 1 - r0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2 * r0
+        y += r0 * np.sqrt(3)
+        row += 1
+    pts = np.array(pts[:n])
+    pts += np.random.uniform(-0.015, 0.015, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    v = np.zeros(3 * n)
+    v[0::3] = pts[:, 0]
+    v[1::3] = pts[:, 1]
+    v[2::3] = r0
+    inits.append(v)
+    
+    # 2. Uniform Grid
+    grid = np.linspace(0.1, 0.9, 5)
+    pts = np.array([[x, y] for x in grid for y in grid][:n])
+    pts += np.random.uniform(-0.015, 0.015, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    v = np.zeros(3 * n)
+    v[0::3] = pts[:, 0]
+    v[1::3] = pts[:, 1]
+    v[2::3] = 0.06
+    inits.append(v)
+    
+    # 3. Random Uniform
+    pts = np.random.uniform(0.1, 0.9, (n, 2))
+    v = np.zeros(3 * n)
+    v[0::3] = pts[:, 0]
+    v[1::3] = pts[:, 1]
+    v[2::3] = 0.05
+    inits.append(v)
+    
+    # 4. Corner & Edge Focused
+    pts = []
+    for cx, cy in [(0.15, 0.15), (0.85, 0.15), (0.15, 0.85), (0.85, 0.85)]:
+        pts.append([cx, cy])
+    for cx, cy in [(0.5, 0.1), (0.5, 0.9), (0.1, 0.5), (0.9, 0.5)]:
+        pts.append([cx, cy])
+    remaining = n - len(pts)
+    pts.extend(np.random.uniform(0.2, 0.8, (remaining, 2)))
+    pts = np.array(pts)
+    pts += np.random.uniform(-0.01, 0.01, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    v = np.zeros(3 * n)
+    v[0::3] = pts[:, 0]
+    v[1::3] = pts[:, 1]
+    v[2::3] = 0.06
+    inits.append(v)
+    
+    return inits
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_vars = None
+    best_sum = -np.inf
+    
+    # Multi-restart strategy with diverse initial layouts
+    for seed in range(12):
+        inits = generate_inits(n, seed)
+        for v0 in inits:
+            try:
+                res = minimize(
+                    objective,
+                    v0,
+                    method='SLSQP',
+                    bounds=bounds,
+                    constraints=cons,
+                    options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False}
+                )
+                if res.success:
+                    current_sum = -res.fun
+                    if current_sum > best_sum:
+                        best_sum = current_sum
+                        best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # Fallback if optimization fails completely
+    if best_vars is None:
+        best_vars = generate_inits(n, 0)[0]
+        best_sum = -objective(best_vars)
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    
+    # Ensure non-negative radii
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(best_sum)
+```

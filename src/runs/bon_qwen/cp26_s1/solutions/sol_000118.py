@@ -1,5 +1,5 @@
 # sol_000118 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 4a327247) state=d8b66414 sum of radii=2.617760 correctness=1.0
+# generation=0 parent=seed (state 4ac25994) state=32ca1949 sum of radii=2.547202 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,75 +7,135 @@
 import numpy as np
 from scipy.optimize import minimize
 
-N = 26
+# Top-level factory functions to avoid lambdas and closures
+def make_x_min_constraint(i, N):
+    def func(v):
+        return v[2 * i] - v[2 * N + i]
+    return func
 
-def objective(vars):
-    """Minimize negative sum of radii (equivalent to maximizing sum)."""
-    radii = vars[2*N:]
-    return -np.sum(radii)
+def make_x_max_constraint(i, N):
+    def func(v):
+        return 1.0 - v[2 * i] - v[2 * N + i]
+    return func
 
-def constraint_fun(vars):
-    """Vectorized constraint function: boundary and non-overlap."""
-    centers = vars[:2*N].reshape(N, 2)
-    radii = vars[2*N:]
+def make_y_min_constraint(i, N):
+    def func(v):
+        return v[2 * i + 1] - v[2 * N + i]
+    return func
+
+def make_y_max_constraint(i, N):
+    def func(v):
+        return 1.0 - v[2 * i + 1] - v[2 * N + i]
+    return func
+
+def make_r_min_constraint(i, N):
+    def func(v):
+        return v[2 * N + i] - 1e-7
+    return func
+
+def make_pair_constraint(i, j, N):
+    def func(v):
+        xi, yi, ri = 2 * i, 2 * i + 1, 2 * N + i
+        xj, yj, rj = 2 * j, 2 * j + 1, 2 * N + j
+        return (v[xi] - v[xj])**2 + (v[yi] - v[yj])**2 - (v[ri] + v[rj])**2
+    return func
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    N = 26
+    
+    # 1. Initial Layout: Hexagonal Packing
+    # Row counts: 6, 5, 6, 5, 4 sums to 26
+    row_counts = [6, 5, 6, 5, 4]
+    r_init = 0.08
+    h = np.sqrt(3) * r_init
+    
+    centers = []
+    y = r_init
+    for row_idx, cnt in enumerate(row_counts):
+        for k in range(cnt):
+            if row_idx % 2 == 0:
+                x = r_init + k * 2 * r_init
+            else:
+                x = 2 * r_init + k * 2 * r_init
+            centers.append([x, y])
+        y += h
+        
+    centers = np.array(centers)
+    
+    # Normalize to [0, 1] with padding to allow room for expansion
+    c_min = centers.min(axis=0)
+    c_max = centers.max(axis=0)
+    c_range = c_max - c_min
+    scale = 0.85 / c_range.max()
+    centers = (centers - c_min) * scale + (1.0 - scale) / 2.0
+    radii = np.full(N, r_init * 0.4)
+    
+    # 2. Prepare Optimization
+    # Variable vector: [x0, y0, x1, y1, ..., x25, y25, r0, r1, ..., r25]
+    x0 = np.concatenate([centers.flatten(), radii])
     
     cons = []
-    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
-    cons.append(centers[:, 0] - radii)
-    cons.append(1 - radii - centers[:, 0])
-    cons.append(centers[:, 1] - radii)
-    cons.append(1 - radii - centers[:, 1])
-    
-    # Overlap constraints: dist^2 >= (r_i + r_j)^2
-    dx = centers[:, 0, None] - centers[:, 0]
-    dy = centers[:, 1, None] - centers[:, 1]
-    dist_sq = dx**2 + dy**2
-    r_sum = radii[:, None] + radii[None, :]
-    # Only consider upper triangle pairs to avoid duplicates
-    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
-    cons.append((dist_sq - r_sum**2)[mask])
-    
-    return np.concatenate(cons)
-
-def run_packing():
-    np.random.seed(42)
-    
-    # Initialize centers on a hexagonal lattice pattern
-    pts = []
-    s = 0.22
-    for i in range(7):
-        for j in range(7):
-            x = 0.1 + j * s + (0.5 * s if i % 2 == 1 else 0)
-            y = 0.1 + i * s * np.sqrt(3)/2
-            if x <= 0.9 and y <= 0.9:
-                pts.append([x, y])
-                
-    pts = np.array(pts[:N])
-    # Fallback to grid if hex pattern yields fewer than N points
-    if len(pts) < N:
-        grid = np.array(np.meshgrid(np.linspace(0.15, 0.85, 6), np.linspace(0.15, 0.85, 6))).T.reshape(-1, 2)
-        pts = np.vstack([pts, grid[len(pts):N]])
+    for i in range(N):
+        cons.append({'type': 'ineq', 'fun': make_x_min_constraint(i, N)})
+        cons.append({'type': 'ineq', 'fun': make_x_max_constraint(i, N)})
+        cons.append({'type': 'ineq', 'fun': make_y_min_constraint(i, N)})
+        cons.append({'type': 'ineq', 'fun': make_y_max_constraint(i, N)})
+        cons.append({'type': 'ineq', 'fun': make_r_min_constraint(i, N)})
         
-    # Small perturbation to break symmetry and aid optimization
-    pts += np.random.uniform(-0.005, 0.005, pts.shape)
+    for i in range(N):
+        for j in range(i + 1, N):
+            cons.append({'type': 'ineq', 'fun': make_pair_constraint(i, j, N)})
+            
+    # Bounds for variables
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
     
-    # Start with small radii to ensure initial feasibility
-    radii_init = np.full(N, 0.03)
-    x0 = np.hstack([pts.flatten(), radii_init])
-    
-    bounds = [(0, 1)] * (2*N) + [(0, 0.5)] * N
-    
-    cons = {'type': 'ineq', 'fun': constraint_fun}
-    
+    # Objective: Maximize sum of radii => Minimize -sum(radii)
+    def objective(v):
+        return -np.sum(v[2 * N:])
+        
     # Run SLSQP optimization
-    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
-                   options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False})
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
                    
-    centers = res.x[:2*N].reshape(N, 2)
-    radii = res.x[2*N:]
+    # Extract results
+    final_centers = res.x[:2 * N].reshape((N, 2))
+    final_radii = res.x[2 * N:]
     
-    # Ensure numerical cleanliness
-    radii = np.maximum(radii, 0.0)
-    centers = np.clip(centers, 0.0, 1.0)
+    # Safety clamp and validation check
+    final_radii = np.maximum(final_radii, 0.0)
+    final_centers = np.clip(final_centers, 0.0, 1.0)
     
-    return centers, radii, float(np.sum(radii))
+    # Re-validate locally to ensure no numerical drift violates constraints strictly
+    # If invalid, fallback to a scaled down version of the result
+    valid = True
+    for i in range(N):
+        if final_centers[i, 0] - final_radii[i] < -1e-9 or final_centers[i, 0] + final_radii[i] > 1 + 1e-9:
+            valid = False
+        if final_centers[i, 1] - final_radii[i] < -1e-9 or final_centers[i, 1] + final_radii[i] > 1 + 1e-9:
+            valid = False
+            
+    if valid:
+        for i in range(N):
+            for j in range(i + 1, N):
+                dist = np.sqrt(np.sum((final_centers[i] - final_centers[j])**2))
+                if dist < final_radii[i] + final_radii[j] - 1e-9:
+                    valid = False
+                    break
+            if not valid:
+                break
+                
+    if not valid:
+        # Fallback: shrink radii slightly until valid
+        scale_factor = 0.99
+        for _ in range(50):
+            final_radii *= scale_factor
+            is_valid = True
+            for i in range(N):
+                if final_centers[i, 0] - final_radii[i] < 0 or final_centers[i, 0] + final_radii[i] > 1:
+                    is_valid = False
+                if final_centers[i, 1] - final_radii[i] < 0 or final_centers[i, 1] + final_radii[i] > 1:
+                    is_valid = False
+            if is_valid:
+                break
+                
+    return final_centers, final_radii, float(np.sum(final_radii))

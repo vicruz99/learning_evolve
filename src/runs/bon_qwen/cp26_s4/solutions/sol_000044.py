@@ -1,0 +1,191 @@
+# sol_000044 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 12653929) state=0c7389ac sum of radii=2.063257 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square to maximize the sum of radii.
+    """
+    n_circles = 26
+    
+    # --- 1. Initial Configuration (Jittered Grid) ---
+    # Create a 5x5 grid of cells. We need 26 circles.
+    # We place 25 circles in the grid cells and 1 extra circle in the largest gap or randomly.
+    # A 5x5 grid implies 25 cells. We can just assign random points within these cells.
+    
+    # Grid dimensions
+    grid_cols = 5
+    grid_rows = 5
+    cell_w = 1.0 / grid_cols
+    cell_h = 1.0 / grid_rows
+    
+    centers = np.zeros((n_circles, 2))
+    
+    # Fill 25 circles in grid cells
+    idx = 0
+    for r in range(grid_rows):
+        for c in range(grid_cols):
+            x = c * cell_w + np.random.uniform(0, cell_w)
+            y = r * cell_h + np.random.uniform(0, cell_h)
+            # Clip slightly to ensure valid start, though LP handles boundaries
+            x = np.clip(x, 1e-4, 1 - 1e-4)
+            y = np.clip(y, 1e-4, 1 - 1e-4)
+            centers[idx] = [x, y]
+            idx += 1
+            
+    # Place 26th circle in the center of the square (a common gap in odd grids)
+    # or a random location. Let's try center.
+    centers[25] = [0.5, 0.5]
+    
+    # --- 2. Helper: Solve LP for optimal radii given centers ---
+    def get_optimal_radii(centers):
+        """
+        Solves LP to maximize sum(r_i) subject to:
+        r_i + r_j <= dist(c_i, c_j)
+        r_i <= dist(c_i, wall)
+        r_i >= 0
+        """
+        n = centers.shape[0]
+        
+        # Objective: minimize -sum(r_i) => c = [-1, -1, ..., -1]
+        c = np.ones(n) * -1.0
+        
+        # Constraints: A_ub @ r <= b_ub
+        # We will collect rows for A_ub and values for b_ub
+        constraints_A = []
+        constraints_b = []
+        
+        # Pairwise constraints: r_i + r_j <= d_ij
+        # Precompute distances to speed up? N=26 is small enough.
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                
+                # Row with 1 at i and 1 at j
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                constraints_A.append(row)
+                constraints_b.append(dist)
+        
+        # Wall constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+        for i in range(n):
+            x, y = centers[i]
+            # r_i <= x
+            row = np.zeros(n); row[i] = 1.0
+            constraints_A.append(row)
+            constraints_b.append(x)
+            
+            # r_i <= 1-x
+            row = np.zeros(n); row[i] = 1.0
+            constraints_A.append(row)
+            constraints_b.append(1 - x)
+            
+            # r_i <= y
+            row = np.zeros(n); row[i] = 1.0
+            constraints_A.append(row)
+            constraints_b.append(y)
+            
+            # r_i <= 1-y
+            row = np.zeros(n); row[i] = 1.0
+            constraints_A.append(row)
+            constraints_b.append(1 - y)
+            
+        A_ub = np.array(constraints_A)
+        b_ub = np.array(constraints_b)
+        
+        # Bounds: r_i >= 0
+        bounds = [(0, None)] * n
+        
+        # Solve
+        # method='highs' is fast and robust
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success:
+            return -res.fun, res.x
+        else:
+            # Fallback if LP fails (shouldn't happen with r=0 feasible)
+            return 0.0, np.zeros(n)
+
+    # --- 3. Optimization (Simulated Annealing) ---
+    
+    # Initial evaluation
+    current_sum, current_radii = get_optimal_radii(centers)
+    best_sum = current_sum
+    best_centers = centers.copy()
+    best_radii = current_radii.copy()
+    
+    # SA Parameters
+    temp = 0.05  # Initial temperature (step size magnitude roughly)
+    min_temp = 1e-6
+    cooling_rate = 0.995
+    num_iterations = 3000 # Number of iterations
+    
+    # To ensure we explore well, we can also restart or use multiple runs, 
+    # but a single good SA run with decent initialization is usually sufficient.
+    
+    for _ in range(num_iterations):
+        # Pick a random circle to move
+        idx = np.random.randint(0, n_circles)
+        
+        # Propose a move
+        # Move distance proportional to temperature
+        move_x = np.random.normal(0, temp)
+        move_y = np.random.normal(0, temp)
+        
+        new_centers = centers.copy()
+        new_centers[idx, 0] = np.clip(new_centers[idx, 0] + move_x, 1e-5, 1 - 1e-5)
+        new_centers[idx, 1] = np.clip(new_centers[idx, 1] + move_y, 1e-5, 1 - 1e-5)
+        
+        # Evaluate new configuration
+        new_sum, new_radii = get_optimal_radii(new_centers)
+        
+        # Acceptance criterion
+        delta = new_sum - current_sum
+        
+        if delta > 0 or np.random.random() < np.exp(delta / (temp + 1e-10)):
+            # Accept move
+            centers = new_centers
+            current_sum = new_sum
+            current_radii = new_radii
+            
+            # Update best
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = current_radii.copy()
+        
+        # Cool down
+        if temp > min_temp:
+            temp *= cooling_rate
+            
+        # Occasionally restart temperature if stuck? 
+        # Not strictly necessary with good initial guess, but helps.
+        # We'll rely on the initial jittered grid.
+
+    # Final validation and formatting
+    # The LP guarantees valid radii for the centers, but let's ensure numerical stability.
+    # The centers returned are 'best_centers', radii 'best_radii'.
+    
+    # Check for any tiny negative radii due to numerical noise in LP result?
+    # LP returns r >= 0, but floating point might give -1e-16.
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, best_sum
+
+# Function required by prompt
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    # (Provided in prompt, included here for completeness if needed, 
+    # but the prompt says "We will run the below validation function")
+    # I will not redefine it here to avoid conflicts, assuming the environment has it.
+    pass

@@ -1,0 +1,268 @@
+# sol_000366 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b037cf31) state=68fa01cb sum of radii=0.800041 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def dist(p1, p2):
+    return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+def get_max_radius(center, centers, radii, idx):
+    """
+    Calculates the maximum possible radius for circle at idx 
+    given the current positions of all circles and their radii.
+    Actually, we want to calculate the max radius allowed by geometry,
+    independent of current radii (since we are optimizing sum).
+    The constraint is distance >= r_i + r_j.
+    So r_i <= dist(i, j) - r_j.
+    This couples radii. 
+    Instead, let's calculate the max radius if all other circles were points? 
+    No, that's not correct.
+    
+    For the optimization, we can treat radii as dependent on centers if we assume 
+    a specific relationship, or optimize both.
+    A common heuristic for maximizing sum of radii is to assume circles grow 
+    until they hit a constraint.
+    
+    Let's define a 'slack' or 'valid radius' based on current centers assuming 
+    other circles have their current radii? 
+    Or better: Maximize sum of r_i subject to r_i + r_j <= dist(i,j).
+    This is a linear program for fixed centers!
+    Maximize sum(r_i)
+    s.t. r_i + r_j <= d_ij for all i < j
+         r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+         r_i >= 0
+         
+    We can solve this LP at each step of center optimization, or approximate it.
+    Since n=26 is small, we can use a simple iterative method to find max radii for fixed centers.
+    """
+    # Not used in final strategy directly, but logic applies.
+    pass
+
+def optimize_radii_for_centers(centers):
+    """
+    Given fixed centers, find radii that maximize sum of radii.
+    This is a Linear Programming problem:
+    Maximize sum(r_i)
+    Subject to:
+      r_i + r_j <= ||c_i - c_j|| for all i != j
+      r_i <= min(x_i, 1-x_i, y_i, 1-y_i) for all i
+      r_i >= 0
+    """
+    n = centers.shape[0]
+    r = np.ones(n) * 0.01 # Initial guess
+    
+    # Simple iterative solver for the radii constraints
+    # r_i <= dist(i,j) - r_j  => r_i + r_j <= dist
+    # This is equivalent to finding the largest r vector in the polytope.
+    # We can use a method of successive projections or gradient ascent.
+    
+    # Constraints matrix A r <= b
+    # But n=26, 26*25/2 = 325 pairwise constraints + 26*4 boundary constraints.
+    # Too big for simple manual LP, but we can use a relaxation.
+    
+    # Let's use a simple 'water filling' or 'pushing' approach.
+    # Initialize r_i to max possible from boundaries.
+    for i in range(n):
+        x, y = centers[i]
+        r[i] = min(x, 1-x, y, 1-y)
+    
+    # Iteratively reduce r_i if it violates pairwise constraints
+    converged = False
+    iteration = 0
+    while not converged and iteration < 100:
+        converged = True
+        iteration += 1
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = dist(centers[i], centers[j])
+                if r[i] + r[j] > d + 1e-9:
+                    # Constraint violated. Reduce the larger one? 
+                    # Or split the difference?
+                    # To maximize sum, we want to keep sum as high as possible.
+                    # If r[i] + r[j] > d, we must reduce sum by (r[i] + r[j] - d).
+                    # We should reduce the radii proportionally or reduce the one 
+                    # that is less constrained by others?
+                    # Heuristic: reduce the larger radius.
+                    if r[i] > r[j]:
+                        excess = (r[i] + r[j] - d) / 2.0
+                        r[i] -= excess
+                        r[j] -= excess # Actually sum must decrease by excess*2? 
+                        # Wait. r[i]_new + r[j]_new = d.
+                        # If we reduce both by excess, sum becomes d.
+                        # But we want to maximize sum. The constraint is hard.
+                        # The sum is already determined by the bottleneck?
+                        # Actually, this greedy reduction might not be optimal globally.
+                        # But for local optimization it's okay.
+                    else:
+                        excess = (r[i] + r[j] - d) / 2.0
+                        r[i] -= excess
+                        r[j] -= excess
+                    # Clamp to 0
+                    if r[i] < 0: r[i] = 0
+                    if r[j] < 0: r[j] = 0
+                    converged = False
+        # Re-apply boundary constraints
+        for i in range(n):
+            x, y = centers[i]
+            max_r_boundary = min(x, 1-x, y, 1-y)
+            if r[i] > max_r_boundary:
+                r[i] = max_r_boundary
+                converged = False
+                
+    return r
+
+def run_packing():
+    np.random.seed(42)
+    n = 26
+    
+    # Initialize centers in a hexagonal lattice pattern
+    # 6 rows to fit 26 circles.
+    # Pattern: 5, 4, 5, 4, 5, 3? Sum = 26.
+    # Or 5, 5, 5, 5, 5, 1?
+    # Let's try to distribute them somewhat evenly.
+    # Hexagonal spacing: vertical dist h, horizontal shift dx.
+    # We want to fill [0,1]x[0,1].
+    
+    centers = np.zeros((n, 2))
+    
+    # Try to place in 6 rows
+    rows = [5, 4, 5, 4, 5, 3] # Sum = 26
+    # Vertical spacing
+    # 6 rows -> 5 gaps. Height 1.
+    # Approx y coords
+    y_coords = np.linspace(0.5 / (len(rows)), 1 - 0.5 / (len(rows)), len(rows)) 
+    # Better: center rows
+    y_coords = np.linspace(0.15, 0.85, len(rows)) # Adjust based on radii later
+    
+    idx = 0
+    for i, count in enumerate(rows):
+        y = y_coords[i]
+        # Stagger rows
+        if i % 2 == 1:
+            # Shifted row
+            # x range [0, 1]
+            # count circles.
+            # Spacing 1/(count) approx?
+            # In hex packing, spacing is 2r. 
+            # If we don't know r, just distribute evenly.
+            # Shift by 0.5 * spacing?
+            spacing = 1.0 / (count + 1) # tentative
+            start_x = spacing
+        else:
+            spacing = 1.0 / (count + 1)
+            start_x = spacing
+            
+        # Actually, let's just use linspace
+        x_coords = np.linspace(0.1, 0.9, count) # Rough placement
+        if i % 2 == 1:
+            # Shift x coordinates slightly to nestle?
+            # If previous row had count+1 or count-1?
+            # Here counts alternate 5, 4, 5...
+            # 4 circles can fit in gaps of 5.
+            # Gaps of 5 circles (spaced 0.2) are at 0.2, 0.4, 0.6, 0.8?
+            # If 5 circles at 0.1, 0.3, 0.5, 0.7, 0.9.
+            # Gaps at 0.2, 0.4, 0.6, 0.8.
+            # So 4 circles should be at 0.2, 0.4, 0.6, 0.8.
+            x_coords = np.array([0.2, 0.4, 0.6, 0.8])
+        else:
+            # 5 circles
+            x_coords = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+            
+        for k in range(count):
+            centers[idx, 0] = x_coords[k]
+            centers[idx, 1] = y
+            idx += 1
+            
+    # Add some noise to break symmetry and help optimization
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    # Clip to [0,1]
+    centers = np.clip(centers, 0.01, 0.99)
+    
+    # Optimization Loop
+    # We will alternate between:
+    # 1. Optimizing radii for fixed centers (Linear Programming relaxation)
+    # 2. Moving centers to increase sum of radii
+    
+    radii = np.ones(n) * 0.05
+    
+    learning_rate = 0.05
+    decay = 0.95
+    
+    for step in range(500):
+        # Step 1: Optimize radii for current centers
+        # We use the iterative solver defined above
+        radii = optimize_radii_for_centers(centers)
+        
+        current_sum = np.sum(radii)
+        
+        # Step 2: Gradient ascent on centers to increase sum of radii
+        # Heuristic: Move circles away from each other and boundaries.
+        # Force on circle i:
+        # From boundary: push away from walls if r_i is close to boundary limit.
+        # From neighbors: repulsive force proportional to violation of r_i + r_j <= dist.
+        
+        forces = np.zeros_like(centers)
+        
+        for i in range(n):
+            # Boundary forces
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left
+            if x - r < 1e-6:
+                forces[i, 0] += (1e-6 - (x - r)) * 10.0 # Push right
+            # Right
+            if x + r > 1 - 1e-6:
+                forces[i, 0] -= ((x + r) - (1 - 1e-6)) * 10.0
+            # Bottom
+            if y - r < 1e-6:
+                forces[i, 1] += (1e-6 - (y - r)) * 10.0
+            # Top
+            if y + r > 1 - 1e-6:
+                forces[i, 1] -= ((y + r) - (1 - 1e-6)) * 10.0
+            
+            # Neighbor forces
+            for j in range(i + 1, n):
+                d = dist(centers[i], centers[j])
+                r_sum = radii[i] + radii[j]
+                if d < r_sum:
+                    # Overlap. Push apart.
+                    # Force magnitude proportional to overlap
+                    overlap = r_sum - d
+                    if d > 1e-9:
+                        dir_vec = (centers[i] - centers[j]) / d
+                        force_mag = overlap * 5.0 # Strong repulsion
+                        forces[i] += dir_vec * force_mag
+                        forces[j] -= dir_vec * force_mag
+                    else:
+                        # Same position, push randomly
+                        forces[i, 0] += np.random.uniform(-1, 1)
+                        forces[i, 1] += np.random.uniform(-1, 1)
+                        forces[j, 0] -= np.random.uniform(-1, 1)
+                        forces[j, 1] -= np.random.uniform(-1, 1)
+        
+        # Apply forces
+        centers += forces * learning_rate
+        
+        # Clip centers to valid range [epsilon, 1-epsilon]
+        centers = np.clip(centers, 0.001, 0.999)
+        
+        # Decay learning rate
+        learning_rate *= 0.995
+        
+        # Periodic re-initialization of radii to ensure they reflect new centers
+        # (optimize_radii_for_centers does this)
+        
+    # Final radii calculation
+    radii = optimize_radii_for_centers(centers)
+    
+    # Verify and clamp any tiny negative values due to numerical errors
+    radii = np.maximum(radii, 0.0)
+    
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

@@ -1,0 +1,122 @@
+# sol_000101 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 80fa60f2) state=6aca1d30 sum of radii=2.550206 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def generate_hex_initialization(n):
+    """
+    Generates initial center coordinates in a hexagonal packing pattern.
+    """
+    centers = np.zeros((n, 2))
+    row_height = np.sqrt(3) / 2 * 0.25  # Scaled for unit square spacing
+    x_spacing = 0.25
+    
+    idx = 0
+    row = 0
+    while idx < n:
+        x_offset = (row % 2) * (x_spacing / 2)
+        # Determine how many circles fit in this row
+        # We want them roughly centered in [0.1, 0.9]
+        num_in_row = n - idx
+        if num_in_row > 10:
+            num_in_row = 10 # Cap row length to keep aspect ratio square-ish
+            
+        for i in range(num_in_row):
+            if idx < n:
+                x = 0.1 + x_offset + i * x_spacing
+                y = 0.1 + row * row_height * 2.5 # Adjust vertical spacing
+                centers[idx] = [x, y]
+                idx += 1
+        row += 1
+        
+    # If we still haven't filled all, add remaining randomly in gaps (fallback)
+    # But the loop above should handle it.
+    # Normalize/Scale if needed, but [0,1] is target.
+    # Let's scale centers to fit well within [0.2, 0.8] initially
+    cx_min, cy_min = np.min(centers[:, 0]), np.min(centers[:, 1])
+    cx_max, cy_max = np.max(centers[:, 0]), np.max(centers[:, 1])
+    
+    if cx_max > cx_min:
+        centers[:, 0] = (centers[:, 0] - cx_min) / (cx_max - cx_min) * 0.6 + 0.2
+    if cy_max > cy_min:
+        centers[:, 1] = (centers[:, 1] - cy_min) / (cy_max - cy_min) * 0.6 + 0.2
+        
+    return centers
+
+def run_packing():
+    n = 26
+    init_centers = generate_hex_initialization(n)
+    init_radii = np.full(n, 0.01) # Start with small radii
+    
+    # Flatten variables: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = init_centers[i, 0]
+        x0[3*i+1] = init_centers[i, 1]
+        x0[3*i+2] = init_radii[i]
+        
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    # Constraints
+    constraints = []
+    
+    # Boundary constraints for each circle
+    # 1. x - r >= 0
+    # 2. 1 - x - r >= 0
+    # 3. y - r >= 0
+    # 4. 1 - y - r >= 0
+    for i in range(n):
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i] - v[3*i+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i+1] - v[3*i+2]})
+        
+    # Non-overlap constraints
+    # dist^2 >= (r_i + r_j)^2
+    for i in range(n):
+        for j in range(i + 1, n):
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda v, i=i, j=j: 
+                    (v[3*i] - v[3*j])**2 + (v[3*i+1] - v[3*j+1])**2 - (v[3*i+2] + v[3*j+2])**2
+            })
+            
+    # Objective function: Maximize sum of radii -> Minimize negative sum
+    def objective(v):
+        r_sum = 0.0
+        for i in range(n):
+            r_sum += v[3*i+2]
+        return -r_sum
+        
+    # Optimization options
+    options = {
+        'maxiter': 2000,
+        'ftol': 1e-10,
+        'disp': False
+    }
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options=options)
+        success = res.success
+    except Exception:
+        success = False
+        
+    # Construct output arrays
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    for i in range(n):
+        centers[i, 0] = res.x[3*i]
+        centers[i, 1] = res.x[3*i+1]
+        radii[i] = res.x[3*i+2]
+        
+    total_radius = np.sum(radii)
+    
+    return centers, radii, total_radius

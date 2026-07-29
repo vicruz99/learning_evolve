@@ -1,0 +1,184 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.626, we need a more robust global search strategy combined with precise local polishing. The current approach uses SLSQP, which is excellent for constrained nonlinear optimization but prone to local minima. 
+
+Key improvements in this strategy:
+1. **Strictly Feasible Initialization**: SLSQP performs poorly if started with violated constraints. We generate initial layouts (hexagonal, grid, random) and compute strictly feasible radii (`0.85 * min(boundary_dist, 0.5 * nearest_neighbor_dist)`). This guarantees all inequality constraints start strictly positive.
+2. **Diverse Topology Search**: We run 120 restarts cycling through hexagonal, square grid, and Poisson-like random distributions. Hexagonal patterns naturally approach optimal packing density, while random starts help escape symmetry-induced local minima.
+3. **Iterative Perturbation & Polish**: After finding the best configuration from the broad search, we perform 60 targeted perturbations around the incumbent best solution. This simulates a local basin exploration. Finally, a high-precision polish run (`ftol=1e-15`, `maxiter=5000`) extracts every last bit of optimality.
+4. **Constraint Formulation**: We maintain the squared distance constraint `dist^2 >= (r_i + r_j)^2` which avoids square roots, making the constraint function smoother and faster to evaluate while preserving mathematical equivalence for non-overlap.
+5. **Robust Validation**: Every candidate is checked against a `-1e-8` tolerance to ensure numerical feasibility before accepting it as the new best. This prevents the optimizer from returning "successful" but slightly infeasible results due to gradient approximation errors.
+
+This multi-phase approach systematically explores the landscape, guarantees feasibility throughout optimization, and aggressively polishes the best found structure to maximize the sum of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def constraint_func(v):
+    """
+    Computes inequality constraints: boundary containment and pairwise separation.
+    All constraints are formulated as g(v) >= 0.
+    """
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    
+    c = []
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Pairwise separation: dist^2 >= (r_i + r_j)^2
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    
+    # Upper triangular mask to avoid duplicates and self-comparison
+    mask = np.triu(np.ones((N_CIRCLES, N_CIRCLES), dtype=bool), k=1)
+    c.append(dist2[mask] - rs[mask]**2)
+    
+    return np.concatenate(c)
+
+def make_init(seed, init_type):
+    """Generates a strictly feasible initial configuration."""
+    rng = np.random.RandomState(seed)
+    pts = np.zeros((N_CIRCLES, 2))
+    
+    if init_type == 0: # Hexagonal lattice
+        r_est = 0.095
+        y = r_est
+        row = 0
+        idx = 0
+        while idx < N_CIRCLES and y <= 1.0 - r_est + 0.01:
+            x = r_est + (row % 2) * r_est
+            while x <= 1.0 - r_est + 0.01 and idx < N_CIRCLES:
+                pts[idx] = [x, y]
+                idx += 1
+                x += 2.0 * r_est
+            y += np.sqrt(3.0) * r_est
+            row += 1
+    elif init_type == 1: # Square grid + center
+        for i in range(5):
+            for j in range(5):
+                pts[i*5+j] = [0.1 + i*0.2, 0.1 + j*0.2]
+        pts[25] = [0.5, 0.5]
+    else: # Random distribution
+        pts = rng.uniform(0.02, 0.98, (N_CIRCLES, 2))
+        
+    # Add controlled perturbation
+    pts += rng.uniform(-0.03, 0.03, pts.shape)
+    pts = np.clip(pts, 0.01, 0.99)
+    
+    # Compute strictly feasible initial radii
+    radii = np.zeros(N_CIRCLES)
+    for i in range(N_CIRCLES):
+        d_bound = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+        d_min = 1.0
+        for j in range(N_CIRCLES):
+            if i != j:
+                d = np.sqrt(np.sum((pts[i] - pts[j])**2))
+                if d < d_min:
+                    d_min = d
+        # Scale down slightly to guarantee strict feasibility for SLSQP start
+        radii[i] = 0.85 * min(d_bound, 0.5 * d_min)
+        
+    v0 = np.zeros(3 * N_CIRCLES)
+    v0[0::3] = pts[:, 0]
+    v0[1::3] = pts[:, 1]
+    v0[2::3] = radii
+    return v0
+
+def run_packing():
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -np.inf
+    best_v = None
+    
+    # Phase 1: Broad search from diverse structured and random starts
+    for seed in range(120):
+        init_type = seed % 3
+        v0 = make_init(seed, init_type)
+        
+        try:
+            res = minimize(
+                objective, 
+                v0, 
+                method='SLSQP', 
+                bounds=bounds,
+                constraints=cons, 
+                options={'maxiter': 3000, 'ftol': 1e-13}
+            )
+            # Verify constraint satisfaction within numerical tolerance
+            c_val = constraint_func(res.x)
+            if np.min(c_val) >= -1e-8:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Targeted local perturbation around the best found configuration
+    if best_v is not None:
+        for k in range(60):
+            rng = np.random.RandomState(k + 2000)
+            v0 = best_v + rng.normal(0, 0.004, best_v.shape)
+            v0[0::3] = np.clip(v0[0::3], 0.01, 0.99)
+            v0[1::3] = np.clip(v0[1::3], 0.01, 0.99)
+            v0[2::3] = np.clip(v0[2::3], 0.001, 0.49)
+            
+            try:
+                res = minimize(
+                    objective, 
+                    v0, 
+                    method='SLSQP', 
+                    bounds=bounds,
+                    constraints=cons, 
+                    options={'maxiter': 2500, 'ftol': 1e-13}
+                )
+                c_val = constraint_func(res.x)
+                if np.min(c_val) >= -1e-8:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_v = res.x.copy()
+            except Exception:
+                continue
+
+    # Phase 3: High-precision polishing of the global best
+    if best_v is not None:
+        try:
+            res_final = minimize(
+                objective, 
+                best_v, 
+                method='SLSQP', 
+                bounds=bounds,
+                constraints=cons, 
+                options={'maxiter': 5000, 'ftol': 1e-15}
+            )
+            if np.min(constraint_func(res_final.x)) >= -1e-8:
+                best_v = res_final.x
+                best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    # Extract and validate final result
+    centers = np.column_stack((best_v[0::3], best_v[1::3]))
+    radii = best_v[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

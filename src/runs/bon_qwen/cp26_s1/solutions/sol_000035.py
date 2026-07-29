@@ -1,218 +1,340 @@
 # sol_000035 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 8e46300b) state=9d8a35e2 sum of radii=2.583882 correctness=1.0
+# generation=0 parent=seed (state b079e3ed) state=acaec29b sum of radii=2.587234 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+import scipy.optimize as opt
+import math
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+def get_initial_centers_hexagonal(n, square_side=1.0):
     """
-    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Generate initial centers in a hexagonal lattice pattern.
     """
-    n = 26
-    rng = np.random.default_rng(42) # Fixed seed for reproducibility
+    centers = []
+    # Estimate spacing to fit n circles
+    # Area per circle ~ 1/n. r ~ sqrt(1/(pi*n)). spacing ~ 2r.
+    # Rough estimate for grid size
+    k = int(math.sqrt(n))
+    if k * k < n:
+        k += 1
+    
+    # Spacing
+    dx = square_side / k
+    dy = dx * math.sqrt(3) / 2
+    
+    count = 0
+    row = 0
+    y = square_side / 2.0 # Start middle
+    while count < n:
+        shift = (row % 2) * (dx / 2.0)
+        x = square_side / 2.0 - (k * dx) / 2.0 + shift + 0.5 * dx
+        col = 0
+        while count < n and x < square_side:
+            if 0 <= x <= square_side:
+                centers.append([x, y])
+                count += 1
+            x += dx
+            col += 1
+        y += dy
+        row += 1
+        # Also try negative y to fill up
+        if count < n:
+             # Fallback to random if hex pattern fails to generate enough
+             pass 
 
-    # --- 1. Generate Initial Guess ---
-    # A hexagonal lattice is denser than a square grid.
-    # We try to fit points in a hexagonal pattern and then optimize.
-    # Approximate radius for 26 circles is around 0.1.
-    # Let's create a grid of points and select 26, or just generate random points.
-    # A structured initialization is usually better.
-    
-    # Attempt a hexagonal packing layout
-    # Rows with alternating counts
-    # 6 rows: 5, 4, 5, 4, 5, 4 -> 27 circles. We can drop one.
-    # Or 5 rows: 6, 5, 6, 5, 6 -> 28 circles.
-    
-    # Let's generate a hexagonal grid and pick 26 points.
-    r_init = 0.08 # Initial radius guess
-    points = []
-    
-    # Hexagonal packing parameters
-    # Horizontal spacing 2*r, Vertical spacing sqrt(3)*r
-    # But we are placing centers.
-    # Let's just use a dense random initialization perturbed around a grid
-    # or a specific pattern.
-    
-    # Simple approach: Random points in [0,1]x[0,1]
-    # But to help convergence, let's place them on a grid first
-    # and then the optimizer will move them.
-    
-    # 6x6 grid has 36 points. We can take a subset.
-    # Or just 5x5 grid (25 points) plus one random point.
-    # Let's try a 6x6 grid subset.
-    
-    x_coords = np.linspace(0.1, 0.9, 10)
-    y_coords = np.linspace(0.1, 0.9, 10)
-    
-    # Generate all grid points
-    grid_points = np.array([(x, y) for x in x_coords for y in y_coords])
-    
-    # Select 26 points that are well spread
-    # Simplest: take first 26
-    init_centers = grid_points[:n]
-    
-    # Add some random noise to break symmetry
-    init_centers += rng.normal(0, 0.02, size=init_centers.shape)
-    
-    # Clip to valid range for centers (radius 0.08)
-    init_centers = np.clip(init_centers, 0.08, 0.92)
-    
-    init_radii = np.full(n, 0.05) # Start small to ensure feasibility
-    
-    # --- 2. Define Objective and Constraints ---
-    
-    def objective(params):
-        # params: [x1, y1, r1, x2, y2, r2, ...]
-        # We want to maximize sum of radii, so minimize negative sum
-        radii = params[2::3]
-        return -np.sum(radii)
-
-    def boundary_constraints(params):
-        constraints = []
-        for i in range(n):
-            x = params[3*i]
-            y = params[3*i + 1]
-            r = params[3*i + 2]
+    if len(centers) < n:
+        # Fill remaining with random
+        np.random.seed(42)
+        while len(centers) < n:
+            centers.append([np.random.uniform(0, 1), np.random.uniform(0, 1)])
             
-            # x - r >= 0  => r - x <= 0 is wrong. x - r >= 0
-            # scipy expects constraint >= 0
-            constraints.append(x - r - 1e-7)
-            constraints.append(1 - x - r - 1e-7)
-            constraints.append(y - r - 1e-7)
-            constraints.append(1 - y - r - 1e-7)
-        return np.array(constraints)
+    return np.array(centers[:n])
 
-    def overlap_constraints(params):
-        constraints = []
+def get_initial_centers_random(n):
+    """
+    Generate random initial centers.
+    """
+    np.random.seed(123) # Fixed seed for reproducibility
+    return np.random.uniform(0, 1, size=(n, 2))
+
+def get_initial_centers_grid(n):
+    """
+    Generate grid initial centers.
+    """
+    centers = []
+    k = int(math.ceil(math.sqrt(n)))
+    dx = 1.0 / k
+    dy = 1.0 / k
+    count = 0
+    for i in range(k):
+        for j in range(k):
+            if count < n:
+                centers.append([dx * (i + 0.5), dy * (j + 0.5)])
+                count += 1
+            else:
+                break
+    return np.array(centers[:n])
+
+def objective(x, n):
+    """
+    Objective function: Minimize negative sum of radii (to maximize sum).
+    x is vector of size 3*n: [x1, y1, r1, ..., xn, yn, rn]
+    """
+    radii = x[2::3]
+    return -np.sum(radii)
+
+def gradient_objective(x, n):
+    """
+    Gradient of the objective function.
+    """
+    grad = np.zeros_like(x)
+    grad[2::3] = -1.0
+    return grad
+
+def get_constraints(n):
+    """
+    Define constraints for the optimization problem.
+    1. Boundary constraints: x - r >= 0, 1 - x - r >= 0, etc.
+    2. Non-overlap constraints: dist^2 >= (r1 + r2)^2
+    """
+    constraints = []
+    
+    # Helper to add constraints
+    def add_constraint(fun, name, n_constraints=None):
+        constraints.append({
+            'type': 'ineq',
+            'fun': fun,
+            'jac': None, # Can provide jacobian for speed, but SLSQP handles it
+            'name': name
+        })
+
+    # 1. Boundary constraints
+    # x_i - r_i >= 0
+    # 1 - x_i - r_i >= 0
+    # y_i - r_i >= 0
+    # 1 - y_i - r_i >= 0
+    
+    # Vectorized boundary constraints might be tricky with standard scipy interface 
+    # if we want to pass them as separate dicts, but we can define a function that returns a vector.
+    # However, scipy.optimize.minimize with SLSQP accepts a list of constraint dicts.
+    # For efficiency, we can combine all boundary constraints into one vector function.
+    
+    def boundary_constraints(x):
+        vals = np.empty(4 * n)
+        idx = 0
+        for i in range(n):
+            xi = x[3*i]
+            yi = x[3*i+1]
+            ri = x[3*i+2]
+            
+            vals[idx] = xi - ri       # Left
+            vals[idx+1] = 1.0 - xi - ri # Right
+            vals[idx+2] = yi - ri     # Bottom
+            vals[idx+3] = 1.0 - yi - ri # Top
+            idx += 4
+        return vals
+
+    # Jacobian for boundary constraints
+    def jacobian_boundary_constraints(x):
+        J = np.zeros((4 * n, 3 * n))
+        for i in range(n):
+            base_j = 4 * i
+            base_x = 3 * i
+            
+            # xi - ri >= 0 -> d/dxi = 1, d/dri = -1
+            J[base_j, base_x] = 1.0
+            J[base_j, base_x+2] = -1.0
+            
+            # 1 - xi - ri >= 0 -> d/dxi = -1, d/dri = -1
+            J[base_j+1, base_x] = -1.0
+            J[base_j+1, base_x+2] = -1.0
+            
+            # yi - ri >= 0 -> d/dyi = 1, d/dri = -1
+            J[base_j+2, base_x+1] = 1.0
+            J[base_j+2, base_x+2] = -1.0
+            
+            # 1 - yi - ri >= 0 -> d/dyi = -1, d/dri = -1
+            J[base_j+3, base_x+1] = -1.0
+            J[base_j+3, base_x+2] = -1.0
+        return J
+
+    constraints.append({
+        'type': 'ineq',
+        'fun': boundary_constraints,
+        'jac': jacobian_boundary_constraints
+    })
+
+    # 2. Non-overlap constraints
+    # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+    num_pairs = n * (n - 1) // 2
+    
+    def overlap_constraints(x):
+        vals = np.empty(num_pairs)
+        idx = 0
         for i in range(n):
             for j in range(i + 1, n):
-                xi, yi = params[3*i], params[3*i + 1]
-                xj, yj = params[3*j], params[3*j + 1]
-                ri, rj = params[3*i + 2], params[3*j + 2]
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
                 
-                dist_sq = (xi - xj)**2 + (yi - yj)**2
-                sum_r = ri + rj
+                dx = xi - xj
+                dy = yi - yj
+                dist_sq = dx*dx + dy*dy
+                rad_sum_sq = (ri + rj)**2
                 
-                # dist >= sum_r  => dist^2 >= sum_r^2
-                # dist_sq - sum_r^2 >= 0
-                # To avoid square root in gradient, we can use squared distance
-                # But constraint is non-smooth at dist=0 if not careful? 
-                # Here dist won't be 0 if initialized well.
-                constraints.append(dist_sq - (sum_r)**2 - 1e-10) 
-        return np.array(constraints)
+                vals[idx] = dist_sq - rad_sum_sq
+                idx += 1
+        return vals
 
-    # Combine constraints
-    # Note: SLSQP can handle arrays of constraints
-    # But defining a single function returning array is better
+    # Jacobian for overlap constraints
+    def jacobian_overlap_constraints(x):
+        J = np.zeros((num_pairs, 3 * n))
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                
+                dx = xi - xj
+                dy = yi - yj
+                rs = ri + rj
+                dist_sq = dx*dx + dy*dy
+                
+                # Derivatives w.r.t xi, yi, ri, xj, yj, rj
+                # d/dxi (dx^2 + dy^2 - rs^2) = 2*dx
+                # d/dyi ... = 2*dy
+                # d/dri ... = -2*rs
+                # d/dxj ... = -2*dx
+                # d/dyj ... = -2*dy
+                # d/drj ... = -2*rs
+                
+                base_row = idx
+                
+                J[base_row, 3*i] = 2 * dx
+                J[base_row, 3*i+1] = 2 * dy
+                J[base_row, 3*i+2] = -2 * rs
+                
+                J[base_row, 3*j] = -2 * dx
+                J[base_row, 3*j+1] = -2 * dy
+                J[base_row, 3*j+2] = -2 * rs
+                
+                idx += 1
+        return J
+
+    constraints.append({
+        'type': 'ineq',
+        'fun': overlap_constraints,
+        'jac': jacobian_overlap_constraints
+    })
     
-    def all_constraints(params):
-        c1 = boundary_constraints(params)
-        c2 = overlap_constraints(params)
-        return np.concatenate([c1, c2])
+    return constraints
 
-    # Bounds
+def run_packing():
+    n = 26
+    constraints = get_constraints(n)
+    
+    # Bounds for variables: x in [0,1], y in [0,1], r in [0, 0.5]
+    # Actually r can be up to 0.5, but realistically smaller.
+    # x, y bounds are handled by constraints, but we can set bounds [0,1] for x,y to help solver.
+    # r bounds [0, 0.5]
     bounds = []
-    for i in range(n):
-        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)]) # x, y, r
-
-    # Initial parameters vector
-    x0 = np.zeros(3 * n)
-    for i in range(n):
-        x0[3*i] = init_centers[i, 0]
-        x0[3*i + 1] = init_centers[i, 1]
-        x0[3*i + 2] = init_radii[i]
-
-    # --- 3. Optimization ---
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    best_sum_radii = -1.0
+    best_x = None
     
-    # Options for SLSQP
-    options = {
-        'maxiter': 500,
-        'ftol': 1e-9,
-        'disp': False
-    }
-
-    # Run optimization
-    # Using SLSQP
-    res = minimize(
-        objective, 
-        x0, 
-        method='SLSQP', 
-        bounds=bounds,
-        constraints={'type': 'ineq', 'fun': all_constraints},
-        options=options
-    )
-
-    # Extract solution
-    best_params = res.x
-    centers = np.array([[best_params[3*i], best_params[3*i + 1]] for i in range(n)])
-    radii = np.array([best_params[3*i + 2] for i in range(n)])
-
-    # --- 4. Post-processing and Validation ---
+    # Try multiple initializations
+    initializations = [
+        get_initial_centers_hexagonal(n),
+        get_initial_centers_random(n),
+        get_initial_centers_grid(n)
+    ]
     
-    # Ensure non-negative radii (optimizer might push slightly negative if bound handling is loose)
-    radii = np.maximum(radii, 1e-9)
-    
-    # Re-check validity and fix if necessary
-    # If invalid, we might need to scale down slightly
-    valid = validate_packing(centers, radii)
-    
-    if not valid:
-        # Fallback: scale down radii until valid
-        # This is a brute force fix
-        scale = 1.0
-        while not valid and scale > 0.1:
-            scale *= 0.95
-            radii_scaled = radii * scale
-            valid = validate_packing(centers, radii_scaled)
-        radii = radii_scaled
-    
-    sum_radii = np.sum(radii)
-    
-    # Return result
-    return centers, radii, sum_radii
+    # Add some perturbed random initializations
+    np.random.seed(42)
+    for _ in range(3):
+        centers = get_initial_centers_random(n)
+        initializations.append(centers)
 
-def validate_packing(centers, radii):
-    """
-    Validate that circles don't overlap and are inside the unit square
-    """
-    import numpy as np
-    n = centers.shape[0]
+    for centers in initializations:
+        # Initial radii: small value to ensure validity, e.g., 0.01
+        initial_radii = np.full(n, 0.01)
+        
+        # Construct initial x vector
+        x0 = np.empty(3 * n)
+        for i in range(n):
+            x0[3*i] = centers[i, 0]
+            x0[3*i+1] = centers[i, 1]
+            x0[3*i+2] = initial_radii[i]
+            
+        # Try to optimize
+        try:
+            res = opt.minimize(
+                objective,
+                x0,
+                args=(n,),
+                method='SLSQP',
+                jac=gradient_objective,
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000, 'ftol': 1e-9, 'disp': False}
+            )
+            
+            if res.success or (res.fun < 0 and -res.fun > best_sum_radii):
+                current_sum = -res.fun
+                if current_sum > best_sum_radii:
+                    # Verify validity just in case numerical issues
+                    # We can't run the full validate function here easily without importing it, 
+                    # but we can do a quick check.
+                    # However, trusting SLSQP with tight tolerances is usually okay.
+                    # Let's just store the best result.
+                    best_sum_radii = current_sum
+                    best_x = res.x.copy()
+        except Exception:
+            continue
 
-    # Check for NaN values
-    if np.isnan(centers).any():
-        # print("NaN values detected in circle centers")
-        return False
+    # Post-processing: Clean up small negative radii or boundary violations
+    if best_x is not None:
+        # Extract centers and radii
+        centers_out = np.empty((n, 2))
+        radii_out = np.empty(n)
+        for i in range(n):
+            centers_out[i, 0] = best_x[3*i]
+            centers_out[i, 1] = best_x[3*i+1]
+            radii_out[i] = best_x[3*i+2]
+            
+        # Clip radii to non-negative
+        radii_out = np.maximum(radii_out, 0.0)
+        
+        # Clip centers to [0,1]
+        centers_out = np.clip(centers_out, 0.0, 1.0)
+        
+        # Final sanity check adjustment
+        # If a circle is slightly outside due to numerical error, shrink radius
+        for i in range(n):
+            x, y = centers_out[i]
+            r = radii_out[i]
+            margin = min(x, 1-x, y, 1-y)
+            if r > margin + 1e-9:
+                radii_out[i] = margin
+                if radii_out[i] < 0: radii_out[i] = 0
+                
+        final_sum = np.sum(radii_out)
+        return centers_out, radii_out, final_sum
 
-    if np.isnan(radii).any():
-        # print("NaN values detected in circle radii")
-        return False
+    # Fallback if optimization fails completely
+    centers = get_initial_centers_grid(n)
+    radii = np.full(n, 0.01)
+    return centers, radii, 0.26
 
-    # Check if radii are nonnegative and not nan
-    for i in range(n):
-        if radii[i] < 0:
-            # print(f"Circle {i} has negative radius {radii[i]}")
-            return False
-        elif np.isnan(radii[i]):
-            # print(f"Circle {i} has nan radius")
-            return False
+# Helper to run validation if needed (not part of solution, just for checking)
+# The problem statement says we must define run_packing.
+# We are inside the solution code block.
 
-    # Check if circles are inside the unit square
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
-            # print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
-            return False
-
-    # Check for overlaps
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
-                # print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
-                return False
-
-    return True
+if __name__ == "__main__":
+    centers, radii, s_r = run_packing()
+    print(f"Sum of radii: {s_r}")
+    print(f"Radii: {radii}")
+    print(f"Centers: {centers}")

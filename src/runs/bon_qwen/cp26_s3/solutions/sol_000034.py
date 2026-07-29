@@ -1,0 +1,265 @@
+# sol_000034 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1f550adc) state=68b2f178 sum of radii=2.505421 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import itertools
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n_circles = 26
+    best_sum_radii = 0.0
+    best_centers = None
+    best_radii = None
+
+    # Generate initial configurations (seeds)
+    seeds = []
+    
+    # Seed 1: Hexagonal grid pattern
+    rows = 5
+    cols = 5
+    # Approximate radius for 5x5 grid is 0.1. Hexagonal spacing allows tighter packing.
+    # Vertical spacing = r * sqrt(3), Horizontal = 2r
+    # Let's try to fit 26 circles. 5 rows of 5 + 1?
+    # Or just a perturbed grid.
+    
+    # Simple grid 5x5 plus one center
+    pts = []
+    for r in range(5):
+        for c in range(5):
+            x = 0.1 + c * 0.2
+            y = 0.1 + r * 0.2
+            pts.append([x, y])
+    pts.append([0.5, 0.5]) # 26th point
+    seeds.append(np.array(pts))
+
+    # Seed 2: Random points
+    rng = np.random.RandomState(42)
+    seeds.append(rng.rand(n_circles, 2))
+    
+    # Seed 3: Another grid configuration
+    pts2 = []
+    # Try to fit 6 in some rows?
+    # 5, 5, 6, 5, 5 is hard to fit with equal circles.
+    # Let's just do a denser random seed
+    seeds.append(rng.rand(n_circles, 2) * 0.8 + 0.1)
+
+    def objective(vars):
+        # vars: [x1, y1, ..., x26, y26, r]
+        # We want to maximize r, so minimize -r
+        return -vars[-1]
+
+    # Constraints
+    # Boundary: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    # Overlap: dist(i, j) >= 2r  => dist^2 - 4r^2 >= 0
+    
+    # To handle the large number of constraints efficiently in SLSQP, 
+    # we can define a function that returns all constraint values.
+    # However, SLSQP expects a list of constraint dicts or a function returning array.
+    # Let's use a list of functions for clarity, though it might be slower.
+    # For n=26, 325 pair constraints + 104 boundary constraints = 429 constraints.
+    # This is manageable.
+    
+    # Better approach for performance: 
+    # Use a penalty method or minimize a scalar objective with soft constraints?
+    # SLSQP is robust. Let's try to construct constraints.
+    
+    # Actually, constructing 429 functions is verbose.
+    # Let's use a single constraint function that returns an array of constraint values.
+    # scipy.optimize.minimize supports 'fun' returning a 1D array for constraints.
+    
+    def constraint_func(vars):
+        centers = vars[:2*n_circles].reshape(-1, 2)
+        r = vars[-1]
+        
+        # Boundary constraints
+        # x >= r  => x - r >= 0
+        # 1 - x >= r => 1 - x - r >= 0
+        # same for y
+        con_bound = []
+        for i in range(n_circles):
+            x, y = centers[i]
+            con_bound.append(x - r)
+            con_bound.append(1 - x - r)
+            con_bound.append(y - r)
+            con_bound.append(1 - y - r)
+            
+        # Overlap constraints
+        # dist^2 >= (2r)^2 => dist^2 - 4r^2 >= 0
+        con_overlap = []
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dist_sq = np.sum((centers[i] - centers[j])**2)
+                con_overlap.append(dist_sq - 4 * r**2)
+                
+        return np.array(con_bound + con_overlap)
+
+    # We need to define the constraint dict
+    constr = {
+        'type': 'ineq',
+        'fun': constraint_func
+        # Gradient (jac) can be omitted for numerical approximation, but analytical is better.
+        # Given the complexity, let's rely on numerical Jacobian first.
+    }
+
+    # Bounds for x, y in [0, 1] and r in [0, 0.5]
+    bounds = [(0, 1)] * (2 * n_circles) + [(0, 0.5)]
+
+    max_r_found = 0.0
+
+    for i, seed in enumerate(seeds):
+        # Prepare initial vector
+        # Flatten centers and append initial radius guess
+        # Guess radius 0.1
+        x0 = np.concatenate([seed.flatten(), [0.1]])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constr, options={'maxiter': 1000, 'ftol': 1e-9})
+            if res.success:
+                r_found = res.x[-1]
+                if r_found > max_r_found:
+                    max_r_found = r_found
+                    best_centers = res.x[:2*n_circles].reshape(-1, 2)
+        except Exception:
+            continue
+
+    # Fallback / Improvement: Force-directed layout to refine or find better local optima
+    # If optimization didn't yield great results, or to improve further.
+    # The equal radius assumption is strong. Let's verify if we can do better with unequal radii?
+    # Usually equal is best for sum.
+    
+    # Let's try a force simulation to see if we can beat the optimizer.
+    # This is often more robust for packing.
+    
+    def simulate_packing(init_centers):
+        centers = init_centers.copy()
+        n = centers.shape[0]
+        # Start with small radius
+        r = 0.001
+        dt = 1e-4
+        alpha = 0.1 # Damping
+        
+        # We want to grow r.
+        # In each step, we increase r slightly, then resolve overlaps by moving centers.
+        
+        for step in range(5000):
+            # Try to increase r
+            r += 1e-6
+            
+            # Calculate forces to resolve overlaps and push away from walls
+            forces = np.zeros_like(centers)
+            
+            for i in range(n):
+                ci = centers[i]
+                
+                # Boundary forces
+                # If circle i hits left wall (x < r), push right
+                if ci[0] < r:
+                    forces[i, 0] += (r - ci[0]) * 100
+                elif ci[0] > 1 - r:
+                    forces[i, 0] -= (ci[0] - (1 - r)) * 100
+                
+                if ci[1] < r:
+                    forces[i, 1] += (r - ci[1]) * 100
+                elif ci[1] > 1 - r:
+                    forces[i, 1] -= (ci[1] - (1 - r)) * 100
+                
+                for j in range(i + 1, n):
+                    cj = centers[j]
+                    dist = np.sqrt(np.sum((ci - cj)**2))
+                    if dist < 2 * r:
+                        # Overlap
+                        overlap = 2 * r - dist
+                        if dist > 1e-9:
+                            direction = (ci - cj) / dist
+                            # Push apart
+                            forces[i] += direction * overlap * 50
+                            forces[j] -= direction * overlap * 50
+                        else:
+                            # Coincident centers, push randomly
+                            forces[i] += np.random.rand(2) * 0.1
+                            forces[j] -= np.random.rand(2) * 0.1
+            
+            # Update centers
+            centers += dt * forces
+            # Clamp to [0, 1] roughly (forces should handle it, but safety)
+            centers = np.clip(centers, 1e-6, 1 - 1e-6)
+            
+            # Check if system is stable (no large forces) to decide if we can grow r faster?
+            # For simplicity, just run fixed steps.
+        
+        return centers, r
+
+    # Run simulation from best optimizer result or random
+    if best_centers is not None:
+        sim_centers, sim_r = simulate_packing(best_centers)
+    else:
+        sim_centers, sim_r = simulate_packing(np.random.rand(26, 2))
+
+    if sim_r > max_r_found:
+        max_r_found = sim_r
+        best_centers = sim_centers
+
+    # Final Validation and Adjustment
+    # The simulation might leave circles slightly overlapping or outside.
+    # We need to ensure validity.
+    # Calculate the actual maximum valid radius for the found centers.
+    if best_centers is not None:
+        # Calculate min distance to boundaries and other centers
+        min_dist = 1.0
+        n = 26
+        centers = best_centers
+        
+        # Boundary
+        for i in range(n):
+            x, y = centers[i]
+            min_dist = min(min_dist, x, 1-x, y, 1-y)
+        
+        # Pairwise
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                min_dist = min(min_dist, dist / 2.0)
+        
+        # This min_dist is the maximum equal radius r for this configuration
+        r_valid = min_dist
+        
+        # However, circles might still overlap if we just set r = min_dist?
+        # No, by definition min_dist <= dist/2 implies 2*r <= dist.
+        # And min_dist <= boundary_dist implies r <= boundary.
+        # So this configuration is valid with radius r_valid.
+        
+        # But wait, the simulation moved centers based on forces.
+        # If forces were strong, centers might have moved such that min_dist is small?
+        # Actually, the forces push them apart, increasing min_dist.
+        # So r_valid should be close to sim_r or better.
+        
+        # Let's re-calculate optimal r for these centers?
+        # No, r_valid is the tightest constraint.
+        
+        # But maybe we can improve sum of radii with UNEQUAL radii?
+        # With centers fixed, we can compute max radius for each circle.
+        # r_i = min(dist(i, boundary), min_j (dist(i, j) - r_j)?
+        # This is circular.
+        # But for equal radii, r = min(...).
+        
+        # Let's stick to equal radii for simplicity and validity.
+        # The problem asks to maximize sum of radii.
+        # If we output equal radii r_valid, sum = 26 * r_valid.
+        
+        radii = np.full(n, r_valid)
+        sum_radii = np.sum(radii)
+        
+        best_centers = centers
+        best_radii = radii
+        best_sum_radii = sum_radii
+        
+    else:
+        # Should not happen
+        best_centers = np.zeros((26, 2))
+        best_radii = np.zeros(26)
+        best_sum_radii = 0.0
+
+    return best_centers, best_radii, best_sum_radii

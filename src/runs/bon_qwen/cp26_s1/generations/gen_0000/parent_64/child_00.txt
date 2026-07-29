@@ -1,0 +1,159 @@
+
+
+<strategy>
+To pack 26 circles in a unit square maximizing the sum of radii, we face a non-convex optimization problem with many inequality constraints (pairwise non-overlap and boundary containment). A purely analytical solution is intractable, so we employ a two-phase numerical strategy:
+
+1. **Force-Directed Relaxation with Radius Expansion**: 
+   - Initialize circles randomly inside the square with small radii.
+   - Iteratively expand all radii by a small factor while applying repulsive forces to resolve overlaps and wall collisions.
+   - Use a decaying learning rate to allow the system to settle into a dense, quasi-optimal configuration. This phase efficiently escapes poor initial configurations and produces a valid, high-density packing.
+
+2. **Constrained Nonlinear Optimization (SLSQP)**:
+   - Use the relaxed configuration as an initial guess for `scipy.optimize.minimize` with the SLSQP method.
+   - Objective: Maximize $\sum r_i$ (minimize $-\sum r_i$).
+   - Constraints: Explicit inequality constraints for all pairwise distances and wall boundaries. SLSQP handles these rigorously, polishing the packing to strictly satisfy tolerances while squeezing out additional radius sum.
+   - Multiple random restarts ensure we avoid local minima.
+
+This hybrid approach combines the global exploration capability of physical relaxation with the precision of gradient-based constrained optimization, reliably approaching the target sum of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def relax_packing(centers, radii, steps=5000):
+    """Force-directed relaxation with continuous radius expansion."""
+    n = len(radii)
+    for step in range(steps):
+        forces = np.zeros_like(centers)
+        
+        # Gradually expand radii
+        growth = 1.0 + 1.2e-5 * np.exp(-step / 2000.0)
+        radii *= growth
+        
+        # Pairwise repulsion forces
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = np.sqrt(dx*dx + dy*dy) + 1e-9
+                overlap = radii[i] + radii[j] - d
+                if overlap > 0:
+                    fx = (dx / d) * overlap
+                    fy = (dy / d) * overlap
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+                    
+        # Wall repulsion forces
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < 0:
+                forces[i, 0] += (r - x) * 3.0
+            elif x + r > 1.0:
+                forces[i, 0] -= (x + r - 1.0) * 3.0
+                
+            if y - r < 0:
+                forces[i, 1] += (r - y) * 3.0
+            elif y + r > 1.0:
+                forces[i, 1] -= (y + r - 1.0) * 3.0
+                
+        # Update positions with decaying learning rate
+        lr = 0.15 / (1.0 + step / 800.0)
+        centers += forces * lr
+        centers = np.clip(centers, radii[:, None], 1.0 - radii[:, None])
+        
+    return centers, radii
+
+def compute_objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def compute_constraints(vars):
+    """Compute all inequality constraints (dist >= r1+r2, wall bounds)."""
+    centers = np.zeros((N_CIRCLES, 2))
+    radii = np.zeros(N_CIRCLES)
+    for i in range(N_CIRCLES):
+        centers[i, 0] = vars[3*i]
+        centers[i, 1] = vars[3*i+1]
+        radii[i] = vars[3*i+2]
+        
+    cons = []
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist_sq = dx*dx + dy*dy
+            cons.append(dist_sq - (radii[i] + radii[j])**2)
+            
+        # Wall boundaries
+        x, y, r = centers[i, 0], centers[i, 1], radii[i]
+        cons.append(x - r)
+        cons.append(1.0 - (x + r))
+        cons.append(y - r)
+        cons.append(1.0 - (y + r))
+        
+    return np.array(cons)
+
+def run_packing():
+    np.random.seed(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Variable bounds for optimization
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(1e-6, 0.5)] * N_CIRCLES
+    constraint_dict = {'type': 'ineq', 'fun': compute_constraints}
+    
+    for trial in range(5):
+        # Randomized initial layout clustered in center to avoid initial wall conflicts
+        centers = np.random.rand(N_CIRCLES, 2) * 0.7 + 0.15
+        radii = np.full(N_CIRCLES, 0.06)
+        
+        # Phase 1: Force-directed relaxation
+        centers, radii = relax_packing(centers, radii, steps=6000)
+        
+        # Flatten for scipy optimizer
+        x0 = np.zeros(3 * N_CIRCLES)
+        for i in range(N_CIRCLES):
+            x0[3*i] = centers[i, 0]
+            x0[3*i+1] = centers[i, 1]
+            x0[3*i+2] = radii[i]
+            
+        # Phase 2: Constrained nonlinear optimization
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=constraint_dict, options={'maxiter': 500, 'ftol': 1e-10})
+            if res.success:
+                s_r = -res.fun
+                if s_r > best_sum:
+                    best_sum = s_r
+                    best_centers = np.array([[res.x[3*i], res.x[3*i+1]] for i in range(N_CIRCLES)])
+                    best_radii = np.array([res.x[3*i+2] for i in range(N_CIRCLES)])
+        except Exception:
+            pass
+            
+        # Fallback: if SLSQP fails, keep the relaxed configuration if it's valid
+        current_sum = np.sum(radii)
+        if current_sum > best_sum:
+            valid = True
+            for i in range(N_CIRCLES):
+                for j in range(i+1, N_CIRCLES):
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    if d < radii[i] + radii[j] - 1e-9:
+                        valid = False
+                        break
+                if not valid:
+                    break
+            if valid:
+                best_sum = current_sum
+                best_centers = centers
+                best_radii = radii
+
+    return best_centers, best_radii, best_sum
+```

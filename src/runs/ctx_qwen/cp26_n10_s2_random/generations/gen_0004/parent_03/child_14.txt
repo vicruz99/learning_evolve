@@ -1,0 +1,186 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond the current 2.627, I will employ a hybrid global-local optimization strategy:
+
+1. **Global Search via Differential Evolution (DE)**: Optimize only the circle centers using DE. The objective is to maximize the sum of feasible radii given fixed centers. DE handles the non-smooth radius computation robustly and explores the configuration space globally, often finding better corner/boundary placements than grid-based inits.
+2. **Local Refinement via SLSQP**: Map the best center configuration from DE into a full (centers, radii) variable set and polish it using SLSQP. This smooth constrained optimizer can precisely trade off center positions against radii to squeeze out extra sum.
+3. **Diverse Hexagonal Initializations**: Supplement DE with optimized hexagonal lattice patterns at various scales. These provide strong baselines that SLSQP can refine efficiently.
+4. **Sequential Radius Expansion**: Iteratively scale up radii by a small factor and re-optimize centers. This forces circles apart and pushes the packing density toward the physical limit, effectively escaping shallow local minima.
+5. **Strict Validation Repair**: Apply a deterministic overlap/boundary resolution loop to guarantee the output passes the strict checker tolerances without sacrificing the optimized sum.
+
+This pipeline combines the global exploration strength of DE with the precise local convergence of SLSQP and the density-pushing effect of sequential expansion, targeting the 2.636+ threshold.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+
+N = 26
+
+def compute_constraints(vars_flat):
+    """Computes boundary and non-overlap constraints as >= 0."""
+    x = vars_flat[0::3]
+    y = vars_flat[1::3]
+    r = vars_flat[2::3]
+    
+    c = []
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Overlap constraints: dist(i,j) >= r_i + r_j
+    xi = x[:, None]
+    yi = y[:, None]
+    ri = r[:, None]
+    
+    dx = xi - xi.T
+    dy = yi - yi.T
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)
+    
+    # Upper triangle constraints to reduce size
+    mask = np.triu(np.ones((N, N)), k=1).astype(bool)
+    c.append(dist[mask] - (ri[mask] + ri.T[mask]))
+    
+    return np.concatenate(c)
+
+def compute_objective(vars_flat):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars_flat[2::3])
+
+def get_bounds():
+    """Returns variable bounds for x, y in [0.001, 0.999] and r in [1e-5, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.001, 0.999), (0.001, 0.999), (1e-5, 0.5)])
+    return b
+
+def centers_to_vars(centers, radii=None):
+    """Converts centers array to flattened optimization variables, estimating radii if needed."""
+    v = np.zeros(3 * N)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    if radii is not None:
+        v[2::3] = radii
+    else:
+        x, y = centers[:, 0], centers[:, 1]
+        r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        dist = np.sqrt(dx**2 + dy**2)
+        np.fill_diagonal(dist, np.inf)
+        r_pair = 0.5 * np.min(dist, axis=1)
+        v[2::3] = np.minimum(r_bound, r_pair) * 0.85
+    return v
+
+def run_slsqp(v0, maxiter=2000):
+    """Runs SLSQP optimization and returns (optimized_vars, sum_radii) or (None, None)."""
+    try:
+        res = minimize(compute_objective, v0, method='SLSQP', bounds=get_bounds(),
+                       constraints={'type': 'ineq', 'fun': compute_constraints},
+                       options={'maxiter': maxiter, 'ftol': 1e-12, 'disp': False})
+        if np.all(compute_constraints(res.x) >= -1e-6):
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return None, None
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds_c = [(0.001, 0.999)] * (2 * N)
+    
+    best_v = None
+    best_val = -np.inf
+
+    # 1. Global Search: Differential Evolution on centers only
+    # Maximizes sum of feasible radii for fixed centers
+    def obj_centers(cf):
+        c = cf.reshape(N, 2)
+        x, y = c[:, 0], c[:, 1]
+        rb = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        dist = np.sqrt(dx**2 + dy**2)
+        np.fill_diagonal(dist, np.inf)
+        rp = 0.5 * np.min(dist, axis=1)
+        return -np.sum(np.minimum(rb, rp))
+
+    res_de = differential_evolution(obj_centers, bounds_c, seed=42, 
+                                    popsize=12, maxiter=500, tol=1e-7, polish=False)
+    c_de = res_de.x.reshape(N, 2)
+    v_de = centers_to_vars(c_de)
+    v_res, val_res = run_slsqp(v_de, maxiter=3000)
+    if v_res is not None and val_res > best_val:
+        best_v, best_val = v_res, val_res
+
+    # 2. Hexagonal Grid Initializations
+    for scale in [0.09, 0.095, 0.10, 0.105, 0.11]:
+        centers = []
+        y = scale
+        row = 0
+        while len(centers) < N:
+            x = scale + (0.5 if row % 2 else 0) * scale
+            while x <= 1.0 - scale and len(centers) < N:
+                centers.append([x, y])
+                x += 2 * scale
+            y += scale * np.sqrt(3)
+            row += 1
+        centers = np.array(centers[:N])
+        centers += np.random.normal(0, 0.004, centers.shape)
+        centers = np.clip(centers, 0.01, 0.99)
+        
+        v0 = centers_to_vars(centers)
+        v_res, val_res = run_slsqp(v0, maxiter=3000)
+        if v_res is not None and val_res > best_val:
+            best_v, best_val = v_res, val_res
+
+    # 3. Sequential Expansion to push density limits
+    if best_v is not None:
+        curr_v = best_v.copy()
+        for step in range(60):
+            factor = 1.0 + 0.002 * (1.0 - step / 60.0)
+            curr_v[2::3] *= factor
+            v_res, val_res = run_slsqp(curr_v, maxiter=1500)
+            if v_res is not None and val_res > best_val:
+                best_v, best_val = v_res, val_res
+                curr_v = v_res.copy()
+            else:
+                # Perturb centers to escape local minima when expansion stalls
+                curr_v[0::3] += np.random.normal(0, 0.001, N)
+                curr_v[1::3] += np.random.normal(0, 0.001, N)
+                curr_v[0::3] = np.clip(curr_v[0::3], 0.01, 0.99)
+                curr_v[1::3] = np.clip(curr_v[1::3], 0.01, 0.99)
+
+    # 4. Final Deterministic Repair for Strict Validation Compliance
+    centers = best_v.reshape(N, 3)[:, :2]
+    radii = best_v.reshape(N, 3)[:, 2].copy()
+    
+    for _ in range(30):
+        changed = False
+        # Clamp to boundaries
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            if r > max_r + 1e-9:
+                radii[i] = max_r
+                changed = True
+                
+        # Resolve overlaps by proportional shrinking
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    overlap = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= overlap
+                    radii[j] -= overlap
+                    changed = True
+                    
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,115 @@
+
+
+<strategy>
+The current approach uses SLSQP with explicit constraints, which can struggle with local minima and constraint conditioning in high dimensions. To break through the 2.626 barrier and reach ~2.636, we can reformulate the problem:
+
+1. **Unconstrained Center Optimization**: Instead of optimizing (x, y, r) with constraints, we optimize only the centers (x, y). For any fixed set of centers, the maximum valid radius for each circle is uniquely determined by the nearest boundary and the nearest neighbor: `r_i = min(dist_to_boundary, 0.5 * min_dist_to_neighbor)`. This transforms the problem into an unconstrained maximization of `sum(radii(centers))` over 52 variables.
+
+2. **Global Search with Differential Evolution**: The objective landscape for circle centers is rugged but well-behaved enough for `scipy.optimize.differential_evolution`. DE efficiently explores the space without getting trapped in poor local minima, unlike gradient-based methods.
+
+3. **Local Refinement with Powell's Method**: After DE converges, we apply derivative-free local search (`Powell`) to polish the solution. Powell handles the non-smooth kinks in the objective function (caused by switching constraints from boundary to neighbor) effectively.
+
+4. **Multi-Start Perturbation**: We run several local searches from slightly perturbed versions of the best DE result to ensure we've found the true basin of attraction.
+
+This strategy guarantees validity by construction (radii are computed to respect constraints), removes constraint-handling overhead, and leverages global+local optimization to push past the current plateau.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+
+N_CIRCLES = 26
+
+def compute_max_radii(centers):
+    """
+    Given fixed centers, compute the maximum valid radius for each circle.
+    r_i = min(distance to boundaries, 0.5 * distance to nearest neighbor)
+    """
+    x = centers[:, 0]
+    y = centers[:, 1]
+    
+    # Distance to square boundaries
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Ignore self-distances
+    np.fill_diagonal(dist, np.inf)
+    min_dist = np.min(dist, axis=1)
+    
+    # Radius limited by half the distance to nearest neighbor
+    r_pair = 0.5 * min_dist
+    
+    # Final radius is the tighter constraint
+    return np.minimum(r_bound, r_pair)
+
+def objective_function(centers_flat):
+    """
+    Objective for optimizers: minimize negative sum of radii.
+    Centers are flattened to 1D array.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    radii = compute_max_radii(centers)
+    return -np.sum(radii)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    # Bounds for centers: keep them slightly inside to avoid degenerate zero-radius cases
+    bounds = [(0.001, 0.999)] * (2 * N_CIRCLES)
+    
+    # Phase 1: Global exploration with Differential Evolution
+    de_res = differential_evolution(
+        objective_function,
+        bounds,
+        seed=42,
+        maxiter=2000,
+        popsize=40,
+        mutation=(0.5, 1.2),
+        recombination=0.9,
+        tol=1e-9,
+        polish=False
+    )
+    
+    best_centers = de_res.x.reshape(-1, 2)
+    best_radii = compute_max_radii(best_centers)
+    best_sum = np.sum(best_radii)
+    
+    # Phase 2: Local refinement with Powell (handles non-smooth objective well)
+    res_local = minimize(
+        objective_function,
+        best_centers.flatten(),
+        method='Powell',
+        options={'maxiter': 10000, 'ftol': 1e-14, 'xtol': 1e-14}
+    )
+    if -res_local.fun > best_sum:
+        best_centers = res_local.x.reshape(-1, 2)
+        best_radii = compute_max_radii(best_centers)
+        best_sum = np.sum(best_radii)
+        
+    # Phase 3: Multi-start perturbation to escape shallow local minima
+    for seed in range(50):
+        np.random.seed(seed)
+        pert_centers = best_centers + np.random.normal(0, 0.002, (N_CIRCLES, 2))
+        pert_centers = np.clip(pert_centers, 0.001, 0.999)
+        
+        res_pert = minimize(
+            objective_function, 
+            pert_centers.flatten(), 
+            method='Powell', 
+            options={'maxiter': 2000, 'ftol': 1e-12}
+        )
+        
+        if -res_pert.fun > best_sum:
+            best_centers = res_pert.x.reshape(-1, 2)
+            best_radii = compute_max_radii(best_centers)
+            best_sum = np.sum(best_radii)
+            
+    # Final safety clipping (should already be valid by construction)
+    best_centers = np.clip(best_centers, 0.0, 1.0)
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, float(best_sum)
+```

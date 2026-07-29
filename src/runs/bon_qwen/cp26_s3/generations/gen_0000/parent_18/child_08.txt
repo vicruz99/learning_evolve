@@ -1,0 +1,166 @@
+
+
+<strategy>
+To pack 26 circles in a unit square and maximize the sum of radii, I will use a numerical optimization approach based on the **Sequential Penalty Method** combined with **L-BFGS-B**. This strategy is highly effective for non-convex geometric packing problems:
+
+1. **Problem Formulation**: 
+   - Variables: 2D centers $(x_i, y_i)$ and radii $r_i$ for $i=0,\dots,25$. Total 78 variables.
+   - Objective: Maximize $\sum r_i$ $\Rightarrow$ Minimize $-\sum r_i$.
+   - Constraints: Boundary ($r_i \le x_i \le 1-r_i$, same for $y$) and Non-overlap ($\|c_i - c_j\| \ge r_i + r_j$).
+
+2. **Penalty Function**: 
+   Since constraints are non-convex and numerous (~370 constraints), I will convert them into a smooth penalty term added to the objective:
+   $f(vars) = -\sum r_i + P \cdot (\sum \text{boundary_violations}^2 + \sum \text{overlap_violations}^2)$
+   The penalty weight $P$ starts moderate and increases sequentially. This allows the optimizer to first find a feasible configuration, then aggressively grow the radii while strictly enforcing constraints.
+
+3. **Vectorization & Efficiency**: 
+   - Pairwise distances and overlap penalties are computed using NumPy broadcasting and `np.triu_indices` for $O(N^2)$ vectorized operations, avoiding slow Python loops.
+   - `L-BFGS-B` is chosen for its efficiency in bounded optimization and robust handling of the penalty landscape.
+
+4. **Multi-Start Strategy**: 
+   - 15 different initial configurations are generated (perturbed hexagonal/grid layouts) to escape local minima.
+   - Each run goes through 4 stages of increasing penalty weights to ensure convergence to a high-quality valid packing.
+
+5. **Validation & Fallback**: 
+   - After optimization, a strict validation check is performed.
+   - If no fully valid packing is found (unlikely with high penalty), a safe radial scaling fallback ensures the returned result strictly passes the `validate_packing` function.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_penalty(vars, n, penalty_weight):
+    """
+    Computes the objective function with penalty terms for constraints.
+    Minimizing this function maximizes sum of radii while satisfying bounds and non-overlap.
+    """
+    centers = vars[:2*n].reshape(n, 2)
+    radii = vars[2*n:]
+    
+    # Base objective: maximize sum of radii -> minimize negative sum
+    obj = -np.sum(radii)
+    penalty = 0.0
+
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    # Penalty accumulates squared violations
+    penalty += np.sum(np.maximum(0, radii - centers[:, 0])**2)
+    penalty += np.sum(np.maximum(0, radii - (1.0 - centers[:, 0]))**2)
+    penalty += np.sum(np.maximum(0, radii - centers[:, 1])**2)
+    penalty += np.sum(np.maximum(0, radii - (1.0 - centers[:, 1]))**2)
+
+    # Overlap constraints: distance >= r_i + r_j
+    # Vectorized pairwise calculation for performance
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    min_dists = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Extract upper triangle indices to avoid double counting and self-comparison
+    i, j = np.triu_indices(n, k=1)
+    overlaps = min_dists[i, j] - dists[i, j]
+    penalty += np.sum(np.maximum(0, overlaps)**2)
+
+    return obj + penalty_weight * penalty
+
+def run_packing():
+    n = 26
+    best_vars = None
+    best_sum = -np.inf
+    
+    # Sequential penalty weights: starts loose, becomes strict
+    penalty_weights = [500, 2000, 8000, 20000]
+    num_restarts = 15
+    
+    for seed in range(num_restarts):
+        np.random.seed(42 + seed)
+        
+        # Initialize centers in a perturbed hexagonal pattern to cover the square efficiently
+        y_coords = np.linspace(0.15, 0.85, 6)
+        x_coords = np.linspace(0.1, 0.9, 5)
+        
+        centers = []
+        for idx, y in enumerate(y_coords):
+            row_offset = 0.05 if idx % 2 == 1 else 0.0
+            for x in x_coords:
+                if len(centers) < n:
+                    centers.append([x + row_offset, y])
+                    
+        centers = np.array(centers[:n])
+        # Add controlled random perturbation
+        centers += np.random.uniform(-0.03, 0.03, size=centers.shape)
+        centers = np.clip(centers, 0.05, 0.95)
+        
+        radii = np.full(n, 0.04)
+        vars0 = np.concatenate([centers.ravel(), radii])
+        
+        bounds = [(0.0, 1.0) for _ in range(2*n)] + [(0.0, 0.5) for _ in range(n)]
+        
+        current_vars = vars0.copy()
+        
+        # Sequential optimization with increasing penalty strictness
+        for pw in penalty_weights:
+            res = minimize(compute_penalty, current_vars, args=(n, pw), 
+                           method='L-BFGS-B', bounds=bounds, 
+                           options={'maxiter': 1000, 'ftol': 1e-12, 'gtol': 1e-10})
+            current_vars = res.x
+            
+        # Evaluate candidate packing
+        centers_opt = current_vars[:2*n].reshape(n, 2)
+        radii_opt = current_vars[2*n:]
+        
+        # Strict validation check
+        valid = True
+        if np.isnan(centers_opt).any() or np.isnan(radii_opt).any():
+            valid = False
+        else:
+            for i in range(n):
+                x, y = centers_opt[i]
+                r = radii_opt[i]
+                if r < 0 or x - r < -1e-9 or x + r > 1 + 1e-9 or y - r < -1e-9 or y + r > 1 + 1e-9:
+                    valid = False
+                    break
+            if valid:
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        d = np.sqrt(np.sum((centers_opt[i] - centers_opt[j])**2))
+                        if d < radii_opt[i] + radii_opt[j] - 1e-9:
+                            valid = False
+                            break
+                    if not valid:
+                        break
+        
+        if valid:
+            s = np.sum(radii_opt)
+            if s > best_sum:
+                best_sum = s
+                best_vars = current_vars.copy()
+    
+    # Prepare output
+    if best_vars is not None:
+        final_centers = best_vars[:2*n].reshape(n, 2)
+        final_radii = best_vars[2*n:]
+    else:
+        # Fallback: scale down radii until valid (guarantees pass)
+        final_centers = current_vars[:2*n].reshape(n, 2)
+        final_radii = current_vars[2*n:]
+        scale = 1.0
+        for _ in range(50):
+            valid = True
+            for i in range(n):
+                x, y = final_centers[i]
+                r = final_radii[i] * scale
+                if x - r < 0 or x + r > 1 or y - r < 0 or y + r > 1:
+                    valid = False; break
+            if valid:
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.sqrt(np.sum((final_centers[i]-final_centers[j])**2))
+                        if d < final_radii[i]*scale + final_radii[j]*scale:
+                            valid = False; break
+                    if not valid: break
+            if valid: break
+            scale *= 0.95
+        final_radii *= scale
+        
+    return final_centers, final_radii, np.sum(final_radii)
+```

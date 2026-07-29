@@ -1,0 +1,186 @@
+# sol_000025 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000020 (state c2ddf6ac) state=808bce88 sum of radii=2.628607 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+N_CIRCLES = 26
+I_IDX, J_IDX = np.triu_indices(N_CIRCLES, k=1)
+N_PAIRS = len(I_IDX)
+BOUNDS = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+
+def objective(params):
+    """Negative sum of radii to be minimized."""
+    return -np.sum(params[2 * N_CIRCLES:])
+
+def constraints(params):
+    """Boundary and non-overlap constraints (must be >= 0)."""
+    c = params[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    r = params[2 * N_CIRCLES:]
+    
+    # Boundary constraints
+    b = np.empty(4 * N_CIRCLES)
+    b[0:N_CIRCLES] = c[:, 0] - r
+    b[N_CIRCLES:2 * N_CIRCLES] = 1.0 - c[:, 0] - r
+    b[2 * N_CIRCLES:3 * N_CIRCLES] = c[:, 1] - r
+    b[3 * N_CIRCLES:4 * N_CIRCLES] = 1.0 - c[:, 1] - r
+    
+    # Pairwise distance constraints
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    overlaps = dists[I_IDX, J_IDX] - (r[I_IDX] + r[J_IDX])
+    
+    return np.concatenate([b, overlaps])
+
+def fix_violations(centers, radii):
+    """Post-process to strictly satisfy boundary and overlap constraints."""
+    n = centers.shape[0]
+    # Fix boundaries
+    for i in range(n):
+        mx = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        if radii[i] > mx:
+            radii[i] = max(0.0, mx - 1e-9)
+            
+    # Fix overlaps iteratively
+    for _ in range(100):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                s = radii[i] + radii[j]
+                if d < s:
+                    diff = s - d + 1e-9
+                    radii[i] -= diff * 0.5
+                    radii[j] -= diff * 0.5
+                    changed = True
+        if not changed:
+            break
+    return centers, radii
+
+def generate_initializations():
+    """Create diverse starting points for optimization."""
+    inits = []
+    # Hexagonal patterns with varying spacing
+    for s in range(10):
+        rng = np.random.RandomState(s)
+        c = np.zeros((N_CIRCLES, 2))
+        r = np.full(N_CIRCLES, 0.045)
+        idx = 0
+        row = 0
+        spacing = 0.16 + s * 0.002
+        margin = 0.06
+        while idx < N_CIRCLES:
+            y = margin + row * spacing * math.sqrt(3) / 2
+            x_off = margin + (row % 2) * spacing / 2
+            col = 0
+            while x_off + col * spacing <= 1.0 - margin and idx < N_CIRCLES:
+                c[idx] = [x_off + col * spacing, y]
+                idx += 1
+                col += 1
+            row += 1
+        c += rng.randn(N_CIRCLES, 2) * 0.008
+        c = np.clip(c, 0.05, 0.95)
+        inits.append(np.concatenate([c.ravel(), r]))
+        
+    # Random initializations
+    for s in range(10):
+        rng = np.random.RandomState(s)
+        c = rng.uniform(0.15, 0.85, (N_CIRCLES, 2))
+        r = np.full(N_CIRCLES, 0.04)
+        inits.append(np.concatenate([c.ravel(), r]))
+        
+    # Grid patterns
+    for s in range(5):
+        rng = np.random.RandomState(s)
+        c = np.zeros((N_CIRCLES, 2))
+        r = np.full(N_CIRCLES, 0.04)
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                if idx < N_CIRCLES:
+                    c[idx] = [0.1 + j * 0.17, 0.1 + i * 0.17]
+                    idx += 1
+        while idx < N_CIRCLES:
+            c[idx] = rng.uniform(0.2, 0.8, 2)
+            idx += 1
+        c += rng.randn(N_CIRCLES, 2) * 0.01
+        c = np.clip(c, 0.05, 0.95)
+        inits.append(np.concatenate([c.ravel(), r]))
+        
+    return inits
+
+def run_packing():
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    # Run optimizations from diverse starts
+    for p0 in generate_initializations():
+        try:
+            res = minimize(objective, p0, method='SLSQP', bounds=BOUNDS, constraints=cons_dict,
+                           options={'maxiter': 3000, 'ftol': 1e-13})
+            c_opt = res.x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+            r_opt = res.x[2 * N_CIRCLES:]
+            c_fix, r_fix = fix_violations(c_opt, r_opt)
+            s_val = np.sum(r_fix)
+            
+            if s_val > best_sum:
+                best_sum = s_val
+                best_c = c_fix.copy()
+                best_r = r_fix.copy()
+                
+                # High-precision refinement pass
+                p_ref = np.concatenate([best_c.ravel(), best_r])
+                res2 = minimize(objective, p_ref, method='SLSQP', bounds=BOUNDS, constraints=cons_dict,
+                                options={'maxiter': 5000, 'ftol': 1e-14})
+                c_opt2 = res2.x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+                r_opt2 = res2.x[2 * N_CIRCLES:]
+                c_fix2, r_fix2 = fix_violations(c_opt2, r_opt2)
+                s_val2 = np.sum(r_fix2)
+                if s_val2 > best_sum:
+                    best_sum = s_val2
+                    best_c = c_fix2.copy()
+                    best_r = r_fix2.copy()
+        except Exception:
+            continue
+
+    # Local perturbation search around the best found solution
+    if best_c is not None:
+        for _ in range(20):
+            rng = np.random.RandomState()
+            c_p = best_c + rng.randn(N_CIRCLES, 2) * 0.005
+            c_p = np.clip(c_p, 0.01, 0.99)
+            r_p = best_r + rng.randn(N_CIRCLES) * 0.001
+            r_p = np.clip(r_p, 0.001, 0.5)
+            p_pert = np.concatenate([c_p.ravel(), r_p])
+            
+            try:
+                res_p = minimize(objective, p_pert, method='SLSQP', bounds=BOUNDS, constraints=cons_dict,
+                                 options={'maxiter': 2000, 'ftol': 1e-12})
+                c_op = res_p.x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+                r_op = res_p.x[2 * N_CIRCLES:]
+                c_fp, r_fp = fix_violations(c_op, r_op)
+                s_vp = np.sum(r_fp)
+                if s_vp > best_sum:
+                    best_sum = s_vp
+                    best_c = c_fp.copy()
+                    best_r = r_fp.copy()
+            except Exception:
+                continue
+
+    # Fallback safety net
+    if best_c is None:
+        best_c = np.zeros((N_CIRCLES, 2))
+        best_r = np.full(N_CIRCLES, 0.02)
+        for i in range(N_CIRCLES):
+            best_c[i] = [0.5, 0.5]
+        best_sum = np.sum(best_r)
+        best_c, best_r = fix_violations(best_c, best_r)
+        best_sum = np.sum(best_r)
+
+    return best_c, best_r, float(best_sum)

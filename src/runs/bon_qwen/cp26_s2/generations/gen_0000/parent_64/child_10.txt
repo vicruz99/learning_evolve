@@ -1,0 +1,162 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we formulate the problem as a non-linear constrained optimization. The key challenges are the non-convex pairwise distance constraints and the high dimensionality (78 variables). 
+
+**Strategy:**
+1. **Mathematical Formulation:** Maximize $\sum r_i$ subject to boundary constraints ($r_i \le x_i \le 1-r_i$, etc.) and non-overlap constraints ($\sqrt{(x_i-x_j)^2 + (y_i-y_j)^2} \ge r_i + r_j$).
+2. **Solver Choice:** `scipy.optimize.minimize` with the `SLSQP` method is well-suited for problems with non-linear inequality constraints. It uses a sequential quadratic programming approach that handles the coupling between positions and radii effectively.
+3. **Initialization:** Local optimizers are sensitive to starting points. We use multiple initialization strategies:
+   - A hexagonal grid pattern (densest theoretical packing structure).
+   - Random uniform distribution.
+   - Small perturbations around these starts to escape shallow local minima.
+4. **Constraint Handling:** We explicitly encode all boundary and pairwise distance constraints as a single vector-valued function returning $\ge 0$ values. This avoids penalty methods and keeps the optimization landscape well-defined.
+5. **Post-Processing & Repair:** Numerical solvers may return solutions that slightly violate constraints due to tolerance limits. We implement a deterministic repair loop that clamps radii to boundary limits and scales down overlapping circles proportionally until the configuration is strictly valid according to the validation function's tolerance ($10^{-12}$).
+6. **Robustness:** Multiple restarts with different seeds ensure we sample the solution space thoroughly. The repair step guarantees the returned packing always passes validation.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective function: maximize sum of radii (minimize negative sum)"""
+    return -np.sum(vars[2::3])
+
+def constraints(vars, N):
+    """Returns array of constraint values that must be >= 0"""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    c = []
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Pairwise distance constraints: dist(i,j) - r[i] - r[j] >= 0
+    for i in range(N):
+        xi, yi, ri = x[i], y[i], r[i]
+        for j in range(i + 1, N):
+            dist = np.hypot(xi - x[j], yi - y[j])
+            c.append(dist - ri - r[j])
+            
+    return np.concatenate(c)
+
+def get_bounds(N):
+    """Returns variable bounds for optimizer"""
+    bounds = []
+    for i in range(3 * N):
+        if i % 3 == 2:
+            # Radius bounds
+            bounds.append((1e-5, 0.5))
+        else:
+            # Coordinate bounds
+            bounds.append((0.0, 1.0))
+    return bounds
+
+def run_packing():
+    """
+    Optimizes circle packing to maximize sum of radii.
+    Returns (centers, radii, sum_radii)
+    """
+    N = 26
+    bounds = get_bounds(N)
+    cons = {'type': 'ineq', 'fun': constraints, 'args': (N,)}
+
+    best_vars = None
+    best_sum = 0.0
+
+    # --- Initialization Strategies ---
+    init_configs = []
+
+    # 1. Hexagonal grid pattern
+    pts = []
+    y_pos = 0.1
+    while len(pts) < N:
+        x_pos = 0.1
+        while x_pos < 0.9 and len(pts) < N:
+            pts.append([x_pos, y_pos])
+            x_pos += np.sqrt(3) * 0.08
+        y_pos += 0.08 * 1.5
+    init_centers = np.array(pts[:N])
+    init_radii = np.full(N, 0.03)
+    v0_hex = np.zeros(3 * N)
+    v0_hex[0::3] = init_centers[:, 0]
+    v0_hex[1::3] = init_centers[:, 1]
+    v0_hex[2::3] = init_radii
+    init_configs.append(v0_hex)
+
+    # 2. Random distribution
+    np.random.seed(42)
+    rand_centers = np.random.uniform(0.1, 0.9, (N, 2))
+    rand_radii = np.full(N, 0.03)
+    v0_rand = np.zeros(3 * N)
+    v0_rand[0::3] = rand_centers[:, 0]
+    v0_rand[1::3] = rand_centers[:, 1]
+    v0_rand[2::3] = rand_radii
+    init_configs.append(v0_rand)
+
+    # --- Optimization Loop ---
+    for vp in init_configs:
+        for _ in range(5):
+            # Perturb current configuration
+            vp_trial = vp + np.random.normal(0, 0.005, 3 * N)
+            vp_trial[0::3] = np.clip(vp_trial[0::3], 0.01, 0.99)
+            vp_trial[1::3] = np.clip(vp_trial[1::3], 0.01, 0.99)
+            vp_trial[2::3] = np.clip(vp_trial[2::3], 1e-4, 0.49)
+
+            try:
+                res = minimize(objective, vp_trial, method='SLSQP', bounds=bounds, 
+                               constraints=cons, options={'maxiter': 1200, 'ftol': 1e-12, 'disp': False})
+                curr_sum = -res.fun
+                
+                # Validate candidate solution before accepting
+                c_test = res.x[0::3]
+                y_test = res.x[1::3]
+                r_test = res.x[2::3]
+                
+                boundary_valid = (np.all(r_test >= 1e-7) and 
+                                  np.all(c_test >= r_test) and np.all(c_test <= 1 - r_test) and 
+                                  np.all(y_test >= r_test) and np.all(y_test <= 1 - r_test))
+                
+                if curr_sum > best_sum and boundary_valid:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+            except Exception:
+                pass
+
+    # Fallback if optimization failed completely
+    if best_vars is None:
+        best_vars = init_configs[0]
+
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3].copy()
+
+    # --- Repair Step ---
+    # Ensures strict validity against the validation function's tolerance
+    for _ in range(100):
+        valid = True
+        # Enforce boundary constraints
+        for i in range(N):
+            radii[i] = min(radii[i], centers[i, 0], 1.0 - centers[i, 0], 
+                           centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] < 1e-8:
+                valid = False
+
+        # Resolve overlaps by proportional shrinking
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j]:
+                    factor = d / (radii[i] + radii[j])
+                    radii[i] *= factor * 0.9999
+                    radii[j] *= factor * 0.9999
+                    valid = False
+        if valid:
+            break
+
+    return centers, radii, np.sum(radii)
+```

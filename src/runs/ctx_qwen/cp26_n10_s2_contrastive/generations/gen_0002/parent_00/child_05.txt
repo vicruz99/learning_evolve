@@ -1,0 +1,218 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.631094, we need a more robust global optimization strategy that effectively escapes local minima and handles the non-convex constraints precisely.
+
+1. **Constraint Formulation**: Use squared distance constraints `(dx^2 + dy^2 - (ri + rj)^2 >= 0)` instead of Euclidean distance. This removes square roots, improves gradient behavior near touching circles, and significantly stabilizes SLSQP convergence.
+2. **Diverse Initializations**: Generate initial configurations from multiple perturbed hexagonal lattices with varying spacings and rotations, uniform grids, and completely random placements. This covers both structured optimal regions and unexplored basins.
+3. **Strict Feasibility Post-Processing**: After each optimization run, immediately project the solution into the strictly feasible region by clipping to boundaries and iteratively resolving overlaps. Evaluate the *true* valid sum of radii for comparison, preventing the optimizer from accepting numerically infeasible "false positives".
+4. **Local Refinement**: Once a strong candidate is found, perform targeted perturbations around it and re-optimize. This basin-hopping style approach polishes the solution and often squeezes out extra radius sum.
+5. **Numerical Stability**: Use tight tolerances (`ftol=1e-14`), reasonable `maxiter`, and safe initial radii (0.02) to ensure SLSQP starts in a feasible region. All helper functions are defined at the top level with no closures or lambdas to comply with constraints.
+
+This structured approach balances exploration (multiple starts) and exploitation (local refinement + high-precision SLSQP) to reliably push past the 2.636 target.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+N = 26
+TRIU_IDX = np.triu_indices(N, k=1)
+
+def objective(x):
+    """Negative sum of radii to be minimized."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Inequality constraints: boundary and non-overlap (squared)."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    n_cons = 4 * N + N * (N - 1) // 2
+    c = np.empty(n_cons)
+    
+    # Boundary constraints
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    # Overlap constraints (squared distances for smooth gradients)
+    i_idx, j_idx = TRIU_IDX
+    dx = cx[i_idx] - cx[j_idx]
+    dy = cy[i_idx] - cy[j_idx]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[i_idx] + r[j_idx]
+    overlap = dist_sq - r_sum**2
+    
+    c[4*N:] = overlap
+    return c
+
+def center_dist(p):
+    """Distance metric from center of square for sorting lattice points."""
+    return (p[0] - 0.5)**2 + (p[1] - 0.5)**2
+
+def enforce_validity(centers, radii):
+    """Project an infeasible configuration to the feasible region."""
+    margin = 1e-9
+    n = centers.shape[0]
+    
+    # Enforce boundary constraints strictly
+    for i in range(n):
+        max_r = min(centers[i,0], 1.0 - centers[i,0], 
+                    centers[i,1], 1.0 - centers[i,1]) - margin
+        if radii[i] > max_r:
+            radii[i] = max(0.0, max_r)
+            
+    # Iteratively resolve overlaps
+    for _ in range(150):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = math.hypot(centers[i,0] - centers[j,0], 
+                               centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    excess = radii[i] + radii[j] - d + 1e-9
+                    radii[i] -= excess / 2.0
+                    radii[j] -= excess / 2.0
+                    changed = True
+        if not changed:
+            break
+            
+    return radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse initial configurations
+    inits = []
+    
+    # 1. Perturbed Hexagonal Lattices with varying spacing/rotation
+    for seed in range(25):
+        rng = np.random.RandomState(seed)
+        spacing = 0.185 + seed * 0.003
+        rotation = seed * 0.04
+        cx = np.zeros(N)
+        cy = np.zeros(N)
+        
+        points = []
+        for i in range(-15, 15):
+            for j in range(-15, 15):
+                x = i * spacing + j * spacing * 0.5
+                y = j * spacing * math.sqrt(3) / 2.0
+                xr = x * math.cos(rotation) - y * math.sin(rotation) + 0.5
+                yr = x * math.sin(rotation) + y * math.cos(rotation) + 0.5
+                if 0.05 <= xr <= 0.95 and 0.05 <= yr <= 0.95:
+                    points.append((xr, yr))
+                    
+        points.sort(key=center_dist)
+        points = points[:N]
+        for k, (px, py) in enumerate(points):
+            cx[k] = px + rng.uniform(-0.005, 0.005)
+            cy[k] = py + rng.uniform(-0.005, 0.005)
+            
+        cx = np.clip(cx, 0.02, 0.98)
+        cy = np.clip(cy, 0.02, 0.98)
+        r = np.full(N, 0.02)
+        inits.append(np.concatenate([cx, cy, r]))
+        
+    # 2. Grid Lattices
+    for seed in range(10):
+        rng = np.random.RandomState(seed + 100)
+        step = 0.18 + seed * 0.005
+        cx = np.zeros(N)
+        cy = np.zeros(N)
+        idx = 0
+        y = step
+        while y < 1.0 and idx < N:
+            x = step
+            while x < 1.0 and idx < N:
+                cx[idx] = x + rng.uniform(-0.01, 0.01)
+                cy[idx] = y + rng.uniform(-0.01, 0.01)
+                idx += 1
+                x += step
+            y += step
+        while idx < N:
+            cx[idx] = rng.uniform(0.2, 0.8)
+            cy[idx] = rng.uniform(0.2, 0.8)
+            idx += 1
+            
+        cx = np.clip(cx, 0.02, 0.98)
+        cy = np.clip(cy, 0.02, 0.98)
+        r = np.full(N, 0.02)
+        inits.append(np.concatenate([cx, cy, r]))
+        
+    # 3. Random Initializations
+    for seed in range(15):
+        rng = np.random.RandomState(seed + 200)
+        cx = rng.uniform(0.15, 0.85, N)
+        cy = rng.uniform(0.15, 0.85, N)
+        r = np.full(N, 0.02)
+        inits.append(np.concatenate([cx, cy, r]))
+        
+    # Primary Optimization Loop
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 12000, 'ftol': 1e-14, 'disp': False})
+            
+            cx = res.x[0::3].copy()
+            cy = res.x[1::3].copy()
+            r = res.x[2::3].copy()
+            centers = np.column_stack((cx, cy))
+            radii = enforce_validity(centers, r)
+            
+            curr_sum = np.sum(radii)
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+        except Exception:
+            continue
+            
+    # Local Refinement (Basin Hopping around best found solution)
+    if best_centers is not None:
+        for i in range(40):
+            rng = np.random.RandomState(i * 31 + 7)
+            cx_p = best_centers[:, 0] + rng.normal(0, 0.002, N)
+            cy_p = best_centers[:, 1] + rng.normal(0, 0.002, N)
+            r_p = best_radii + rng.normal(0, 0.001, N)
+            
+            cx_p = np.clip(cx_p, 0.01, 0.99)
+            cy_p = np.clip(cy_p, 0.01, 0.99)
+            r_p = np.clip(r_p, 0.001, 0.5)
+            
+            x0_p = np.concatenate([cx_p, cy_p, r_p])
+            try:
+                res = minimize(objective, x0_p, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+                
+                cx = res.x[0::3].copy()
+                cy = res.x[1::3].copy()
+                r = res.x[2::3].copy()
+                centers = np.column_stack((cx, cy))
+                radii = enforce_validity(centers, r)
+                
+                curr_sum = np.sum(radii)
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_centers = centers.copy()
+                    best_radii = radii.copy()
+            except Exception:
+                pass
+                
+    # Fallback (should not be reached given the robust init strategy)
+    if best_centers is None:
+        best_centers = np.column_stack([np.full(N, 0.5), np.full(N, 0.5)])
+        best_radii = np.full(N, 0.02)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, float(best_sum)
+```

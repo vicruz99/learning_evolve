@@ -1,0 +1,455 @@
+# sol_000234 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1140c965) state=d258a808 sum of radii=2.390653 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+import random
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def get_constraints_violation(centers, radii):
+    """
+    Calculate a penalty score. Lower is better. 
+    Returns sum of penalties. If 0, packing is valid.
+    """
+    penalty = 0.0
+    n = centers.shape[0]
+    
+    # Boundary violations
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        # Left
+        if x - r < 0: penalty += (r - x) * 100
+        # Right
+        if x + r > 1: penalty += (x + r - 1) * 100
+        # Bottom
+        if y - r < 0: penalty += (r - y) * 100
+        # Top
+        if y + r > 1: penalty += (y + r - 1) * 100
+        
+    # Overlap violations
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            min_dist = radii[i] + radii[j]
+            if dist < min_dist:
+                penalty += (min_dist - dist) * 100
+                
+    return penalty
+
+def calculate_score(centers, radii):
+    """
+    Returns a score to maximize. 
+    We want to maximize sum of radii. 
+    If constraints are violated, we penalize heavily.
+    """
+    s = np.sum(radii)
+    violation = get_constraints_violation(centers, radii)
+    if violation > 0:
+        return s - violation
+    return s
+
+def run_packing():
+    np.random.seed(42)
+    random.seed(42)
+    
+    n = 26
+    
+    # Initial configuration: 5 rows with counts 6, 5, 6, 5, 4
+    # This allows a hexagonal-like density.
+    row_counts = [6, 5, 6, 5, 4]
+    
+    # Estimate radius based on density. 
+    # A 5x5 grid has r=0.1. Hexagonal is denser.
+    # Let's start with r approx 0.095 for main circles, smaller for edge ones.
+    
+    centers = []
+    radii = []
+    
+    # Vertical spacing for 5 rows. 
+    # Height 1. Margins r. Spacing between centers sqrt(3)*r approx 1.732*r.
+    # Let's try to fit 5 rows.
+    # y positions: r, r + h, r + 2h, r + 3h, r + 4h
+    # 2r + 4h <= 1. If h = sqrt(3)r, 2r + 6.92r = 8.92r <= 1 => r <= 0.112.
+    # But width constraints will limit r.
+    
+    # Let's construct initial positions
+    base_r = 0.095
+    
+    # Row heights
+    h_spacing = math.sqrt(3) * base_r
+    # Adjust to fit in [0,1] vertically
+    # Total height needed = 2*base_r + 4*h_spacing
+    # Scale factor if needed
+    # For now, just place them
+    
+    current_idx = 0
+    for row_idx, count in enumerate(row_counts):
+        # y coordinate
+        # Shift rows to pack tightly
+        y = base_r + row_idx * h_spacing
+        
+        # Shift y to center vertically if possible, but let's keep bottom aligned first
+        # Actually, better to center the whole block.
+        # But for initialization, let's just use relative positions.
+        
+        # x coordinates
+        # Width for 'count' circles is 2*count*r (approx). 
+        # For count=6, width = 12r. If r=0.095, width=1.14 > 1.
+        # So we need to scale r down for rows with 6.
+        
+        # Dynamic radius per circle
+        r = base_r
+        if count == 6:
+            r = 1.0 / 13.0 # Width 12r + margin? 12r <= 1 => r <= 0.0833. 
+            # Actually width of 6 circles is 10*dist + 2r? No.
+            # 6 circles centers: x, x+2r, ... x+10r. Extent 2r + 10r = 12r.
+            # So r <= 1/12 = 0.0833.
+            r = 0.080 # Start a bit smaller to allow movement
+        else:
+            # For 5 or 4, r can be larger.
+            # 5 circles: 10r <= 1 => r <= 0.1
+            r = 0.095
+            
+        # x centering
+        # For shifted rows, shift by r
+        shift = (row_idx % 2) * r
+        
+        total_width = 2 * r * count
+        start_x = (1.0 - total_width) / 2.0 + shift
+        
+        # If start_x + total_width + shift > 1, clamp
+        # Actually, let's just distribute them evenly in [0,1] with margin
+        
+        # Simple distribution:
+        # Available width 1. 
+        # If count=6, step = 1/6? No, need 2r spacing.
+        # Let's place centers at linspace
+        # But maintain 2r distance.
+        
+        # Fallback: place in valid spots
+        if count == 6:
+            # 6 circles. Centers at 1/12, 3/12, 5/12, 7/12, 9/12, 11/12?
+            # Spacing 2/12 = 1/6 = 0.166. 2r = 0.16. Fits.
+            # r = 0.0833.
+            step = 1.0 / 6.0
+            for k in range(count):
+                x = (k + 0.5) * step
+                # Check if shifted
+                if row_idx % 2 == 1:
+                    x += r/2 # Small shift? No, standard hex shift is r.
+                    # If we shift by r=0.083, x becomes > 1 for last circle.
+                    # So for count 6, maybe don't shift much or accept boundary push.
+                    # Let's keep them aligned for count 6 to fit width.
+                    pass 
+                # Actually, if row has 6, it's full width. No shift allowed if r is max.
+                # Let's just place them straight.
+                pass
+            
+            # Recalculate x for straight packing
+            step_x = 1.0 / count
+            for k in range(count):
+                x = (k + 0.5) * step_x
+                centers.append([x, y])
+                radii.append(r)
+                current_idx += 1
+                
+        else:
+            # 5 or 4 circles. Can afford shift.
+            # Shift by r relative to previous? 
+            # Let's just place them centered.
+            step_x = 1.0 / count
+            shift_x = 0
+            if row_idx % 2 == 1:
+                shift_x = r # Shift by radius
+                
+            for k in range(count):
+                x = (k + 0.5) * step_x + shift_x
+                # Clamp to [r, 1-r]
+                x = max(r, min(1-r, x))
+                centers.append([x, y])
+                radii.append(r)
+                current_idx += 1
+
+    centers = np.array(centers)
+    radii = np.array(radii)
+    
+    # Normalize vertical positions to fit in [0,1]
+    min_y = np.min(centers[:, 1])
+    max_y = np.max(centers[:, 1])
+    # Ideally min_y - r >= 0 and max_y + r <= 1
+    # Current y range is approx 4*h_spacing.
+    # Let's scale and shift.
+    target_height = 1.0 - 2 * np.mean(radii) # Approx
+    # Just shift to center
+    current_h = max_y - min_y
+    if current_h < 1.0:
+        shift_y = (1.0 - current_h) / 2.0 - min_y + np.mean(radii) # Rough centering
+        # Better: shift so min_y becomes approx mean_r
+        # Let's just add an offset to center the block
+        offset_y = 0.5 - (min_y + max_y)/2
+        centers[:, 1] += offset_y
+        
+    # Optimization loop
+    # Simulated Annealing / Local Search
+    temperature = 0.1
+    best_score = calculate_score(centers, radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    # We want to maximize sum of radii.
+    # We can try to increase radii if space permits, or move centers.
+    
+    n_iter = 5000
+    
+    for iter in range(n_iter):
+        # Decide move type
+        move_type = random.random()
+        
+        if move_type < 0.5:
+            # Move a circle
+            i = random.randint(0, n-1)
+            delta = np.random.normal(0, temperature) * 2
+            new_centers = centers.copy()
+            new_radii = radii.copy()
+            
+            # Perturb center
+            new_centers[i, 0] += delta[0]
+            new_centers[i, 1] += delta[1]
+            
+            # Clamp boundaries
+            new_centers[i, 0] = max(new_radii[i], min(1 - new_radii[i], new_centers[i, 0]))
+            new_centers[i, 1] = max(new_radii[i], min(1 - new_radii[i], new_centers[i, 1]))
+            
+        else:
+            # Adjust radius of a circle
+            i = random.randint(0, n-1)
+            # Try to increase radius slightly
+            delta_r = random.uniform(-0.002, 0.005) # Bias towards increase
+            new_radii = radii.copy()
+            new_radii[i] += delta_r
+            if new_radii[i] < 1e-4: new_radii[i] = 1e-4
+            
+            # Clamp center to valid box for new radius
+            new_centers = centers.copy()
+            new_centers[i, 0] = max(new_radii[i], min(1 - new_radii[i], new_centers[i, 0]))
+            new_centers[i, 1] = max(new_radii[i], min(1 - new_radii[i], new_centers[i, 1]))
+
+        score = calculate_score(new_centers, new_radii)
+        
+        if score > best_score:
+            best_score = score
+            best_centers = new_centers.copy()
+            best_radii = new_radii.copy()
+            centers = new_centers
+            radii = new_radii
+        else:
+            # Accept with probability
+            prob = math.exp((score - best_score) / temperature)
+            if random.random() < prob:
+                centers = new_centers
+                radii = new_radii
+        
+        # Cool down
+        if iter % 500 == 0 and temperature > 0.001:
+            temperature *= 0.8
+
+    # Final validation and clean up
+    # Ensure radii are reasonable and constraints met
+    # The score function penalizes violations, so if best_score is high, it should be valid.
+    # But let's do a final check and maybe shrink radii slightly if needed to remove tiny overlaps
+    
+    # Final run to ensure validity
+    # If there are tiny overlaps, reduce radii
+    violation = get_constraints_violation(best_centers, best_radii)
+    if violation > 0:
+        # Reduce all radii by a small factor
+        factor = 0.99
+        best_radii *= factor
+        # Recalculate centers clamped
+        for i in range(n):
+            r = best_radii[i]
+            best_centers[i, 0] = max(r, min(1-r, best_centers[i, 0]))
+            best_centers[i, 1] = max(r, min(1-r, best_centers[i, 1]))
+
+    return best_centers, best_radii, np.sum(best_radii)
+
+# Note: The run_packing function must be defined as requested.
+# The code above defines it. 
+# However, I should make sure I don't use closures or lambdas if forbidden.
+# The helper functions are top level. 
+# No lambdas used.
+
+# One detail: The prompt asks for "run_packing" to be defined.
+# I will wrap the logic properly.
+
+def run_packing():
+    np.random.seed(42)
+    random.seed(42)
+    
+    n = 26
+    
+    # Initialization parameters
+    base_r = 0.095
+    h_spacing = math.sqrt(3) * base_r
+    
+    centers = []
+    radii = []
+    
+    row_counts = [6, 5, 6, 5, 4]
+    
+    for row_idx, count in enumerate(row_counts):
+        y = base_r + row_idx * h_spacing
+        
+        if count == 6:
+            r = 0.080
+            step_x = 1.0 / count
+            for k in range(count):
+                x = (k + 0.5) * step_x
+                centers.append([x, y])
+                radii.append(r)
+        else:
+            r = 0.095
+            step_x = 1.0 / count
+            shift_x = r if row_idx % 2 == 1 else 0
+            for k in range(count):
+                x = (k + 0.5) * step_x + shift_x
+                x = max(r, min(1-r, x))
+                centers.append([x, y])
+                radii.append(r)
+
+    centers = np.array(centers)
+    radii = np.array(radii)
+    
+    # Center vertically
+    min_y = np.min(centers[:, 1])
+    max_y = np.max(centers[:, 1])
+    current_h = max_y - min_y
+    if current_h < 1.0:
+        offset_y = 0.5 - (min_y + max_y)/2
+        centers[:, 1] += offset_y
+        
+    temperature = 0.05
+    best_score = calculate_score(centers, radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    n_iter = 8000
+    
+    for iter in range(n_iter):
+        move_type = random.random()
+        
+        if move_type < 0.6:
+            # Move center
+            i = random.randint(0, n-1)
+            # Adaptive step size
+            step = temperature * 0.1
+            delta_x = np.random.normal(0, step)
+            delta_y = np.random.normal(0, step)
+            
+            new_centers = centers.copy()
+            new_radii = radii.copy()
+            
+            new_centers[i, 0] += delta_x
+            new_centers[i, 1] += delta_y
+            
+            r_i = new_radii[i]
+            new_centers[i, 0] = max(r_i, min(1 - r_i, new_centers[i, 0]))
+            new_centers[i, 1] = max(r_i, min(1 - r_i, new_centers[i, 1]))
+            
+        else:
+            # Adjust radius
+            i = random.randint(0, n-1)
+            # Try increasing radius more often
+            if random.random() < 0.7:
+                delta_r = random.uniform(0, 0.005)
+            else:
+                delta_r = random.uniform(-0.002, 0.002)
+                
+            new_radii = radii.copy()
+            new_radii[i] += delta_r
+            if new_radii[i] < 1e-4: new_radii[i] = 1e-4
+            
+            new_centers = centers.copy()
+            r_i = new_radii[i]
+            new_centers[i, 0] = max(r_i, min(1 - r_i, new_centers[i, 0]))
+            new_centers[i, 1] = max(r_i, min(1 - r_i, new_centers[i, 1]))
+
+        score = calculate_score(new_centers, new_radii)
+        
+        if score > best_score:
+            best_score = score
+            best_centers = new_centers.copy()
+            best_radii = new_radii.copy()
+            centers = new_centers
+            radii = new_radii
+        else:
+            prob = math.exp((score - best_score) / max(temperature, 1e-6))
+            if random.random() < prob:
+                centers = new_centers
+                radii = new_radii
+        
+        if iter % 1000 == 0 and temperature > 0.001:
+            temperature *= 0.9
+
+    # Final validation fix
+    violation = get_constraints_violation(best_centers, best_radii)
+    if violation > 0:
+        best_radii *= 0.999
+        for i in range(n):
+            r = best_radii[i]
+            best_centers[i, 0] = max(r, min(1-r, best_centers[i, 0]))
+            best_centers[i, 1] = max(r, min(1-r, best_centers[i, 1]))
+
+    return best_centers, best_radii, np.sum(best_radii)

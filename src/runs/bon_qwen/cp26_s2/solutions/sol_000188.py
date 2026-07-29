@@ -1,0 +1,194 @@
+# sol_000188 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 624944be) state=b7876d78 sum of radii=2.589318 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = 26
+    
+    # --- 1. Initialization (Dense Hexagonal Lattice) ---
+    centers = []
+    row_height = np.sqrt(3) / 2.0
+    
+    # We distribute 26 circles into rows to approximate a hexagonal packing
+    # 6, 5, 6, 5, 4 is 26 circles. 
+    # Rows 0, 2, 4 (even) have 6 circles. Rows 1, 3 (odd) have 5 circles.
+    # The last row has 4 circles to sum to 26? No, 6+5+6+5+4 = 26.
+    # Let's try a more standard 6-5-6-5-4 distribution.
+    # Row y-coords: 0, row_height, 2*row_height, etc.
+    
+    # Better: Generate a grid and keep the most central ones or just fill row by row.
+    # Let's use a 6-5-6-5-4 pattern.
+    counts = [6, 5, 6, 5, 4]
+    
+    current_y = 0.1 # Small margin
+    total_height_approx = 4 * row_height + 0.2
+    
+    for i, count in enumerate(counts):
+        # Calculate x positions for this row
+        # For even rows (0, 2, 4), start at margin. 
+        # For odd rows (1, 3), shift by 1 unit (radius-wise) to nest.
+        # Actually, standard hex: row 0 starts at 0. Row 1 starts at 0.5 (in unit spacing).
+        # Let's define spacing s = 2.0 (representing 2 radii).
+        # In unit square, we want to scale this.
+        
+        # Let's just place them in a 5x6 grid area and scale.
+        pass
+
+    # Simplified Initialization: 
+    # Place 26 points in a slightly randomized grid inside [0.1, 0.9]
+    # Then use the optimizer to expand them.
+    
+    # Hexagonal grid coordinates
+    pts = []
+    r_step = 1.0 # Arbitrary unit for grid
+    h_step = np.sqrt(3)/2.0 * r_step
+    
+    # 5 rows of roughly 5-6 circles
+    # Row 0: 6 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 6 circles
+    # Row 3: 5 circles (shifted)
+    # Row 4: 4 circles
+    # Total: 26
+    
+    rows_config = [6, 5, 6, 5, 4]
+    
+    raw_centers = []
+    y_idx = 0
+    
+    for i, count in enumerate(rows_config):
+        if i % 2 == 0:
+            x_start = 0.0
+        else:
+            x_start = r_step / 2.0 # Shift for hexagonal nesting
+            
+        for j in range(count):
+            x = x_start + j * r_step
+            y = y_idx * h_step
+            raw_centers.append([x, y])
+        
+        y_idx += 1
+        
+    # Normalize raw_centers to fit in [0, 1] x [0, 1] with a small margin
+    raw_centers = np.array(raw_centers)
+    min_x, min_y = raw_centers.min(axis=0)
+    max_x, max_y = raw_centers.max(axis=0)
+    
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    # Scale to fit in [0.05, 0.95] roughly
+    margin = 0.1
+    scale = min((1 - 2*margin) / width, (1 - 2*margin) / height) if width > 0 and height > 0 else 1
+    
+    centers = (raw_centers - np.array([min_x, min_y])) * scale
+    centers += margin # Shift to start at margin
+    
+    # Initial radii: small value
+    radii = np.full(n, 0.02)
+    
+    # --- 2. Optimization Setup ---
+    # Variables: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+
+    # Objective: Maximize sum of radii -> Minimize -sum(radii)
+    def objective(vars):
+        return -sum(vars[2::3]) # Every 3rd variable starting from index 2 is a radius
+
+    # Constraints
+    cons = []
+    
+    # Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+    # i.e., x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    # We formulate these as inequality constraints g(vars) >= 0
+    # scipy.optimize.minimize expects cons in form dict with 'type': 'ineq' (>= 0)
+    
+    # Non-overlap constraints: dist(i, j) >= ri + rj
+    # i.e., dist(i, j) - ri - rj >= 0
+    
+    # We will define constraints using functions
+    # To avoid defining 4*26 + 26*25/2 functions, we can use a single function returning array?
+    # SLSQP supports constraints as list of dicts or a single function returning array.
+    # Returning array is often more efficient if possible, but for non-linear, individual might be safer for gradients.
+    # However, with 350 constraints, list of dicts is slow.
+    # Let's use a single constraint function that returns an array of all constraints.
+    
+    def constraints(vars):
+        vals = np.zeros(4 * n + n * (n - 1) // 2)
+        idx = 0
+        
+        # Boundary constraints
+        for i in range(n):
+            x_i = vars[3*i]
+            y_i = vars[3*i+1]
+            r_i = vars[3*i+2]
+            
+            vals[idx] = x_i - r_i          # x - r >= 0
+            vals[idx+1] = 1.0 - x_i - r_i  # 1 - x - r >= 0
+            vals[idx+2] = y_i - r_i        # y - r >= 0
+            vals[idx+3] = 1.0 - y_i - r_i  # 1 - y - r >= 0
+            idx += 4
+            
+        # Overlap constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                x_i, y_i = vars[3*i], vars[3*i+1]
+                x_j, y_j = vars[3*j], vars[3*j+1]
+                r_i, r_j = vars[3*i+2], vars[3*j+2]
+                
+                dist = np.sqrt((x_i - x_j)**2 + (y_i - y_j)**2)
+                vals[idx] = dist - r_i - r_j
+                idx += 1
+                
+        return vals
+
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    # Bounds: x, y in [0, 1], r >= 0
+    bounds = []
+    for i in range(n):
+        bounds.extend([(0, 1), (0, 1), (0, 0.5)]) # x, y in [0,1], r in [0, 0.5]
+
+    # --- 3. Execution ---
+    # Use SLSQP for constrained optimization
+    # We might need multiple restarts or a good initial guess.
+    # The grid initialization is usually good.
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                       options={'ftol': 1e-9, 'maxiter': 1000, 'disp': False})
+        
+        if res.success:
+            final_vars = res.x
+        else:
+            # Fallback to initial if optimization fails
+            final_vars = x0
+    except Exception:
+        final_vars = x0
+
+    # Extract results
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i] = [final_vars[3*i], final_vars[3*i+1]]
+        final_radii[i] = final_vars[3*i+2]
+        
+    # Ensure non-negative radii and clip slightly if numerical errors
+    final_radii = np.maximum(final_radii, 0)
+    
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii

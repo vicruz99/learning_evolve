@@ -1,0 +1,218 @@
+
+
+<strategy>
+To improve the packing beyond 2.634 and target 2.636, we will employ a more robust optimization pipeline:
+
+1. **Parameterization**: Use $(r, u, v)$ variables where $x = r + u(1-2r)$ and $y = r + v(1-2r)$ with $u, v \in [0, 1]$. This automatically satisfies all boundary constraints, reducing the constraint set from $O(N^2) + 4N$ to just $O(N^2)$ pairwise separation constraints. This dramatically improves solver stability and convergence speed.
+2. **Diverse Initializations**: Combine force-directed layouts (which naturally spread points to maximize minimum distances) with rotated and scaled hexagonal lattice patterns. Hexagonal packing is theoretically optimal for dense circles, but boundary effects require rotational and scaling variations to find the best fit for $N=26$.
+3. **Aggressive Local Refinement**: After finding the best initial configuration, perform extensive random perturbation around the optimal variables. Perturbing $u, v$ more aggressively than $r$ helps escape symmetric local minima and discover better topological arrangements.
+4. **High-Precision Polish**: Finally, run a tight-tolerance optimization pass to squeeze out the last bits of sum-of-radii improvement.
+5. **Strict Feasibility Checks**: Validate constraints at each step to ensure the optimizer doesn't drift into infeasible regions, which SLSQP can occasionally do numerically.
+
+This systematic approach balances global exploration with precise local exploitation, targeting the geometric bottlenecks that limit current packings.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective_func(vars_vec):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars_vec[:N])
+
+def constraints_func(vars_vec):
+    """
+    Computes inequality constraints g(vars_vec) >= 0.
+    Uses (r, u, v) parameterization to automatically satisfy boundary constraints.
+    Only pairwise non-overlap constraints are enforced.
+    """
+    r = vars_vec[:N]
+    u = vars_vec[N:2*N]
+    v = vars_vec[2*N:3*N]
+    
+    # Map normalized u, v to actual coordinates within [r, 1-r]
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Vectorized pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[I_IDX, J_IDX] - r_sum_sq[I_IDX, J_IDX]
+
+def force_init(seed, steps=600):
+    """Generates a strictly feasible initial configuration using force-directed layout."""
+    np.random.seed(seed)
+    pts = np.random.rand(N, 2)
+    r_curr = np.full(N, 0.05)
+    
+    for step in range(steps):
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        dists = np.maximum(dists, 1e-8)
+        repulsion = 1.0 / dists**2
+        np.fill_diagonal(repulsion, 0.0)
+        forces = np.sum(repulsion[:, :, np.newaxis] * diff / dists[:, :, np.newaxis], axis=1)
+        
+        for d in range(2):
+            forces[:, d] += 5.0 * np.maximum(0, r_curr - pts[:, d])
+            forces[:, d] -= 5.0 * np.maximum(0, pts[:, d] - (1.0 - r_curr))
+            
+        step_size = 0.008 * (0.998**step)
+        pts += step_size * forces
+        pts = np.clip(pts, 1e-5, 1.0 - 1e-5)
+        
+        # Adaptively update radii during simulation
+        for i in range(N):
+            dw = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+            dp = np.min(np.linalg.norm(pts[i] - pts, axis=1))
+            r_curr[i] = 0.8 * min(dw, dp/2.0)
+            
+    # Final feasible radii computation
+    r_final = np.zeros(N)
+    for i in range(N):
+        dw = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+        dists = np.linalg.norm(pts[i] - pts, axis=1)
+        dists[i] = np.inf
+        dp = np.min(dists)
+        r_final[i] = 0.85 * min(dw, dp/2.0)
+        
+    denom = np.clip(1.0 - 2.0 * r_final, 1e-6, 1.0)
+    u = np.clip((pts[:, 0] - r_final) / denom, 0.0, 1.0)
+    v = np.clip((pts[:, 1] - r_final) / denom, 0.0, 1.0)
+    
+    return np.concatenate([r_final, u, v])
+
+def hex_init(seed, rot=0.0, scale=1.0):
+    """Generates a hexagonal lattice initialization with rotation and scaling."""
+    np.random.seed(seed)
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        shift = r_est if row % 2 == 1 else 0.0
+        x = r_est + shift
+        while x <= 1.0 - r_est and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+        
+    pts = np.array(pts[:N])
+    pts -= 0.5
+    pts *= scale
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        pts = pts @ np.array([[c, -s], [s, c]])
+    pts += 0.5
+    pts += np.random.uniform(-0.015, 0.015, pts.shape)
+    pts = np.clip(pts, 0.02, 0.98)
+    
+    r_vals = np.zeros(N)
+    for i in range(N):
+        dw = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+        dists = np.linalg.norm(pts[i] - pts, axis=1)
+        dists[i] = np.inf
+        dp = np.min(dists)
+        r_vals[i] = 0.92 * min(dw, dp/2.0)
+        
+    denom = np.clip(1.0 - 2.0 * r_vals, 1e-6, 1.0)
+    u = np.clip((pts[:, 0] - r_vals) / denom, 0.0, 1.0)
+    v = np.clip((pts[:, 1] - r_vals) / denom, 0.0, 1.0)
+    
+    return np.concatenate([r_vals, u, v])
+
+def run_packing():
+    bounds = [(1e-6, 0.5)] * N + [(0.0, 1.0)] * N + [(0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraints_func}
+    
+    best_vars = None
+    best_sum = -np.inf
+    rng = np.random.RandomState(42)
+    
+    inits = []
+    
+    # 1. Force-based initializations (excellent at finding tight packings)
+    for s in range(30):
+        inits.append(force_init(seed=s))
+        
+    # 2. Hexagonal lattice variations with random rotations and scales
+    for s in range(30):
+        rot = rng.uniform(-0.3, 0.3)
+        scale = rng.uniform(0.85, 1.15)
+        inits.append(hex_init(seed=s, rot=rot, scale=scale))
+        
+    # Phase 1: Broad search from diverse initializations
+    for x0 in inits:
+        try:
+            res = minimize(objective_func, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13})
+            if res.success:
+                c_val = constraints_func(res.x)
+                if np.min(c_val) >= -1e-7:
+                    s_val = -res.fun
+                    if s_val > best_sum:
+                        best_sum = s_val
+                        best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local perturbation refinement to escape local minima
+    if best_vars is not None:
+        for k in range(50):
+            x0 = best_vars.copy()
+            # Perturb u, v more aggressively to change topology, r slightly
+            x0[N:3*N] += rng.normal(0, 0.015, 2*N)
+            x0[:N] += rng.normal(0, 0.002, N)
+            x0 = np.clip(x0, 1e-6, None)
+            x0[N:3*N] = np.clip(x0[N:3*N], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective_func, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13})
+                if res.success:
+                    c_val = constraints_func(res.x)
+                    if np.min(c_val) >= -1e-7:
+                        s_val = -res.fun
+                        if s_val > best_sum:
+                            best_sum = s_val
+                            best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+        # Phase 3: High-precision polish
+        try:
+            res = minimize(objective_func, best_vars, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14})
+            if np.min(constraints_func(res.x)) >= -1e-7:
+                best_vars = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+            
+    # Fallback configuration (should rarely be reached)
+    if best_vars is None:
+        fallback_centers = np.column_stack([np.linspace(0.1, 0.9, 6).repeat(5)[:N], 
+                                            np.tile(np.linspace(0.1, 0.9, 5), 6)[:N]])
+        fallback_radii = np.full(N, 0.04)
+        return fallback_centers, fallback_radii, float(np.sum(fallback_radii))
+
+    r_opt = best_vars[:N]
+    u_opt = best_vars[N:2*N]
+    v_opt = best_vars[2*N:3*N]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    radii = np.maximum(r_opt, 0.0)
+    
+    return centers, radii, float(best_sum)
+```

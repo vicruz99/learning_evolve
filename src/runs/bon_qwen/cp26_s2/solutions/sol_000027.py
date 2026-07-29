@@ -1,0 +1,259 @@
+# sol_000027 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state e154041e) state=74cd11fe sum of radii=2.509983 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # Initial placement: Hexagonal packing
+    # We try to fit 26 circles. 
+    # A 5x5 grid fits 25 circles of radius 0.1.
+    # Hexagonal packing might allow slightly larger radii or better usage.
+    # Let's try to fit 26 circles with a base radius.
+    # Estimate: 26 circles. Maybe 5 rows?
+    # Row counts: 5, 5, 6, 5, 5 (Sum 26) or 5, 5, 5, 5, 6?
+    # Or 6, 5, 5, 5, 5?
+    # Let's try a dense hexagonal packing.
+    
+    # Let's initialize with a grid and then optimize.
+    # Start with radius 0.09 to ensure fit, then expand.
+    r_init = 0.09
+    
+    centers = np.zeros((n, 2))
+    radii = np.full(n, r_init)
+    
+    # Fill centers in a hexagonal pattern
+    # Rows
+    rows = []
+    # Try to fit roughly 5 rows
+    # Row 0: 5 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 6 circles
+    # Row 3: 5 circles
+    # Row 4: 5 circles
+    # Total 26.
+    
+    # Let's define row configurations
+    # We need to fit width 1 and height 1.
+    # Horizontal spacing 2r, vertical spacing sqrt(3)r.
+    
+    # Let's just distribute them somewhat evenly first, then let optimizer work.
+    # A simple grid 6x5 = 30 slots, pick 26?
+    # Or just 5 rows with varying counts.
+    
+    row_counts = [5, 6, 5, 6, 4] # Sum = 26
+    # Check if this fits roughly.
+    # Width for 6 circles: 6*2r = 12r. If r=0.09, 1.08 > 1. Too wide.
+    # Width for 5 circles: 10r = 0.9. Fits.
+    # So max row length 5 is safer for r ~ 0.1.
+    
+    # Let's try row_counts = [5, 5, 5, 5, 6]? 6 is wide.
+    # Maybe [5, 5, 5, 5, 5, 1]?
+    # Let's stick to a 5x5 grid + 1 circle in center, then optimize.
+    # 5x5 grid of radius 0.1 fits perfectly.
+    # Add 26th circle in center with small radius.
+    
+    idx = 0
+    for r_idx in range(5):
+        for c_idx in range(5):
+            x = 0.1 + c_idx * 0.2
+            y = 0.1 + r_idx * 0.2
+            centers[idx] = [x, y]
+            radii[idx] = 0.1
+            idx += 1
+            
+    # Place 26th circle in the center with small radius
+    centers[25] = [0.5, 0.5]
+    radii[25] = 0.01 # Small to avoid overlap initially
+    
+    # Optimization parameters
+    num_iterations = 2000
+    temp = 1.0
+    
+    # To speed up, we can use a simple iterative repulsion/expansion
+    # Since we cannot use complex solvers easily without imports, we write a custom loop.
+    
+    # We will try to maximize sum of radii.
+    # In each step, we try to increase all radii by a small amount.
+    # If overlap occurs, we push circles apart.
+    
+    current_sum = np.sum(radii)
+    
+    for step in range(num_iterations):
+        # Try to grow radii
+        # Determine max possible radius for each circle based on current positions
+        # Then scale up
+        
+        # 1. Calculate max radius constrained by others and boundaries
+        max_radii = np.full(n, 1.0)
+        
+        for i in range(n):
+            # Boundary constraints
+            max_r_i = min(centers[i][0], 1.0 - centers[i][0], 
+                          centers[i][1], 1.0 - centers[i][1])
+            
+            # Pairwise constraints
+            for j in range(n):
+                if i == j: continue
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                # dist >= r_i + r_j  => r_i <= dist - r_j
+                if dist > radii[j]:
+                    max_r_i = min(max_r_i, dist - radii[j])
+                else:
+                    max_r_i = 0.0 # Overlap, radius must be 0 or move
+            
+            max_radii[i] = max(0.0, max_r_i)
+        
+        # 2. Update radii: move towards max_radii
+        # We can increase radii gradually
+        growth_rate = 0.1 # How much to grow
+        # To prevent oscillation, maybe only grow if not overlapping?
+        
+        # Simple strategy: Scale radii up slightly if valid, else move centers.
+        # Let's try to increase sum of radii by expanding.
+        
+        # Calculate current valid radii if we were to expand uniformly?
+        # No, let's just try to set radii to max_radii? No, that might violate pairwise if we do sequentially.
+        
+        # Let's use a force-based approach.
+        # Forces:
+        # 1. Expansion force (want larger r)
+        # 2. Repulsion force (if dist < r_i + r_j)
+        # 3. Boundary force (keep inside)
+        
+        # We can't easily do gradient descent on sum(r) with constraints in pure numpy efficiently for 78 vars.
+        # But we can do a discrete simulation.
+        
+        # Let's try to increase radii by a small factor if no overlap
+        # If overlap, push apart.
+        
+        # Check overlaps
+        overlaps = []
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if dist < radii[i] + radii[j] - 1e-9:
+                    overlaps.append((i, j, dist, radii[i] + radii[j]))
+        
+        if not overlaps:
+            # No overlaps, try to grow radii
+            # Grow by small percentage
+            growth = 1.0 + 0.001
+            for i in range(n):
+                # Check boundary limit
+                limit = min(centers[i][0], 1.0 - centers[i][0], 
+                            centers[i][1], 1.0 - centers[i][1])
+                new_r = radii[i] * growth
+                if new_r > limit:
+                    new_r = limit
+                radii[i] = new_r
+        else:
+            # Resolve overlaps
+            # For each overlap, move centers apart
+            for (i, j, dist, r_sum) in overlaps:
+                if dist < 1e-9:
+                    # Same position, push randomly
+                    angle = np.random.rand() * 2 * np.pi
+                    dx, dy = np.cos(angle), np.sin(angle)
+                else:
+                    # Vector from i to j
+                    dx, dy = centers[j] - centers[i]
+                    dx, dy = dx / dist, dy / dist
+                
+                # Amount to separate
+                separation = (r_sum - dist) / 2.0 + 1e-6
+                
+                # Move i away from j, j away from i
+                centers[i][0] -= dx * separation
+                centers[i][1] -= dy * separation
+                centers[j][0] += dx * separation
+                centers[j][1] += dy * separation
+                
+                # Clamp to boundaries
+                for k in [i, j]:
+                    x, y = centers[k]
+                    r = radii[k]
+                    centers[k][0] = np.clip(x, r, 1.0 - r)
+                    centers[k][1] = np.clip(y, r, 1.0 - r)
+
+    # After optimization, we might have overlaps or boundary violations due to discrete steps.
+    # Let's do a final cleanup pass to ensure validity and maybe squeeze more.
+    
+    # Final pass: reduce radii slightly to resolve any tiny numerical overlaps
+    for _ in range(100):
+        changed = False
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if dist < radii[i] + radii[j]:
+                    # Reduce radii
+                    excess = (radii[i] + radii[j] - dist) / 2.0 + 1e-10
+                    # Reduce proportionally or just reduce sum
+                    # To maximize sum, we should reduce the smaller one? Or equal?
+                    # Reducing larger one hurts sum more? No, sum is linear.
+                    # But larger circle might be harder to fit elsewhere.
+                    # Let's reduce both equally.
+                    reduction = excess
+                    radii[i] = max(0, radii[i] - reduction)
+                    radii[j] = max(0, radii[j] - reduction)
+                    changed = True
+            
+            # Boundary check
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < 0:
+                r = x
+                radii[i] = r
+                changed = True
+            elif x + r > 1:
+                r = 1 - x
+                radii[i] = r
+                changed = True
+            if y - r < 0:
+                r = y
+                radii[i] = r
+                changed = True
+            elif y + r > 1:
+                r = 1 - y
+                radii[i] = r
+                changed = True
+        
+        if not changed:
+            break
+            
+    # One last check to ensure no overlaps with the reduced radii
+    # If we just reduced radii, they might still overlap if centers are too close.
+    # The loop above reduces radii until dist >= r_i + r_j.
+    # Wait, the condition `dist < radii[i] + radii[j]` is checked.
+    # If true, we reduce radii.
+    # But after reduction, dist might still be < new_sum?
+    # Yes, if we reduce by `excess`, new sum = old sum - 2*excess?
+    # excess = (old_sum - dist)/2.
+    # new_sum = old_sum - 2*excess? No, we reduced each by excess.
+    # new_r_i = r_i - excess, new_r_j = r_j - excess.
+    # new_sum = r_i + r_j - 2*excess = r_i + r_j - (old_sum - dist) = dist.
+    # So they should be touching.
+    # But we reduced by `excess` which was calculated based on old radii.
+    # If we iterate, it converges.
+    
+    # Calculate final sum
+    final_sum = np.sum(radii)
+    
+    return centers, radii, final_sum
+
+# To make it runnable and self-contained as per requirements
+if __name__ == "__main__":
+    import numpy as np # Ensure numpy is imported
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Centers shape: {centers.shape}")
+    print(f"Radii shape: {radii.shape}")
+    
+    # Validation
+    # We can't import the validate function here as it's provided by the user environment,
+    # but we can assume the logic is correct.

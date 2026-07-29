@@ -1,0 +1,129 @@
+# sol_000334 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 28c61761) state=753a3c4f sum of radii=1.300000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # 1. Initial Configuration: Staggered Hexagonal Layout
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.05
+    
+    y_row = 0.0
+    row_idx = 0
+    circles_placed = 0
+    
+    # Create enough rows to fit 26 circles
+    while circles_placed < n:
+        row_shift = 0.15 if row_idx % 2 == 1 else 0.0
+        x_col = 0.05 + row_shift
+        
+        while x_col <= 0.95 and circles_placed < n:
+            centers[circles_placed, 0] = x_col
+            centers[circles_placed, 1] = y_row + 0.05
+            circles_placed += 1
+            x_col += 0.18 # Horizontal spacing for staggering
+        
+        y_row += 0.15 # Vertical spacing for staggering
+        row_idx += 1
+        
+    # 2. Define the penalty-based objective function
+    def objective(vars):
+        c = vars.reshape(n, 3)
+        x = c[:, 0]
+        y = c[:, 1]
+        r = c[:, 2]
+        
+        # Primary objective: Maximize sum of radii (Minimize negative sum)
+        obj_val = -np.sum(r)
+        
+        penalty = 0.0
+        # Boundary penalties
+        for i in range(n):
+            # x - r >= 0  -> violation if x - r < 0
+            v1 = max(0, r[i] - x[i])
+            # 1 - x - r >= 0 -> violation if 1 - x - r < 0
+            v2 = max(0, x[i] + r[i] - 1)
+            # y - r >= 0
+            v3 = max(0, r[i] - y[i])
+            # 1 - y - r >= 0
+            v4 = max(0, y[i] + r[i] - 1)
+            # r >= 0
+            v5 = max(0, -r[i])
+            penalty += 1000 * (v1**2 + v2**2 + v3**2 + v4**2 + v5**2)
+            
+        # Overlap penalties
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = math.sqrt((x[i] - x[j])**2 + (y[i] - y[j])**2)
+                overlap = r[i] + r[j] - dist
+                if overlap > 0:
+                    penalty += 1000 * overlap**2
+                    
+        return obj_val + penalty
+
+    # 3. Optimization Process
+    best_result = None
+    best_score = -np.inf
+    
+    # Try multiple restarts with slightly different starting positions
+    for trial in range(5):
+        # Add small random jitter to initial centers
+        if trial > 0:
+            centers_jittered = centers + np.random.normal(0, 0.01, centers.shape)
+            centers_jittered = np.clip(centers_jittered, 0.01, 0.99)
+        else:
+            centers_jittered = centers
+            
+        # Flatten variables: [x1, y1, r1, x2, y2, r2, ...]
+        x0 = np.zeros(n * 3)
+        for i in range(n):
+            x0[3*i] = centers_jittered[i, 0]
+            x0[3*i+1] = centers_jittered[i, 1]
+            x0[3*i+2] = radii[i]
+            
+        # Bounds for variables: x, y in [0, 1], r in [0, 1]
+        bounds = [(0, 1), (0, 1), (0, 1)] * n
+        
+        # Run L-BFGS-B optimizer
+        res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds, 
+                       options={'maxiter': 2000, 'ftol': 1e-9})
+        
+        # Evaluate the final radius sum (excluding penalty)
+        c = res.x.reshape(n, 3)
+        current_sum = np.sum(c[:, 2])
+        
+        # Check validity strictly before updating best
+        # We perform a quick validation on the raw results
+        valid = True
+        # Check overlaps roughly
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = math.sqrt((c[i, 0] - c[j, 0])**2 + (c[i, 1] - c[j, 1])**2)
+                if dist < c[i, 2] + c[j, 2] - 1e-7:
+                    valid = False
+                    break
+            if not valid: break
+        if valid:
+            if current_sum > best_score:
+                best_score = current_sum
+                best_result = c
+
+    if best_result is None:
+        best_result = np.zeros((n, 3))
+        # Fallback if optimization fails
+        centers_final = centers
+        radii_final = np.ones(n) * 0.05
+        best_score = 26 * 0.05
+    else:
+        centers_final = best_result[:, :2]
+        radii_final = best_result[:, 2]
+        best_score = np.sum(radii_final)
+
+    return centers_final, radii_final, best_score

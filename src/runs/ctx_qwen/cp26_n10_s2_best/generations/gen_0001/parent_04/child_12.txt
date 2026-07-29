@@ -1,0 +1,119 @@
+
+
+<strategy>
+To improve the packing and approach the target sum of radii (2.636), we focus on three key optimizations:
+1. **Vectorized Constraints & Squared Distances**: Replace the computationally expensive and numerically unstable `sqrt` in pairwise constraints with squared distances: `(x_i - x_j)^2 + (y_i - y_j)^2 >= (r_i + r_j)^2`. This improves conditioning and allows full vectorization, dramatically speeding up each optimizer iteration.
+2. **Multi-Start SLSQP with Perturbed Hexagonal Lattices**: The global optimum for dense circle packing closely follows a hexagonal arrangement. We generate 30 diverse initial configurations by perturbing a tight hexagonal grid. This helps escape local minima that plague single-start optimizations.
+3. **Robust Post-Processing**: Optimization solvers often return solutions that sit exactly on constraint boundaries or violate them by machine epsilon. We apply a deterministic shrinkage routine that strictly enforces boundary and non-overlap constraints within the validator's tolerance (`1e-12`), guaranteeing a valid output without sacrificing meaningful radius sum.
+
+The combination of tight initial guesses, efficient constraint evaluation, and high-iteration local search allows the solver to push circles closer together, extracting additional radius sum from the gaps.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(v):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v, i_idx, j_idx):
+    """
+    Compute inequality constraints:
+    - Boundary: circles inside [0,1]^2
+    - Pairwise: squared distance >= squared sum of radii
+    Returns array where all elements must be >= 0.
+    """
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    m = 4 * N + len(i_idx)
+    c = np.empty(m)
+    
+    # Boundary constraints
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    # Pairwise non-overlap constraints (vectorized)
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    c[4*N:] = dx**2 + dy**2 - (r[i_idx] + r[j_idx])**2
+    
+    return c
+
+def run_packing():
+    # Precompute pair indices for efficient constraint evaluation
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints, 'args': (i_idx, j_idx)}
+    
+    best_val = -np.inf
+    best_x = None
+    np.random.seed(42)
+    
+    # Multi-start optimization from perturbed hexagonal lattices
+    for trial in range(30):
+        # Generate base hexagonal lattice
+        r0 = 0.09
+        centers = []
+        y = r0
+        row = 0
+        while len(centers) < N + 15:
+            x_start = r0 if row % 2 == 0 else 2 * r0
+            x = x_start
+            while x <= 1 - r0 and len(centers) < N + 15:
+                centers.append([x, y])
+                x += 2 * r0
+            y += r0 * np.sqrt(3)
+            row += 1
+            
+        # Select N centers and apply controlled jitter to break symmetry
+        init_centers = np.array(centers[:N])
+        jitter = np.random.uniform(-0.025, 0.025, size=init_centers.shape)
+        init_centers = np.clip(init_centers + jitter, 0.02, 0.98)
+        
+        # Initial radii small enough to guarantee feasibility
+        x0 = np.concatenate([init_centers[:, 0], init_centers[:, 1], np.full(N, 0.03)])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                           options={'maxiter': 10000, 'ftol': 1e-12, 'disp': False})
+            
+            # Accept if better and sufficiently feasible
+            if -res.fun > best_val:
+                if np.all(constraints(res.x, i_idx, j_idx) >= -1e-9):
+                    best_val = -res.fun
+                    best_x = res.x.copy()
+        except Exception:
+            continue
+
+    # Extract best configuration
+    centers = np.column_stack((best_x[:N], best_x[N:2*N]))
+    radii = best_x[2*N:].copy()
+    
+    # Strict post-processing to guarantee validator tolerance
+    # 1. Enforce boundary constraints
+    for i in range(N):
+        cx, cy = centers[i]
+        radii[i] = min(radii[i], cx, 1.0 - cx, cy, 1.0 - cy)
+        
+    # 2. Enforce non-overlap constraints iteratively
+    for _ in range(10):
+        for i in range(N):
+            for j in range(i + 1, N):
+                dist = np.sqrt((centers[i, 0] - centers[j, 0])**2 + 
+                               (centers[i, 1] - centers[j, 1])**2)
+                sum_r = radii[i] + radii[j]
+                if dist < sum_r - 1e-10:
+                    shrink = (sum_r - dist) / 2.0 + 1e-10
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+                    
+    return centers, radii, float(np.sum(radii))
+```

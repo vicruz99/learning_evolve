@@ -1,0 +1,154 @@
+# sol_000036 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000017 (state 58c90071) state=ae916370 sum of radii=2.624294 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_constraints(vars_flat):
+    """Computes all boundary and non-overlap constraints for the packing."""
+    X = vars_flat.reshape(N, 3)
+    xs = X[:, 0]
+    ys = X[:, 1]
+    rs = X[:, 2]
+
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c1 = xs - rs
+    c2 = 1.0 - xs - rs
+    c3 = ys - rs
+    c4 = 1.0 - ys - rs
+
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    idx = np.triu_indices(N, k=1)
+    dx = xs[idx[0]] - xs[idx[1]]
+    dy = ys[idx[0]] - ys[idx[1]]
+    dr = rs[idx[0]] + rs[idx[1]]
+    c5 = dx**2 + dy**2 - dr**2
+
+    return np.concatenate([c1, c2, c3, c4, c5])
+
+def compute_objective(vars_flat):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars_flat[2::3])
+
+def get_bounds():
+    """Returns variable bounds for x, y, r."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)])
+    return b
+
+def generate_initial_configs(seed):
+    """Generates diverse feasible initial configurations."""
+    rng = np.random.default_rng(seed)
+    configs = []
+    
+    # 1. Hexagonal grid initialization
+    pos = []
+    r_init = 0.095
+    rows = [5, 5, 5, 5, 6]
+    y = r_init
+    for r_idx, count in enumerate(rows):
+        x_start = r_init + (r_idx % 2) * r_init
+        for c in range(count):
+            x = x_start + c * (2 * r_init)
+            pos.append([x, y])
+        y += r_init * np.sqrt(3)
+    pos = np.array(pos[:N]) + rng.normal(0, 0.005, (N, 2))
+    pos = np.clip(pos, 0.05, 0.95)
+    configs.append(pos)
+    
+    # 2. Random dense initialization
+    pos2 = rng.uniform(0.15, 0.85, (N, 2))
+    configs.append(pos2)
+    
+    # 3. Perturbed grid initialization
+    grid = []
+    for i in range(5):
+        for j in range(5):
+            grid.append([0.12 + 0.2*i, 0.12 + 0.2*j])
+    grid.append([0.5, 0.08])
+    grid = np.array(grid[:N]) + rng.normal(0, 0.015, (N, 2))
+    grid = np.clip(grid, 0.05, 0.95)
+    configs.append(grid)
+    
+    results = []
+    for pos in configs:
+        vars_flat = np.zeros(N * 3)
+        for i in range(N):
+            vars_flat[3*i] = pos[i, 0]
+            vars_flat[3*i+1] = pos[i, 1]
+            vars_flat[3*i+2] = 0.025  # Small safe radius ensures initial feasibility
+        results.append(vars_flat)
+    return results
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+
+    best_vars = None
+    best_obj = -np.inf
+
+    # Generate diverse initial configurations
+    all_inits = []
+    for s in range(6):
+        all_inits.extend(generate_initial_configs(s))
+
+    # Primary optimization phase
+    for x0 in all_inits:
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            
+            c_vals = compute_constraints(res.x)
+            if np.all(c_vals >= -1e-6):
+                curr_obj = -res.fun
+                if curr_obj > best_obj:
+                    best_obj = curr_obj
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+
+    # Refinement phase: perturb best solution and re-optimize to escape local minima
+    if best_vars is not None:
+        rng = np.random.default_rng(123)
+        for _ in range(12):
+            x_curr = best_vars.copy()
+            # Small random perturbation
+            x_curr += rng.normal(0, 0.0008, x_curr.shape)
+            x_curr = np.clip(x_curr, 0.0, 1.0)
+            x_curr[2::3] = np.clip(x_curr[2::3], 1e-6, 0.5)
+            
+            try:
+                res = minimize(compute_objective, x_curr, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+                
+                c_vals = compute_constraints(res.x)
+                if np.all(c_vals >= -1e-6):
+                    curr_obj = -res.fun
+                    if curr_obj > best_obj:
+                        best_obj = curr_obj
+                        best_vars = res.x.copy()
+            except Exception:
+                continue
+
+    # Fallback if optimization fails entirely
+    if best_vars is None:
+        best_vars = generate_initial_configs(0)[0]
+
+    # Final safety adjustment to strictly satisfy validator tolerance
+    c_check = compute_constraints(best_vars)
+    if np.min(c_check) < 0:
+        best_vars[2::3] -= 1e-5
+        best_vars[2::3] = np.clip(best_vars[2::3], 1e-6, 0.5)
+
+    centers = best_vars.reshape(N, 3)[:, :2]
+    radii = best_vars.reshape(N, 3)[:, 2]
+    radii = np.maximum(radii, 0.0)
+    sum_r = float(np.sum(radii))
+    
+    return centers, radii, sum_r

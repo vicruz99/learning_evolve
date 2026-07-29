@@ -1,0 +1,277 @@
+# sol_000341 | problem=circle_packing_26 entrypoint=run_packing
+# generation=12 parent=sol_000242 (state 71f24e7d) state=afdbe199 sum of radii=2.610158 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, 1)
+NUM_PAIRS = N * (N - 1) // 2
+
+# Precompute LP constraint matrix structure
+A_LP = np.zeros((NUM_PAIRS + 4 * N, N))
+PAIR_IDX = []
+idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_LP[idx, i] = 1.0
+        A_LP[idx, j] = 1.0
+        PAIR_IDX.append((i, j))
+        idx += 1
+for i in range(N):
+    base = NUM_PAIRS + 4 * i
+    A_LP[base, i] = 1.0
+    A_LP[base + 1, i] = 1.0
+    A_LP[base + 2, i] = 1.0
+    A_LP[base + 3, i] = 1.0
+
+def solve_lp(centers):
+    """Solves LP for maximal radii given fixed centers. Returns radii, sum, and duals."""
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-12)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.zeros(NUM_PAIRS + 4 * N)
+    k = 0
+    for i, j in PAIR_IDX:
+        b[k] = dists[i, j]
+        k += 1
+    for i in range(N):
+        b[k] = centers[i, 0]; k += 1
+        b[k] = 1.0 - centers[i, 0]; k += 1
+        b[k] = centers[i, 1]; k += 1
+        b[k] = 1.0 - centers[i, 1]; k += 1
+        
+    bounds = [(0.0, u) for u in ub]
+    res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b, bounds=bounds, method='highs')
+    
+    if res.success:
+        try:
+            duals = res.marginals.ineqlin
+        except AttributeError:
+            duals = np.zeros(len(b))
+        return res.x, np.sum(res.x), duals
+    return np.zeros(N), 0.0, np.zeros(len(b))
+
+def compute_grad(centers, duals):
+    """Computes gradient of sum of radii w.r.t centers using LP duals."""
+    grad = np.zeros_like(centers)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    k = 0
+    for i, j in PAIR_IDX:
+        mu = duals[k]
+        if mu > 1e-10:
+            d = dists[i, j]
+            if d > 1e-10:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+        k += 1
+        
+    b_start = NUM_PAIRS
+    for i in range(N):
+        grad[i, 0] += duals[b_start + 4*i] - duals[b_start + 4*i + 1]
+        grad[i, 1] += duals[b_start + 4*i + 2] - duals[b_start + 4*i + 3]
+    return grad
+
+def lbfgs_opt(centers0, bounds, maxiter=2000):
+    """Local optimization using L-BFGS-B with exact LP gradient."""
+    c = centers0.copy()
+    def obj_grad(x):
+        x = np.clip(x.reshape(N, 2), 1e-6, 1.0 - 1e-6)
+        _, s, d = solve_lp(x)
+        g = compute_grad(x, d)
+        return -s, -g.flatten()
+        
+    try:
+        res = minimize(obj_grad, c.flatten(), method='L-BFGS-B', jac=True,
+                       bounds=bounds, options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-11})
+        return res.x.reshape(N, 2), -res.fun
+    except Exception:
+        return c, 0.0
+
+def slsqp_joint(c0, r0):
+    """Joint SLSQP optimization of centers and radii."""
+    v0 = np.concatenate([c0.flatten(), r0])
+    
+    def obj(v):
+        return -np.sum(v[2 * N:])
+        
+    def cons(v):
+        c = v[:2 * N].reshape(N, 2)
+        r = v[2 * N:]
+        con = []
+        con.append(c[:, 0] - r)
+        con.append(1.0 - c[:, 0] - r)
+        con.append(c[:, 1] - r)
+        con.append(1.0 - c[:, 1] - r)
+        dx = c[TRIU_I, 0] - c[TRIU_J, 0]
+        dy = c[TRIU_I, 1] - c[TRIU_J, 1]
+        dr = r[TRIU_I] + r[TRIU_J]
+        con.append(dx**2 + dy**2 - dr**2)
+        return np.concatenate(con)
+        
+    bnds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    try:
+        res = minimize(obj, v0, method='SLSQP', bounds=bnds,
+                       constraints={'type': 'ineq', 'fun': cons},
+                       options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+        if np.min(cons(res.x)) >= -1e-8:
+            return res.x[:2 * N].reshape(N, 2), res.x[2 * N:], -res.fun
+    except Exception:
+        pass
+    return c0, r0, np.sum(r0)
+
+def repair(centers, radii):
+    """Deterministic repair to guarantee strict validation compliance."""
+    radii = radii.copy()
+    for _ in range(150):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-11:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_s = -1.0
+    bounds = [(1e-5, 1.0 - 1e-5)] * (2 * N)
+    
+    starts = []
+    
+    # 1. Hexagonal patterns
+    pats = [[6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], 
+            [5, 5, 6, 5, 5], [4, 6, 6, 6, 4], [6, 4, 6, 5, 5]]
+    for pat in pats:
+        for r0 in [0.092, 0.098, 0.104, 0.110, 0.115]:
+            c = []
+            y = r0
+            for ri, cnt in enumerate(pat):
+                sh = r0 if ri % 2 == 1 else 0.0
+                x = r0 + sh
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            starts.append(np.array(c[:N]) + rng.normal(0, 0.003, (N, 2)))
+            
+    # 2. Force-directed
+    for _ in range(15):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(600):
+            f = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d_vec = c[i] - c[j]
+                    d = np.linalg.norm(d_vec)
+                    if d < 0.25 and d > 1e-4:
+                        push = (0.25 - d) * 0.05
+                        f[i] += d_vec / d * push
+                        f[j] -= d_vec / d * push
+            c += f
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+        
+    # 3. Corner/Edge biased
+    for _ in range(15):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        corners = [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92]]
+        c[:4] = corners
+        starts.append(c)
+
+    # Phase 1: Multi-start L-BFGS-B
+    for c_init in starts:
+        c_opt, s_opt = lbfgs_opt(c_init, bounds, maxiter=2500)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # Phase 2: Basin Hopping
+    if best_c is not None:
+        c_curr = best_c.copy()
+        s_curr = best_s
+        T = 0.008
+        decay = 0.996
+        
+        for step in range(400):
+            noise = 0.008 * (0.96 ** (step / 40.0))
+            c_try = c_curr + rng.normal(0, noise, c_curr.shape)
+            c_try = np.clip(c_try, 0.02, 0.98)
+            
+            c_try, s_try = lbfgs_opt(c_try, bounds, maxiter=600)
+            
+            if s_try is None or s_try < 0:
+                continue
+                
+            delta = s_try - s_curr
+            if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-9)):
+                c_curr = c_try
+                s_curr = s_try
+                if s_curr > best_s:
+                    best_s = s_curr
+                    best_c = c_curr.copy()
+            T *= decay
+            
+        # Polish
+        r_lp, _, _ = solve_lp(best_c)
+        c_pol, r_pol, s_pol = slsqp_joint(best_c, r_lp)
+        if s_pol > best_s:
+            best_s = s_pol
+            best_c = c_pol
+            best_r = r_pol
+            
+    # Phase 3: Swaps & Refinement
+    if best_c is not None:
+        r_lp, _, _ = solve_lp(best_c)
+        for _ in range(15):
+            idx1, idx2 = rng.choice(N, 2, replace=False)
+            c_swap = best_c.copy()
+            c_swap[[idx1, idx2]] = c_swap[[idx2, idx1]]
+            c_swap, s_swap = lbfgs_opt(c_swap, bounds, maxiter=800)
+            if s_swap > best_s:
+                best_s = s_swap
+                best_c = c_swap
+                r_lp, _, _ = solve_lp(best_c)
+                
+        c_fin, r_fin, s_fin = slsqp_joint(best_c, r_lp)
+        if s_fin > best_s:
+            best_s = s_fin
+            best_c = c_fin
+            best_r = r_fin
+        else:
+            best_r = r_lp
+
+    # Fallback & Final Repair
+    if best_c is None:
+        best_c = starts[0]
+        best_r, best_s, _ = solve_lp(best_c)
+    else:
+        if best_r is None:
+            best_r, _, _ = solve_lp(best_c)
+            
+    radii = repair(best_c, best_r)
+    return best_c, radii, float(np.sum(radii))

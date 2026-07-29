@@ -1,0 +1,243 @@
+# sol_000326 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state fe3e1745) state=295fc6af sum of radii=1.982394 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    # Set seed for reproducibility
+    np.random.seed(42)
+    
+    n = 26
+    
+    # 1. Initialization: Hexagonal Lattice
+    # We initialize with a hexagonal grid to get a good starting point.
+    # Estimate radius for 26 circles. 25 circles fit in 5x5 grid with r=0.1.
+    # 26 circles will likely have r slightly less, maybe around 0.09.
+    # We start with r=0.09 to ensure validity and allow optimization to grow them.
+    
+    # Generate hexagonal coordinates
+    centers = []
+    r_init = 0.09
+    
+    # We need to fit 26 circles. 
+    # Try filling rows with 5 and 6 circles? 
+    # Hexagonal packing density is high.
+    # Let's try a 6-row arrangement. 
+    # Row lengths: 5, 5, 5, 5, 5, 1? No, that's inefficient.
+    # Maybe 6, 5, 5, 5, 5? Total 26.
+    # But row of 6 requires width 12r. If r=0.09, width 1.08 > 1.
+    # So we cannot have a row of 6 with r=0.09.
+    # We need a layout that fits.
+    # 5x5 grid is 25 circles. Add 1 in a gap?
+    # Or 6 rows of ~4.3 circles?
+    
+    # Let's try a generic hexagonal tiling generation and filter/crop to 26.
+    # Or just place them on a grid and let optimizer fix.
+    
+    # Simple grid initialization for robustness
+    # 6 rows, 5 columns (with one extra)
+    # Actually, let's just place them randomly in a valid hex-like pattern
+    # or a dense grid that is slightly compressed.
+    
+    # A 5x5 grid has 25 circles. 
+    # Let's create a 6x5 grid (30 circles) and remove 4 randomly?
+    # Or just place 26 circles in a 5x6 rectangular grid pattern (dense)
+    # and let the optimizer shrink them to fit.
+    
+    # Better initialization: 25 in 5x5, 1 in center?
+    # 5x5 centers: x in [0.1, 0.9], y in [0.1, 0.9] step 0.2
+    # That's for r=0.1.
+    # If we use r=0.08, step 0.16.
+    # 5 circles: span 4*0.16 = 0.64. Range [0.08, 0.72].
+    # We have plenty of space.
+    
+    # Let's try to generate 26 points on a hexagonal lattice that fits roughly.
+    # We'll generate more and pick the best 26 or just take first 26.
+    
+    points = []
+    # Hexagonal lattice vectors
+    v1 = np.array([1.0, 0.0])
+    v2 = np.array([0.5, np.sqrt(3)/2])
+    
+    # Search for lattice points in unit square
+    # We can iterate u, v such that u*v1 + v*v2 is in [0,1]x[0,1]
+    # Scale factor s. If radius r, distance 2r.
+    # Let's assume target r ~ 0.1. Spacing 0.2.
+    
+    spacing = 0.18 # slightly less than 0.2 to fit more
+    # Lattice points
+    candidates = []
+    for i in range(0, 10):
+        for j in range(0, 10):
+            x = i * spacing
+            y = j * spacing * np.sqrt(3)/2
+            if i % 2 == 1:
+                y += spacing * np.sqrt(3)/4 # Shift odd rows? 
+                # Standard hex: row y = j * h. x = i * w + (j%2)*w/2
+            # Let's use standard hex generation
+            
+    # Standard Hex Generation
+    candidates = []
+    # Try a few scales
+    scale = 0.18
+    for j in range(7): # rows
+        y = j * scale * np.sqrt(3)/2
+        if j % 2 == 1:
+            offset = scale / 2
+        else:
+            offset = 0
+        for i in range(7): # cols
+            x = i * scale + offset
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                candidates.append([x, y])
+    
+    # If we have fewer than 26, reduce scale
+    if len(candidates) < 26:
+        scale = 0.12
+        candidates = []
+        for j in range(10):
+            y = j * scale * np.sqrt(3)/2
+            if j % 2 == 1:
+                offset = scale / 2
+            else:
+                offset = 0
+            for i in range(10):
+                x = i * scale + offset
+                if 0 <= x <= 1 and 0 <= y <= 1:
+                    candidates.append([x, y])
+    
+    # Take first 26 candidates
+    if len(candidates) >= 26:
+        centers = np.array(candidates[:26])
+    else:
+        # Fallback to random valid
+        centers = np.random.rand(26, 2) * 0.8 + 0.1 # Keep away from edges
+    
+    # Initial radii
+    # Check min distance to set initial radius
+    min_dist = np.inf
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            if d < min_dist:
+                min_dist = d
+    r_init = min_dist / 2.0 - 1e-4
+    # Also check boundaries
+    dist_to_bound = np.min(centers, axis=1)
+    dist_to_bound = np.minimum(dist_to_bound, 1 - np.max(centers, axis=1))
+    r_bound = np.min(dist_to_bound)
+    r_init = min(r_init, r_bound)
+    
+    radii = np.full(n, r_init)
+    
+    # 2. Optimization
+    # Variables: centers (26, 2) + radii (26) -> 78 vars
+    # We can fix radii to be equal for simplicity and robustness?
+    # "Maximize sum of radii" -> if equal, maximize 26*r.
+    # If we allow variable radii, the problem is harder.
+    # However, equal radii is a very good heuristic.
+    # Let's optimize centers and a single radius variable?
+    # But the return type requires radii array.
+    # We can optimize centers and a global radius r, then set all radii to r.
+    
+    def objective(vars):
+        # vars: [x0, y0, ..., x25, y25, r]
+        # We want to maximize sum(r) = 26*r.
+        # Equivalent to minimizing -r.
+        centers_opt = vars[:52].reshape(26, 2)
+        r = vars[52]
+        
+        penalty = 0.0
+        # Boundary constraints
+        for i in range(n):
+            x, y = centers_opt[i]
+            # If circle goes out, penalty
+            if x - r < 0: penalty += (x - r)**2
+            if x + r > 1: penalty += (x + r - 1)**2
+            if y - r < 0: penalty += (y - r)**2
+            if y + r > 1: penalty += (y + r - 1)**2
+            
+        # Overlap constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers_opt[i] - centers_opt[j])
+                if dist < 2 * r:
+                    penalty += (2 * r - dist)**2
+        
+        # We want to maximize r, so minimize -r + penalty
+        # Scale penalty to be significant
+        return -r + 100 * penalty
+
+    # Initial guess
+    x0 = np.zeros(53)
+    x0[:52] = centers.flatten()
+    x0[52] = r_init
+    
+    # Bounds: r must be non-negative. Centers in [0,1] is soft constraint via penalty, 
+    # but we can add bounds for centers to help.
+    bounds = [(0, 1)] * 52 + [(0, 1)] # r <= 1
+    
+    # Optimization
+    # Using Nelder-Mead or L-BFGS-B
+    # L-BFGS-B is good for bounds.
+    res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds, 
+                   options={'maxiter': 1000, 'ftol': 1e-12, 'gtol': 1e-12})
+    
+    # Extract results
+    best_centers = res.x[:52].reshape(26, 2)
+    best_r = res.x[52]
+    best_radii = np.full(26, best_r)
+    
+    # Clip centers to [0,1] just in case
+    best_centers = np.clip(best_centers, 0, 1)
+    
+    # Re-validate and adjust if necessary
+    # If optimization failed or penalty is high, we might need to shrink radius
+    # Let's check validity
+    valid = True
+    # Check boundaries
+    for i in range(n):
+        if best_centers[i,0] - best_r < -1e-12 or best_centers[i,0] + best_r > 1 + 1e-12:
+            valid = False
+        if best_centers[i,1] - best_r < -1e-12 or best_centers[i,1] + best_r > 1 + 1e-12:
+            valid = False
+    
+    if valid:
+        # Check overlaps
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.linalg.norm(best_centers[i] - best_centers[j])
+                if d < 2*best_r - 1e-12:
+                    valid = False
+                    break
+            if not valid: break
+    
+    if not valid:
+        # If invalid, shrink radius until valid
+        # This is a fallback
+        shrink_factor = 1.0
+        while not valid:
+            shrink_factor *= 0.99
+            best_r *= 0.99
+            best_radii[:] = best_r
+            # Re-check (simplified, assume centers ok)
+            valid = True
+            for i in range(n):
+                 if best_centers[i,0] - best_r < 0 or best_centers[i,0] + best_r > 1:
+                     valid = False; break
+                 if best_centers[i,1] - best_r < 0 or best_centers[i,1] + best_r > 1:
+                     valid = False; break
+            if valid:
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.linalg.norm(best_centers[i] - best_centers[j])
+                        if d < 2*best_r:
+                            valid = False
+                            break
+                    if not valid: break
+
+    return best_centers, best_radii, np.sum(best_radii)

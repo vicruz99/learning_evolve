@@ -1,0 +1,143 @@
+# sol_000390 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 19a68663) state=6e0106c1 sum of radii=2.500448 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def get_radii_and_grad(centers):
+    """Compute radii constrained by walls and neighbors, and their gradients."""
+    n = centers.shape[0]
+    
+    # Distances to walls: [left, right, bottom, top]
+    left = centers[:, 0]
+    right = 1 - centers[:, 0]
+    bottom = centers[:, 1]
+    top = 1 - centers[:, 1]
+    wall_dists = np.stack([left, right, bottom, top], axis=1)
+    min_wall = np.min(wall_dists, axis=1)
+    
+    # Pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dists, np.inf)
+    min_center = np.min(dists, axis=1)
+    
+    # Radii are limited by walls and half the distance to nearest neighbor
+    radii = np.minimum(min_wall, 0.5 * min_center)
+    
+    # Compute gradient for each circle
+    grad = np.zeros_like(centers)
+    tol = 1e-7
+    for i in range(n):
+        r = radii[i]
+        mw = min_wall[i]
+        mc = 0.5 * min_center[i]
+        
+        # Determine active constraint
+        if abs(mw - r) < tol and mw <= mc + tol:
+            # Wall constraint active
+            idx = np.argmin(wall_dists[i])
+            if idx == 0: grad[i, 0] = 1.0    # left: x
+            elif idx == 1: grad[i, 0] = -1.0 # right: 1-x
+            elif idx == 2: grad[i, 1] = 1.0  # bottom: y
+            else: grad[i, 1] = -1.0          # top: 1-y
+        else:
+            # Neighbor constraint active
+            j = np.argmin(dists[i])
+            d = dists[i, j]
+            if d > 1e-9:
+                grad[i] = 0.5 * diff[i, j] / d
+            else:
+                grad[i] = np.random.randn(2) * 0.1
+                
+    return radii, grad
+
+def optimize(init_centers, iterations=30000, lr_init=0.08):
+    """Run gradient ascent to maximize sum of radii."""
+    centers = init_centers.copy()
+    lr = lr_init
+    
+    radii, _ = get_radii_and_grad(centers)
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    for it in range(iterations):
+        radii, grad = get_radii_and_grad(centers)
+        current_sum = np.sum(radii)
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            
+        # Update positions
+        centers += lr * grad
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Learning rate decay
+        lr *= 0.9996
+        
+        # Occasional perturbation to escape local minima
+        if it > 0 and it % 8000 == 0:
+            centers += np.random.randn(*centers.shape) * 0.015
+            
+    return best_centers, best_radii, float(best_sum)
+
+def run_packing():
+    """Main function to execute packing strategy and return best result."""
+    np.random.seed(42)
+    n = 26
+    
+    best_centers = None
+    best_radii = None
+    best_total = -1.0
+    
+    # Strategy 1: Perturbed 5x5 grid + center
+    xs = np.linspace(0.12, 0.88, 5)
+    ys = np.linspace(0.12, 0.88, 5)
+    grid = np.array(np.meshgrid(xs, ys)).T.reshape(-1, 2)
+    init1 = np.vstack([grid, [0.5, 0.5]])
+    init1 += np.random.randn(*init1.shape) * 0.02
+    
+    # Strategy 2: Uniform random
+    init2 = np.random.rand(n, 2)
+    
+    # Strategy 3: Hexagonal-ish lattice
+    hex_pts = []
+    for row in range(6):
+        y = 0.1 + row * 0.16
+        cols = 5 if row % 2 == 0 else 4
+        x_start = 0.14 if row % 2 == 1 else 0.1
+        for c in range(cols):
+            x = x_start + c * 0.2
+            hex_pts.append([x, y])
+    while len(hex_pts) < n:
+        hex_pts.append(np.random.rand(2))
+    init3 = np.array(hex_pts[:n])
+    
+    # Strategy 4: Concentric rings approximation
+    init4 = np.zeros((n, 2))
+    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+    radii_ring = np.linspace(0.1, 0.45, n)
+    for i in range(n):
+        init4[i] = [0.5 + radii_ring[i]*np.cos(angles[i]), 
+                    0.5 + radii_ring[i]*np.sin(angles[i])]
+    init4 += np.random.randn(*init4.shape) * 0.01
+        
+    inits = [init1, init2, init3, init4]
+    
+    for i, init in enumerate(inits):
+        # Vary parameters slightly for diversity
+        c, r, s = optimize(init, iterations=25000, lr_init=0.07 + i*0.01)
+        if s > best_total:
+            best_total = s
+            best_centers = c
+            best_radii = r
+            
+    # Final refinement pass on the best configuration
+    best_centers, best_radii, best_total = optimize(best_centers, iterations=10000, lr_init=0.02)
+    
+    return best_centers, best_radii, best_total

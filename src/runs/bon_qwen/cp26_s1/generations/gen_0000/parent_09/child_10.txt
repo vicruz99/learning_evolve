@@ -1,98 +1,157 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we treat this as a bi-level optimization problem:
-1. **Outer Loop (Geometry/Positions)**: Optimize the $(x, y)$ coordinates of the 26 circle centers. This landscape is highly non-convex with many local optima.
-2. **Inner Loop (Sizes/Radii)**: For any fixed set of centers, finding the maximum radii that satisfy non-overlap and boundary constraints is a **Linear Programming (LP)** problem. The constraints are linear in radii: $r_i \ge 0$, $r_i \le \text{dist to boundary}$, and $r_i + r_j \le \text{dist}(c_i, c_j)$. Maximizing $\sum r_i$ is trivially solved by `scipy.optimize.linprog`.
+To maximize the sum of radii for 26 circles in a unit square, we must find an optimal configuration of centers and radii. The problem is non-convex, but we can approach it in two stages:
 
-**Optimization Pipeline**:
-- **Global Search**: Use `differential_evolution` to robustly explore the 52-dimensional space of centers. DE is ideal for rugged, non-differentiable objective landscapes.
-- **Exact Feasibility**: Each DE evaluation calls the LP solver. This guarantees that every evaluated configuration is physically valid and extracts the absolute best radii for those positions.
-- **Local Refinement**: After DE converges, run `Nelder-Mead` local optimization on the best centers to fine-tune positions and squeeze out additional radius sum. Nelder-Mead handles the piecewise-linear nature of the LP objective well.
-- **Efficiency**: Vectorized distance computation and sparse constraint construction keep the LP extremely fast (~1-2 ms), allowing thousands of evaluations within reasonable time.
+1.  **Initialization:** Generate a high-quality initial configuration using a hexagonal lattice (densest packing for circles) to place 26 points within the unit square.
+2.  **Local Optimization:** Refine the positions of the centers to maximize the sum of radii. Since the optimal radii for a fixed set of centers can be found by solving a Linear Programming (LP) problem, we use a gradient-free optimizer (Nelder-Mead) to adjust the centers. The objective function evaluates the LP to determine the maximum possible sum of radii for the current center positions.
 
-This hybrid approach reliably converges to high-quality packings exceeding the target sum of radii.
+This strategy leverages the geometric properties of hexagonal packing and robust local search to converge to a solution near the target sum of 2.636.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import linprog, differential_evolution, minimize
+from scipy.optimize import minimize, linprog
 
-def compute_lp_objective(centers_flat):
+def get_optimal_radii(centers):
     """
-    Given fixed centers, solve the LP to maximize sum of radii.
-    Returns (sum_radii, radii_array)
+    Solves the Linear Program to find the optimal radii for a fixed set of centers.
+    Maximizes sum(r_i) subject to packing and boundary constraints.
     """
-    centers = np.asarray(centers_flat).reshape(26, 2)
-    n = 26
-    c = -np.ones(n)  # We want to maximize sum(r), so minimize -sum(r)
+    n = centers.shape[0]
     
-    # Precompute pairwise distances
-    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    # Objective: maximize sum(r_i) => minimize -sum(r_i)
+    c_obj = np.ones(n)
     
-    # Upper triangle indices for i < j
-    rows, cols = np.triu_indices(n, k=1)
-    num_constraints = len(rows)
+    # Bounds for radii: r_i >= 0
+    bounds = [(0, None) for _ in range(n)]
     
-    # Build A_ub and b_ub for constraints: r_i + r_j <= d_ij
-    A_ub = np.zeros((num_constraints, n))
-    A_ub[np.arange(num_constraints), rows] = 1.0
-    A_ub[np.arange(num_constraints), cols] = 1.0
-    b_ub = dists[rows, cols]
+    # Inequality constraints: A_ub @ r <= b_ub
+    constraints_A = []
+    constraints_b = []
     
-    # Boundary constraints: 0 <= r_i <= min(x, 1-x, y, 1-y)
-    bounds = []
+    # Boundary constraints:
+    # r_i <= x_i
+    # r_i <= 1 - x_i
+    # r_i <= y_i
+    # r_i <= 1 - y_i
     for i in range(n):
         x, y = centers[i]
-        max_r = min(x, 1.0 - x, y, 1.0 - y)
-        bounds.append((0.0, max(0.0, max_r)))
         
-    try:
-        # 'highs' is a fast, robust LP solver available in modern scipy
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        if res.success and res.fun is not None:
-            return -res.fun, res.x
-    except Exception:
-        pass
+        # r_i <= x_i  =>  1*r_i <= x_i
+        row = np.zeros(n)
+        row[i] = 1
+        constraints_A.append(row)
+        constraints_b.append(x)
         
-    # Fallback if LP fails (should not happen as r=0 is always feasible)
-    return 0.0, np.zeros(n)
+        # r_i <= 1 - x_i  =>  1*r_i <= 1 - x_i
+        row = np.zeros(n)
+        row[i] = 1
+        constraints_A.append(row)
+        constraints_b.append(1 - x)
+        
+        # r_i <= y_i  =>  1*r_i <= y_i
+        row = np.zeros(n)
+        row[i] = 1
+        constraints_A.append(row)
+        constraints_b.append(y)
+        
+        # r_i <= 1 - y_i  =>  1*r_i <= 1 - y_i
+        row = np.zeros(n)
+        row[i] = 1
+        constraints_A.append(row)
+        constraints_b.append(1 - y)
+        
+    # Pairwise distance constraints:
+    # r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            row = np.zeros(n)
+            row[i] = 1
+            row[j] = 1
+            constraints_A.append(row)
+            constraints_b.append(dist)
+            
+    A_ub = np.array(constraints_A)
+    b_ub = np.array(constraints_b)
+    
+    # Solve LP
+    res = linprog(-c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        return np.sum(res.x), res.x
+    else:
+        # Fallback to zero if LP fails (should not happen with valid centers)
+        return 0.0, np.zeros(n)
 
-def objective_func(x):
-    """Objective for optimization solvers: minimize negative sum of radii"""
-    s, _ = compute_lp_objective(x)
-    return -s
+def objective_function(center_flat):
+    """
+    Objective function for the optimizer.
+    Input: flat array of 52 coordinates
+    Output: negative sum of radii (to be minimized)
+    """
+    centers = center_flat.reshape(-1, 2)
+    sum_radii, _ = get_optimal_radii(centers)
+    return -sum_radii
 
 def run_packing():
+    # 1. Initialization: Hexagonal Lattice
+    # We need to place 26 points. A hexagonal lattice is a good start.
+    # We approximate a radius of 0.1 to fit them initially.
     n = 26
-    bounds = [(0.0, 1.0)] * (2 * n)
+    r_init = 0.1
     
-    # 1. Global exploration with Differential Evolution
-    de_result = differential_evolution(
-        objective_func,
-        bounds,
-        maxiter=200,
-        popsize=15,
-        tol=1e-7,
-        mutation=(0.5, 1.5),
-        recombination=0.9,
-        seed=42,
-        disp=False
-    )
+    # Hexagonal grid spacing
+    dx = 2 * r_init
+    dy = np.sqrt(3) * r_init
     
-    # 2. Local refinement with Nelder-Mead
-    local_result = minimize(
-        objective_func,
-        de_result.x,
-        method='Nelder-Mead',
-        tol=1e-9,
-        options={'maxiter': 3000, 'xatol': 1e-8, 'fatol': 1e-9}
-    )
+    centers_list = []
+    x = 0.1 # Start with margin
+    y = 0.1
     
-    # Extract final packing
-    best_centers = local_result.x.reshape(n, 2)
-    _, best_radii = compute_lp_objective(local_result.x)
+    # Generate points in a zig-zag pattern
+    row = 0
+    count = 0
+    while count < n:
+        # X positions for current row (offset every other row)
+        offset = 0.5 * dx if row % 2 == 1 else 0
+        x_pos = 0.1 + offset
+        
+        # Add points in this row until we hit the right boundary
+        while x_pos + r_init <= 1.0 and count < n:
+            centers_list.append([x_pos, y])
+            count += 1
+            x_pos += dx
+        
+        y += dy
+        row += 1
     
-    return best_centers, best_radii, np.sum(best_radii)
+    centers = np.array(centers_list[:n])
+    
+    # 2. Optimization
+    # Use Nelder-Mead to optimize centers to maximize the sum of radii
+    # Initial guess flattened
+    x0 = centers.flatten()
+    
+    # Bounds for centers [0, 1]
+    bounds = [(0, 1) for _ in range(2 * n)]
+    
+    # Run optimization
+    # maxiter might need to be high for convergence
+    res = minimize(objective_function, x0, method='Nelder-Mead', 
+                   options={'maxiter': 5000, 'xatol': 1e-7, 'fatol': 1e-9})
+    
+    optimal_centers = res.x.reshape(-1, 2)
+    optimal_sum, optimal_radii = get_optimal_radii(optimal_centers)
+    
+    return optimal_centers, optimal_radii, optimal_sum
+
+# To test locally
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Min radius: {np.min(radii)}, Max radius: {np.max(radii)}")
+    # Run validation
+    # validate_packing(centers, radii)
 ```

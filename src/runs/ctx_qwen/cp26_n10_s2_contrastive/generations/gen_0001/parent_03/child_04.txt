@@ -1,0 +1,180 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that avoids local minima and handles constraints precisely. Past solutions using simple SLSQP with random initializations plateau around 2.60-2.62. 
+
+Key improvements in this approach:
+1. **Decoupled Optimization (LP Oracle)**: For any fixed set of centers, the problem of finding optimal radii is a Linear Program (maximize $\sum r_i$ subject to $r_i + r_j \leq d_{ij}$ and boundary constraints). Solving this LP is extremely fast and guarantees valid, maximal radii for those centers. We use this as an oracle to evaluate center configurations.
+2. **Dual Optimization Strategies**:
+   - **Strategy 1 (Powell + LP)**: Optimizes centers using a derivative-free Powell optimizer with the LP value as the objective. This navigates the non-smooth landscape of optimal radii effectively.
+   - **Strategy 2 (SLSQP Joint)**: Directly optimizes centers and radii together using SLSQP. This leverages gradient information for fine-tuning and often escapes traps that derivative-free methods hit.
+   - **Strategy 3 (Refinement)**: Perturbs the best found configuration and runs both methods again to squeeze out marginal gains.
+3. **Structured Initialization**: Instead of purely random starts, we use a hexagonal lattice pattern (6-5-6-5-4 circles) tailored to 26 circles, with controlled noise. This starts the optimizer in a high-density region known to be near-optimal for circle packing.
+4. **Precomputed LP Structure**: The constraint matrix for the LP is constant. Precomputing it accelerates the center optimization loop significantly.
+5. **Robustness**: Bounds and constraints are carefully formulated. The LP post-processing step ensures the final output strictly satisfies all non-overlap and boundary constraints while maximizing the sum.
+
+This hybrid approach combines global search robustness with precise constraint handling, targeting the 2.636+ threshold.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+# Precompute LP structure for speed
+_NUM_PAIRS = N * (N - 1) // 2
+_A_LP = np.zeros((_NUM_PAIRS, N))
+_PAIR_INDICES = []
+_idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        _A_LP[_idx, i] = 1.0
+        _A_LP[_idx, j] = 1.0
+        _PAIR_INDICES.append((i, j))
+        _idx += 1
+
+def get_lp_radii(centers):
+    """Given fixed centers, solve LP to find radii maximizing sum."""
+    n = N
+    c = -np.ones(n)
+    
+    # Bounds: 0 <= r_i <= distance to nearest boundary
+    bounds = []
+    for x, y in centers:
+        mr = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(0.0, mr)))
+        
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    b_ub = np.zeros(_NUM_PAIRS)
+    for k, (i, j) in enumerate(_PAIR_INDICES):
+        dx = centers[i, 0] - centers[j, 0]
+        dy = centers[i, 1] - centers[j, 1]
+        b_ub[k] = np.hypot(dx, dy)
+        
+    try:
+        res = linprog(c, A_ub=_A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except:
+        pass
+    return np.zeros(n), 0.0
+
+def objective_centers(centers_flat):
+    """Objective for center optimization: negative max sum of radii."""
+    centers = centers_flat.reshape(N, 2)
+    _, sum_r = get_lp_radii(centers)
+    return -sum_r
+
+def objective_slxqp(params):
+    """Objective for joint SLSQP: negative sum of radii."""
+    r = params[2::3]
+    return -np.sum(r)
+
+def constraints_slxqp(params):
+    """Constraints for joint SLSQP: g(x) >= 0."""
+    n = N
+    cx = params[0::3]
+    cy = params[1::3]
+    r = params[2::3]
+    
+    cons = []
+    # Boundary constraints
+    cons.extend(cx - r)          # x - r >= 0
+    cons.extend(1.0 - cx - r)    # 1 - x - r >= 0
+    cons.extend(cy - r)          # y - r >= 0
+    cons.extend(1.0 - cy - r)    # 1 - y - r >= 0
+    
+    # Non-overlap constraints: dist >= r_i + r_j
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = cx[i] - cx[j]
+            dy = cy[i] - cy[j]
+            cons.append(np.hypot(dx, dy) - r[i] - r[j])
+    return np.array(cons)
+
+def get_hex_init(seed):
+    """Initialize centers in a hexagonal pattern tailored for 26 circles."""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    idx = 0
+    # Row pattern summing to 26
+    row_counts = [6, 5, 6, 5, 4]
+    ys = np.linspace(0.09, 0.91, 5)
+    
+    for r_idx, count in enumerate(row_counts):
+        y = ys[r_idx]
+        x_start = 0.05 + (r_idx % 2) * 0.04
+        x_end = 0.95 - (r_idx % 2) * 0.04
+        xs = np.linspace(x_start, x_end, count)
+        for x in xs:
+            centers[idx] = [x + rng.uniform(-0.02, 0.02), y + rng.uniform(-0.02, 0.02)]
+            idx += 1
+    return centers
+
+def run_packing():
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Center optimization with LP radii oracle (Powell)
+    for trial in range(12):
+        np.random.seed(trial * 13 + 3)
+        c_init = get_hex_init(seed=trial)
+        c_init += np.random.randn(N, 2) * 0.02
+        c_init = np.clip(c_init, 0.02, 0.98)
+        
+        res = minimize(objective_centers, c_init.flatten(), method='Powell',
+                       options={'maxiter': 1200, 'ftol': 1e-9})
+        opt_c = res.x.reshape(N, 2)
+        radii, s = get_lp_radii(opt_c)
+        if s > best_sum:
+            best_sum = s
+            best_centers = opt_c.copy()
+            best_radii = radii.copy()
+            
+    # Strategy 2: Direct joint optimization (SLSQP)
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints_slxqp}
+    
+    for trial in range(8):
+        np.random.seed(trial * 23 + 11)
+        cx = np.random.uniform(0.15, 0.85, N)
+        cy = np.random.uniform(0.15, 0.85, N)
+        r = np.full(N, 0.06)
+        x0 = np.zeros(3 * N)
+        x0[0::3] = cx
+        x0[1::3] = cy
+        x0[2::3] = r
+        
+        res = minimize(objective_slxqp, x0, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12})
+        if res.success:
+            s = -res.fun
+            if s > best_sum:
+                opt_c = np.column_stack((res.x[0::3], res.x[1::3]))
+                # LP refinement guarantees valid & maximal radii for these centers
+                radii, s_lp = get_lp_radii(opt_c)
+                if s_lp > best_sum:
+                    best_sum = s_lp
+                    best_centers = opt_c.copy()
+                    best_radii = radii.copy()
+                    
+    # Strategy 3: Local refinement of best solution found so far
+    if best_centers is not None:
+        for trial in range(5):
+            np.random.seed(trial * 37 + 7)
+            c_curr = best_centers.copy() + np.random.randn(N, 2) * 0.005
+            c_curr = np.clip(c_curr, 0.01, 0.99)
+            
+            res = minimize(objective_centers, c_curr.flatten(), method='Powell',
+                           options={'maxiter': 1500, 'ftol': 1e-10})
+            opt_c = res.x.reshape(N, 2)
+            radii, s = get_lp_radii(opt_c)
+            if s > best_sum:
+                best_sum = s
+                best_centers = opt_c.copy()
+                best_radii = radii.copy()
+                
+    return best_centers, best_radii, float(best_sum)
+```

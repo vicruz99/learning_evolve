@@ -1,0 +1,378 @@
+
+
+<strategy>
+Looking at the past solutions, they converge around 2.631-2.636. To push beyond 2.636, I need a different strategy:
+
+1. **trust-constr optimizer**: This handles non-linear constraints more robustly than SLSQP and can escape shallow local minima better
+2. **More diverse initial configurations**: Including corner-exploiting patterns where circles are explicitly placed near corners/edges to maximize radii
+3. **Multi-phase refinement**: After initial optimization, do aggressive perturbation with varying scales, then fine-grained refinement
+4. **COBYLA as alternative optimizer**: Gradient-free, which can escape local minima differently than SLSQP
+5. **Sequential approach**: Try fixing radii and optimizing positions, then vice versa
+6. **Boundary-hugging configurations**: Explicitly generate patterns where circles hug the square boundaries
+
+The key insight is that circles near corners can be larger (constrained by only 2 walls instead of neighbors on all sides), so we should try configurations that exploit this.
+
+I'll generate hexagonal patterns with wider parameter sweeps, force-relaxed configurations, and boundary-aligned patterns. Then optimize with both SLSQP and trust-constr, followed by perturbation-based local search.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, NonlinearConstraint
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    
+    return c
+
+def compute_initial_radii(centers):
+    r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+    r = np.minimum(r, np.min(dists, axis=1) / 2.0)
+    
+    return np.clip(r * 0.88, 0.001, 0.5)
+
+def generate_hex_pattern(r0, angle=0.0, sx=0.0, sy=0.0):
+    pts = []
+    y = r0 + sy
+    row = 0
+    while len(pts) < N + 15:
+        x_start = r0 + sx + (row % 2) * r0
+        x = x_start
+        while x <= 1.0 - r0 and len(pts) < N + 15:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += r0 * np.sqrt(3.0)
+        row += 1
+    
+    pts = np.array(pts[:N])
+    
+    if angle != 0.0:
+        c, s = np.cos(angle), np.sin(angle)
+        pts = pts - 0.5
+        pts = pts @ np.array([[c, -s], [s, c]])
+        pts = pts + 0.5
+    
+    return np.clip(pts, 0.02, 0.98)
+
+def generate_boundary_hugging_config(seed):
+    """Generate configuration with circles hugging boundaries."""
+    np.random.seed(seed)
+    pts = []
+    
+    # Corner circles
+    corner_margin = 0.08 + np.random.uniform(-0.01, 0.01)
+    pts.append([corner_margin, corner_margin])
+    pts.append([1.0 - corner_margin, corner_margin])
+    pts.append([corner_margin, 1.0 - corner_margin])
+    pts.append([1.0 - corner_margin, 1.0 - corner_margin])
+    
+    # Edge circles
+    edge_positions = np.sort(np.random.uniform(0.2, 0.8, 12))
+    margin = 0.07 + np.random.uniform(-0.005, 0.005)
+    
+    for p in edge_positions[:3]:
+        pts.append([margin, p])
+        pts.append([1.0 - margin, p])
+    for p in edge_positions[3:6]:
+        pts.append([p, margin])
+        pts.append([p, 1.0 - margin])
+    
+    # Interior circles
+    interior_count = N - len(pts)
+    if interior_count > 0:
+        interior = np.random.uniform(0.2, 0.8, (interior_count, 2))
+        pts.extend(interior.tolist())
+    
+    pts = np.array(pts[:N])
+    return np.clip(pts, 0.03, 0.97)
+
+def force_relax(centers, steps=800):
+    pts = centers.copy()
+    lr = 0.03
+    target_dist = 0.28
+    for _ in range(steps):
+        forces = np.zeros_like(pts)
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pts[i, 0] - pts[j, 0]
+                dy = pts[i, 1] - pts[j, 1]
+                d = np.hypot(dx, dy)
+                if d < target_dist and d > 1e-4:
+                    f = (target_dist - d) / d * 0.8
+                    forces[i, 0] += f * dx
+                    forces[i, 1] += f * dy
+                    forces[j, 0] -= f * dx
+                    forces[j, 1] -= f * dy
+        
+        for i in range(N):
+            if pts[i, 0] < 0.12:
+                forces[i, 0] += 0.12
+            if pts[i, 0] > 0.88:
+                forces[i, 0] -= 0.12
+            if pts[i, 1] < 0.12:
+                forces[i, 1] += 0.12
+            if pts[i, 1] > 0.88:
+                forces[i, 1] -= 0.12
+        
+        pts += forces * lr
+        pts = np.clip(pts, 0.05, 0.95)
+        lr *= 0.997
+    
+    return pts
+
+def optimize_config(v0, bounds, cons):
+    """Try optimizing with multiple methods."""
+    best_res = None
+    best_obj = np.inf
+    
+    # Try SLSQP
+    try:
+        res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                      constraints=cons,
+                      options={'maxiter': 15000, 'ftol': 1e-13, 'disp': False})
+        if -res.fun < best_obj:
+            cv = constraints(res.x)
+            if np.min(cv) >= -1e-6:
+                best_obj = -res.fun
+                best_res = res
+    except Exception:
+        pass
+    
+    # Try COBYLA (gradient-free)
+    try:
+        bounds_list = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+        cons_eq = []
+        cons_ineq = [{'type': 'ineq', 'fun': constraints}]
+        
+        res_cobyla = minimize(objective, v0, method='COBYLA',
+                              bounds=bounds_list, constraints=cons_ineq,
+                              options={'maxiter': 15000, 'rhobeg': 0.001, 'rhofinal': 1e-10})
+        if -res_cobyla.fun < best_obj:
+            cv = constraints(res_cobyla.x)
+            if np.min(cv) >= -1e-5:
+                best_obj = -res_cobyla.fun
+                best_res = res_cobyla
+    except Exception:
+        pass
+    
+    return best_res
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    inits = []
+    
+    # 1. Hexagonal patterns - dense parameter sweep
+    for r0 in np.linspace(0.082, 0.112, 12):
+        for angle in np.linspace(-0.30, 0.30, 11):
+            for sx in np.linspace(-0.03, 0.03, 5):
+                for sy in np.linspace(-0.03, 0.03, 5):
+                    pts = generate_hex_pattern(r0, angle, sx, sy)
+                    inits.append(pts)
+    
+    # 2. Boundary-hugging configurations
+    for seed in range(20):
+        pts = generate_boundary_hugging_config(seed)
+        inits.append(pts)
+    
+    # 3. Force-relaxed random starts
+    for seed in range(25):
+        np.random.seed(seed)
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        pts = force_relax(pts, steps=800)
+        inits.append(pts)
+    
+    # 4. Perturbed grids with various spacings
+    for seed in range(15):
+        np.random.seed(seed + 100)
+        spx = 0.15 + np.random.uniform(-0.02, 0.02)
+        spy = 0.18 + np.random.uniform(-0.02, 0.02)
+        pts = []
+        for i in range(7):
+            for j in range(5):
+                x = 0.07 + i * spx + np.random.uniform(-0.008, 0.008)
+                y = 0.07 + j * spy + np.random.uniform(-0.008, 0.008)
+                pts.append([x, y])
+        if len(pts) >= N:
+            inits.append(np.array(pts[:N]))
+    
+    # Phase 1: Multi-start optimization
+    for idx, centers in enumerate(inits):
+        r_init = compute_initial_radii(centers)
+        v0 = np.concatenate([centers[:, 0], centers[:, 1], r_init])
+        
+        res = optimize_config(v0, bounds, cons)
+        if res is not None:
+            s = -res.fun
+            if s > best_sum:
+                cv = constraints(res.x)
+                if np.min(cv) >= -1e-6:
+                    best_sum = s
+                    best_v = res.x.copy()
+    
+    # Fallback
+    if best_v is None:
+        centers_fallback = inits[0]
+        r_fallback = compute_initial_radii(centers_fallback)
+        best_v = np.concatenate([centers_fallback[:, 0], centers_fallback[:, 1], r_fallback])
+        best_sum = -np.sum(r_fallback)
+    
+    # Phase 2: Aggressive perturbation and refinement
+    current_v = best_v.copy()
+    for step in range(60):
+        np.random.seed(step + 500)
+        pert = current_v.copy()
+        
+        # Varying noise scales
+        noise_scale = 0.008 * (1.0 - 0.5 * (step / 60.0))
+        pert[:2*N] += np.random.uniform(-noise_scale, noise_scale, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        
+        # Shrink radii to create room
+        pert[2*N:] *= 0.85
+        c_pts = pert[:2*N].reshape(N, 2)
+        pert[2*N:] = compute_initial_radii(c_pts) * 0.90
+        
+        res = optimize_config(pert, bounds, cons)
+        if res is not None:
+            s = -res.fun
+            if s > best_sum:
+                cv = constraints(res.x)
+                if np.min(cv) >= -1e-6:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    current_v = best_v.copy()
+    
+    # Phase 3: trust-constr refinement for best solution
+    try:
+        bounds_tc = np.array([(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N)
+        nlc = NonlinearConstraint(constraints, 0, np.inf, keep_feasible=True)
+        
+        for seed in range(15):
+            np.random.seed(seed + 600)
+            v_pert = best_v.copy()
+            v_pert[:2*N] += np.random.uniform(-0.003, 0.003, 2*N)
+            v_pert[:2*N] = np.clip(v_pert[:2*N], 0.01, 0.99)
+            v_pert[2*N:] *= 0.93
+            
+            try:
+                res = minimize(objective, v_pert, method='trust-constr',
+                              bounds=bounds_tc, constraints=nlc,
+                              options={'maxiter': 4000, 'verbose': 0})
+                s = -res.fun
+                if s > best_sum:
+                    cv = constraints(res.x)
+                    if np.min(cv) >= -1e-6:
+                        best_sum = s
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    # Phase 4: Fine-grained perturbation on best solution
+    current_v = best_v.copy()
+    for step in range(40):
+        np.random.seed(step + 700)
+        pert = current_v.copy()
+        
+        noise_scale = 0.002 * (1.0 - 0.5 * (step / 40.0))
+        pert[:2*N] += np.random.uniform(-noise_scale, noise_scale, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        
+        pert[2*N:] *= 0.96
+        c_pts = pert[:2*N].reshape(N, 2)
+        pert[2*N:] = compute_initial_radii(c_pts) * 0.97
+        
+        try:
+            res = minimize(objective, pert, method='SLSQP', bounds=bounds,
+                          constraints=cons,
+                          options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                cv = constraints(res.x)
+                if np.min(cv) >= -1e-6:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    current_v = best_v.copy()
+        except Exception:
+            pass
+    
+    # Phase 5: trust-constr fine refinement
+    try:
+        bounds_tc = np.array([(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N)
+        nlc = NonlinearConstraint(constraints, 0, np.inf, keep_feasible=True)
+        
+        for seed in range(10):
+            np.random.seed(seed + 800)
+            v_pert = best_v.copy()
+            v_pert[:2*N] += np.random.uniform(-0.001, 0.001, 2*N)
+            v_pert[:2*N] = np.clip(v_pert[:2*N], 0.01, 0.99)
+            
+            try:
+                res = minimize(objective, v_pert, method='trust-constr',
+                              bounds=bounds_tc, constraints=nlc,
+                              options={'maxiter': 5000, 'verbose': 0})
+                s = -res.fun
+                if s > best_sum:
+                    cv = constraints(res.x)
+                    if np.min(cv) >= -1e-6:
+                        best_sum = s
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    # Extract and post-process
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        cr[i] = min(cr[i], centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        cr[i] = max(cr[i], 0.0)
+    
+    # Enforce non-overlap iteratively
+    for _ in range(30):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if cr[i] + cr[j] > d - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+    
+    return centers, cr, float(np.sum(cr))
+```

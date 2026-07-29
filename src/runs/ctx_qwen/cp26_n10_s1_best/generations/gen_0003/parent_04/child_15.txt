@@ -1,0 +1,251 @@
+
+
+<strategy>
+Looking at the past solutions, the best sum of radii achieved is ~2.634292. To push toward 2.636, I need:
+
+1. **More diverse initializations**: Different row patterns for hexagonal lattices, varied rotation angles, and force-directed layouts to explore the configuration space more thoroughly.
+
+2. **Alternating LP/NLP refinement**: After initial SLSQP optimization, use Linear Programming to optimally scale radii for fixed centers (this is exact and convex), then re-optimize positions. This alternating approach can escape SLSQP local minima because the LP provides globally optimal radii for any fixed center configuration.
+
+3. **Constraint handling improvements**: Use squared distance constraints for numerical stability, and carefully clip projections when perturbing.
+
+4. **Multiple refinement passes**: After finding a good solution, run several rounds of: LP radii → perturb positions → SLSQP positions/radii → repeat.
+
+5. **Force-directed initialization**: Create well-spread initial configurations that break symmetry and avoid pathological starting points.
+
+The key insight is that the LP step can find globally optimal radii for any center configuration, which the NLP then tries to improve by moving centers. This combination is more robust than pure NLP.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def obj(x):
+    return -np.sum(x[2::3])
+
+def constr(x):
+    n = N
+    cx = x[0::3]
+    cy = x[1::3]
+    cr = x[2::3]
+    
+    b = np.concatenate([cx - cr, 1.0 - cx - cr, cy - cr, 1.0 - cy - cr])
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dr = cr[:, None] + cr[None, :]
+    i, j = np.tril_indices(n, -1)
+    o = dx[i, j]**2 + dy[i, j]**2 - dr[i, j]**2
+    
+    return np.concatenate([b, o])
+
+def bd():
+    return [(0.0, 1.0), (0.0, 1.0), (1e-10, 0.5)] * N
+
+def hex(rows, r, seed=0):
+    np.random.seed(seed)
+    c = np.zeros((N, 2))
+    ra = np.full(N, r)
+    idx = 0
+    y = r
+    for ri, cnt in enumerate(rows):
+        xs = r if ri % 2 == 0 else 2 * r
+        for k in range(cnt):
+            if idx >= N:
+                break
+            c[idx] = [xs + k * 2 * r, y]
+            idx += 1
+        y += np.sqrt(3) * r
+    while idx < N:
+        c[idx] = np.random.uniform(0.2, 0.8, 2)
+        ra[idx] = 0.05
+        idx += 1
+    return c + np.random.normal(0, 0.002, (N, 2)), ra
+
+def rot(c, a):
+    cx, cy = 0.5, 0.5
+    co, si = np.cos(a), np.sin(a)
+    nc = np.zeros_like(c)
+    for i in range(len(c)):
+        dx, dy = c[i, 0] - cx, c[i, 1] - cy
+        nc[i] = [dx * co - dy * si + cx, dx * si + dy * co + cy]
+    return np.clip(nc, 0.05, 0.95)
+
+def lp_rad(centers):
+    n = N
+    c = -np.ones(n)
+    A = np.zeros((n + n * (n - 1) // 2, n))
+    b = np.zeros(n + n * (n - 1) // 2)
+    idx = 0
+    for i in range(n):
+        b[idx] = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        A[idx, i] = 1
+        idx += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[idx, i] = 1
+            A[idx, j] = 1
+            b[idx] = d
+            idx += 1
+    res = linprog(c, A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+    return res.x if res.success else None
+
+def force_init(seed):
+    np.random.seed(seed)
+    c = np.random.uniform(0.15, 0.85, (N, 2))
+    r = np.full(N, 0.09)
+    
+    for _ in range(800):
+        fx = np.zeros(N)
+        fy = np.zeros(N)
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = c[j, 0] - c[i, 0]
+                dy = c[j, 1] - c[i, 1]
+                d = np.hypot(dx, dy)
+                if d < 0.3 and d > 1e-6:
+                    f = 0.01 / (d ** 2 + 0.001)
+                    fx[i] -= f * dx
+                    fy[i] -= f * dy
+                    fx[j] += f * dx
+                    fy[j] += f * dy
+            if c[i, 0] < r[i]:
+                fx[i] += 0.1
+            if c[i, 0] > 1 - r[i]:
+                fx[i] -= 0.1
+            if c[i, 1] < r[i]:
+                fy[i] += 0.1
+            if c[i, 1] > 1 - r[i]:
+                fy[i] -= 0.1
+        c += np.column_stack([fx, fy]) * 0.02
+        c = np.clip(c, r, 1 - r)
+    
+    return c, r
+
+def run_packing():
+    n = N
+    b = bd()
+    con = {'type': 'ineq', 'fun': constr}
+    
+    best_s = -1
+    best_x = None
+    
+    pats = [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 6, 6, 5, 4], [6, 6, 5, 5, 4],
+            [5, 5, 6, 6, 4], [4, 6, 6, 6, 4], [5, 7, 5, 5, 4], [7, 5, 5, 5, 4]]
+    
+    for pat in pats:
+        for r0 in [0.088, 0.092, 0.096, 0.10]:
+            for seed in range(8):
+                c, r = hex(pat, r0, seed)
+                for ang in [0, 0.04, 0.08, 0.12, -0.04, -0.08, -0.12]:
+                    if ang != 0:
+                        cr = rot(c.copy(), ang)
+                    else:
+                        cr = c
+                    x0 = np.zeros(3 * n)
+                    x0[0::3] = cr[:, 0]
+                    x0[1::3] = cr[:, 1]
+                    x0[2::3] = r
+                    
+                    try:
+                        res = minimize(obj, x0, method='SLSQP', bounds=b, constraints=con,
+                                     options={'maxiter': 15000, 'ftol': 1e-12, 'disp': False})
+                        if -res.fun > best_s:
+                            cv = constr(res.x)
+                            if np.min(cv) >= -1e-6:
+                                best_s = -res.fun
+                                best_x = res.x.copy()
+                    except Exception:
+                        pass
+    
+    for seed in range(8):
+        c, r = force_init(seed)
+        x0 = np.zeros(3 * n)
+        x0[0::3] = c[:, 0]
+        x0[1::3] = c[:, 1]
+        x0[2::3] = r
+        
+        try:
+            res = minimize(obj, x0, method='SLSQP', bounds=b, constraints=con,
+                         options={'maxiter': 15000, 'ftol': 1e-12, 'disp': False})
+            if -res.fun > best_s:
+                cv = constr(res.x)
+                if np.min(cv) >= -1e-6:
+                    best_s = -res.fun
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+    
+    if best_x is not None:
+        centers = np.column_stack((best_x[0::3], best_x[1::3]))
+        radii = best_x[2::3]
+        
+        for _ in range(6):
+            r_new = lp_rad(centers)
+            if r_new is not None and np.sum(r_new) > np.sum(radii) - 1e-8:
+                radii = r_new.copy()
+                x0 = np.zeros(3 * n)
+                x0[0::3] = centers[:, 0]
+                x0[1::3] = centers[:, 1]
+                x0[2::3] = radii
+                
+                for _ in range(3):
+                    x0 += np.random.normal(0, 1e-4, 3 * n)
+                    for i in range(n):
+                        ri = radii[i]
+                        x0[3 * i] = np.clip(x0[3 * i], ri, 1 - ri)
+                        x0[3 * i + 1] = np.clip(x0[3 * i + 1], ri, 1 - ri)
+                        x0[3 * i + 2] = ri
+                    
+                    try:
+                        res = minimize(obj, x0, method='SLSQP', bounds=b, constraints=con,
+                                     options={'maxiter': 12000, 'ftol': 1e-12, 'disp': False})
+                        if -res.fun > best_s:
+                            cv = constr(res.x)
+                            if np.min(cv) >= -1e-6:
+                                best_s = -res.fun
+                                best_x = res.x.copy()
+                                centers = np.column_stack((best_x[0::3], best_x[1::3]))
+                                radii = best_x[2::3]
+                    except Exception:
+                        pass
+    
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    
+    valid = True
+    for i in range(n):
+        if radii[i] < 0 or centers[i, 0] < radii[i] - 1e-10 or centers[i, 0] + radii[i] > 1 + 1e-10 or \
+           centers[i, 1] < radii[i] - 1e-10 or centers[i, 1] + radii[i] > 1 + 1e-10:
+            valid = False
+            break
+    if valid:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1]) < radii[i] + radii[j] - 1e-10:
+                    valid = False
+                    break
+            if not valid:
+                break
+    
+    if not valid:
+        for _ in range(100):
+            radii *= 0.995
+            centers[:, 0] = np.clip(centers[:, 0], radii, 1 - radii)
+            centers[:, 1] = np.clip(centers[:, 1], radii, 1 - radii)
+            ok = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1]) < radii[i] + radii[j] - 1e-12:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                break
+    
+    return centers, radii, float(np.sum(radii))
+```

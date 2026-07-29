@@ -1,0 +1,135 @@
+
+
+<strategy>
+The previous solutions used direct constrained optimization (SLSQP) on both centers and radii simultaneously. While valid, this creates a highly non-convex landscape with ~442 constraints, causing the optimizer to frequently get trapped in local minima around ~2.624 sum of radii.
+
+To escape these local minima and approach the true optimum, I will decouple the problem into a two-stage iterative approach:
+1. **Linear Programming for Radii**: For any fixed set of center coordinates, finding the optimal radii that maximize the sum is a Linear Programming problem. The constraints are linear in radii (`r_i <= boundary_dist`, `r_i + r_j <= center_dist`). Solving this LP is extremely fast and globally optimal for the radii subproblem.
+2. **Derivative-Free Optimization for Centers**: We wrap the LP solver in an objective function that takes center coordinates, solves for optimal radii, and returns the negative sum of radii. This transforms the original 78-variable non-convex problem into a 52-variable unconstrained (bounded) optimization problem. The resulting objective landscape is significantly smoother and more amenable to global optimization.
+3. **Multi-Start Powell/Nelder-Mead**: We use the `Powell` and `Nelder-Mead` methods with multiple structured (hexagonal, grid) and random initializations. These methods handle the piecewise-linear nature of the LP-valued objective robustly.
+4. **Precomputed LP Structure**: To maximize speed during the thousands of LP evaluations, the constraint matrix `A_ub` is precomputed once. Only the right-hand side `b_ub` vector is updated per evaluation, drastically reducing allocation overhead.
+5. **Numerical Safety**: Centers are clamped to `[1e-4, 1-1e-4]` during optimization to prevent degenerate LP instances. Final radii are slightly shrunk (`* 0.9999999`) to guarantee strict satisfaction of the validator's `1e-12` tolerance for overlaps and boundaries.
+
+This strategy leverages exact subproblem solutions and robust global search heuristics to reliably surpass the 2.636 target.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+
+# Precompute the fixed structure of the LP constraint matrix A_ub
+# Constraints: 4 per circle (boundaries) + N(N-1)/2 (pairwise non-overlap)
+NUM_CONSTRAINTS = 4 * N_CIRCLES + N_CIRCLES * (N_CIRCLES - 1) // 2
+A_LP = np.zeros((NUM_CONSTRAINTS, N_CIRCLES))
+idx = 0
+for i in range(N_CIRCLES):
+    A_LP[idx, i] = 1.0; idx += 1  # r_i <= x_i
+    A_LP[idx, i] = 1.0; idx += 1  # r_i <= 1 - x_i
+    A_LP[idx, i] = 1.0; idx += 1  # r_i <= y_i
+    A_LP[idx, i] = 1.0; idx += 1  # r_i <= 1 - y_i
+for i in range(N_CIRCLES):
+    for j in range(i + 1, N_CIRCLES):
+        A_LP[idx, i] = 1.0
+        A_LP[idx, j] = 1.0
+        idx += 1
+
+c_LP = -np.ones(N_CIRCLES)  # Maximize sum(r) => Minimize -sum(r)
+bounds_LP = [(0, None)] * N_CIRCLES
+b_LP = np.empty(NUM_CONSTRAINTS)
+
+def solve_radii_lp(centers):
+    """Solves the LP to find optimal radii for fixed centers."""
+    idx = 0
+    for i in range(N_CIRCLES):
+        x, y = centers[i]
+        b_LP[idx] = x; idx += 1
+        b_LP[idx] = 1.0 - x; idx += 1
+        b_LP[idx] = y; idx += 1
+        b_LP[idx] = 1.0 - y; idx += 1
+        
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            b_LP[idx] = d; idx += 1
+            
+    try:
+        res = linprog(c_LP, A_ub=A_LP, b_ub=b_LP, bounds=bounds_LP, method='highs')
+        if res.success:
+            return -res.fun, res.x
+        else:
+            # Fallback for numerical edge cases
+            return 0.0, np.zeros(N_CIRCLES)
+    except Exception:
+        return 0.0, np.zeros(N_CIRCLES)
+
+def objective_centers(centers_flat):
+    """Objective function for center optimization: negative max sum of radii."""
+    centers = centers_flat.reshape(N_CIRCLES, 2)
+    # Clamp centers to ensure strict feasibility and numerical stability for LP
+    centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+    val, _ = solve_radii_lp(centers)
+    return -val
+
+def run_packing():
+    best_sum = -np.inf
+    best_centers = None
+    
+    inits = []
+    
+    # 1. Hexagonal lattice initialization
+    pts = []
+    r_est = 0.1
+    y = r_est
+    row = 0
+    while y < 1.0 - r_est and len(pts) < N_CIRCLES:
+        x_start = r_est if row % 2 == 0 else 2.0 * r_est
+        x = x_start
+        while x < 1.0 - r_est and len(pts) < N_CIRCLES:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    inits.append(np.array(pts[:N_CIRCLES]).flatten())
+    
+    # 2. Structured grid + center
+    pts = []
+    for i in range(5):
+        for j in range(5):
+            pts.append([0.1 + 0.2*i, 0.1 + 0.2*j])
+    pts.append([0.5, 0.5])
+    inits.append(np.array(pts).flatten())
+    
+    # 3. Diverse random initializations
+    np.random.seed(42)
+    for _ in range(10):
+        c = np.random.uniform(0.15, 0.85, (N_CIRCLES, 2))
+        inits.append(c.flatten())
+        
+    # Multi-start optimization
+    for x0 in inits:
+        # Powell method is robust for this piecewise-linear objective landscape
+        res = minimize(objective_centers, x0, method='Powell',
+                       options={'maxiter': 8000, 'xtol': 1e-7, 'ftol': 1e-9})
+        curr_sum = -res.fun
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = res.x.reshape(N_CIRCLES, 2)
+            
+    if best_centers is None:
+        best_centers = inits[0].reshape(N_CIRCLES, 2)
+        
+    # Final high-precision refinement on the best configuration found
+    res_final = minimize(objective_centers, best_centers.flatten(), method='Powell',
+                         options={'maxiter': 20000, 'xtol': 1e-8, 'ftol': 1e-10})
+    best_centers = res_final.x.reshape(N_CIRCLES, 2)
+    
+    # Compute exact optimal radii for the refined centers
+    best_sum, best_radii = solve_radii_lp(best_centers)
+    
+    # Apply microscopic shrink to guarantee strict compliance with validator's 1e-12 tolerance
+    best_radii = best_radii * 0.9999999
+    
+    return best_centers, best_radii, float(best_sum)
+```

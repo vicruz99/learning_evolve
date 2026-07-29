@@ -1,0 +1,195 @@
+
+
+<strategy>
+To improve the sum of radii from ~2.626 to the target 2.636, we need a more robust global search strategy combined with high-precision local refinement. The key improvements are:
+1. **Diverse Initialization**: Generate configurations from multiple geometric templates (hexagonal lattice, square grid, boundary-hugging, and random) with varying perturbation magnitudes. This helps explore different topological basins.
+2. **Strict Feasibility Enforcement**: Compute initial radii conservatively (using 45% of the minimum distance to boundaries and neighbors) to guarantee strict feasibility for SLSQP, preventing early constraint violations that stall optimization.
+3. **Iterative Perturbation & Refinement**: After finding the best configuration from initial runs, perform a "cooling" local search: slightly perturb the best solution, re-optimize, and accept improvements. This escapes shallow local minima common in packing problems.
+4. **Numerical Precision**: Use `ftol=1e-15` and `maxiter=8000` for the final polishing steps. Constraints are vectorized using `np.triu_indices` for efficiency and stability.
+5. **Fallback LP Validation**: As a safety net, we can conceptually verify feasibility, but relying on strict SLSQP bounds and constraint tolerances is sufficient. The code focuses on maximizing the objective while maintaining `g(x) >= -1e-8`.
+
+This approach systematically explores the configuration space and aggressively polishes the best found packing, targeting the 2.636 sum of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def constraints(v):
+    """
+    Computes inequality constraints: boundary containment and pairwise separation.
+    All constraints are formulated as g(v) >= 0.
+    """
+    xc = v[0::3]
+    yc = v[1::3]
+    r = v[2::3]
+    
+    c = []
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c.append(xc - r)
+    c.append(1.0 - xc - r)
+    c.append(yc - r)
+    c.append(1.0 - yc - r)
+    
+    # Pairwise separation: dist^2 >= (r_i + r_j)^2
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    dx = xc[i_idx] - xc[j_idx]
+    dy = yc[i_idx] - yc[j_idx]
+    dr = r[i_idx] + r[j_idx]
+    c.append(dx**2 + dy**2 - dr**2)
+    
+    return np.concatenate(c)
+
+def generate_init(strategy, seed):
+    """Generates a strictly feasible initial configuration."""
+    np.random.seed(seed)
+    centers = np.zeros((N, 2))
+    
+    if strategy == 'hex':
+        r_est = 0.095
+        y = r_est
+        row = 0
+        idx = 0
+        while y < 1.0 - r_est + 0.01 and idx < N:
+            x = r_est + (row % 2) * r_est
+            while x < 1.0 - r_est + 0.01 and idx < N:
+                centers[idx] = [x, y]
+                idx += 1
+                x += 2.0 * r_est
+            y += np.sqrt(3.0) * r_est
+            row += 1
+    elif strategy == 'grid':
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                centers[idx] = [0.1 + 0.2*i, 0.1 + 0.2*j]
+                idx += 1
+        centers[25] = [0.5, 0.5]
+    elif strategy == 'boundary':
+        # Push circles towards edges to allow larger radii
+        idx = 0
+        for i in range(N):
+            if i < 8:
+                centers[i] = [0.05 + i*0.1, 0.05]
+            elif i < 16:
+                centers[i] = [0.95 - (i-8)*0.1, 0.05]
+            elif i < 22:
+                centers[i] = [0.05 + (i-16)*0.1, 0.95]
+            else:
+                centers[i] = [0.5, 0.5 + (i-22)*0.125]
+    else:
+        centers = np.random.rand(N, 2)
+        
+    # Add controlled jitter
+    jitter_scale = 0.02 if strategy != 'rand' else 0.05
+    centers += np.random.uniform(-jitter_scale, jitter_scale, centers.shape)
+    centers = np.clip(centers, 0.03, 0.97)
+    
+    # Compute strictly feasible initial radii
+    r_safe = np.zeros(N)
+    for i in range(N):
+        d_bound = min(centers[i, 0], 1.0 - centers[i, 0], 
+                      centers[i, 1], 1.0 - centers[i, 1])
+        d_min = 1.0
+        for j in range(N):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if d < d_min:
+                    d_min = d
+        r_safe[i] = 0.45 * min(d_bound, 0.5 * d_min)
+        
+    return np.column_stack([centers, r_safe]).flatten()
+
+def run_packing():
+    best_sum = -np.inf
+    best_x = None
+    
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    strategies = ['hex', 'grid', 'boundary', 'rand']
+    n_restarts = 60
+    
+    # Phase 1: Broad search
+    for s_idx in range(n_restarts):
+        strat = strategies[s_idx % len(strategies)]
+        x0 = generate_init(strat, seed=s_idx + 100)
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, 
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            
+            if res.success:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_x = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Iterative perturbation refinement (Simulated Annealing style)
+    if best_x is not None:
+        current_x = best_x.copy()
+        temp_best = best_sum
+        
+        for perturb_iter in range(40):
+            # Generate perturbation that shrinks as we iterate
+            scale = 0.02 * (1.0 - perturb_iter / 50.0)
+            x_pert = current_x + np.random.randn(3 * N) * scale
+            x_pert[0::3] = np.clip(x_pert[0::3], 0.01, 0.99)
+            x_pert[1::3] = np.clip(x_pert[1::3], 0.01, 0.99)
+            x_pert[2::3] = np.clip(x_pert[2::3], 1e-6, 0.49)
+            
+            try:
+                res = minimize(objective, x_pert, method='SLSQP', bounds=bounds,
+                               constraints=cons, 
+                               options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+                
+                if res.success:
+                    c_val = constraints(res.x)
+                    if np.min(c_val) >= -1e-7:
+                        curr_sum = -res.fun
+                        if curr_sum > temp_best:
+                            temp_best = curr_sum
+                            current_x = res.x.copy()
+            except Exception:
+                continue
+                
+        if temp_best > best_sum:
+            best_sum = temp_best
+            best_x = current_x
+            
+    # Phase 3: High-precision final polish
+    if best_x is not None:
+        try:
+            res_final = minimize(objective, best_x, method='SLSQP', bounds=bounds,
+                                 constraints=cons, 
+                                 options={'maxiter': 8000, 'ftol': 1e-15, 'disp': False})
+            if res_final.success:
+                c_val = constraints(res_final.x)
+                if np.min(c_val) >= -1e-7:
+                    best_x = res_final.x
+                    best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    # Fallback (should not be reached)
+    if best_x is None:
+        best_x = generate_init('hex', seed=0)
+        best_sum = -objective(best_x)
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(best_sum)
+```

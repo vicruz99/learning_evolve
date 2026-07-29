@@ -1,0 +1,159 @@
+# sol_000022 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000011 (state bbbe9bd5) state=4a92721c sum of radii=2.614634 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars):
+    """
+    Returns a 1D array of constraint values.
+    All constraints are formulated as g(vars) >= 0.
+    Includes boundary constraints and pairwise non-overlap constraints.
+    """
+    c = vars.reshape(N, 3)
+    x, y, r = c[:, 0], c[:, 1], c[:, 2]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    cons = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Pairwise non-overlap constraints: dist_sq - (r_i + r_j)^2 >= 0
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    dist_sq = dx**2 + dy**2
+    min_dist_sq = dr**2
+    
+    # Extract upper triangular indices for i < j to avoid duplicates and self-comparison
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    cons = np.concatenate([cons, dist_sq[mask] - min_dist_sq[mask]])
+    return cons
+
+def get_safe_radii(centers):
+    """Computes strictly feasible initial radii based on nearest neighbors and boundaries."""
+    n = centers.shape[0]
+    radii = np.zeros(n)
+    for i in range(n):
+        d_bound = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        d_neigh = 1.0
+        for j in range(n):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if d < d_neigh:
+                    d_neigh = d
+        # 0.8 factor ensures strict feasibility for SLSQP start
+        radii[i] = min(d_bound, d_neigh / 2.0) * 0.8
+    return radii
+
+def run_packing():
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -np.inf
+    best_vars = None
+    np.random.seed(42)
+    
+    inits = []
+    
+    # 1. 5x5 grid + 1 in a gap
+    pts1 = np.array([[0.1 + i*0.2, 0.1 + j*0.2] for i in range(5) for j in range(5)])
+    pts1 = np.vstack([pts1, [0.2, 0.2]])
+    inits.append(pts1)
+    
+    # 2. Hexagonal rows: 6, 5, 6, 5, 4
+    pts2 = []
+    r0 = 0.09
+    y = r0
+    for row in range(5):
+        count = [6, 5, 6, 5, 4][row]
+        shift = (row % 2) * r0
+        x = r0 + shift
+        for _ in range(count):
+            if len(pts2) < N:
+                pts2.append([x, y])
+            x += 2*r0
+        y += np.sqrt(3)*r0
+    inits.append(np.array(pts2[:N]))
+    
+    # 3. 6x5 dense grid, remove 4 random points
+    pts3 = np.array([[0.09 + i*0.18, 0.11 + j*0.2] for i in range(6) for j in range(5)])
+    rem = np.random.choice(30, 4, replace=False)
+    mask = np.ones(30, dtype=bool)
+    mask[rem] = False
+    inits.append(pts3[mask])
+    
+    # 4. 5x6 dense grid, remove 4 random points
+    pts4 = np.array([[0.11 + i*0.18, 0.09 + j*0.18] for i in range(5) for j in range(6)])
+    rem = np.random.choice(30, 4, replace=False)
+    mask = np.ones(30, dtype=bool)
+    mask[rem] = False
+    inits.append(pts4[mask])
+    
+    # 5. Random spread
+    inits.append(np.random.rand(N, 2))
+    
+    # Multi-start optimization
+    for init_c in inits:
+        for _ in range(4):
+            c_pert = init_c + np.random.randn(N, 2) * 0.02
+            c_pert = np.clip(c_pert, 0.01, 0.99)
+            r_safe = get_safe_radii(c_pert)
+            
+            vars0 = np.zeros(3*N)
+            vars0[0::3] = c_pert[:, 0]
+            vars0[1::3] = c_pert[:, 1]
+            vars0[2::3] = r_safe
+            
+            try:
+                res = minimize(objective, vars0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
+                # Verify numerical feasibility
+                c_val = constraint_func(res.x)
+                if np.min(c_val) > -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # High-precision refinement on the best configuration
+    if best_vars is not None:
+        res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                             constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+        best_vars = res_final.x
+        
+    # Local perturbation search to escape shallow local minima
+    for _ in range(20):
+        idx = np.random.randint(N)
+        c_new = best_vars.reshape(N, 3).copy()
+        c_new[idx, 0] += np.random.uniform(-0.02, 0.02)
+        c_new[idx, 1] += np.random.uniform(-0.02, 0.02)
+        c_new[idx, 2] += np.random.uniform(-0.01, 0.01)
+        c_new = np.clip(c_new, [0.01, 0.01, 1e-4], [0.99, 0.99, 0.5])
+        
+        try:
+            res_loc = minimize(objective, c_new.flatten(), method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 1000, 'ftol': 1e-12})
+            c_val = constraint_func(res_loc.x)
+            if np.min(c_val) > -1e-7:
+                curr_sum = -res_loc.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res_loc.x.copy()
+        except Exception:
+            continue
+            
+    centers = best_vars.reshape(N, 3)[:, :2]
+    radii = best_vars.reshape(N, 3)[:, 2]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, np.sum(radii)

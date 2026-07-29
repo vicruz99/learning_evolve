@@ -1,0 +1,109 @@
+# sol_000005 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state ca1ebfe6) state=233a9748 sum of radii=2.610363 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def constraint_non_overlap(vars):
+    centers = vars[:2*N].reshape(N, 2)
+    radii = vars[2*N:]
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    idx = np.triu_indices(N, k=1)
+    return dists[idx] - radii[idx[0]] - radii[idx[1]]
+
+def constraint_boundary(vars):
+    centers = vars[:2*N].reshape(N, 2)
+    radii = vars[2*N:]
+    x, y = centers[:, 0], centers[:, 1]
+    return np.concatenate([x - radii, 1.0 - x - radii, y - radii, 1.0 - y - radii])
+
+def objective(vars):
+    return -np.sum(vars[2*N:])
+
+def run_packing():
+    # Initial configuration: Hexagonal-like grid
+    centers_init = []
+    row_counts = [6, 5, 6, 5, 4]
+    y_coords = np.linspace(0.15, 0.85, len(row_counts))
+    
+    for idx, count in enumerate(row_counts):
+        y = y_coords[idx]
+        shift = 0.08 if idx % 2 == 1 else 0.0
+        x_coords = np.linspace(0.1 + shift, 0.9 - shift, count)
+        for x in x_coords:
+            centers_init.append([x, y])
+            
+    centers_init = np.array(centers_init)
+    radii_init = np.full(N, 0.06)
+    
+    x0 = np.concatenate([centers_init.ravel(), radii_init])
+    
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    
+    cons = [
+        {'type': 'ineq', 'fun': constraint_non_overlap},
+        {'type': 'ineq', 'fun': constraint_boundary}
+    ]
+    
+    best_res = None
+    best_sum = -np.inf
+    
+    # Run optimization with multiple starts to ensure global optimum
+    for trial in range(8):
+        if trial > 0:
+            rng = np.random.RandomState(trial + 123)
+            pert = rng.randn(len(x0)) * 0.02
+            x0_trial = np.clip(x0 + pert, 0.02, 0.98)
+            x0_trial[-N:] = np.clip(x0_trial[-N:], 0.02, 0.3)
+        else:
+            x0_trial = x0.copy()
+            
+        try:
+            res = minimize(objective, x0_trial, method='SLSQP', 
+                          bounds=bounds, constraints=cons,
+                          options={'maxiter': 1500, 'ftol': 1e-10})
+            if res.success or res.nit >= 1400:
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_res = res
+        except Exception:
+            continue
+            
+    if best_res is not None:
+        centers_opt = best_res.x[:2*N].reshape(N, 2)
+        radii_opt = best_res.x[2*N:]
+    else:
+        centers_opt = centers_init
+        radii_opt = radii_init
+        
+    # Post-optimization correction to ensure strict feasibility
+    # Adjust for boundary
+    for i in range(N):
+        x, y = centers_opt[i]
+        r = radii_opt[i]
+        r = min(r, x, 1.0 - x, y, 1.0 - y)
+        radii_opt[i] = max(r, 0.0)
+        
+    # Adjust for overlaps
+    for _ in range(5):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.sqrt(np.sum((centers_opt[i] - centers_opt[j])**2))
+                r_sum = radii_opt[i] + radii_opt[j]
+                if r_sum > d + 1e-9:
+                    scale = d / r_sum
+                    radii_opt[i] *= scale
+                    radii_opt[j] *= scale
+                    changed = True
+        if not changed:
+            break
+            
+    return centers_opt, radii_opt, float(np.sum(radii_opt))

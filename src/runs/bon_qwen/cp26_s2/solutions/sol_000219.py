@@ -1,0 +1,243 @@
+# sol_000219 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b505a133) state=a1b042fe sum of radii=2.340000 correctness=1.0
+# stdout(first 200): Optimization failed: operands could not be broadcast together with shapes (26,2) (2,26)
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_overlap_constraints(centers, radii):
+    """
+    Returns the list of non-overlap constraint functions.
+    dist(i, j) >= r_i + r_j  <=>  (r_i + r_j)^2 - dist(i, j)^2 <= 0
+    """
+    constraints = []
+    n = centers.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            def overlap_c(x, i=i, j=j):
+                # x structure: [x1, y1, r1, x2, y2, r2, ...]
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                radii_sum_sq = (ri + rj)**2
+                
+                # We want dist_sq >= radii_sum_sq
+                # Constraint function g(x) <= 0
+                # So g(x) = radii_sum_sq - dist_sq <= 0
+                return radii_sum_sq - dist_sq
+            constraints.append({'type': 'ineq', 'fun': lambda x, c=overlap_c: -c(x)}) 
+            # Wait, scipy 'ineq' expects fun(x) >= 0.
+            # So we need -(radii_sum_sq - dist_sq) >= 0 => dist_sq - radii_sum_sq >= 0.
+    return constraints
+
+def get_boundary_constraints(centers, radii):
+    """
+    Returns boundary constraints.
+    x - r >= 0 => -(x - r) <= 0 ? No, 'ineq' is >= 0.
+    So:
+    x - r >= 0
+    1 - x - r >= 0
+    y - r >= 0
+    1 - y - r >= 0
+    r >= 0
+    """
+    constraints = []
+    n = centers.shape[0]
+    for i in range(n):
+        idx = 3 * i
+        
+        # x - r >= 0
+        def c1(x, i=i): return x[3*i] - x[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': c1})
+        
+        # 1 - x - r >= 0
+        def c2(x, i=i): return 1.0 - x[3*i] - x[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': c2})
+        
+        # y - r >= 0
+        def c3(x, i=i): return x[3*i+1] - x[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': c3})
+        
+        # 1 - y - r >= 0
+        def c4(x, i=i): return 1.0 - x[3*i+1] - x[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': c4})
+        
+        # r >= 0
+        def c5(x, i=i): return x[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': c5})
+        
+    return constraints
+
+def objective(x):
+    """
+    Minimize negative sum of radii.
+    """
+    radii = x[2::3] # Extract every 3rd element starting from index 2
+    return -np.sum(radii)
+
+def generate_hexagonal_guess(n=26):
+    """
+    Generate an initial guess using a hexagonal packing pattern.
+    """
+    # Estimate radius. For n=26, area density argument suggests r ~ 0.1.
+    # We start slightly smaller to be safe.
+    r_start = 0.09
+    
+    centers = []
+    
+    # We try to pack rows.
+    # Row spacing dy = sqrt(3) * r
+    # Horizontal spacing dx = 2 * r
+    dy = np.sqrt(3) * r_start
+    dx = 2 * r_start
+    
+    y = r_start
+    row_idx = 0
+    
+    while len(centers) < n:
+        # Determine number of circles in this row
+        # Even rows (0, 2, ...) can fit more? Or shifted?
+        # Let's alternate counts.
+        # If row_idx is even, start at x = r_start.
+        # If row_idx is odd, start at x = r_start + r_start (shifted by r) ? 
+        # Actually shift is r_start.
+        
+        start_x = r_start
+        if row_idx % 2 == 1:
+            start_x += r_start # Shift by radius
+            
+        # Count how many fit
+        # x_k = start_x + k * dx
+        # Constraint: x_k + r_start <= 1
+        # start_x + k * dx + r_start <= 1
+        # k * dx <= 1 - 2*r_start - (shift if any)
+        
+        limit = 1 - 2*r_start
+        if row_idx % 2 == 1:
+            limit -= r_start
+            
+        if limit < 0:
+            break # No space
+            
+        max_k = int(limit // dx) + 1
+        count = max_k
+        
+        # But we might not need full row
+        needed = n - len(centers)
+        if count > needed:
+            count = needed
+            
+        for k in range(count):
+            x_coord = start_x + k * dx
+            centers.append([x_coord, y])
+            
+        y += dy
+        row_idx += 1
+        
+    return np.array(centers)
+
+def run_packing():
+    n = 26
+    
+    # 1. Initial Guess
+    centers_guess = generate_hexagonal_guess(n)
+    r_guess = 0.09
+    
+    # Construct initial vector: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers_guess[i, 0]
+        x0[3*i+1] = centers_guess[i, 1]
+        x0[3*i+2] = r_guess
+        
+    # 2. Bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+        bounds.append((0, 0.5)) # r
+    
+    # 3. Constraints
+    constraints = []
+    # Boundary constraints
+    constraints.extend(get_boundary_constraints(centers_guess, np.zeros(n)))
+    
+    # Overlap constraints
+    # To reduce number of constraint functions, we can define one function that returns array?
+    # But scipy 'ineq' with array output is supported in some versions, 
+    # but safer to define individually or use a vectorized function if supported.
+    # Let's define a single function for all overlaps returning a vector.
+    def all_overlaps(x):
+        # x is flattened [x1, y1, r1, ...]
+        # Reshape to (n, 3)
+        points = x.reshape((n, 3))
+        xs = points[:, 0]
+        ys = points[:, 1]
+        rs = points[:, 2]
+        
+        # Compute pairwise distances squared
+        # (n, n) matrix
+        dist_sq = np.sum((points[:, :2] - points[:, :2].T)**2, axis=2)
+        
+        # Compute sum of radii squared
+        radii_sum_sq = (rs[:, None] + rs[None, :])**2
+        
+        # Constraint: dist_sq - radii_sum_sq >= 0
+        # We only need upper triangle
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        slacks = dist_sq[mask] - radii_sum_sq[mask]
+        return slacks
+    
+    constraints.append({'type': 'ineq', 'fun': all_overlaps})
+    
+    # 4. Optimization
+    # SLSQP is good for constrained nonlinear problems
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                       options={'maxiter': 1000, 'ftol': 1e-9, 'disp': False})
+        x_opt = res.x
+    except Exception as e:
+        # Fallback or error handling
+        print(f"Optimization failed: {e}")
+        x_opt = x0
+
+    # 5. Extract results
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i] = [x_opt[3*i], x_opt[3*i+1]]
+        radii[i] = x_opt[3*i+2]
+        
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+
+# For local testing
+if __name__ == "__main__":
+    centers, radii, s_r = run_packing()
+    print(f"Sum of radii: {s_r}")
+    print(f"Centers shape: {centers.shape}")
+    print(f"Radii shape: {radii.shape}")
+    
+    # Validate
+    # Note: validate_packing is not imported here, but we assume it works as per prompt.
+    # Let's do a quick manual check
+    print("Checking overlaps...")
+    for i in range(len(centers)):
+        for j in range(i+1, len(centers)):
+            d = np.sqrt(np.sum((centers[i]-centers[j])**2))
+            r_sum = radii[i] + radii[j]
+            if d < r_sum - 1e-9:
+                print(f"Overlap {i} {j}: dist={d}, r_sum={r_sum}")
+    print("Checking bounds...")
+    for i in range(len(centers)):
+        x, y = centers[i]
+        r = radii[i]
+        if x < r or x > 1-r or y < r or y > 1-r:
+            print(f"Bound violation {i}")
+            
+    print(f"Final Sum: {np.sum(radii)}")

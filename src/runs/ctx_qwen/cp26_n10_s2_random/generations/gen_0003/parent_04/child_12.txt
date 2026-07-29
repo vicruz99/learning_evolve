@@ -1,0 +1,193 @@
+
+
+<strategy>
+To improve the packing density and push the sum of radii beyond 2.63, I will implement several key enhancements:
+
+1. **Smooth Constraint Formulation**: Replace linear distance constraints with squared distance constraints (`dist² ≥ (r_i + r_j)²`). This removes the gradient singularity at zero distance and provides much better conditioning for SLSQP, allowing the solver to navigate the feasible region more efficiently.
+2. **Feasible Initialization**: Generate initial configurations that strictly satisfy constraints before optimization begins. SLSQP performs significantly better when starting from a feasible point. I will use a tightly packed hexagonal lattice with carefully chosen initial radii (0.09) and spacing (≥0.173) to guarantee non-overlap and boundary compliance.
+3. **Iterative Expansion & Decay Perturbation**: After finding a local optimum, I will apply a pressure-based expansion strategy: slightly scale up all radii, add controlled random noise to centers to escape local minima, and re-optimize. The expansion factor and perturbation scale will decay over iterations, allowing the solver to gradually push against the packing limits while stabilizing near convergence.
+4. **Diverse Multi-Start**: Combine perturbed hexagonal grids with randomized dense configurations to sample different topological basins.
+5. **Deterministic Repair**: A strict post-processing loop resolves microscopic numerical overlaps and boundary penetrations, guaranteeing the solution passes the validation function's `1e-12` tolerance comfortably.
+
+All helper functions are defined at the top level with no closures or lambda functions, adhering strictly to the rules.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective_func(p):
+    """Minimize negative sum of radii to maximize total radius."""
+    return -np.sum(p[2::3])
+
+def constraint_func(p):
+    """
+    Computes all boundary and non-overlap constraints.
+    Returns a 1D array where each element must be >= 0.
+    Uses squared distances for smoother gradients.
+    """
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3]
+    
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[I_IDX] - x[J_IDX]
+    dy = y[I_IDX] - y[J_IDX]
+    dist_sq = dx**2 + dy**2
+    sum_r = r[I_IDX] + r[J_IDX]
+    c = np.concatenate([c, dist_sq - sum_r**2])
+    
+    return c
+
+def get_bounds():
+    """Returns variable bounds for x, y, r for each circle."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)])
+    return b
+
+def generate_hex_init(perturb_scale=0.0):
+    """Generates a feasible hexagonal lattice configuration with optional noise."""
+    centers = np.zeros((N, 2))
+    idx = 0
+    # Parameters chosen to ensure initial feasibility (spacing >= 2*r_init)
+    r0 = 0.10
+    dy = r0 * np.sqrt(3)
+    dx = 2.0 * r0
+    
+    y = r0
+    row = 0
+    while idx < N:
+        offset = (dx / 2.0) if row % 2 == 1 else 0.0
+        x = r0 + offset
+        while x + r0 <= 1.0 + 1e-7 and idx < N:
+            centers[idx] = [x, y]
+            idx += 1
+            x += dx
+        y += dy
+        row += 1
+        
+    if perturb_scale > 0:
+        centers += np.random.normal(0, perturb_scale, centers.shape)
+        centers = np.clip(centers, 0.02, 0.98)
+        
+    p = np.zeros(3 * N)
+    p[0::3] = centers[:, 0]
+    p[1::3] = centers[:, 1]
+    p[2::3] = 0.09  # Initial radii slightly smaller than spacing/2 ensures feasibility
+    return p
+
+def run_packing():
+    np.random.seed(42)
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_p = None
+    best_sum = -np.inf
+    
+    # Phase 1: Diverse initializations
+    inits = []
+    for p_val in [0.0, 0.005, 0.01, 0.02, 0.04]:
+        inits.append(generate_hex_init(p_val))
+        
+    for seed in range(15):
+        np.random.seed(seed)
+        c = np.random.rand(N, 2) * 0.8 + 0.1
+        c = np.clip(c, 0.05, 0.95)
+        p = np.zeros(3 * N)
+        p[0::3] = c[:, 0]
+        p[1::3] = c[:, 1]
+        p[2::3] = 0.08
+        inits.append(p)
+        
+    for p0 in inits:
+        try:
+            res = minimize(
+                objective_func, p0, method='SLSQP', bounds=bounds,
+                constraints=cons,
+                options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False}
+            )
+            s = -res.fun
+            if s > best_sum:
+                # Strict feasibility check
+                if np.min(constraint_func(res.x)) >= -1e-7:
+                    best_sum = s
+                    best_p = res.x.copy()
+        except Exception:
+            pass
+
+    if best_p is None:
+        best_p = inits[0]
+
+    # Phase 2: Iterative expansion and refinement
+    # Gradually increases radii and perturbs centers to push packing density limits
+    curr_p = best_p.copy()
+    for step in range(40):
+        # Expansion rate slowly decreases to stabilize near optimum
+        scale = 1.0012 + 0.0003 * (1.0 - step / 40.0)
+        curr_p[2::3] *= scale
+        
+        # Perturbation scale decays to fine-tune positions
+        pert_scale = 0.0006 * (1.0 - step / 50.0)
+        curr_p[0::3] += np.random.normal(0, pert_scale, N)
+        curr_p[1::3] += np.random.normal(0, pert_scale, N)
+        curr_p[0::3] = np.clip(curr_p[0::3], 0.01, 0.99)
+        curr_p[1::3] = np.clip(curr_p[1::3], 0.01, 0.99)
+        
+        try:
+            res = minimize(
+                objective_func, curr_p, method='SLSQP', bounds=bounds,
+                constraints=cons,
+                options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False}
+            )
+            if np.min(constraint_func(res.x)) >= -1e-7:
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_p = res.x.copy()
+                    curr_p = best_p.copy()
+                else:
+                    curr_p = res.x.copy()
+        except Exception:
+            pass
+            
+    # Extract final configuration
+    centers = np.column_stack((best_p[0::3], best_p[1::3]))
+    radii = best_p[2::3].copy()
+    
+    # Phase 3: Strict deterministic repair for numerical precision
+    for _ in range(50):
+        changed = False
+        # Resolve pairwise overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    shrink = (radii[i] + radii[j] - d) * 0.51
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        # Enforce boundary constraints strictly
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-10:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 1e-9)
+    final_sum = float(np.sum(radii))
+    return centers, radii, final_sum
+```

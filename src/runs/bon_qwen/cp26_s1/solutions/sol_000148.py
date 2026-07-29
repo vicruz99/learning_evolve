@@ -1,131 +1,124 @@
 # sol_000148 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 08bd70cf) state=4fad2414 sum of radii=2.349714 correctness=1.0
+# generation=0 parent=seed (state e234a3e4) state=bd41047d sum of radii=2.592939 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
+from scipy.optimize import minimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+def obj_func(x, n):
+    """
+    Objective function to minimize: -sum(radii)
+    x is the flattened vector of [x1, y1, r1, x2, y2, r2, ...]
+    """
+    # Radii are at indices 2, 5, 8, ... (every 3rd element starting at 2)
+    r = x[2::3]
+    return -np.sum(r)
+
+def bound_con(x, n):
+    """
+    Boundary constraints:
+    r <= x <= 1-r  =>  x - r >= 0  AND  1 - x - r >= 0
+    r <= y <= 1-r  =>  y - r >= 0  AND  1 - y - r >= 0
+    """
+    con = np.zeros(n * 4)
+    idx = 0
+    for i in range(n):
+        xi = x[3*i]
+        yi = x[3*i+1]
+        ri = x[3*i+2]
+        con[idx] = xi - ri
+        con[idx+1] = 1.0 - xi - ri
+        con[idx+2] = yi - ri
+        con[idx+3] = 1.0 - yi - ri
+        idx += 4
+    return con
+
+def pair_con(x, n):
+    """
+    Pairwise non-overlap constraints:
+    dist(i, j)^2 >= (ri + rj)^2  =>  dist^2 - (ri + rj)^2 >= 0
+    """
+    constraints = []
+    for i in range(n):
+        xi = x[3*i]
+        yi = x[3*i+1]
+        ri = x[3*i+2]
+        for j in range(i + 1, n):
+            xj = x[3*j]
+            yj = x[3*j+1]
+            rj = x[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            dist_sq = dx*dx + dy*dy
+            r_sum = ri + rj
+            constraints.append(dist_sq - r_sum*r_sum)
+    return np.array(constraints)
+
+def run_packing():
+    """
+    Runs the packing optimization for 26 circles.
+    """
     n = 26
     np.random.seed(42)
-
-    # 1. Initialize centers on a hexagonal grid pattern
-    # Hexagonal packing is denser than square packing
-    centers = np.zeros((n, 2))
-    idx = 0
     
-    # Parameters for grid generation
-    row_height = 0.25
-    col_width = 0.18
-    y = 0.2
+    # --- Initialization ---
+    # Start with a 5x5 grid for 25 circles
+    x_grid = np.linspace(0.1, 0.9, 5)
+    y_grid = np.linspace(0.1, 0.9, 5)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    centers = np.column_stack((X.flatten(), Y.flatten()))
     
-    while idx < n:
-        x = 0.15
-        is_offset = (int((y - 0.2) / row_height) % 2 == 1)
-        if is_offset:
-            x += col_width / 2
-        
-        while x < 0.85 and idx < n:
-            centers[idx] = [x, y]
-            idx += 1
-            x += col_width
-        y += row_height
-        
-    # Add slight random jitter to prevent perfect symmetry locking
-    centers += np.random.uniform(-0.01, 0.01, centers.shape)
-    centers = np.clip(centers, 0.01, 0.99)
-
-    # 2. Initialize radii and velocities
-    radii = np.full(n, 0.04) # Start with a reasonable small radius
-    velocities = np.zeros_like(centers)
-
-    # 3. Physics-based Optimization Loop
-    # Parameters tuned for convergence
-    dt = 0.05
-    repulsion_k = 500.0
-    damping = 0.85
-    growth_rate = 1.0003 # Slowly grow radii
-    max_steps = 3000
+    # Add the 26th circle. 
+    # Place it near the corner (0,0) with a safe radius to avoid initial overlap.
+    # Grid points are at 0.1, 0.3... Distance from (0.04, 0.04) to (0.1, 0.1) is ~0.085.
+    # With r=0.04, 2r = 0.08. 0.085 > 0.08, so it's valid.
+    centers = np.vstack([centers, [0.04, 0.04]])
     
-    # Precompute indices for pairs to optimize loop speed
-    pair_indices = [(i, j) for i in range(n) for j in range(i + 1, n)]
-
-    for step in range(max_steps):
-        # Increase radii
-        radii *= growth_rate
-        
-        # Calculate forces
-        forces = np.zeros_like(centers)
-        
-        # Boundary constraints and repulsion
-        for i in range(n):
-            x, y = centers[i]
-            r = radii[i]
-            fx, fy = 0.0, 0.0
-
-            # Boundary forces (push away from walls)
-            if x - r < 0:
-                fx += repulsion_k * (r - x)
-            if x + r > 1:
-                fx -= repulsion_k * (x + r - 1)
-            if y - r < 0:
-                fy += repulsion_k * (r - y)
-            if y + r > 1:
-                fy -= repulsion_k * (y + r - 1)
-            
-            forces[i] = [fx, fy]
-
-        # Circle-Circle Repulsion
-        for i, j in pair_indices:
-            pi = centers[i]
-            pj = centers[j]
-            dist_vec = pi - pj
-            dist = np.linalg.norm(dist_vec)
-            min_dist = radii[i] + radii[j]
-            
-            if dist < min_dist and dist > 1e-9:
-                # Overlap detected
-                overlap = min_dist - dist
-                # Force proportional to overlap, normalized direction
-                # Divide by dist to normalize vector
-                force_mag = repulsion_k * overlap / dist
-                f_vec = dist_vec * force_mag
-                
-                forces[i] += f_vec
-                forces[j] -= f_vec
-        
-        # Update velocities and positions (Euler integration)
-        velocities += forces * dt
-        velocities *= damping
-        centers += velocities * dt
-
-        # Clip centers to ensure they don't escape bounds numerically
-        centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
-
-    # 4. Post-processing to ensure strict validity
-    # Clamp radii so circles are strictly inside and non-overlapping
-    # We iterate to resolve any remaining tight overlaps by shrinking radii
-    for _ in range(10):
-        for i in range(n):
-            # Boundary constraint
-            r_boundary = min(centers[i, 0], 1 - centers[i, 0], 
-                             centers[i, 1], 1 - centers[i, 1])
-            radii[i] = min(radii[i], r_boundary - 1e-10)
-            
-            # Overlap constraint
-            for j in range(i + 1, n):
-                dist = np.linalg.norm(centers[i] - centers[j])
-                max_r_sum = dist - 1e-10
-                if radii[i] + radii[j] > max_r_sum:
-                    # Shrink the larger radius or split difference
-                    excess = (radii[i] + radii[j]) - max_r_sum
-                    # Heuristic: shrink proportionally or just reduce current
-                    # Simple approach: reduce current radius to satisfy pair
-                    radii[i] = max(0, max_r_sum - radii[j])
-
-    # Final sum calculation
-    sum_radii = float(np.sum(radii))
+    # Initial radii
+    r_init = 0.04
+    radii = np.full(n, r_init)
     
-    # Return results
-    return centers, radii, sum_radii
+    # Flatten variables: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+        
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+        
+    # Constraints
+    cons = [
+        {'type': 'ineq', 'fun': bound_con, 'args': (n,)},
+        {'type': 'ineq', 'fun': pair_con, 'args': (n,)}
+    ]
+    
+    # Run Optimization
+    # SLSQP is suitable for this type of constrained non-linear problem
+    res = minimize(obj_func, x0, args=(n,), method='SLSQP', bounds=bounds, constraints=cons,
+                   options={'maxiter': 5000, 'ftol': 1e-12})
+    
+    x_opt = res.x
+    
+    # Extract results
+    centers_opt = np.zeros((n, 2))
+    radii_opt = np.zeros(n)
+    for i in range(n):
+        centers_opt[i, 0] = x_opt[3*i]
+        centers_opt[i, 1] = x_opt[3*i+1]
+        radii_opt[i] = x_opt[3*i+2]
+        
+    # Ensure non-negative radii
+    radii_opt = np.maximum(radii_opt, 0)
+    
+    sum_radii = np.sum(radii_opt)
+    
+    return centers_opt, radii_opt, sum_radii

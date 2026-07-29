@@ -1,204 +1,103 @@
 # sol_000070 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state cae61cda) state=28aefa4d sum of radii=2.552043 correctness=1.0
+# generation=0 parent=seed (state 3353d097) state=bd1a778f sum of radii=2.480249 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize as opt
+from scipy.optimize import minimize
+from scipy.spatial.distance import pdist
 
-def solve_radii(centers):
-    """
-    Given fixed centers, solves the Linear Program to maximize the sum of radii
-    subject to non-overlap and boundary constraints.
-    """
-    n = len(centers)
-    # Variables: r_0, ..., r_{n-1}
-    # Objective: max sum(r) -> min -sum(r)
-    c = np.ones(n) * -1.0
+def get_boundary_constraints(centers, r):
+    """Computes boundary constraint values: x-r, y-r, 1-x-r, 1-y-r >= 0"""
+    n = centers.shape[0]
+    con = np.empty(4 * n)
+    con[:n] = centers[:, 0] - r
+    con[n:2*n] = centers[:, 1] - r
+    con[2*n:3*n] = 1.0 - centers[:, 0] - r
+    con[3*n:] = 1.0 - centers[:, 1] - r
+    return con
 
-    # Constraints: A_ub * r <= b_ub
-    # We need to construct the matrix for:
-    # 1. Wall constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-    # 2. Pairwise constraints: r_i + r_j <= dist(i, j)
-    
-    n_pairs = n * (n - 1) // 2
-    n_constraints = 4 * n + n_pairs
-    A_ub = np.zeros((n_constraints, n))
-    b_ub = np.zeros(n_constraints)
-    
-    row = 0
-    for i in range(n):
-        x, y = centers[i]
-        
-        # r_i <= x
-        A_ub[row, i] = 1.0
-        b_ub[row] = x
-        row += 1
-        # r_i <= 1 - x
-        A_ub[row, i] = 1.0
-        b_ub[row] = 1.0 - x
-        row += 1
-        # r_i <= y
-        A_ub[row, i] = 1.0
-        b_ub[row] = y
-        row += 1
-        # r_i <= 1 - y
-        A_ub[row, i] = 1.0
-        b_ub[row] = 1.0 - y
-        row += 1
-        
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            A_ub[row, i] = 1.0
-            A_ub[row, j] = 1.0
-            b_ub[row] = dist
-            row += 1
-            
-    # Bounds for r: [0, infinity)
-    bounds = [(0, None) for _ in range(n)]
-    
-    # Solve LP
-    res = opt.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-    
-    if res.success:
-        radii = res.x
-    else:
-        radii = np.zeros(n)
-        
-    return radii, -res.fun
+def get_overlap_constraints(centers, r):
+    """Computes overlap constraint values: dist_ij - 2r >= 0"""
+    return pdist(centers) - 2.0 * r
 
-def generate_hex_lattice(n_circles):
-    """
-    Generates a hexagonal lattice of points within [0, 1] x [0, 1].
-    """
-    # Approximate spacing based on n
-    # Area ~ 1. n * pi * r^2 * density ~ 1.
-    # We just want a good spread.
-    
-    # Try to fit points. 
-    # Hexagonal packing density is high.
-    # Spacing s. Points at (i*s, j*s*sqrt(3)/2)
-    
-    points = []
-    # Heuristic grid search for hex parameters
-    best_n = 0
-    best_spacing = 0.1
-    
-    # We can just generate a grid and pick first n
-    # Hex grid:
-    # row y = k * h
-    # col x = m * w + (k % 2) * w/2
-    
-    h = 0.12
-    w = 0.2
-    pts = []
-    
-    y = 0.1 # margin
-    while y < 0.9:
-        x = 0.1
-        row_offset = (int(y / h) % 2) * (w / 2)
-        while x < 0.9:
-            pts.append([x + row_offset, y])
-            x += w
-        y += h
-        
-    if len(pts) < n_circles:
-        # Increase density
-        pts = []
-        h = 0.08
-        w = 0.14
-        y = 0.05
-        while y < 0.95:
-            x = 0.05
-            row_offset = (int(y / h) % 2) * (w / 2)
-            while x < 0.95:
-                pts.append([x + row_offset, y])
-                x += w
-            y += h
-            
-    # Take first n_circles
-    # Shuffle to break symmetry slightly
-    pts = pts[:n_circles]
-    return np.array(pts)
+def objective_function(x):
+    """Maximize radius (minimize negative radius)"""
+    return -x[-1]
 
-def run_packing():
+def constraint_boundary(x):
+    r = x[-1]
+    centers = x[:-1].reshape(-1, 2)
+    return get_boundary_constraints(centers, r)
+
+def constraint_overlap(x):
+    r = x[-1]
+    centers = x[:-1].reshape(-1, 2)
+    return get_overlap_constraints(centers, r)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     n = 26
-    np.random.seed(123) # For reproducibility
     
-    # 1. Initialization
-    centers = generate_hex_lattice(n)
+    # 1. Generate initial hexagonal lattice configuration
+    r_init = 0.101
+    centers_init = []
+    cols, rows = 5, 6
     
-    # Add small random jitter to avoid symmetry issues
-    centers += np.random.uniform(-0.01, 0.01, (n, 2))
-    centers = np.clip(centers, 0.01, 0.99)
-    
-    best_centers = centers.copy()
-    best_sum = 0.0
-    
-    # 2. Optimization Loop
-    for iteration in range(2000):
-        # Solve LP for current centers
-        radii, current_sum = solve_radii(centers)
-        
-        if current_sum > best_sum:
-            best_sum = current_sum
-            best_centers = centers.copy()
+    for r_idx in range(rows):
+        for c_idx in range(cols):
+            if len(centers_init) >= n:
+                break
+            x = c_idx * 2 * r_init + (r_idx % 2) * r_init
+            y = r_idx * np.sqrt(3) * r_init
+            centers_init.append([x, y])
+        if len(centers_init) >= n:
+            break
             
-        # Calculate forces for next iteration
-        forces = np.zeros_like(centers)
+    centers_init = np.array(centers_init[:n])
+    
+    # Normalize to center within the unit square
+    min_c = centers_init.min(axis=0)
+    max_c = centers_init.max(axis=0)
+    span = np.max(max_c - min_c)
+    scale = 0.85 / span
+    centers_init = (centers_init - min_c) * scale + (1.0 - 0.85) / 2.0
+    
+    # 2. Setup optimization variables and bounds
+    x0 = np.concatenate([centers_init.flatten(), [r_init]])
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.2)]
+    
+    constraints = [
+        {'type': 'ineq', 'fun': constraint_boundary},
+        {'type': 'ineq', 'fun': constraint_overlap}
+    ]
+    
+    # 3. Run optimizer
+    res = minimize(
+        objective_function, 
+        x0, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=constraints, 
+        options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False}
+    )
+    
+    final_centers = res.x[:-1].reshape(-1, 2)
+    final_r = res.x[-1]
+    
+    # 4. Post-processing to ensure strict feasibility
+    # Check and enforce boundary constraints
+    for i in range(n):
+        x, y = final_centers[i]
+        final_r = min(final_r, x, y, 1.0 - x, 1.0 - y)
         
-        # Force parameters
-        repulsion_strength = 0.05
-        wall_strength = 0.05
+    # Check and enforce non-overlap constraints
+    dists = pdist(final_centers)
+    min_dist = np.min(dists)
+    if min_dist < 2.0 * final_r - 1e-10:
+        final_r = (min_dist * 0.9999) / 2.0
         
-        # Pairwise forces (Repulsion if touching)
-        for i in range(n):
-            for j in range(i + 1, n):
-                r_sum = radii[i] + radii[j]
-                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                
-                # If distance is approximately equal to sum of radii, they are touching/constrained
-                # We apply a force to push them apart to allow growth
-                if dist < r_sum + 1e-4:
-                    vec = centers[i] - centers[j]
-                    if dist > 1e-8:
-                        norm_vec = vec / dist
-                        forces[i] += repulsion_strength * norm_vec
-                        forces[j] -= repulsion_strength * norm_vec
-        
-        # Wall forces (Push away if constrained)
-        for i in range(n):
-            x, y = centers[i]
-            r = radii[i]
-            
-            # Left wall
-            if x - r < 1e-4:
-                forces[i, 0] += wall_strength
-            # Right wall
-            if x + r > 1.0 - 1e-4:
-                forces[i, 0] -= wall_strength
-            # Bottom wall
-            if y - r < 1e-4:
-                forces[i, 1] += wall_strength
-            # Top wall
-            if y + r > 1.0 - 1e-4:
-                forces[i, 1] -= wall_strength
-                
-        # Apply forces with decay
-        step_size = 0.5 / (1 + iteration * 0.05)
-        centers += step_size * forces
-        
-        # Boundary check for centers
-        centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
-        
-        # Random perturbation (Simulated Annealing style) to escape local optima
-        if iteration % 50 == 0:
-            idx = np.random.randint(n)
-            centers[idx] += np.random.uniform(-0.05, 0.05, 2)
-            centers[idx] = np.clip(centers[idx], 1e-5, 1.0 - 1e-5)
-
-    # Final calculation
-    radii, final_sum = solve_radii(best_centers)
-    return best_centers, radii, final_sum
+    radii = np.full(n, final_r)
+    total_sum = np.sum(radii)
+    
+    return final_centers, radii, total_sum

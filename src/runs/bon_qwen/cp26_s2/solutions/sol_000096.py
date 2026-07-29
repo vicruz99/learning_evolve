@@ -1,0 +1,271 @@
+# sol_000096 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2a23e4d6) state=a3b8c4d2 sum of radii=0.455755 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+import random
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    random.seed(42)
+    
+    n_circles = 26
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    # --- 1. Initial Placement (Hexagonal-ish Grid) ---
+    # We try to place circles in a pattern that utilizes space well.
+    # A mix of rows with 5 and 6 circles, offset, is a good start.
+    
+    # Let's create a base radius slightly less than 0.1 to ensure validity initially
+    r_base = 0.09
+    centers_list = []
+    
+    # Layout: 5 rows. 
+    # Row counts: 5, 6, 5, 6, 4 (Total 26)
+    # This creates a dense hexagonal structure.
+    row_counts = [5, 6, 5, 6, 4]
+    
+    # Calculate positions
+    # Vertical spacing for hex packing is sqrt(3)/2 * diameter = sqrt(3) * r
+    # But since we start with a grid, let's just place them carefully.
+    
+    y_current = r_base
+    row_idx = 0
+    
+    for count in row_counts:
+        # Calculate x positions for this row
+        # To center the row in [0, 1]
+        # Width occupied by 'count' circles of radius r is count * 2*r
+        # But we want them to touch boundaries eventually.
+        # For now, just spread them.
+        
+        # X range available for centers: [r, 1-r]
+        # Length = 1 - 2r
+        # Step = (1 - 2r) / (count - 1) if count > 1 else 0
+        
+        if count == 1:
+            x_pos = 0.5
+            xs = [x_pos]
+        else:
+            # Start at r, end at 1-r
+            start_x = r_base
+            end_x = 1.0 - r_base
+            step = (end_x - start_x) / (count - 1)
+            xs = [start_x + i * step for i in range(count)]
+        
+        # Shift every other row for hexagonal packing
+        # Shift amount should be roughly half the step size to nest in gaps
+        # But step size changes if we change r. 
+        # A fixed shift of r_base might be safer for hex nesting.
+        if row_idx % 2 == 1:
+            shift = r_base # Shift by radius (half diameter)
+            xs = [x + shift for x in xs]
+            # Clamp to [r, 1-r] roughly, but let optimizer fix
+            # Actually, if we shift, we might go out of bounds.
+            # Let's clamp centers to valid range [r_base, 1-r_base]
+            # But for initialization, let's just ensure they are inside.
+            # If shifted, the row might not fit.
+            # Let's adjust the layout to be safe.
+            pass
+        
+        # Let's refine the layout logic to be safe inside [0,1]
+        # We will generate coordinates and then clamp/scale if needed.
+        
+        for i in range(count):
+            x = xs[i]
+            # Clamp x to [r_base, 1-r_base] to ensure valid start
+            x = max(r_base, min(1.0 - r_base, x))
+            centers_list.append([x, y_current])
+            
+        y_current += math.sqrt(3) * r_base # Vertical pitch
+        row_idx += 1
+        
+    # Convert to array
+    centers = np.array(centers_list)
+    radii[:] = r_base
+    
+    # --- 2. Optimization Loop ---
+    
+    # We will run a simulation that expands radii and resolves overlaps.
+    
+    max_iter = 2000
+    expansion_rate = 5e-5 # How much to grow radii per step
+    step_size = 1e-3      # Movement step for centers
+    
+    # Random perturbation frequency
+    perturb_freq = 50
+    
+    for it in range(max_iter):
+        # --- Step A: Expand Radii ---
+        # Increase radii uniformly to maximize sum
+        # To prevent explosion, we can scale by a factor or add small constant
+        # Adding small constant encourages filling space
+        radii += expansion_rate
+        
+        # --- Step B: Resolve Overlaps (Repulsion) ---
+        # Calculate forces
+        forces = np.zeros_like(centers)
+        
+        # Boundary forces
+        for i in range(n_circles):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left wall
+            if x - r < 0:
+                forces[i, 0] += (0 - (x - r)) * 10.0
+            # Right wall
+            if x + r > 1:
+                forces[i, 0] -= ((x + r) - 1) * 10.0
+            # Bottom wall
+            if y - r < 0:
+                forces[i, 1] += (0 - (y - r)) * 10.0
+            # Top wall
+            if y + r > 1:
+                forces[i, 1] -= ((y + r) - 1) * 10.0
+                
+        # Circle-Circle repulsion
+        # Vectorized check
+        # centers: (N, 2), radii: (N,)
+        # diff: (N, N, 2)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        
+        # Avoid self distance
+        np.fill_diagonal(dist_sq, np.inf)
+        
+        dist = np.sqrt(dist_sq)
+        
+        # Check for overlap
+        # Overlap condition: dist < r_i + r_j
+        # We want to push apart if overlapping
+        radii_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        
+        overlap = radii_sum - dist
+        # Only consider positive overlaps
+        overlap = np.maximum(0, overlap)
+        
+        # Force magnitude proportional to overlap
+        # Direction is along the line connecting centers
+        # Normalized diff vector
+        # Handle zero distance (unlikely but safe)
+        safe_dist = np.maximum(dist, 1e-9)
+        norm_diff = diff / safe_dist[:, :, np.newaxis]
+        
+        # Force on i due to j: push i away from j
+        # F_ij = overlap * norm_vector
+        # We accumulate forces. 
+        # Since diff[i,j] = -diff[j,i], forces will be opposite.
+        # Summing over j for each i.
+        
+        # To avoid O(N^3) with broadcasting for force accumulation, 
+        # we can iterate or use efficient numpy ops.
+        # For N=26, simple loop is fast enough.
+        
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                d = dist[i, j]
+                r_sum = radii[i] + radii[j]
+                if d < r_sum:
+                    overlap_amount = r_sum - d
+                    if d < 1e-9:
+                        # Random push if exactly same center
+                        dx, dy = random.uniform(-1, 1), random.uniform(-1, 1)
+                        dx /= max(1e-9, math.sqrt(dx**2 + dy**2))
+                        dy /= max(1e-9, math.sqrt(dx**2 + dy**2))
+                        forces[i, 0] -= dx * overlap_amount * 5
+                        forces[i, 1] -= dy * overlap_amount * 5
+                        forces[j, 0] += dx * overlap_amount * 5
+                        forces[j, 1] += dy * overlap_amount * 5
+                    else:
+                        dx = (centers[j, 0] - centers[i, 0])
+                        dy = (centers[j, 1] - centers[i, 1])
+                        # Unit vector from i to j
+                        ux = dx / d
+                        uy = dy / d
+                        
+                        # Push i away from j (negative direction)
+                        # Push j away from i (positive direction)
+                        push = overlap_amount * 2.0 # Stiffness
+                        
+                        forces[i, 0] -= ux * push
+                        forces[i, 1] -= uy * push
+                        forces[j, 0] += ux * push
+                        forces[j, 1] += uy * push
+
+        # --- Step C: Update Centers ---
+        # Apply forces with a step size
+        # Clamp velocities or just move
+        centers += forces * step_size
+        
+        # Clamp centers to valid range [0, 1] strictly to prevent drift out
+        # But circles must be inside, so centers must be in [r, 1-r]
+        # However, r changes. Let's just clamp to [0, 1] and let boundary forces handle it.
+        # Actually, hard clamping to [0, 1] is safe for centers, 
+        # provided radii are small enough.
+        centers[:, 0] = np.clip(centers[:, 0], 0.0, 1.0)
+        centers[:, 1] = np.clip(centers[:, 1], 0.0, 1.0)
+        
+        # --- Step D: Random Perturbation (Simulated Annealing style) ---
+        if it % perturb_freq == 0:
+            # Try to move a random circle to a random spot or swap?
+            # Just jitter all slightly
+            jitter = np.random.uniform(-0.01, 0.01, size=(n_circles, 2))
+            centers += jitter
+            centers[:, 0] = np.clip(centers[:, 0], 0.0, 1.0)
+            centers[:, 1] = np.clip(centers[:, 1], 0.0, 1.0)
+            
+            # Also try to vary radii slightly to fill gaps
+            # Increase radius of smallest circles more?
+            min_r = np.min(radii)
+            radii += np.random.uniform(0, 0.005, size=n_circles)
+            
+            # Reset expansion rate if we are stuck?
+            pass
+
+    # --- 3. Final Validation and Cleanup ---
+    # Ensure strict validity
+    # If any overlap remains, reduce radii of overlapping pairs
+    # This is a final pass to ensure the returned solution is valid.
+    
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            dist = math.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            r_sum = radii[i] + radii[j]
+            if dist < r_sum:
+                # Reduce radii to just touch
+                # Distribute reduction proportionally or just fix one?
+                # Better to reduce both slightly
+                reduction = (r_sum - dist) / 2.0 + 1e-5
+                radii[i] -= reduction
+                radii[j] -= reduction
+    
+    # Check boundaries and reduce if needed
+    for i in range(n_circles):
+        x, y = centers[i]
+        r = radii[i]
+        # Max allowed radius at (x,y)
+        max_r = min(x, 1-x, y, 1-y)
+        if r > max_r:
+            radii[i] = max_r - 1e-5
+        if radii[i] < 0:
+            radii[i] = 0 # Should not happen with valid centers
+            
+    sum_radii = np.sum(radii)
+    
+    # Ensure no NaNs
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        # Fallback to a simple grid if optimization failed
+        centers = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for j in range(5) for i in range(5)] + [[0.5, 0.95]]) # 26th
+        radii = np.ones(26) * 0.01 # Tiny fallback
+        sum_radii = np.sum(radii)
+        
+    return centers, radii, float(sum_radii)

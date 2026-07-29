@@ -1,0 +1,227 @@
+# sol_000033 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000018 (state cd1c4815) state=1417f407 sum of radii=2.629093 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(x):
+    """Objective function: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """
+    Constraint function: returns array of constraint values that must be >= 0.
+    Constraints:
+    1. Boundary: x_i >= r_i, 1-x_i >= r_i, y_i >= r_i, 1-y_i >= r_i
+    2. Non-overlap: dist(i,j)^2 >= (r_i + r_j)^2
+    """
+    n = N_CIRCLES
+    c = []
+    for i in range(n):
+        xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+        c.append(xi - ri)
+        c.append(1.0 - xi - ri)
+        c.append(yi - ri)
+        c.append(1.0 - yi - ri)
+        
+    for i in range(n):
+        xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            rs = ri + rj
+            c.append(dx*dx + dy*dy - rs*rs)
+    return np.array(c)
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [0, 0.5]"""
+    b = []
+    for _ in range(N_CIRCLES):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def resolve_overlaps(centers, radii, n):
+    """Force-directed relaxation to resolve initial overlaps and boundary violations."""
+    for _ in range(500):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist and dist > 1e-9:
+                    shift = (min_dist - dist) * 0.5
+                    nx, ny = dx / dist, dy / dist
+                    centers[i, 0] -= shift * nx
+                    centers[i, 1] -= shift * ny
+                    centers[j, 0] += shift * nx
+                    centers[j, 1] += shift * ny
+                    changed = True
+                    
+        # Clip to valid boundary ranges
+        for i in range(n):
+            radii[i] = max(0.01, radii[i])
+            centers[i, 0] = np.clip(centers[i, 0], radii[i], 1.0 - radii[i])
+            centers[i, 1] = np.clip(centers[i, 1], radii[i], 1.0 - radii[i])
+            
+        if not changed:
+            break
+    return centers, radii
+
+def create_hex_init(n, seed):
+    """Generate a hexagonal lattice initial configuration."""
+    np.random.seed(seed)
+    centers = np.zeros((n, 2))
+    radii = np.full(n, 0.09)
+    idx = 0
+    row_counts = [5, 6, 5, 6, 4]  # Sums to 26
+    y = 0.09
+    for i, count in enumerate(row_counts):
+        x_start = 0.09 if i % 2 == 0 else 0.18  # Stagger odd rows
+        for k in range(count):
+            if idx >= n:
+                break
+            x = x_start + k * 0.18
+            centers[idx] = [x + np.random.uniform(-0.005, 0.005), 
+                            y + np.random.uniform(-0.005, 0.005)]
+            radii[idx] = 0.09 + np.random.uniform(-0.005, 0.005)
+            idx += 1
+        y += 0.09 * np.sqrt(3)
+    return centers, radii
+
+def create_grid_init(n, seed):
+    """Generate a grid-based initial configuration."""
+    np.random.seed(seed)
+    centers = np.zeros((n, 2))
+    radii = np.full(n, 0.1)
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            if idx < n:
+                centers[idx] = [0.1 + i * 0.2, 0.1 + j * 0.2]
+                radii[idx] = 0.1
+                idx += 1
+    if idx < n:
+        centers[idx] = [0.5, 0.5]
+        radii[idx] = 0.04
+        
+    # Add perturbation to break symmetry
+    centers += np.random.uniform(-0.01, 0.01, centers.shape)
+    radii += np.random.uniform(-0.005, 0.005, radii.shape)
+    radii = np.clip(radii, 0.01, 0.2)
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_x = None
+    best_val = -np.inf
+    
+    # Generate diverse initial configurations
+    inits = []
+    for s in range(5):
+        inits.append(create_hex_init(n, s))
+        inits.append(create_grid_init(n, s))
+        
+    # Optimize each initial configuration
+    for centers, radii in inits:
+        centers, radii = resolve_overlaps(centers, radii, n)
+        x0 = np.zeros(3 * n)
+        x0[0::3] = centers[:, 0]
+        x0[1::3] = centers[:, 1]
+        x0[2::3] = radii
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            if -res.fun > best_val:
+                best_val = -res.fun
+                best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    # Refinement phase: perturb best solution and re-optimize to escape local minima
+    if best_x is not None:
+        for _ in range(3):
+            x0 = best_x + np.random.normal(0, 1e-4, 3 * n)
+            for i in range(n):
+                x0[3*i] = np.clip(x0[3*i], 0.0, 1.0)
+                x0[3*i+1] = np.clip(x0[3*i+1], 0.0, 1.0)
+                x0[3*i+2] = max(0.0, x0[3*i+2])
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+                if -res.fun > best_val:
+                    best_val = -res.fun
+                    best_x = res.x.copy()
+            except Exception:
+                pass
+                
+    # Fallback if optimization completely fails
+    if best_x is None:
+        best_x = np.zeros(3 * n)
+        best_x[0::3] = 0.5
+        best_x[1::3] = 0.5
+        best_x[2::3] = 0.05
+        best_val = 0.05 * n
+        
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    centers[:, 0] = best_x[0::3]
+    centers[:, 1] = best_x[1::3]
+    radii = best_x[2::3]
+    
+    # Validation and safety shrinkage to guarantee strict feasibility
+    valid = True
+    for i in range(n):
+        if radii[i] < 0:
+            valid = False
+            break
+        if (centers[i, 0] - radii[i] < -1e-12 or centers[i, 0] + radii[i] > 1 + 1e-12 or
+            centers[i, 1] - radii[i] < -1e-12 or centers[i, 1] + radii[i] > 1 + 1e-12):
+            valid = False
+            break
+            
+    if valid:
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt((centers[i, 0] - centers[j, 0])**2 + (centers[i, 1] - centers[j, 1])**2)
+                if dist < radii[i] + radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+                
+    if not valid:
+        factor = 0.999
+        for _ in range(100):
+            radii *= factor
+            ok = True
+            for i in range(n):
+                if (centers[i, 0] - radii[i] < -1e-12 or centers[i, 0] + radii[i] > 1 + 1e-12 or
+                    centers[i, 1] - radii[i] < -1e-12 or centers[i, 1] + radii[i] > 1 + 1e-12):
+                    ok = False
+                    break
+            if ok:
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        dist = np.sqrt((centers[i, 0] - centers[j, 0])**2 + (centers[i, 1] - centers[j, 1])**2)
+                        if dist < radii[i] + radii[j] - 1e-12:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if ok:
+                    break
+        best_val = np.sum(radii)
+        
+    return centers, radii, float(best_val)

@@ -1,0 +1,138 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.628 and reach the target of ~2.636, we shift from optimizing centers and radii jointly with explicit constraints to a **center-only formulation**. This approach naturally handles non-overlap and boundary constraints by defining the maximum valid radius for each circle as the minimum of its distance to the boundaries and half the distance to its nearest neighbor. This reduces the search space from 78 variables to 52, eliminates constraint-handling overhead, and creates a continuous (though non-smooth) objective landscape that is well-suited for derivative-free optimizers.
+
+Key improvements:
+1. **Center-Only Objective**: `r_i(C) = min(dist_to_boundary, 0.5 * min_j dist(c_i, c_j))`. The optimizer directly maximizes `sum(r_i(C))`.
+2. **Multi-Start Local Search**: We run multiple optimizations from diverse starting points (perturbed hexagonal lattices and dense random configurations) to escape local minima.
+3. **Two-Stage Optimization**: 
+   - `Nelder-Mead` for robust basin exploration and handling non-smoothness.
+   - `Powell` for high-precision polishing of the best candidates.
+4. **Strict Feasibility Repair**: A final deterministic pass clamps centers to `[0,1]`, enforces boundary limits, and proportionally shrinks radii to resolve any microscopic overlaps caused by floating-point drift, guaranteeing `validate_packing` passes.
+5. **Vectorized Distance Computation**: Efficient NumPy broadcasting ensures fast objective evaluations, allowing more restarts within computational limits.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_radii(centers):
+    """Computes the maximum valid radii for a given set of centers."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    # Distance to the four boundaries
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Vectorized pairwise Euclidean distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dists = np.sqrt(dx**2 + dy**2)
+    # Ignore self-distances
+    np.fill_diagonal(dists, np.inf)
+    # Radius limited by nearest neighbor
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(vars_flat):
+    """Objective function to minimize (negative sum of radii)."""
+    centers = vars_flat.reshape(-1, 2)
+    # Clamp to ensure we stay within the unit square during optimization
+    centers = np.clip(centers, 0.0, 1.0)
+    return -np.sum(compute_radii(centers))
+
+def get_hex_init(seed, noise_scale=0.008):
+    """Generates a hexagonal lattice initialization with Gaussian noise."""
+    np.random.seed(seed)
+    n = 26
+    r0 = 0.095
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < n:
+        x = r0 if row % 2 == 0 else 2 * r0
+        while x < 1.0 - r0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    c = np.array(pts[:n])
+    c += np.random.normal(0, noise_scale, c.shape)
+    return np.clip(c, 0.02, 0.98)
+
+def get_rand_init(seed):
+    """Generates a random dense initialization."""
+    np.random.seed(seed)
+    return np.random.uniform(0.1, 0.9, (26, 2))
+
+def repair_solution(centers, radii):
+    """Ensures strict feasibility within numerical tolerance."""
+    n = centers.shape[0]
+    radii = radii.copy()
+    
+    # Clamp radii to boundary limits
+    for i in range(n):
+        x, y = centers[i]
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        if radii[i] > max_r:
+            radii[i] = max_r
+            
+    # Resolve overlaps by shrinking radii
+    for _ in range(20):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Uses a center-only formulation with multi-start local optimization and polishing.
+    """
+    n = 26
+    best_sum = 0.0
+    best_c = None
+    
+    np.random.seed(42)
+    seeds = [0, 1, 2, 3, 4, 5, 6, 7]
+    
+    for s in seeds:
+        for init_type in ['hex', 'rand']:
+            if init_type == 'hex':
+                c0 = get_hex_init(s, noise_scale=0.01)
+            else:
+                c0 = get_rand_init(s)
+            
+            # Phase 1: Nelder-Mead for robust basin exploration
+            res = minimize(objective, c0.flatten(), method='Nelder-Mead',
+                           options={'maxiter': 8000, 'xatol': 1e-7, 'fatol': 1e-8})
+            c_opt = np.clip(res.x.reshape(n, 2), 0.0, 1.0)
+            
+            # Phase 2: Powell for high-precision local refinement
+            res2 = minimize(objective, c_opt.flatten(), method='Powell',
+                            options={'maxiter': 6000, 'xtol': 1e-9, 'ftol': 1e-10})
+            c_opt2 = np.clip(res2.x.reshape(n, 2), 0.0, 1.0)
+            r_opt2 = compute_radii(c_opt2)
+            s_val2 = np.sum(r_opt2)
+            
+            if s_val2 > best_sum:
+                best_sum = s_val2
+                best_c = c_opt2.copy()
+                
+    # Final safety repair to guarantee validation passes within tolerance
+    final_radii = repair_solution(best_c, compute_radii(best_c))
+    final_sum = float(np.sum(final_radii))
+    
+    return best_c, final_radii, final_sum
+```

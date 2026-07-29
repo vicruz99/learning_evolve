@@ -1,0 +1,135 @@
+# sol_000143 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 24d569ae) state=1fafacbe sum of radii=2.469115 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    n = 26
+    
+    # Objective: minimize negative radius (equivalent to maximizing r)
+    def objective(vars):
+        return -vars[-1]
+        
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    def bound_constraints(vars):
+        r = vars[-1]
+        res = np.empty(4 * n)
+        for i in range(n):
+            xi = vars[2*i]
+            yi = vars[2*i+1]
+            res[4*i]   = xi - r
+            res[4*i+1] = 1 - xi - r
+            res[4*i+2] = yi - r
+            res[4*i+3] = 1 - yi - r
+        return res
+        
+    # Pairwise non-overlap constraints: dist_ij^2 >= (2r)^2
+    def pair_constraints(vars):
+        r = vars[-1]
+        centers = vars[:-1].reshape(-1, 2)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        idx = np.triu_indices(n, k=1)
+        return dist_sq[idx] - 4 * r**2
+
+    cons = [
+        {'type': 'ineq', 'fun': bound_constraints},
+        {'type': 'ineq', 'fun': pair_constraints}
+    ]
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(1e-6, 0.5)]
+    
+    best_val = -np.inf
+    best_centers = None
+    best_r = None
+    
+    # Try multiple initializations to escape local optima
+    for seed in range(4):
+        np.random.seed(seed)
+        
+        if seed == 0:
+            # Perturbed 5x5 grid + center
+            pts = []
+            for i in range(5):
+                for j in range(5):
+                    pts.append([0.1 + i*0.2, 0.1 + j*0.2])
+            pts.append([0.5, 0.5])
+            init_centers = np.array(pts) + np.random.randn(26, 2) * 0.01
+            init_r = 0.09
+        elif seed == 1:
+            # Hexagonal-ish layout shifted to fit boundaries
+            pts = []
+            r_init = 0.095
+            for row in range(5):
+                y = 0.1 + row * 2 * r_init * np.sqrt(3)/2
+                cols = 5
+                for col in range(cols):
+                    x = 0.1 + col * 2 * r_init + (r_init if row % 2 == 1 else 0)
+                    pts.append([x, y])
+            while len(pts) < 26:
+                pts.append([np.random.rand()*0.8+0.1, np.random.rand()*0.8+0.1])
+            init_centers = np.array(pts[:26])
+            init_r = 0.08
+        else:
+            # Random points in safe region
+            init_centers = np.random.rand(26, 2) * 0.6 + 0.2
+            init_r = 0.05
+            
+        init_centers = np.clip(init_centers, 0.05, 0.95)
+        
+        # Ensure strict feasibility for x0 to help SLSQP
+        min_d = np.inf
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.linalg.norm(init_centers[i] - init_centers[j])
+                if d < min_d:
+                    min_d = d
+        r_feas = min(init_r, min_d / 2 * 0.85, 
+                     np.min(init_centers[:,0]), np.min(1-init_centers[:,0]),
+                     np.min(init_centers[:,1]), np.min(1-init_centers[:,1])) * 0.85
+        x0 = np.concatenate([init_centers.flatten(), [r_feas]])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 400, 'ftol': 1e-14, 'disp': False})
+            
+            c = res.x[:-1].reshape(-1, 2)
+            r = res.x[-1]
+            
+            # Rigorous validation step
+            valid = True
+            if r < 0: 
+                valid = False
+            else:
+                for i in range(n):
+                    if c[i][0]-r < -1e-11 or c[i][0]+r > 1+1e-11 or c[i][1]-r < -1e-11 or c[i][1]+r > 1+1e-11:
+                        valid = False; break
+                if valid:
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            if np.linalg.norm(c[i]-c[j]) < 2*r - 1e-11:
+                                valid = False; break
+                        if not valid: break
+            
+            if valid and -res.fun > best_val:
+                best_val = -res.fun
+                best_centers = c.copy()
+                best_r = r
+        except Exception:
+            continue
+            
+    # Fallback deterministic grid if optimization fails
+    if best_centers is None:
+        pts = np.array([[i*0.2+0.1, j*0.2+0.1] for i in range(5) for j in range(5)])
+        pts = np.vstack([pts, [[0.5, 0.5]]])
+        best_r = 0.09
+        best_centers = pts
+
+    # Apply a tiny safety margin to guarantee passing the 1e-12 validation tolerance
+    best_r *= 0.99999
+    radii = np.full(n, best_r)
+    return best_centers, radii, best_r * n

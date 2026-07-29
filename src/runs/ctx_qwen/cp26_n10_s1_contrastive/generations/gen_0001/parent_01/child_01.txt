@@ -1,0 +1,195 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.612 towards the target of 2.636, we need a more robust optimization strategy that avoids local minima and explores the configuration space more effectively.
+
+Key improvements:
+1. **Smart Initialization via Force-Directed Layout**: Instead of purely random or static grid starts, we use a repulsion-based simulation. We start circles in a structured hexagonal grid, then iteratively push them apart using overlap-repulsion and wall-repulsion forces. This quickly yields high-quality, space-filling initial configurations that are much closer to the optimum than random guesses.
+2. **Reparameterization for Boundary Constraints**: We maintain the clever parameterization $x_i = r_i + u_i(1 - 2r_i)$ and $y_i = r_i + v_i(1 - 2r_i)$ where $u_i, v_i \in [0,1]$. This automatically satisfies all boundary constraints, reducing the optimization problem to only 325 pairwise non-overlap constraints. This makes SLSQP significantly more stable and faster.
+3. **Multi-Phase Optimization**: 
+   - Phase 1: Run the force layout multiple times with different random seeds and perturbations, then refine each with SLSQP.
+   - Phase 2: Take the best result and perform targeted local perturbations (shaking) followed by re-optimization to escape any shallow local minima.
+4. **Numerical Stability**: We use vectorized constraint evaluation for speed, clip variables strictly within bounds, and use tight tolerances (`ftol=1e-11`) to squeeze out every bit of precision.
+
+This combination of physics-inspired initialization and rigorous local refinement consistently breaks through previous local optima in circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective function: maximize sum of radii (minimize negative sum)."""
+    return -np.sum(vars[0::3])
+
+def constraint_func(vars):
+    """
+    Constraint function: ensures non-overlap between all circle pairs.
+    Returns array of constraint values >= 0.
+    """
+    radii = vars[0::3]
+    u = vars[1::3]
+    v = vars[2::3]
+    n = 26
+    
+    # Transform normalized coordinates to actual positions
+    # This parameterization automatically satisfies boundary constraints:
+    # x in [r, 1-r] and y in [r, 1-r]
+    x = radii + u * (1.0 - 2.0 * radii)
+    y = radii + v * (1.0 - 2.0 * radii)
+    
+    # Compute pairwise squared distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Compute squared minimum allowed distances
+    r_sum = radii[:, None] + radii[None, :]
+    min_dist_sq = r_sum**2
+    
+    # Extract upper triangular part (i < j) to avoid duplicates and self
+    i, j = np.triu_indices(n, k=1)
+    return dist_sq[i, j] - min_dist_sq[i, j]
+
+def force_layout_init(n, seed, steps=800):
+    """Generates a well-packed initial configuration using repulsion forces."""
+    np.random.seed(seed)
+    
+    # Start with a perturbed hexagonal grid for better structure
+    pts = []
+    y = 0.1
+    row = 0
+    while len(pts) < n:
+        x = 0.1
+        shift = (row % 2) * 0.1
+        while x <= 0.9 and len(pts) < n:
+            pts.append([x + shift, y])
+            x += 0.2
+        y += 0.1732 # approx sqrt(3)/2 * 0.2
+        row += 1
+        
+    centers = np.array(pts[:n])
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    target_r = 0.095
+    radii = np.full(n, target_r)
+    
+    for t in range(steps):
+        diff = centers[:, None, :] - centers[None, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        dist = np.sqrt(np.maximum(dist_sq, 1e-12))
+        np.fill_diagonal(dist, 1e-12)
+        
+        r_sum = radii[:, None] + radii[None, :]
+        overlap = np.maximum(0, r_sum - dist)
+        # Force magnitude proportional to overlap, softened by distance
+        force_mag = overlap / (dist + 1e-8)
+        
+        # Sum forces along each axis
+        forces = np.sum(force_mag[:, :, None] * diff, axis=1)
+        
+        # Vectorized wall repulsion
+        wall_f = np.zeros_like(centers)
+        wall_f[:, 0] += np.maximum(0, radii - centers[:, 0]) * 30.0
+        wall_f[:, 0] -= np.maximum(0, centers[:, 0] - (1.0 - radii)) * 30.0
+        wall_f[:, 1] += np.maximum(0, radii - centers[:, 1]) * 30.0
+        wall_f[:, 1] -= np.maximum(0, centers[:, 1] - (1.0 - radii)) * 30.0
+        
+        # Adaptive step size that decays over time
+        step_size = 0.025 / (1.0 + t * 0.015)
+        centers += (forces + wall_f) * step_size
+        centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+        
+    return centers
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sol = None
+    best_val = -np.inf
+    
+    # Bounds: r in [1e-4, 0.5], u in [0, 1], v in [0, 1]
+    bounds = [(1e-4, 0.5), (0, 1), (0, 1)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    # Phase 1: Force layout initialization + SLSQP refinement
+    for seed in range(20):
+        centers_init = force_layout_init(n, seed=seed)
+        
+        # Convert to (r, u, v) parameterization
+        r_init = np.full(n, 0.095)
+        u_init = (centers_init[:, 0] - r_init) / (1.0 - 2.0 * r_init)
+        v_init = (centers_init[:, 1] - r_init) / (1.0 - 2.0 * r_init)
+        u_init = np.clip(u_init, 0.0, 1.0)
+        v_init = np.clip(v_init, 0.0, 1.0)
+        
+        vars0 = np.empty(n * 3)
+        vars0[0::3] = r_init
+        vars0[1::3] = u_init
+        vars0[2::3] = v_init
+        
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-11})
+            
+            val = -res.fun
+            # Verify constraints are satisfied within tolerance
+            c_vals = constraint_func(res.x)
+            if np.min(c_vals) >= -1e-6 and val > best_val:
+                best_val = val
+                best_sol = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Perturb best solution and re-optimize to escape local minima
+    if best_sol is not None:
+        for pert_iter in range(15):
+            np.random.seed(200 + pert_iter)
+            vars_pert = best_sol.copy()
+            
+            # Apply random perturbations
+            vars_pert[0::3] += np.random.uniform(-0.003, 0.003, n)
+            vars_pert[1::3] += np.random.uniform(-0.025, 0.025, n)
+            vars_pert[2::3] += np.random.uniform(-0.025, 0.025, n)
+            
+            # Enforce bounds strictly
+            vars_pert[0::3] = np.clip(vars_pert[0::3], 1e-4, 0.5)
+            vars_pert[1::3] = np.clip(vars_pert[1::3], 0.0, 1.0)
+            vars_pert[2::3] = np.clip(vars_pert[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, vars_pert, method='SLSQP', bounds=bounds, 
+                               constraints=cons, options={'maxiter': 4000, 'ftol': 1e-11})
+                
+                val = -res.fun
+                c_vals = constraint_func(res.x)
+                if np.min(c_vals) >= -1e-6 and val > best_val:
+                    best_val = val
+                    best_sol = res.x.copy()
+            except Exception:
+                continue
+
+    # Fallback if optimization fails completely (should not happen)
+    if best_sol is None:
+        r_fall = 0.05
+        u_fall = np.random.uniform(0, 1, n)
+        v_fall = np.random.uniform(0, 1, n)
+        best_sol = np.empty(n * 3)
+        best_sol[0::3] = r_fall
+        best_sol[1::3] = u_fall
+        best_sol[2::3] = v_fall
+        best_val = -np.sum(r_fall)
+
+    # Reconstruct final centers from optimized parameters
+    radii = best_sol[0::3]
+    u = best_sol[1::3]
+    v = best_sol[2::3]
+    x = radii + u * (1.0 - 2.0 * radii)
+    y = radii + v * (1.0 - 2.0 * radii)
+    centers = np.column_stack((x, y))
+    
+    # Ensure non-negative radii (safety against numerical drift)
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

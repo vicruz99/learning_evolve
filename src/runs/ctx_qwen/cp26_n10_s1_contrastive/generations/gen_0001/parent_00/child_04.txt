@@ -1,0 +1,164 @@
+
+
+<strategy>
+To improve the packing and push the sum of radii beyond the current ~2.625, I will employ a robust multi-start optimization strategy with SLSQP, focusing on high-quality initial configurations and thorough local refinement.
+
+Key improvements:
+1. **Vectorized & Efficient Constraints**: Precompute upper-triangle indices to avoid mask creation overhead. Use a single constraint function that returns all boundary and pairwise constraints efficiently.
+2. **Diverse Initializations**: Generate multiple hexagonal lattice patterns with different row counts (6-5-6-5-4, 5-6-5-6-4, etc.), a randomized grid, and a center-outward layout. This covers different topological basins.
+3. **Controlled Perturbation**: Apply small random noise to each initialization to break symmetries and escape shallow local minima before feeding to the optimizer.
+4. **Multi-Phase Optimization**: Run SLSQP with high iteration limits and tight tolerances across many restarts. After finding the best candidate, perform a final high-precision refinement pass.
+5. **Strict Validity Enforcement**: Post-process the result to shrink radii minimally if numerical drift causes constraint violations, ensuring the validator passes while preserving the sum.
+
+This approach systematically explores the configuration space and leverages SLSQP's strength in handling smooth nonlinear constraints, typically yielding optimal or near-optimal packings for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def _objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def _constraints(x):
+    """Compute inequality constraints >= 0."""
+    cx = x[0::3]
+    cy = x[1::3]
+    cr = x[2::3]
+    
+    # Pre-allocate constraint array
+    c = np.empty(4 * N + N * (N - 1) // 2)
+    
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c[0::4] = cx - cr
+    c[1::4] = 1.0 - cx - cr
+    c[2::4] = cy - cr
+    c[3::4] = 1.0 - cy - cr
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = cx[I_IDX] - cx[J_IDX]
+    dy = cy[I_IDX] - cy[J_IDX]
+    dist_sq = dx * dx + dy * dy
+    r_sum_sq = (cr[I_IDX] + cr[J_IDX]) ** 2
+    c[4 * N:] = dist_sq - r_sum_sq
+    
+    return c
+
+def _generate_hex_init(row_counts, r_init, scale=1.0, shift_x=0.0, shift_y=0.0):
+    """Generate initial centers from a hexagonal pattern."""
+    pts = []
+    y = r_init
+    for i, count in enumerate(row_counts):
+        shift = (r_init if i % 2 == 1 else 0.0) + shift_x
+        x = r_init + shift
+        for _ in range(count):
+            if len(pts) < N:
+                pts.append([x, y])
+            x += 2.0 * r_init
+        y += np.sqrt(3.0) * r_init
+        
+    centers = np.array(pts[:N])
+    centers = centers * scale + np.array([shift_x, shift_y])
+    centers = np.clip(centers, 0.05, 0.95)
+    return centers
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_sum = -np.inf
+    best_vars = None
+    
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-5, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': _constraints}
+    
+    # Diverse initial configurations
+    inits = []
+    inits.append(_generate_hex_init([6, 5, 6, 5, 4], 0.095))
+    inits.append(_generate_hex_init([5, 6, 5, 6, 4], 0.095))
+    inits.append(_generate_hex_init([6, 6, 5, 5, 4], 0.092))
+    inits.append(_generate_hex_init([4, 5, 6, 5, 6], 0.094))
+    
+    # Randomized grid
+    np.random.seed(10)
+    inits.append(np.random.uniform(0.1, 0.9, (N, 2)))
+    
+    # Center-outward
+    pts_c = []
+    pts_c.append([0.5, 0.5])
+    for angle in np.linspace(0, 2*np.pi, N-1, endpoint=False):
+        r = 0.35
+        pts_c.append([0.5 + r*np.cos(angle), 0.5 + r*np.sin(angle)])
+    inits.append(np.clip(pts_c, 0.05, 0.95))
+
+    for idx, center_init in enumerate(inits):
+        for trial in range(10):
+            np.random.seed(idx * 100 + trial)
+            
+            # Perturb centers
+            pert_centers = center_init + np.random.uniform(-0.02, 0.02, (N, 2))
+            pert_centers = np.clip(pert_centers, 0.05, 0.95)
+            
+            # Initial radii
+            r_init = np.full(N, 0.09)
+            
+            # Flatten
+            x0 = np.zeros(3 * N)
+            for i in range(N):
+                x0[3*i] = pert_centers[i, 0]
+                x0[3*i+1] = pert_centers[i, 1]
+                x0[3*i+2] = r_init[i]
+                
+            try:
+                res = minimize(_objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 2500, 'ftol': 1e-12})
+                
+                if res.success:
+                    current_sum = -res.fun
+                    c_vals = _constraints(res.x)
+                    if np.min(c_vals) >= -1e-6:
+                        if current_sum > best_sum:
+                            best_sum = current_sum
+                            best_vars = res.x.copy()
+            except Exception:
+                continue
+
+    # Fallback
+    if best_vars is None:
+        x0 = np.zeros(3*N)
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                x0[idx] = 0.1 + i*0.2
+                x0[idx+1] = 0.1 + j*0.2
+                x0[idx+2] = 0.09
+                idx += 3
+        x0[75], x0[76], x0[77] = 0.5, 0.5, 0.01
+        best_vars = x0
+        best_sum = np.sum(best_vars[2::3])
+        
+    # Final high-precision refinement
+    try:
+        res_final = minimize(_objective, best_vars, method='SLSQP', bounds=bounds,
+                             constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13})
+        if res_final.success and -res_final.fun > best_sum - 1e-7:
+            best_vars = res_final.x
+            best_sum = -res_final.fun
+    except Exception:
+        pass
+        
+    # Extract and enforce strict validity
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    
+    c_vals = _constraints(best_vars)
+    if np.min(c_vals) < -1e-9:
+        max_viol = -np.min(c_vals)
+        scale_factor = 1.0 - max_viol * 2.0
+        radii *= max(0.99, scale_factor)
+        best_vars[2::3] = radii
+        best_sum = np.sum(radii)
+            
+    return centers, radii, float(best_sum)
+```

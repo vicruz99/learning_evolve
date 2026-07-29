@@ -1,0 +1,332 @@
+
+
+<strategy>
+I'll approach this circle packing problem by:
+
+1. **Initial Configuration**: Create a hexagonal grid arrangement with 5 rows (counts: 5+5+5+5+6=26), which is near-optimal for circle packing density. Start with equal radii around 0.08-0.09.
+
+2. **Optimization**: Use L-BFGS-B with a penalty method to simultaneously optimize centers and radii. The penalty method converts constraints (boundary, non-overlap, non-negative radii) into penalty terms added to the objective function.
+
+3. **Multi-start Strategy**: Run optimization from multiple random initial seeds and different penalty weights to escape local optima.
+
+4. **Post-processing**: After optimization, fix any minor constraint violations by clipping centers and adjusting radii.
+
+5. **Vectorization**: Use vectorized numpy operations for the penalty computation to speed up optimization.
+
+Key insights:
+- Hexagonal packing is the densest 2D circle arrangement
+- Unequal radii can achieve higher sum than equal radii (larger circles near boundaries/corners, smaller ones filling gaps)
+- The theoretical upper bound is √(26/π) ≈ 2.88, so target 2.636 is achievable
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+
+def generate_hexagonal_initial(n, r_init, offset_seed):
+    """Generate hexagonal grid initial configuration."""
+    np.random.seed(offset_seed)
+    
+    # Determine row arrangement to get n circles
+    # Try 5 rows with hexagonal pattern
+    row_counts = None
+    
+    # Try different row count combinations
+    for first_count in range(6, 3, -1):
+        counts = []
+        remaining = n
+        row = 0
+        while remaining > 0:
+            if row % 2 == 0:
+                c = first_count
+            else:
+                c = first_count - 1
+            c = max(1, min(c, remaining))
+            counts.append(c)
+            remaining -= c
+            row += 1
+        if sum(counts) == n:
+            row_counts = counts
+            break
+    
+    if row_counts is None:
+        row_counts = [5, 5, 5, 5, 6]
+    
+    r = r_init
+    centers = []
+    y = r
+    
+    for row_idx, count in enumerate(row_counts):
+        if row_idx % 2 == 0:
+            if count == 1:
+                x_positions = [0.5]
+            else:
+                x_positions = np.linspace(r, 1 - r, count)
+        else:
+            # Offset row
+            if count == 1:
+                x_positions = [0.5]
+            else:
+                x_positions = np.linspace(r + r, 1 - r - r, count)
+        
+        for x in x_positions:
+            centers.append([x, y])
+        
+        y += np.sqrt(3) * r
+        if len(centers) >= n:
+            break
+    
+    centers = np.array(centers[:n])
+    radii = np.full(n, r)
+    
+    # Small random perturbation
+    centers += np.random.randn(n, 2) * 0.003
+    centers = np.clip(centers, 0.01, 0.99)
+    
+    return centers, radii
+
+
+def generate_random_initial(n, seed):
+    """Generate random initial configuration with repulsion."""
+    np.random.seed(seed)
+    
+    centers = np.random.rand(n, 2)
+    radii = np.full(n, 0.08)
+    
+    # Apply repulsion to spread out
+    for _ in range(100):
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[j] - centers[i]
+                dist = np.linalg.norm(diff)
+                if dist < 0.2 and dist > 0:
+                    push = 0.01 * diff / dist
+                    centers[i] -= push
+                    centers[j] += push
+        
+        centers = np.clip(centers, 0.05, 0.95)
+    
+    return centers, radii
+
+
+def compute_penalty_objective(params, n, weight):
+    """Compute objective with penalty for constraint violations (vectorized)."""
+    centers = params[:2 * n].reshape(n, 2)
+    radii = params[2 * n:]
+    
+    # Base objective: maximize sum of radii (minimize negative)
+    obj = -np.sum(radii)
+    
+    # Boundary penalties
+    x = centers[:, 0]
+    y = centers[:, 1]
+    
+    # x >= r => r - x <= 0
+    violations_x_low = np.maximum(0, radii - x)
+    obj += weight * np.sum(violations_x_low ** 2)
+    
+    # x <= 1 - r => x + r - 1 <= 0
+    violations_x_high = np.maximum(0, x + radii - 1)
+    obj += weight * np.sum(violations_x_high ** 2)
+    
+    # y >= r => r - y <= 0
+    violations_y_low = np.maximum(0, radii - y)
+    obj += weight * np.sum(violations_y_low ** 2)
+    
+    # y <= 1 - r => y + r - 1 <= 0
+    violations_y_high = np.maximum(0, y + radii - 1)
+    obj += weight * np.sum(violations_y_high ** 2)
+    
+    # r >= 0
+    violations_r = np.maximum(0, -radii)
+    obj += weight * np.sum(violations_r ** 2)
+    
+    # Overlap penalties (vectorized)
+    # Compute all pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    
+    # Minimum required distances
+    min_dists = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Violations: min_dists - dists > 0
+    violations = np.maximum(0, min_dists - dists)
+    
+    # Only count upper triangle (i < j)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    obj += weight * np.sum((violations * mask) ** 2)
+    
+    return obj
+
+
+def get_optimization_bounds(n):
+    """Get bounds for optimization variables."""
+    bounds = []
+    for i in range(n):
+        bounds.append((0.001, 0.999))  # x
+        bounds.append((0.001, 0.999))  # y
+        bounds.append((0.001, 0.499))  # r
+    return bounds
+
+
+def check_validity(centers, radii, n):
+    """Check if configuration is valid."""
+    for i in range(n):
+        if np.isnan(radii[i]) or radii[i] < 0:
+            return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-10 or x + r > 1 + 1e-10:
+            return False
+        if y - r < -1e-10 or y + r > 1 + 1e-10:
+            return False
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-10:
+                return False
+    
+    return True
+
+
+def fix_configuration(centers, radii, n):
+    """Fix minor constraint violations."""
+    centers = centers.copy()
+    radii = radii.copy()
+    
+    # Clip centers to valid range
+    for i in range(n):
+        r = radii[i]
+        centers[i, 0] = np.clip(centers[i, 0], r, 1 - r)
+        centers[i, 1] = np.clip(centers[i, 1], r, 1 - r)
+        radii[i] = max(0, radii[i])
+    
+    # Reduce radii to fix overlaps (iterative)
+    for _ in range(50):
+        max_violation = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                required = radii[i] + radii[j]
+                if dist < required - 1e-12:
+                    violation = required - dist
+                    max_violation = max(max_violation, violation)
+                    # Reduce both radii proportionally
+                    total_r = radii[i] + radii[j]
+                    if total_r > 0:
+                        scale_i = radii[i] / total_r
+                        scale_j = radii[j] / total_r
+                        radii[i] -= violation * scale_i * 0.5
+                        radii[j] -= violation * scale_j * 0.5
+        
+        if max_violation < 1e-10:
+            break
+    
+    # Ensure non-negative
+    radii = np.maximum(radii, 0)
+    
+    return centers, radii
+
+
+def run_packing():
+    """Main function to pack 26 circles in unit square."""
+    n = 26
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Hexagonal initial with various seeds and penalty weights
+    for seed in range(40):
+        for r_init in [0.08, 0.085, 0.09, 0.095, 0.1]:
+            centers_init, radii_init = generate_hexagonal_initial(n, r_init, seed)
+            params0 = np.concatenate([centers_init.flatten(), radii_init])
+            
+            for weight in [2000, 5000, 10000, 20000]:
+                result = minimize(
+                    compute_penalty_objective,
+                    params0,
+                    args=(n, weight),
+                    method='L-BFGS-B',
+                    bounds=get_optimization_bounds(n),
+                    options={'maxiter': 8000, 'ftol': 1e-16, 'gtol': 1e-12}
+                )
+                
+                if result.fun < 0:  # Negative means we're maximizing sum
+                    params_opt = result.x
+                    centers_opt = params_opt[:2 * n].reshape(n, 2)
+                    radii_opt = params_opt[2 * n:]
+                    
+                    centers_opt, radii_opt = fix_configuration(centers_opt, radii_opt, n)
+                    
+                    if check_validity(centers_opt, radii_opt, n):
+                        current_sum = np.sum(radii_opt)
+                        if current_sum > best_sum:
+                            best_sum = current_sum
+                            best_centers = centers_opt.copy()
+                            best_radii = radii_opt.copy()
+    
+    # Strategy 2: Random initial configurations
+    for seed in range(30):
+        centers_init, radii_init = generate_random_initial(n, seed)
+        params0 = np.concatenate([centers_init.flatten(), radii_init])
+        
+        for weight in [5000, 10000]:
+            result = minimize(
+                compute_penalty_objective,
+                params0,
+                args=(n, weight),
+                method='L-BFGS-B',
+                bounds=get_optimization_bounds(n),
+                options={'maxiter': 8000, 'ftol': 1e-16}
+            )
+            
+            if result.fun < 0:
+                params_opt = result.x
+                centers_opt = params_opt[:2 * n].reshape(n, 2)
+                radii_opt = params_opt[2 * n:]
+                
+                centers_opt, radii_opt = fix_configuration(centers_opt, radii_opt, n)
+                
+                if check_validity(centers_opt, radii_opt, n):
+                    current_sum = np.sum(radii_opt)
+                    if current_sum > best_sum:
+                        best_sum = current_sum
+                        best_centers = centers_opt.copy()
+                        best_radii = radii_opt.copy()
+    
+    # Strategy 3: Refine best solution with higher weight
+    if best_centers is not None:
+        params0 = np.concatenate([best_centers.flatten(), best_radii])
+        for weight in [50000, 100000, 200000]:
+            result = minimize(
+                compute_penalty_objective,
+                params0,
+                args=(n, weight),
+                method='L-BFGS-B',
+                bounds=get_optimization_bounds(n),
+                options={'maxiter': 15000, 'ftol': 1e-16}
+            )
+            
+            params_opt = result.x
+            centers_opt = params_opt[:2 * n].reshape(n, 2)
+            radii_opt = params_opt[2 * n:]
+            
+            centers_opt, radii_opt = fix_configuration(centers_opt, radii_opt, n)
+            
+            if check_validity(centers_opt, radii_opt, n):
+                current_sum = np.sum(radii_opt)
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = centers_opt.copy()
+                    best_radii = radii_opt.copy()
+    
+    # Fallback if nothing worked
+    if best_centers is None:
+        best_centers, best_radii = generate_hexagonal_initial(n, 0.08, 0)
+        best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, best_sum
+```

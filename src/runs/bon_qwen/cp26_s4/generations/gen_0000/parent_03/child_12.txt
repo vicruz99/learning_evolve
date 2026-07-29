@@ -1,0 +1,328 @@
+
+
+<strategy>
+I'll use an alternating optimization approach combining Linear Programming and non-linear optimization:
+
+1. **Initialize**: Place 26 circles in a hexagonal lattice pattern (6 rows with pattern 5-4-5-4-5-3 = 26 circles)
+
+2. **Alternating Optimization Loop**:
+   - **Step A (LP for radii)**: Given fixed centers, solve a linear program to maximize Σr_i subject to r_i + r_j ≤ d_ij and boundary constraints. This is convex and exact.
+   - **Step B (Nonlinear for centers)**: Given fixed radii, optimize centers using L-BFGS-B to minimize overlap penalties. Use penalty method for non-overlap constraints.
+
+3. **Multiple Restart Strategies**: Try different initial arrangements (hexagonal patterns with varying row counts, grid patterns) to escape local optima.
+
+4. **Refinement**: After the alternating loop, do a final joint optimization using SLSQP with explicit constraints to squeeze out any remaining improvement.
+
+Key insights:
+- The LP step is crucial: given fixed centers, the optimal radii are found exactly in a few milliseconds
+- The center optimization uses a smooth penalty approach to handle the non-differentiable max(0, violation) function
+- Multiple starting points help avoid bad local optima
+- The hexagonal arrangement is the densest 2D packing, so starting near it gives a good initialization
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+
+def generate_hexagonal_pattern(n, row_counts, offset_pattern=None):
+    """Generate circles in a hexagonal lattice arrangement."""
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.035
+    
+    idx = 0
+    num_rows = len(row_counts)
+    for row_idx, count in enumerate(row_counts):
+        for i in range(count):
+            x = (i + 0.5) / count
+            y = (row_idx + 0.5) / num_rows
+            if offset_pattern is not None and offset_pattern[row_idx]:
+                x += 0.5 / max(count, 1)
+            centers[idx] = [x, y]
+            idx += 1
+    
+    return centers, radii
+
+
+def generate_initial(n, trial=0):
+    """Generate initial arrangements with different patterns."""
+    if trial == 0:
+        # 6 rows: 5,4,5,4,5,3 = 26
+        row_counts = [5, 4, 5, 4, 5, 3]
+        offsets = [False, True, False, True, False, True]
+        return generate_hexagonal_pattern(n, row_counts, offsets)
+    elif trial == 1:
+        # 5 rows: 6,5,6,5,4 = 26
+        row_counts = [6, 5, 6, 5, 4]
+        offsets = [False, True, False, True, False]
+        return generate_hexagonal_pattern(n, row_counts, offsets)
+    elif trial == 2:
+        # 6 rows: 4,5,4,5,4,4 = 26
+        row_counts = [4, 5, 4, 5, 4, 4]
+        offsets = [True, False, True, False, True, False]
+        return generate_hexagonal_pattern(n, row_counts, offsets)
+    elif trial == 3:
+        # 5 rows: 5,6,5,5,5 = 26
+        row_counts = [5, 6, 5, 5, 5]
+        offsets = [False, True, False, True, False]
+        return generate_hexagonal_pattern(n, row_counts, offsets)
+    else:
+        # 6 rows: 5,5,4,4,4,4 = 26
+        row_counts = [5, 5, 4, 4, 4, 4]
+        offsets = [False, True, False, True, False, True]
+        return generate_hexagonal_pattern(n, row_counts, offsets)
+
+
+def update_radii_lp(centers, n):
+    """Given fixed centers, optimize radii using linear programming."""
+    c = -np.ones(n)
+    
+    num_pairwise = n * (n - 1) // 2
+    num_constraints = num_pairwise + n
+    A_ub = np.zeros((num_constraints, n))
+    b_ub = np.zeros(num_constraints)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dist
+            idx += 1
+    
+    for i in range(n):
+        bd = min(
+            centers[i, 0],
+            1.0 - centers[i, 0],
+            centers[i, 1],
+            1.0 - centers[i, 1]
+        )
+        A_ub[idx, i] = 2.0
+        b_ub[idx] = bd
+        idx += 1
+    
+    bounds = [(1e-10, None)] * n
+    
+    try:
+        result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if result.success:
+            return result.x
+    except Exception:
+        pass
+    
+    return np.ones(n) * 0.03
+
+
+def update_centers_lbfgs(centers, radii, n):
+    """Given fixed radii, optimize centers to minimize overlaps."""
+    
+    def objective(x_vec):
+        c = x_vec.reshape(n, 2)
+        penalty = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = c[i, 0] - c[j, 0]
+                dy = c[i, 1] - c[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy + 1e-18)
+                required = radii[i] + radii[j]
+                if dist < required:
+                    penalty += (required - dist) ** 2
+        
+        # Boundary penalties
+        for i in range(n):
+            r = radii[i]
+            if c[i, 0] < r:
+                penalty += (r - c[i, 0]) ** 2 * 100.0
+            if c[i, 0] > 1 - r:
+                penalty += (c[i, 0] - (1 - r)) ** 2 * 100.0
+            if c[i, 1] < r:
+                penalty += (r - c[i, 1]) ** 2 * 100.0
+            if c[i, 1] > 1 - r:
+                penalty += (c[i, 1] - (1 - r)) ** 2 * 100.0
+        
+        return penalty
+    
+    x0 = centers.flatten()
+    lb = 1e-6
+    ub = 1 - 1e-6
+    bounds = [(lb, ub)] * (2 * n)
+    
+    try:
+        result = minimize(
+            objective, x0, method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 2000, 'ftol': 1e-15, 'gtol': 1e-12}
+        )
+        if result.success or result.fun < 1e-6:
+            return result.x.reshape(n, 2)
+    except Exception:
+        pass
+    
+    return centers
+
+
+def smooth_penalty_objective(x_vec, n, alpha=1e7):
+    """Smooth penalty objective for joint optimization."""
+    centers = x_vec[:2 * n].reshape(n, 2)
+    radii = x_vec[2 * n:]
+    
+    obj = -np.sum(radii)
+    
+    # Overlap penalties
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist_sq = dx * dx + dy * dy
+            dist = np.sqrt(dist_sq + 1e-20)
+            required = radii[i] + radii[j]
+            violation = required - dist
+            if violation > 0:
+                obj += alpha * violation ** 2
+    
+    # Boundary penalties
+    for i in range(n):
+        x, y, r = centers[i, 0], centers[i, 1], radii[i]
+        v1 = r - x
+        v2 = x + r - 1.0
+        v3 = r - y
+        v4 = y + r - 1.0
+        for v in [v1, v2, v3, v4]:
+            if v > 0:
+                obj += alpha * v ** 2
+    
+    return obj
+
+
+def finalize_with_slsqp(centers, radii, n):
+    """Final refinement using SLSQP with explicit constraints."""
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers[i, 0]
+        x0[3 * i + 1] = centers[i, 1]
+        x0[3 * i + 2] = radii[i]
+    
+    bounds = [(1e-6, 1 - 1e-6)] * (2 * n) + [(1e-8, 0.499)] * n
+    
+    def objective(x):
+        return -np.sum(x[2::3])
+    
+    constraints = []
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            def make_constraint(ia, ja):
+                def con(x):
+                    xi = x[3 * ia]
+                    yi = x[3 * ia + 1]
+                    ri = x[3 * ia + 2]
+                    xj = x[3 * ja]
+                    yj = x[3 * ja + 1]
+                    rj = x[3 * ja + 2]
+                    dist = np.sqrt((xi - xj) ** 2 + (yi - yj) ** 2)
+                    return dist - ri - rj
+                return con
+            constraints.append({'type': 'ineq', 'fun': make_constraint(i, j)})
+    
+    for i in range(n):
+        def make_bl(ia):
+            def con(x):
+                return x[3 * ia] - x[3 * ia + 2]
+            return con
+        def make_bh(ia):
+            def con(x):
+                return 1.0 - x[3 * ia] - x[3 * ia + 2]
+            return con
+        def make_bdl(ia):
+            def con(x):
+                return x[3 * ia + 1] - x[3 * ia + 2]
+            return con
+        def make_bdhl(ia):
+            def con(x):
+                return 1.0 - x[3 * ia + 1] - x[3 * ia + 2]
+            return con
+        constraints.append({'type': 'ineq', 'fun': make_bl(i)})
+        constraints.append({'type': 'ineq', 'fun': make_bh(i)})
+        constraints.append({'type': 'ineq', 'fun': make_bdl(i)})
+        constraints.append({'type': 'ineq', 'fun': make_bdhl(i)})
+    
+    try:
+        result = minimize(
+            objective, x0, method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'maxiter': 3000, 'ftol': 1e-14}
+        )
+        if result.success:
+            centers_out = np.zeros((n, 2))
+            radii_out = np.zeros(n)
+            for i in range(n):
+                centers_out[i, 0] = result.x[3 * i]
+                centers_out[i, 1] = result.x[3 * i + 1]
+                radii_out[i] = max(0, result.x[3 * i + 2])
+            return centers_out, radii_out
+    except Exception:
+        pass
+    
+    return centers, radii
+
+
+def run_packing():
+    n = 26
+    
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    for trial in range(5):
+        centers, radii = generate_initial(n, trial)
+        
+        # Alternating optimization
+        for outer_iter in range(120):
+            radii = update_radii_lp(centers, n)
+            centers = update_centers_lbfgs(centers, radii, n)
+        
+        # Joint refinement with smooth penalty
+        x_vec = np.zeros(3 * n)
+        for i in range(n):
+            x_vec[3 * i] = centers[i, 0]
+            x_vec[3 * i + 1] = centers[i, 1]
+            x_vec[3 * i + 2] = radii[i]
+        
+        lb = 1e-6
+        ub = 1 - 1e-6
+        r_lb = 1e-8
+        r_ub = 0.499
+        bounds = [(lb, ub)] * (2 * n) + [(r_lb, r_ub)] * n
+        
+        try:
+            result = minimize(
+                smooth_penalty_objective, x_vec, args=(n, 5e7),
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 8000, 'ftol': 1e-16, 'gtol': 1e-13}
+            )
+            if result.success:
+                centers = result.x[:2 * n].reshape(n, 2)
+                radii = result.x[2 * n:]
+        except Exception:
+            pass
+        
+        # Final SLSQP refinement
+        centers, radii = finalize_with_slsqp(centers, radii, n)
+        
+        current_sum = np.sum(radii)
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+    
+    # Clean up any numerical issues
+    best_centers = np.nan_to_num(best_centers, nan=0.5)
+    best_radii = np.nan_to_num(best_radii, nan=0.05)
+    best_radii = np.maximum(best_radii, 0.0)
+    best_centers = np.clip(best_centers, 0.0, 1.0)
+    
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

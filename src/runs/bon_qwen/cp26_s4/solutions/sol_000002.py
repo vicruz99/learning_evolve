@@ -1,0 +1,281 @@
+# sol_000002 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state d058a929) state=e5af16be sum of radii=2.483628 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def solve_radii_lp(centers):
+    """
+    Solves the Linear Programming problem to find optimal radii for fixed centers.
+    
+    Objective: Maximize sum(r_i)
+    Constraints:
+      1. r_i >= 0
+      2. r_i <= min(x_i, 1-x_i, y_i, 1-y_i)  (Boundary constraints)
+      3. r_i + r_j <= dist(c_i, c_j)         (Non-overlap constraints)
+    """
+    n = centers.shape[0]
+    
+    # Objective: Minimize -sum(r_i)
+    c_obj = -np.ones(n)
+    
+    # Inequality constraints: A_ub @ r <= b_ub
+    # We will collect them in lists and stack
+    A_ub = []
+    b_ub = []
+    
+    # 1. Boundary constraints: r_i <= dist_to_wall
+    for i in range(n):
+        x, y = centers[i]
+        dist_wall = min(x, 1-x, y, 1-y)
+        # r_i <= dist_wall  =>  r_i - dist_wall <= 0 ? 
+        # Actually standard form is A_ub @ x <= b_ub.
+        # Row for r_i: [0, ..., 1, ..., 0] (1 at index i)
+        # So we need 1 * r_i <= dist_wall
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(dist_wall)
+        
+    # 2. Pairwise non-overlap: r_i + r_j <= d_ij
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dist)
+            
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    # Bounds for variables r_i: r_i >= 0
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    # method='highs' is efficient for LP
+    try:
+        res = opt.linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+        else:
+            # If LP fails (e.g. infeasible due to numerical issues or bad centers), 
+            # return small radii or previous valid ones? 
+            # For robustness, return zeros or handle error.
+            # In our iterative process, centers should be valid (inside box).
+            # Infeasibility might happen if centers are same (dist=0) and boundary limits negative?
+            # But centers are in [0,1], so boundary limits >= 0.
+            # If centers coincide, dist=0, constraint r_i + r_j <= 0 => r_i=r_j=0. Feasible.
+            return np.zeros(n), 0.0
+    except Exception:
+        return np.zeros(n), 0.0
+
+def run_packing():
+    # 1. Initialization
+    n = 26
+    centers = np.zeros((n, 2))
+    
+    # Hexagonal grid initialization
+    # Try to fit points in [0, 1]x[0, 1]
+    # Estimate spacing. 26 points. Area ~ 1/26. Side ~ 1/sqrt(26) ~ 0.2
+    spacing = 0.2
+    row = 0
+    col = 0
+    idx = 0
+    
+    # Simple grid first, then maybe perturb
+    # 5x5 grid has 25 points. We need 26.
+    # Let's try to place them in a pattern.
+    # 6 rows: 5, 4, 5, 4, 5, 3 ? Sum = 26.
+    # Or just random valid positions and let optimizer fix.
+    # Random initialization might be slow to converge.
+    # Let's use a dense packing pattern.
+    
+    # Pattern: 5, 5, 5, 5, 5, 1 (Total 26) - might not fit well.
+    # Pattern: 5, 4, 5, 4, 5, 3?
+    # Let's just generate a grid of points and select 26.
+    # Or fill row by row.
+    
+    # Let's try a specific layout that is known to be dense for square.
+    # 5 rows of 5 circles is standard. 26th circle needs to fit.
+    # Let's place 25 in 5x5 grid and 1 in center or gap?
+    # Actually, let's just use a grid of 26 points roughly.
+    
+    # Grid 6x5? 30 points. Remove 4.
+    # Or just random initialization inside [0,1] with some separation.
+    
+    # Better initialization: Hexagonal lattice points scaled to fit.
+    # Spacing s.
+    # We want ~26 points.
+    # Let's try to place them.
+    
+    # Simple approach: Place on a grid 6x5, take first 26.
+    x_coords = np.linspace(0.1, 0.9, 6) # 6 cols
+    y_coords = np.linspace(0.1, 0.9, 5) # 5 rows
+    # 30 points.
+    grid_points = []
+    for y in y_coords:
+        for x in x_coords:
+            grid_points.append([x, y])
+    # Take first 26
+    centers = np.array(grid_points[:n])
+    
+    # To make it more hexagonal-like, shift odd rows
+    for i in range(n):
+        if i // 6 % 2 == 1: # Shift every other row (approx)
+            centers[i, 0] += 0.05
+            centers[i, 0] = np.clip(centers[i, 0], 0.05, 0.95)
+
+    # 2. Optimization Loop
+    radii = np.ones(n) * 0.01 # Initial small radii
+    
+    # Parameters
+    learning_rate = 0.005
+    decay = 0.99
+    iterations = 1000
+    
+    current_sum_radii = 0
+    
+    for it in range(iterations):
+        # Solve for optimal radii given current centers
+        radii, current_sum_radii = solve_radii_lp(centers)
+        
+        # Check if valid and update best
+        # (We assume LP solution is valid by construction, but validate later)
+        
+        # Compute Forces
+        forces = np.zeros_like(centers)
+        
+        # Pairwise forces
+        # We only apply force if constraint is active (r_i + r_j approx d_ij)
+        # Or simply repulsive force proportional to 1/d^2 to spread them?
+        # A constant repulsion for close circles works well for packing.
+        # Let's use a force that pushes apart if r_i + r_j is close to distance.
+        
+        # However, since radii change, maybe just use a constant repulsion 
+        # to maximize distance between centers, which allows larger radii.
+        # But we must respect the "tightness".
+        # If circles are far apart, moving them further apart doesn't help radii much 
+        # (unless they are constrained by other circles).
+        # If they are touching, moving them apart helps.
+        
+        # Let's compute a "stress" or "slack"
+        slack = 1e-4 # Tolerance
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                vec = centers[j] - centers[i]
+                dist = np.linalg.norm(vec)
+                if dist < 1e-9:
+                    dist = 1e-9
+                    vec = np.array([1.0, 0.0]) # arbitrary
+                
+                sum_r = radii[i] + radii[j]
+                
+                # If touching or overlapping
+                if sum_r > dist - slack:
+                    # Repulsive force
+                    # Direction: i pushed away from j
+                    # Magnitude: proportional to overlap? or constant?
+                    # Constant force is stable.
+                    force_mag = 1.0 
+                    # Normalize vec
+                    n_vec = vec / dist
+                    forces[i] -= force_mag * n_vec
+                    forces[j] += force_mag * n_vec
+        
+        # Boundary forces
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Check boundary constraints
+            # r <= x  => if r approx x, push right
+            # r <= 1-x => if r approx 1-x, push left
+            # r <= y
+            # r <= 1-y
+            
+            # Distance to walls
+            dx_left = x
+            dx_right = 1 - x
+            dy_bottom = y
+            dy_top = 1 - y
+            
+            # If radius is close to distance to wall, apply force
+            if r > dx_left - slack:
+                forces[i, 0] += 1.0
+            if r > dx_right - slack:
+                forces[i, 0] -= 1.0
+            if r > dy_bottom - slack:
+                forces[i, 1] += 1.0
+            if r > dy_top - slack:
+                forces[i, 1] -= 1.0
+                
+        # Update centers
+        centers += learning_rate * forces
+        
+        # Clip centers to stay within [0, 1] (with a small margin to avoid singularity?)
+        # Actually, centers can be anywhere, but radii will become 0 if on boundary.
+        # But to allow radii > 0, centers must be inside.
+        # The forces push centers away from boundaries if radii are large.
+        # If radii are small, centers might wander.
+        # Let's keep centers in [0, 1].
+        centers = np.clip(centers, 0, 1)
+        
+        # Decay learning rate?
+        # learning_rate *= decay # Maybe too aggressive. Keep constant or slow decay.
+        
+    # Final validation and refinement
+    # Run LP one last time to get exact optimal radii for final centers
+    radii, current_sum_radii = solve_radii_lp(centers)
+    
+    # Check for validity
+    if not validate_packing(centers, radii):
+        # If invalid (shouldn't be), try to fix?
+        # Or return a safe packing.
+        # But with LP constraints, it should be valid.
+        pass
+        
+    return centers, radii, float(np.sum(radii))
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        return False
+    if np.isnan(radii).any():
+        return False
+
+    # Check if radii are nonnegative
+    for i in range(n):
+        if radii[i] < -1e-12: # Allow small negative due to precision? No, radii must be >= 0
+             return False
+    
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        # Allow tiny tolerance for boundary?
+        # The problem statement says "inside", usually strict, but validation allows 1e-12 error.
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+
+    return True
+
+# Import numpy for validation function if needed (already imported)

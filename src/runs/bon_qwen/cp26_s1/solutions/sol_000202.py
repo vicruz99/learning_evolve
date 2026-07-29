@@ -1,75 +1,97 @@
 # sol_000202 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 4a6b07ba) state=f1c408f4 sum of radii=2.613794 correctness=1.0
+# generation=0 parent=seed (state 263f0241) state=1e039abd sum of radii=2.479803 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint
+import warnings
 
-def obj_func(vars, n):
-    """Objective function: maximize sum of radii (minimize negative sum)."""
-    return -np.sum(vars[2*n:])
+warnings.filterwarnings('ignore')
 
-def con_func(vars, n):
-    """Constraint function: boundary and pairwise non-overlap."""
-    c = vars[:2*n].reshape((n, 2))
-    r = vars[2*n:]
-    
-    # Boundary constraints: circle inside [0,1]x[0,1]
-    c1 = c[:, 0] - r
-    c2 = 1.0 - c[:, 0] - r
-    c3 = c[:, 1] - r
-    c4 = 1.0 - c[:, 1] - r
-    
-    # Pairwise non-overlap constraints
-    iu, ju = np.triu_indices(n, k=1)
-    diff = c[iu] - c[ju]
-    dists = np.sqrt(np.sum(diff**2, axis=1))
-    c5 = dists - (r[iu] + r[ju])
-    
-    return np.concatenate([c1, c2, c3, c4, c5])
+N_CIRCLES = 26
+
+def objective_func(x):
+    """Objective: maximize radius r (minimize -r)"""
+    return -x[-1]
+
+def bound_constraints_func(x):
+    """Boundary constraints: circles must stay inside [0,1]x[0,1]"""
+    centers = x[:2*N_CIRCLES].reshape((N_CIRCLES, 2))
+    r = x[-1]
+    con = np.empty(4 * N_CIRCLES)
+    for i in range(N_CIRCLES):
+        con[4*i]   = centers[i, 0] - r
+        con[4*i+1] = 1.0 - centers[i, 0] - r
+        con[4*i+2] = centers[i, 1] - r
+        con[4*i+3] = 1.0 - centers[i, 1] - r
+    return con
+
+def pair_constraints_func(x):
+    """Pairwise non-overlap constraints: dist^2 >= 4r^2"""
+    centers = x[:2*N_CIRCLES].reshape((N_CIRCLES, 2))
+    r = x[-1]
+    # Vectorized pairwise squared distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    # Extract upper triangle to avoid duplicates and self-comparisons
+    idxs = np.triu_indices(N_CIRCLES, k=1)
+    return dist_sq[idxs] - 4.0 * r**2
+
+def generate_initial_config(seed=42):
+    """Generate a structured initial layout with slight random perturbation"""
+    rng = np.random.default_rng(seed)
+    centers = np.zeros((N_CIRCLES, 2))
+    cols = 6
+    for i in range(N_CIRCLES):
+        r_idx = i // cols
+        c_idx = i % cols
+        centers[i, 0] = (c_idx + 0.5) / cols
+        centers[i, 1] = (r_idx + 0.5) / 5.0
+    # Perturb to break symmetry and help optimizer explore
+    centers += rng.uniform(-0.02, 0.02, size=centers.shape)
+    # Ensure initial positions are safely inside boundaries
+    centers = np.clip(centers, 0.05, 0.95)
+    return centers
 
 def run_packing():
-    n = 26
-    best_sum = 0.0
-    best_c = np.zeros((n, 2))
-    best_r = np.zeros(n)
+    # Variable bounds: centers in [0,1], radius in [1e-6, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(1e-6, 0.5)]
     
-    # Try multiple initializations to avoid local minima
-    np.random.seed(42)
-    for seed in range(20):
-        np.random.seed(seed)
-        
-        # Generate initial centers spread in [0.1, 0.9]
-        centers = np.random.rand(n, 2) * 0.8 + 0.1
-        radii = np.full(n, 0.09)
-        x0 = np.concatenate([centers.flatten(), radii])
-        
-        # Variable bounds: centers in [0,1], radii in [1e-4, 0.5]
-        bounds = [(0.0, 1.0)] * (2*n) + [(1e-4, 0.5)] * n
-        
-        cons = {'type': 'ineq', 'fun': con_func, 'args': (n,)}
-        
+    # Define constraints
+    bnds_con = NonlinearConstraint(bound_constraints_func, 0, np.inf)
+    pairs_con = NonlinearConstraint(pair_constraints_func, 0, np.inf)
+    
+    best_r = 0.0
+    best_centers = None
+    
+    # Try multiple starting configurations to improve global search
+    initial_configs = [generate_initial_config(seed=i) for i in range(3)]
+    
+    for centers0 in initial_configs:
+        x0 = np.concatenate([centers0.flatten(), [0.08]])
         try:
-            res = minimize(obj_func, x0, args=(n,), bounds=bounds, constraints=cons,
-                           method='SLSQP', options={'maxiter': 1000, 'ftol': 1e-12})
-            
-            if res.success:
-                cur_r = res.x[2*n:]
-                cur_sum = np.sum(cur_r)
-                if cur_sum > best_sum:
-                    best_sum = cur_sum
-                    best_c = res.x[:2*n].reshape((n, 2))
-                    best_r = cur_r
+            res = minimize(objective_func, x0, method='SLSQP', bounds=bounds,
+                           constraints=[bnds_con, pairs_con],
+                           options={'maxiter': 1500, 'ftol': 1e-10, 'disp': False})
+            current_r = -res.fun
+            if current_r > best_r:
+                best_r = current_r
+                best_centers = res.x[:2*N_CIRCLES].reshape((N_CIRCLES, 2))
         except Exception:
             continue
             
-    # Ensure strict feasibility for numerical safety
-    best_r = np.maximum(best_r, 1e-9)
-    # Clip centers to respect radii boundaries
-    best_c[:, 0] = np.clip(best_c[:, 0], best_r, 1.0 - best_r)
-    best_c[:, 1] = np.clip(best_c[:, 1], best_r, 1.0 - best_r)
-    
-    final_sum = np.sum(best_r)
-    return best_c, best_r, final_sum
+    # Fallback to a valid configuration if optimization yields nothing useful
+    if best_centers is None or best_r < 0.05:
+        best_centers = generate_initial_config(seed=0)
+        best_r = 0.08
+        
+    # Ensure numerical validity
+    best_r = max(best_r, 1e-7)
+    for i in range(N_CIRCLES):
+        best_centers[i, 0] = np.clip(best_centers[i, 0], best_r, 1.0 - best_r)
+        best_centers[i, 1] = np.clip(best_centers[i, 1], best_r, 1.0 - best_r)
+        
+    radii = np.full(N_CIRCLES, best_r)
+    return best_centers, radii, np.sum(radii)

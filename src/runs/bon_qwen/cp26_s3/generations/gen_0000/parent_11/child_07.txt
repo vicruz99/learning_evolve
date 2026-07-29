@@ -1,0 +1,317 @@
+
+
+<strategy>
+I need to pack 26 circles in a unit square to maximize the sum of radii, targeting ~2.636.
+
+Key insights:
+1. The theoretical upper bound for equal circles in hexagonal packing gives average radius ≈ 0.105, suggesting sum ≈ 2.73. The target 2.636 is achievable.
+2. I need a combination of good initialization and robust optimization.
+3. Penalty-based optimization with L-BFGS-B works well but needs careful tuning.
+4. Multiple restarts from different configurations help escape local optima.
+
+Strategy:
+1. **Multiple initialization strategies**: Hexagonal grid, random, and corner-biased patterns
+2. **Circle growth phase**: Start small and expand circles while resolving overlaps via repulsive forces
+3. **Local optimization**: Use L-BFGS-B with penalty-based objective to refine positions and radii
+4. **Constraint handling**: Large penalty coefficients ensure feasibility, with iterative growth for radii
+
+The key technical detail is using a smooth penalty function (squared violations) that L-BFGS-B can handle well, combined with gradual circle expansion to navigate the non-convex landscape.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+
+def run_packing() -> tuple:
+    n = 26
+
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+
+    # Try many different initial configurations
+    for trial in range(40):
+        centers, radii = _initialize(n, trial)
+        centers, radii = _optimize(centers, radii, n)
+        
+        if _is_valid(centers, radii):
+            s = float(np.sum(radii))
+            if s > best_sum:
+                best_sum = s
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+
+    return best_centers, best_radii, float(best_sum)
+
+
+def _initialize(n: int, seed: int):
+    np.random.seed(seed * 7 + 3)
+    
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.08
+
+    init_type = seed % 4
+    
+    if init_type == 0:
+        # Hexagonal pattern: rows of 6, 5, 6, 5, 4 = 26
+        _hexagonal_init(centers, radii, n)
+    elif init_type == 1:
+        # Random initialization with repulsion
+        _random_init(centers, radii, n)
+    elif init_type == 2:
+        # Corner-heavy: try to place larger circles near corners
+        _corner_init(centers, radii, n)
+    else:
+        # Dense hexagonal
+        _dense_hex_init(centers, radii, n)
+    
+    return centers, radii
+
+
+def _hexagonal_init(centers, radii, n):
+    """Hexagonal grid pattern"""
+    row_counts = [6, 5, 6, 5, 4]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        for col in range(count):
+            if idx >= n:
+                break
+            # Calculate positions to fill the square
+            if row % 2 == 0:
+                x = 0.05 + col * 0.155
+            else:
+                x = 0.127 + col * 0.155
+            y = 0.05 + row * 0.21
+            centers[idx] = [x, y]
+            idx += 1
+
+
+def _random_init(centers, radii, n):
+    """Random positions with simple repulsion"""
+    for _ in range(500):
+        # Random positions
+        for i in range(n):
+            centers[i] = np.random.uniform(0.15, 0.85, 2)
+        
+        # Quick repulsion pass
+        for _ in range(100):
+            for i in range(n):
+                for j in range(i + 1, n):
+                    diff = centers[j] - centers[i]
+                    dist = np.linalg.norm(diff)
+                    if dist < 0.15 and dist > 1e-10:
+                        push = (0.15 - dist) * diff / dist * 0.01
+                        centers[i] -= push
+                        centers[j] += push
+            centers = np.clip(centers, 0.05, 0.95)
+
+
+def _corner_init(centers, radii, n):
+    """Bias toward corners and edges"""
+    # Place circles in a grid but shifted toward edges
+    row_counts = [6, 5, 6, 5, 4]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        for col in range(count):
+            if idx >= n:
+                break
+            x = 0.08 + col * 0.145
+            y = 0.08 + row * 0.19
+            centers[idx] = [x, y]
+            idx += 1
+
+
+def _dense_hex_init(centers, radii, n):
+    """Tighter hexagonal packing"""
+    row_counts = [6, 5, 6, 5, 4]
+    idx = 0
+    for row, count in enumerate(row_counts):
+        for col in range(count):
+            if idx >= n:
+                break
+            if row % 2 == 0:
+                x = 0.06 + col * 0.142
+            else:
+                x = 0.131 + col * 0.142
+            y = 0.06 + row * 0.205
+            centers[idx] = [x, y]
+            idx += 1
+
+
+def _optimize(centers, radii, n):
+    """Multi-stage optimization"""
+    # Stage 1: Circle growth with force-based relaxation
+    centers, radii = _circle_growth(centers, radii, n, steps=3000)
+    
+    # Stage 2: Local optimization with penalties
+    centers, radii = _local_opt(centers, radii, n)
+    
+    # Stage 3: Another round of growth
+    centers, radii = _circle_growth(centers, radii, n, steps=2000)
+    
+    # Stage 4: Final refinement
+    centers, radii = _local_opt(centers, radii, n)
+    
+    return centers, radii
+
+
+def _circle_growth(centers, radii, n, steps=2000):
+    """Grow circles while maintaining non-overlap"""
+    centers = centers.copy()
+    radii = radii.copy()
+    
+    for step in range(steps):
+        learning_rate = 0.5 / (1 + step * 0.001)
+        growth_rate = 0.002 / (1 + step * 0.0005)
+        
+        forces = np.zeros((n, 2))
+        
+        # Repulsion between overlapping/near circles
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[j] - centers[i]
+                dist = np.linalg.norm(diff)
+                target_dist = radii[i] + radii[j]
+                
+                if dist < target_dist + 0.05 and dist > 1e-10:
+                    overlap = max(0, target_dist - dist)
+                    force_mag = overlap * 50 / (dist + 1e-10)
+                    force_dir = diff / (dist + 1e-10)
+                    forces[i] -= force_dir * force_mag
+                    forces[j] += force_dir * force_mag
+        
+        # Boundary repulsion
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x < r + 0.001:
+                forces[i][0] += 20 * (r + 0.001 - x)
+            if x > 1 - r - 0.001:
+                forces[i][0] -= 20 * (x - (1 - r - 0.001))
+            if y < r + 0.001:
+                forces[i][1] += 20 * (r + 0.001 - y)
+            if y > 1 - r - 0.001:
+                forces[i][1] -= 20 * (y - (1 - r - 0.001))
+        
+        # Apply forces
+        centers += forces * learning_rate * 0.01
+        centers = np.clip(centers, 0.001, 0.999)
+        
+        # Grow circles
+        for i in range(n):
+            max_r = min(centers[i][0], 1 - centers[i][0],
+                       centers[i][1], 1 - centers[i][1])
+            
+            for j in range(n):
+                if i != j:
+                    dist = np.linalg.norm(centers[i] - centers[j])
+                    max_r = min(max_r, dist - radii[j])
+            
+            if max_r > radii[i]:
+                radii[i] += min(max_r - radii[i], growth_rate)
+            radii[i] = max(radii[i], 0.001)
+    
+    return centers, radii
+
+
+def _local_opt(centers, radii, n):
+    """Local optimization using L-BFGS-B with penalty method"""
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    # Bounds: positions in [0,1], radii in [0.001, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.extend([(0.0001, 0.9999), (0.0001, 0.9999)])
+        bounds.append((0.001, 0.5))
+    
+    def objective(params):
+        c = params[:2 * n].reshape(n, 2)
+        r = params[2 * n:]
+        
+        # Primary objective: maximize sum of radii
+        obj = -np.sum(r)
+        
+        penalty = 0.0
+        
+        # Boundary constraint penalties
+        for i in range(n):
+            x, y = c[i]
+            ri = r[i]
+            # Left boundary
+            if x < ri:
+                penalty += 20000.0 * (ri - x) ** 2
+            # Right boundary
+            if x + ri > 1:
+                penalty += 20000.0 * (x + ri - 1) ** 2
+            # Bottom boundary
+            if y < ri:
+                penalty += 20000.0 * (ri - y) ** 2
+            # Top boundary
+            if y + ri > 1:
+                penalty += 20000.0 * (y + ri - 1) ** 2
+            # Non-negative radius
+            if ri < 0:
+                penalty += 20000.0 * ri ** 2
+        
+        # Overlap constraint penalties
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = c[i][0] - c[j][0]
+                dy = c[i][1] - c[j][1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                min_dist = r[i] + r[j]
+                if dist < min_dist:
+                    penalty += 20000.0 * (min_dist - dist) ** 2
+        
+        return obj + penalty
+    
+    result = minimize(
+        objective,
+        x0,
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={
+            'maxiter': 50000,
+            'ftol': 1e-16,
+            'gtol': 1e-12,
+            'eps': 1e-8
+        }
+    )
+    
+    centers = result.x[:2 * n].reshape(n, 2)
+    radii = result.x[2 * n:]
+    
+    # Ensure non-negative radii
+    radii = np.maximum(radii, 0.0001)
+    # Ensure positions are within bounds
+    centers = np.clip(centers, 0.0001, 0.9999)
+    
+    return centers, radii
+
+
+def _is_valid(centers, radii):
+    """Check if packing is valid"""
+    n = len(radii)
+    
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        
+        if r < -1e-10:
+            return False
+        
+        if x - r < -1e-10 or x + r > 1 + 1e-10:
+            return False
+        if y - r < -1e-10 or y + r > 1 + 1e-10:
+            return False
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt((centers[i][0] - centers[j][0]) ** 2 + 
+                          (centers[i][1] - centers[j][1]) ** 2)
+            if dist < radii[i] + radii[j] - 1e-10:
+                return False
+    
+    return True
+```

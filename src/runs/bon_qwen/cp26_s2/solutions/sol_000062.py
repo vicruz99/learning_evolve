@@ -1,0 +1,168 @@
+# sol_000062 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4705e2a5) state=cde13a48 sum of radii=2.289720 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def repulsive_force(c1, c2, r1, r2):
+    dx = c1[0] - c2[0]
+    dy = c1[1] - c2[1]
+    dist = math.hypot(dx, dy)
+    
+    if dist < 1e-9:
+        dist = 1e-9
+        dx = 1e-9
+    
+    min_dist = r1 + r2
+    if dist < min_dist:
+        overlap = min_dist - dist
+        force_mag = overlap * 10.0
+        fx = (dx / dist) * force_mag
+        fy = (dy / dist) * force_mag
+        return [fx, fy]
+    return [0.0, 0.0]
+
+def boundary_force(c, r):
+    fx = 0.0
+    fy = 0.0
+    force_factor = 20.0
+    
+    if c[0] < r:
+        fx = (r - c[0]) * force_factor
+    elif c[0] > 1 - r:
+        fx = (c[0] - (1 - r)) * -force_factor
+        
+    if c[1] < r:
+        fy = (r - c[1]) * force_factor
+    elif c[1] > 1 - r:
+        fy = (c[1] - (1 - r)) * -force_factor
+        
+    return [fx, fy]
+
+def run_packing():
+    np.random.seed(42)
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # 1. Hexagonal Initialization
+    # Arrange circles in a dense hexagonal pattern to start
+    row_idx = 0
+    col_idx = 0
+    current_r = 0.08 # Start with small radius
+    
+    for i in range(n):
+        # Hexagonal row offset
+        offset = (row_idx % 2) * current_r * math.sqrt(3)
+        x = col_idx * 2 * current_r + 0.1 + offset
+        y = row_idx * current_r * math.sqrt(3) + 0.1
+        
+        # If row gets too wide, move to next row
+        while x + current_r > 0.9:
+            col_idx = 0
+            row_idx += 1
+            offset = (row_idx % 2) * current_r * math.sqrt(3)
+            x = col_idx * 2 * current_r + 0.1 + offset
+            y = row_idx * current_r * math.sqrt(3) + 0.1
+            
+        centers[i] = [x, y]
+        radii[i] = current_r
+        col_idx += 1
+
+    # 2. Optimization Loop (Repulsion and Expansion)
+    # Iteratively grow radii and resolve conflicts
+    step = 0
+    max_steps = 800
+    
+    while step < max_steps:
+        forces = np.zeros((n, 2))
+        valid = True
+        
+        # Calculate forces for all circles
+        for i in range(n):
+            # Boundary forces
+            fb = boundary_force(centers[i], radii[i])
+            forces[i] += fb
+            
+            # Circle-Circle repulsive forces
+            for j in range(i + 1, n):
+                fc = repulsive_force(centers[i], centers[j], radii[i], radii[j])
+                forces[i] += fc
+                forces[j] += [-fc[0], -fc[1]]
+                
+                # Check for severe overlap to stop expansion if needed
+                dx = centers[i][0] - centers[j][0]
+                dy = centers[i][1] - centers[j][1]
+                dist = math.hypot(dx, dy)
+                if dist < radii[i] + radii[j] - 1e-4:
+                    valid = False
+
+        # Update centers based on forces
+        # Adaptive damping to stabilize
+        damping = 1.0 / (1.0 + step * 0.01)
+        step_size = 0.1 * damping
+        
+        for i in range(n):
+            centers[i, 0] += forces[i][0] * step_size
+            centers[i, 1] += forces[i][1] * step_size
+            
+            # Clamp to boundaries [0, 1]
+            centers[i, 0] = max(0.0, min(1.0, centers[i, 0]))
+            centers[i, 1] = max(0.0, min(1.0, centers[i, 1]))
+
+        # Expand radii
+        # Expansion rate slows down as we progress
+        expansion_rate = 0.0002 * (1.0 + 0.5 * math.exp(-step / 200.0))
+        
+        if valid or step < 100: # Allow some expansion even with slight overlap to break symmetry
+            for i in range(n):
+                # Limit max radius to avoid taking over space
+                if radii[i] < 0.25:
+                    radii[i] += expansion_rate
+        
+        # Adjust radii to ensure they fit their current position boundaries
+        # (Simple projection to keep valid)
+        for i in range(n):
+            r = radii[i]
+            x, y = centers[i]
+            
+            # If circle hits boundary, reduce radius slightly or move center
+            # Here we just clamp radius to current position validity
+            max_r = min(x, 1-x, y, 1-y)
+            if r > max_r:
+                radii[i] = max_r * 0.99
+
+        step += 1
+
+    # 3. Final Validation and Correction
+    # Ensure strict validity by shrinking radii if necessary
+    for i in range(n):
+        r = radii[i]
+        x, y = centers[i]
+        # Boundary check
+        r = min(r, x, 1-x, y, 1-y)
+        
+        # Overlap check (brute force shrink)
+        for j in range(n):
+            if i == j: continue
+            dx = centers[i][0] - centers[j][0]
+            dy = centers[i][1] - centers[j][1]
+            dist = math.hypot(dx, dy)
+            min_dist = dist - radii[j]
+            if r > min_dist:
+                r = max(0, min_dist - 1e-6)
+        radii[i] = r
+
+    # Ensure non-negative
+    radii = np.maximum(radii, 0.0)
+    
+    # Final clamp of centers to be safe
+    for i in range(n):
+        centers[i, 0] = max(radii[i], min(1.0 - radii[i], centers[i, 0]))
+        centers[i, 1] = max(radii[i], min(1.0 - radii[i], centers[i, 1]))
+
+    total_sum = np.sum(radii)
+    return centers, radii, float(total_sum)

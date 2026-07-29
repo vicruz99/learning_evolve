@@ -1,0 +1,149 @@
+
+
+<strategy>
+To improve upon the current packing sum of radii (2.594679) and approach the target (2.636), we need a more robust global search strategy. Circle packing is a highly non-convex optimization problem with many local minima. A single initialization often traps the solver in a suboptimal configuration.
+
+Key improvements in this approach:
+1. **Diverse Initialization via Transformed Hexagonal Lattices**: Hexagonal packing is geometrically densest in the plane. We generate a base hexagonal layout and then apply random rotations, scalings, and translations. This explores the continuous symmetries of the problem and helps circles nest optimally into the square's corners and edges, which is critical for maximizing radii.
+2. **Strict Feasibility Guarantee**: Initial radii and coordinates are carefully clipped and scaled to ensure all constraints are strictly satisfied at the start. This prevents the solver from wasting iterations recovering from large constraint violations.
+3. **Multi-Restart SLSQP Optimization**: We run 30 independent optimizations from different randomized initial configurations. SLSQP is chosen for its reliable handling of nonlinear inequality constraints. Each run keeps the best result found so far.
+4. **High-Precision Final Refinement**: After identifying the best configuration from all restarts, we perform a final optimization pass with tighter tolerances (`ftol=1e-14`) and more iterations to squeeze out the last bits of precision.
+5. **Vectorized Constraint Evaluation**: Pairwise and boundary constraints are computed using NumPy broadcasting and `np.triu_indices`, making the constraint function fast and memory-efficient, which speeds up each solver iteration.
+
+This strategy systematically covers more of the configuration space than grid or single-lattice starts, significantly increasing the probability of finding the global or near-global optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    radii = vars.reshape(N_CIRCLES, 3)[:, 2]
+    return -np.sum(radii)
+
+def constraint_func(vars):
+    """
+    Returns a 1D array of constraint values.
+    All constraints are formulated as g(vars) >= 0.
+    Includes boundary constraints and pairwise non-overlap constraints.
+    """
+    pts = vars.reshape(N_CIRCLES, 3)
+    centers = pts[:, :2]
+    radii = pts[:, 2]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    c_boundary = np.column_stack([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ]).flatten()
+    
+    # Non-overlap constraints: dist_sq - (r_i + r_j)^2 >= 0
+    dx = centers[:, np.newaxis, 0] - centers[np.newaxis, :, 0]
+    dy = centers[:, np.newaxis, 1] - centers[np.newaxis, :, 1]
+    dist_sq = dx**2 + dy**2
+    rad_sum_sq = (radii[:, np.newaxis] + radii[np.newaxis, :])**2
+    
+    # Extract upper triangular indices for i < j to avoid duplicates and self-comparison
+    i, j = np.triu_indices(N_CIRCLES, k=1)
+    c_overlap = dist_sq[i, j] - rad_sum_sq[i, j]
+    
+    return np.concatenate([c_boundary, c_overlap])
+
+def run_packing():
+    best_vars = None
+    best_sum = -1.0
+    
+    # Bounds: x,y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(N_CIRCLES):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    np.random.seed(42)
+    n_restarts = 30
+    
+    for attempt in range(n_restarts):
+        # 1. Generate base hexagonal lattice
+        pts = []
+        r_init = 0.07
+        y_curr = r_init
+        row = 0
+        while len(pts) < N_CIRCLES:
+            x_start = r_init if row % 2 == 0 else 2 * r_init
+            x_curr = x_start
+            while x_curr <= 1.0 - r_init and len(pts) < N_CIRCLES:
+                pts.append([x_curr, y_curr])
+                x_curr += 2 * r_init
+            y_curr += r_init * np.sqrt(3)
+            row += 1
+            
+        pts = np.array(pts[:N_CIRCLES])
+        
+        # 2. Center and scale to fit comfortably inside [0.1, 0.9]
+        pts = (pts - 0.5) * 0.8 + 0.5
+        
+        # 3. Apply random rotation to explore corner-nesting configurations
+        angle = np.random.uniform(-np.pi/4, np.pi/4)
+        c, s = np.cos(angle), np.sin(angle)
+        rot = np.array([[c, -s], [s, c]])
+        pts = (pts - 0.5) @ rot.T + 0.5
+        
+        # 4. Add controlled jitter and clip to ensure strict feasibility
+        pts += np.random.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts, 0.1, 0.9)
+        
+        # Initialize radii to a safe small value
+        r_vals = np.full(N_CIRCLES, 0.04)
+        
+        # Flatten into optimization vector: [x0, y0, r0, x1, y1, r1, ...]
+        vars_init = np.zeros(3 * N_CIRCLES)
+        for k in range(N_CIRCLES):
+            vars_init[3*k] = pts[k, 0]
+            vars_init[3*k+1] = pts[k, 1]
+            vars_init[3*k+2] = r_vals[k]
+            
+        # 5. Local optimization
+        try:
+            res = minimize(objective, vars_init, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback to a valid grid if all optimizations fail (highly unlikely)
+    if best_vars is None:
+        vars_init = np.zeros(3 * N_CIRCLES)
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                vars_init[idx] = 0.1 + 0.2*i
+                vars_init[idx+1] = 0.1 + 0.2*j
+                vars_init[idx+2] = 0.09
+                idx += 3
+        vars_init[75] = 0.5; vars_init[76] = 0.5; vars_init[77] = 0.01
+        res = minimize(objective, vars_init, method='SLSQP', bounds=bounds, 
+                       constraints=cons, options={'maxiter': 2000})
+        best_vars = res.x
+
+    # 6. High-precision refinement on the best configuration found
+    res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds, 
+                         constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+    best_vars = res_final.x
+        
+    centers = best_vars.reshape(N_CIRCLES, 3)[:, :2]
+    radii = best_vars.reshape(N_CIRCLES, 3)[:, 2]
+    
+    # Ensure non-negative radii (safety against numerical drift)
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, np.sum(radii)
+```

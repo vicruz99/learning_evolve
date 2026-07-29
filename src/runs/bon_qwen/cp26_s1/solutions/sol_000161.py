@@ -1,131 +1,122 @@
 # sol_000161 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 5dc93b19) state=08ffc5b0 sum of radii=2.340000 correctness=1.0
-# stdout(first 200): 
+# generation=0 parent=seed (state 3daa574a) state=04841438 sum of radii=2.471015 correctness=1.0
+# stdout(first 200): `gtol` termination condition is satisfied. Number of iterations: 120, function evaluations: 9006, CG iterations: 276, optimality: 8.27e-09, constraint violation: 0.00e+00, execution time: 1.6e+02 s.
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Packs 26 circles in a unit square to maximize the sum of radii.
-    """
+def run_packing():
     n = 26
     
-    # 1. Initialization: Hexagonal packing pattern
-    # We generate enough centers and select the first 26.
-    # Radius estimate for initialization: 0.09 (small enough to fit easily)
-    r_init = 0.09
-    centers = []
+    # Initial placement: Grid pattern with small radius
+    # 6 columns, 5 rows = 30 slots, we take first 26
+    # This fits well in [0,1]x[0,1] with r=0.05
+    r_init = 0.05
+    cols = 6
+    rows = 5
     
-    # Hexagonal lattice generation
-    # Row spacing: sqrt(3) * r
-    # Col spacing: 2 * r
-    # Shift odd rows by r
-    row_idx = 0
-    while len(centers) < n:
-        y = r_init + row_idx * np.sqrt(3) * r_init
-        
-        # Shift x for odd rows
-        x_start = r_init if row_idx % 2 == 0 else 2 * r_init
-        
-        col_idx = 0
-        while True:
-            x = x_start + col_idx * 2 * r_init
-            if x > 1 - r_init:
-                break
-            centers.append([x, y])
-            col_idx += 1
-        row_idx += 1
-        
-    # Trim to exactly n circles
-    centers = np.array(centers[:n])
+    centers = np.zeros((n, 2))
+    radii = np.full(n, r_init)
     
-    # 2. Optimization: Maximize radius r (assuming equal radii)
-    # Variables: x1, y1, x2, y2, ..., x26, y26, r
-    # Total variables: 52 + 1 = 53
-    # However, scipy optimize works with 1D arrays.
-    # Let's map indices: 0..51 for coords, 52 for r.
-    
-    def objective(vars):
-        # We want to maximize sum of radii. Since r_i = r for all i,
-        # maximizing r is equivalent to maximizing sum.
-        # Objective for minimizer is negative of sum.
-        return -vars[52] # Maximize r
+    for i in range(n):
+        col = i % cols
+        row = i // cols
+        
+        # Spacing of 0.17 between centers to allow expansion
+        # Range [0.1, 0.9] roughly
+        x = 0.1 + col * 0.15
+        y = 0.1 + row * 0.15
+        
+        # Clamp to valid range [r, 1-r]
+        x = np.clip(x, r_init, 1 - r_init)
+        y = np.clip(y, r_init, 1 - r_init)
+        
+        centers[i] = [x, y]
 
-    def constraint_boundary(vars):
-        # r <= x_i <= 1-r  => x_i - r >= 0  and  1 - r - x_i >= 0
-        # r <= y_i <= 1-r  => y_i - r >= 0  and  1 - r - y_i >= 0
-        r = vars[52]
-        coords = vars[:52].reshape(n, 2)
-        # Flatten constraints
-        c1 = coords[:, 0] - r
-        c2 = (1 - r) - coords[:, 0]
-        c3 = coords[:, 1] - r
-        c4 = (1 - r) - coords[:, 1]
-        return np.concatenate([c1, c2, c3, c4])
+    # Flatten variables for optimization: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers[i, 0]
+        x0[3 * i + 1] = centers[i, 1]
+        x0[3 * i + 2] = radii[i]
 
-    def constraint_overlap(vars):
-        # dist(i, j) >= 2r
-        # dist^2 >= 4r^2
-        r = vars[52]
-        coords = vars[:52].reshape(n, 2)
+    # Define objective: Maximize sum of radii -> Minimize negative sum
+    def objective(vars_vec):
+        r_sum = 0
+        for i in range(n):
+            r_sum += vars_vec[3 * i + 2]
+        return -r_sum
+
+    # Define constraints
+    # 1. Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+    # 2. Non-overlap: dist >= r_i + r_j
+
+    def boundary_constraints(vars_vec):
+        constraints = []
+        for i in range(n):
+            x = vars_vec[3 * i]
+            y = vars_vec[3 * i + 1]
+            r = vars_vec[3 * i + 2]
+            # x - r >= 0
+            constraints.append(x - r)
+            # 1 - (x + r) >= 0
+            constraints.append(1 - x - r)
+            # y - r >= 0
+            constraints.append(y - r)
+            # 1 - (y + r) >= 0
+            constraints.append(1 - y - r)
+        return np.array(constraints)
+
+    def overlap_constraints(vars_vec):
         constraints = []
         for i in range(n):
             for j in range(i + 1, n):
-                dist_sq = np.sum((coords[i] - coords[j])**2)
-                # constraint: dist_sq - 4r^2 >= 0
-                constraints.append(dist_sq - 4 * r**2)
+                x_i, y_i, r_i = vars_vec[3 * i:3 * i + 3]
+                x_j, y_j, r_j = vars_vec[3 * j:3 * j + 3]
+                
+                dx = x_i - x_j
+                dy = y_i - y_j
+                dist_sq = dx**2 + dy**2
+                min_dist = r_i + r_j
+                
+                # We want dist >= min_dist <=> dist^2 >= min_dist^2
+                # Constraint: dist^2 - min_dist^2 >= 0
+                constraints.append(dist_sq - min_dist**2)
         return np.array(constraints)
 
-    # Initial guess
-    x0 = np.concatenate([centers.flatten(), [r_init]])
-    
-    # Bounds for variables
-    # x, y in [0, 1]
-    # r in [0, 0.5] (upper bound 0.5 is safe)
-    bounds = [(0, 1)] * (2 * n) + [(0, 0.5)]
-    
-    # Constraints
-    cons = (
-        {'type': 'ineq', 'fun': constraint_boundary},
-        {'type': 'ineq', 'fun': constraint_overlap}
-    )
-    
-    # Run optimization
-    try:
-        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
-                       options={'maxiter': 1000, 'ftol': 1e-9})
-        
-        if res.success:
-            final_vars = res.x
-            final_centers = final_vars[:52].reshape(n, 2)
-            final_r = final_vars[52]
-            final_radii = np.full(n, final_r)
-            
-            # Calculate sum of radii
-            sum_radii = np.sum(final_radii)
-            
-            # Return
-            return final_centers, final_radii, sum_radii
-        else:
-            # If optimization fails, return initial valid packing (scaled down if needed to be valid)
-            # Fallback: use the initial configuration but ensure it's valid.
-            # The initial config was generated with r_init=0.09 which should be valid.
-            # However, coordinates might have drifted or been cut.
-            # Let's just return the initial valid one with r_init.
-            # Re-verify initial centers
-            valid_centers = centers
-            valid_radii = np.full(n, r_init)
-            
-            # Check validity of initial
-            # (Simple check, assuming construction was correct)
-            return valid_centers, valid_radii, np.sum(valid_radii)
-            
-    except Exception:
-        # Fallback in case of errors
-        return centers, np.full(n, r_init), 26 * r_init
+    # Combine constraints
+    def all_constraints(vars_vec):
+        return np.concatenate([boundary_constraints(vars_vec), overlap_constraints(vars_vec)])
 
-# Helper to ensure top-level functions and no closures
-# The function run_packing is self-contained.
+    # Define bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+        bounds.append((0, 0.5)) # r
+
+    # Create constraint object for scipy
+    # NonlinearConstraint requires fun(x) >= lb and fun(x) <= ub
+    # We want constraints >= 0
+    nonlin_constraint = NonlinearConstraint(all_constraints, 0, np.inf)
+
+    # Run optimization
+    # Trust-constr is good for bounded nonlinear problems
+    res = minimize(objective, x0, method='trust-constr', bounds=bounds, constraints=[nonlin_constraint], 
+                   options={'verbose': 1, 'maxiter': 1000})
+
+    # Extract solution
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i, 0] = res.x[3 * i]
+        final_centers[i, 1] = res.x[3 * i + 1]
+        final_radii[i] = res.x[3 * i + 2]
+
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii

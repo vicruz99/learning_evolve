@@ -1,0 +1,208 @@
+# sol_000176 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 0ae2e142) state=630e5303 sum of radii=2.557564 correctness=1.0
+# stdout(first 200): Circle 0 at (0.09915075559319854, 0.09970944706983319) with radius 0.09927456772879224 is outside the unit square Circle 0 at (0.09915075559319854, 0.09970944706983319) with radius 0.09927456772879224
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def objective_function(x, n):
+    centers = x[:2 * n].reshape(n, 2)
+    radii = x[2 * n:]
+
+    # Objective: Minimize negative sum of radii (Maximize sum)
+    val = -np.sum(radii)
+
+    # Penalty weights
+    mu = 1000.0
+
+    # Boundary Penalties
+    # Left: x >= r -> r - x <= 0. Violation: max(0, r - x)
+    p_left = np.maximum(0, radii - centers[:, 0])
+    # Right: x + r <= 1 -> r + x - 1 <= 0. Violation: max(0, r + x - 1)
+    p_right = np.maximum(0, radii + centers[:, 0] - 1)
+    # Bottom: y >= r -> r - y <= 0. Violation: max(0, r - y)
+    p_bottom = np.maximum(0, radii - centers[:, 1])
+    # Top: y + r <= 1 -> r + y - 1 <= 0. Violation: max(0, r + y - 1)
+    p_top = np.maximum(0, radii + centers[:, 1] - 1)
+
+    boundary_penalty = np.sum(p_left**2 + p_right**2 + p_bottom**2 + p_top**2)
+
+    # Overlap Penalties
+    overlap_penalty = 0.0
+    # Vectorized distance computation
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    
+    # Mask to ignore self-distances and upper triangle duplicates
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    
+    # Compute overlaps only for unique pairs
+    # overlap = radii[i] + radii[j] - dist
+    # We need broadcasting for radii sum
+    rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    overlap = rad_sum - dists
+    
+    # Only consider positive overlaps in the upper triangle
+    positive_overlap = np.maximum(0, overlap[mask])
+    overlap_penalty = np.sum(positive_overlap**2)
+
+    return val + mu * (boundary_penalty + overlap_penalty)
+
+def generate_initial_configurations(n, num_configs):
+    configs = []
+    # Configuration 1: Hexagonal Lattice
+    # Spacing for r approx 0.1
+    r_est = 0.1
+    dx = 2 * r_est
+    dy = np.sqrt(3) * r_est
+    
+    centers_list = []
+    y = r_est
+    while y < 1 - r_est + 1e-6:
+        x = r_est
+        shift = dy / 2
+        # Odd rows (index 1, 3...) shifted by dx/2
+        row_idx = int(round((y - r_est) / dy))
+        start_x = r_est + (dx / 2) * (row_idx % 2)
+        
+        x = start_x
+        while x < 1 - r_est + 1e-6:
+            centers_list.append([x, y])
+            x += dx
+        y += dy
+    
+    # Trim or pad to n
+    if len(centers_list) < n:
+        # Fill with small circles in center if not enough
+        while len(centers_list) < n:
+            centers_list.append([0.5, 0.5]) 
+    centers = np.array(centers_list[:n])
+    
+    # Add random perturbations
+    for _ in range(num_configs):
+        c = centers + np.random.normal(0, 0.005, size=centers.shape)
+        # Clamp to bounds
+        c = np.clip(c, 0, 1)
+        radii = np.full(n, 0.09) # Start slightly smaller to allow growth
+        x0 = np.concatenate([c.flatten(), radii])
+        configs.append(x0)
+        
+    return configs
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # Generate multiple starting points
+    initial_configs = generate_initial_configurations(n, 5)
+    
+    best_sum_radii = -np.inf
+    best_centers = None
+    best_radii = None
+    
+    bounds = [(0, 1)] * (2 * n) + [(0, 0.5)] * n
+    
+    for x0 in initial_configs:
+        try:
+            res = minimize(objective_function, x0, args=(n,), method='L-BFGS-B', bounds=bounds,
+                           options={'maxiter': 2000, 'ftol': 1e-12})
+            
+            if res.success or res.fun < 1e-4: # Check if we found a valid low-penalty state
+                current_centers = res.x[:2 * n].reshape(n, 2)
+                current_radii = res.x[2 * n:]
+                current_sum = np.sum(current_radii)
+                
+                # Check validity
+                if validate_packing(current_centers, current_radii):
+                    if current_sum > best_sum_radii:
+                        best_sum_radii = current_sum
+                        best_centers = current_centers.copy()
+                        best_radii = current_radii.copy()
+                else:
+                    # If invalid, try to shrink radii slightly to make valid
+                    # This is a fallback, ideally penalty handles it.
+                    # Reduce radii until valid
+                    scale = 1.0
+                    while scale > 0.01:
+                        temp_radii = current_radii * scale
+                        if validate_packing(current_centers, temp_radii):
+                            valid_sum = np.sum(temp_radii)
+                            if valid_sum > best_sum_radii:
+                                best_sum_radii = valid_sum
+                                best_centers = current_centers.copy()
+                                best_radii = temp_radii.copy()
+                            break
+                        scale -= 0.001
+        except Exception as e:
+            continue
+            
+    # Fallback if optimization failed completely (should not happen)
+    if best_centers is None:
+        # Grid fallback
+        best_centers = np.array([[i/5, j/5] for i in range(5) for j in range(5)] + [[0.5, 0.5]])
+        best_radii = np.full(26, 0.05)
+        best_sum_radii = np.sum(best_radii)
+
+    # Final strict validation and adjustment
+    if not validate_packing(best_centers, best_radii):
+        # Scale down just enough
+        scale = 1.0
+        while scale > 0.0:
+            temp_radii = best_radii * scale
+            if validate_packing(best_centers, temp_radii):
+                best_radii = temp_radii
+                best_sum_radii = np.sum(best_radii)
+                break
+            scale -= 0.001
+
+    return best_centers, best_radii, float(best_sum_radii)

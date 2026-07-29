@@ -1,0 +1,166 @@
+# sol_000064 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000028 (state f1a8096e) state=d3ffe84c sum of radii=2.620761 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def objective(p):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(p[2::3])
+
+def compute_constraints(p):
+    """Compute all boundary and non-overlap constraints (vectorized)."""
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3]
+    
+    c = []
+    # Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r, r >= 0
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    c.append(r)
+    
+    # Overlap: dist^2 >= (ri + rj)^2
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    s2 = (r[:, None] + r[None, :])**2
+    
+    idx = np.triu_indices(N, k=1)
+    c.append(d2[idx] - s2[idx])
+    
+    return np.concatenate(c)
+
+def get_bounds():
+    """Returns variable bounds for x, y in [0,1] and r in [0, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def init_hex(r0):
+    """Generates an initial configuration using a hexagonal lattice."""
+    pts = []
+    dx = 2.0 * r0
+    dy = np.sqrt(3) * r0
+    y = r0
+    row = 0
+    while len(pts) < N:
+        x = r0 + (dx / 2.0 if row % 2 == 1 else 0.0)
+        while x + r0 <= 1.0 and len(pts) < N:
+            pts.append([x, y])
+            x += dx
+        y += dy
+        row += 1
+        
+    # Fill remaining if necessary
+    while len(pts) < N:
+        pts.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+        
+    p = np.zeros(3 * N)
+    for i, pt in enumerate(pts[:N]):
+        p[3 * i] = pt[0]
+        p[3 * i + 1] = pt[1]
+        p[3 * i + 2] = r0
+    return p
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    A_ub = []
+    b_ub = []
+    
+    # Pairwise distance constraints: r_i + r_j <= dist_ij
+    dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    for i in range(n):
+        for j in range(i + 1, n):
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(max(dists[i, j], 1e-9))
+            
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        bounds_vals = [centers[i, 0], 1.0 - centers[i, 0], 
+                       centers[i, 1], 1.0 - centers[i, 1]]
+        for bv in bounds_vals:
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(max(bv, 1e-9))
+            
+    res = linprog(c_obj, A_ub=np.array(A_ub), b_ub=np.array(b_ub), 
+                  bounds=(0.0, None), method='highs')
+    if res.success:
+        return res.x
+    return np.full(n, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize sum of radii."""
+    np.random.seed(42)
+    bounds = get_bounds()
+    cons_dict = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    # Generate diverse initial configurations
+    starts = []
+    for r0 in [0.090, 0.095, 0.100, 0.105, 0.110]:
+        starts.append(init_hex(r0))
+        
+    for _ in range(10):
+        p = np.zeros(3 * N)
+        p[0::3] = np.random.uniform(0.15, 0.85, N)
+        p[1::3] = np.random.uniform(0.15, 0.85, N)
+        p[2::3] = 0.05
+        starts.append(p)
+        
+    # Optimization loop with multiple restarts
+    for p0 in starts:
+        # Add small deterministic noise to break symmetry
+        p0 = p0 + np.random.normal(0, 0.002, 3 * N)
+        p0 = np.clip(p0, 0.0, 1.0)
+        p0[2::3] = np.clip(p0[2::3], 0.0, 0.5)
+        
+        try:
+            res = minimize(objective, p0, method='SLSQP', bounds=bounds, 
+                           constraints=cons_dict, 
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            
+            # Extract centers and ensure they are strictly inside the square
+            c_temp = np.column_stack((res.x[0::3], res.x[1::3]))
+            c_temp = np.clip(c_temp, 1e-9, 1.0 - 1e-9)
+            
+            # Use LP to find the exact optimal radii for these centers
+            r_lp = solve_lp_radii(c_temp)
+            curr_sum = np.sum(r_lp)
+            
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = c_temp
+                best_radii = r_lp
+        except Exception:
+            continue
+            
+    # Fallback in case all optimizations fail
+    if best_centers is None:
+        p0 = init_hex(0.10)
+        best_centers = np.column_stack((p0[0::3], p0[1::3]))
+        best_radii = solve_lp_radii(best_centers)
+        best_sum = np.sum(best_radii)
+        
+    # Final safety clip
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, float(best_sum)

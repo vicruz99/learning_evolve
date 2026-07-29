@@ -1,0 +1,180 @@
+# sol_000020 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 38145db4) state=4af2a18d sum of radii=2.617322 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, basinhopping
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n = 26
+    
+    # ---------------------------------------------------------
+    # 1. Initial Configuration: Hexagonal Lattice
+    # ---------------------------------------------------------
+    # We generate points in a hexagonal pattern and then scale/position them 
+    # to fit within the unit square.
+    centers_init = np.zeros((n, 2))
+    radii_init = np.zeros(n)
+    
+    idx = 0
+    # Approximate radius for 26 circles in hexagonal packing
+    # Density ~ 0.9, Area ~ 0.9 => 26 * pi * r^2 = 0.9 => r ~ 0.105
+    # Start with a slightly smaller radius to ensure initial validity
+    r_start = 0.095
+    
+    # Hexagonal grid generation
+    # Row spacing: r * sqrt(3)
+    # Col spacing: 2 * r
+    y_curr = r_start
+    row_idx = 0
+    
+    while idx < n:
+        # Alternate row shift
+        x_start = r_start if row_idx % 2 == 0 else r_start + r_start # Shift by r
+        
+        # Determine how many circles fit in this row
+        # Width available is 1 - 2*r
+        # Number of circles k such that 2*r + (k-1)*2*r <= 1 => k <= 1/(2r)
+        # But we just place them and let optimizer handle boundaries
+        
+        x_curr = x_start
+        while idx < n:
+            # Check if next circle fits in width (roughly)
+            if x_curr + r_start <= 1 + 1e-6:
+                centers_init[idx] = [x_curr, y_curr]
+                radii_init[idx] = r_start
+                idx += 1
+                x_curr += 2 * r_start
+            else:
+                break
+        
+        y_curr += r_start * math.sqrt(3)
+        row_idx += 1
+        
+        # Safety break to avoid infinite loop if logic is off
+        if row_idx > 20: 
+            break
+            
+    # If we didn't generate enough (should not happen with this logic), fill rest randomly
+    while idx < n:
+        centers_init[idx] = np.random.rand(2) * 0.8 + 0.1
+        radii_init[idx] = 0.05
+        idx += 1
+        
+    # Ensure initial state is valid (resize if necessary)
+    # The hexagonal generation above might place circles outside if not careful with shifts
+    # Let's clamp and resize to ensure validity for the optimizer start
+    for i in range(n):
+        cx, cy = centers_init[i]
+        r = radii_init[i]
+        # Clamp to boundaries
+        centers_init[i, 0] = np.clip(cx, r, 1-r)
+        centers_init[i, 1] = np.clip(cy, r, 1-r)
+        
+    # ---------------------------------------------------------
+    # 2. Optimization Setup
+    # ---------------------------------------------------------
+    
+    def objective(x):
+        """
+        Objective function to minimize (negative sum of radii).
+        x contains [x1, y1, r1, x2, y2, r2, ..., xn, yn, rn]
+        """
+        radii = x[2::3]
+        return -np.sum(radii)
+
+    def constraints(x):
+        """
+        Constraints for the optimization problem.
+        1. Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+        2. Non-overlap constraints: dist_ij >= ri + rj
+        """
+        cons = []
+        
+        # Boundary constraints
+        for i in range(n):
+            x_i = x[3*i]
+            y_i = x[3*i + 1]
+            r_i = x[3*i + 2]
+            
+            # x - r >= 0  => r - x <= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: x[3*i] - x[3*i+2]})
+            # x + r <= 1  => x + r - 1 <= 0  => 1 - x - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: 1 - x[3*i] - x[3*i+2]})
+            
+            # y - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: x[3*i+1] - x[3*i+2]})
+            # y + r <= 1
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: 1 - x[3*i+1] - x[3*i+2]})
+            
+            # r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: x[3*i+2]})
+
+        # Non-overlap constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                
+                # dist^2 >= (ri + rj)^2
+                # dist^2 - (ri + rj)^2 >= 0
+                def non_overlap(x, i=i, j=j):
+                    xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                    xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                    dist_sq = (xi - xj)**2 + (yi - yj)**2
+                    sum_r = ri + rj
+                    return dist_sq - sum_r**2
+                
+                cons.append({'type': 'ineq', 'fun': non_overlap})
+                
+        return cons
+
+    # Flatten initial state
+    x0 = np.zeros(n * 3)
+    for i in range(n):
+        x0[3*i] = centers_init[i, 0]
+        x0[3*i+1] = centers_init[i, 1]
+        x0[3*i+2] = radii_init[i]
+
+    # ---------------------------------------------------------
+    # 3. Optimization Execution
+    # ---------------------------------------------------------
+    
+    # First, a local optimization to fix any initial validity issues and improve
+    # SLSQP is good for constrained problems
+    try:
+        res_local = minimize(objective, x0, method='SLSQP', 
+                             constraints=constraints(x0), 
+                             options={'maxiter': 100, 'ftol': 1e-8})
+        x_opt = res_local.x
+    except Exception:
+        x_opt = x0
+
+    # If we have time/resources, we could run Basin Hopping, but for a single shot
+    # and N=26, a good SLSQP run from a hexagonal start is often sufficient.
+    # However, to be robust, let's try a few random restarts or perturbations if needed.
+    # Given the constraints, let's stick to a refined SLSQP with the hexagonal start.
+    
+    # Extract results
+    centers_opt = np.zeros((n, 2))
+    radii_opt = np.zeros(n)
+    
+    for i in range(n):
+        centers_opt[i, 0] = x_opt[3*i]
+        centers_opt[i, 1] = x_opt[3*i+1]
+        radii_opt[i] = x_opt[3*i+2]
+        
+    sum_radii = np.sum(radii_opt)
+    
+    return centers_opt, radii_opt, sum_radii

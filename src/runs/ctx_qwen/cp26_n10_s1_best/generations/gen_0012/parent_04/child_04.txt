@@ -1,0 +1,313 @@
+
+
+<strategy>
+To improve the packing sum beyond 2.636, we need to better explore the discrete topological space of circle arrangements. The main bottleneck in previous attempts was getting stuck in local minima where circles form rigid contact networks that cannot be rearranged to increase total radius.
+
+Strategy:
+1. **LP-Driven Objective**: For any fixed set of center positions, the optimal radii that maximize the sum can be found exactly and very quickly via Linear Programming. This transforms the non-linear, non-convex packing problem into a global optimization problem over center coordinates: $\max_{C} \sum r_i(C)$.
+2. **Simulated Annealing on Centers**: Instead of gradient descent which gets trapped, we apply Simulated Annealing directly to the center positions. At each step, we compute the optimal radii via LP. This allows the algorithm to accept temporarily "worse" configurations that break rigid contacts, eventually settling into superior topologies.
+3. **Diverse Perturbations**: The SA step mixes translation, rotation of subsets, and swapping of circle positions. Swapping is particularly effective in packing problems to untangle interlocked configurations.
+4. **Gradient Polish**: After SA finds a strong topology, we switch to SLSQP for smooth gradient-based refinement, followed by coordinate descent for microscopic adjustments.
+5. **Strict Validation**: A final repair loop ensures absolute compliance with the `1e-12` tolerance of the validation function by minimally shrinking radii if numerical drift occurs.
+
+This hybrid approach systematically searches the configuration space, leverages exact LP evaluation for precise feedback, and polishes the result to machine precision.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+N = 26
+TRIL_IDX = np.tril_indices(N, -1)
+
+def objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Returns all inequality constraints >= 0 (vectorized)."""
+    xs, ys, rs = x[0::3], x[1::3], x[2::3]
+    c = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dr = rs[:, None] + rs[None, :]
+    c = np.concatenate([c, np.hypot(dx[TRIL_IDX], dy[TRIL_IDX]) - dr[TRIL_IDX]])
+    return c
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [1e-7, 0.5]."""
+    return [(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)] * N
+
+def solve_lp_radii(centers):
+    """Optimally compute radii for fixed centers using Linear Programming."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    num_ineq = n + n * (n - 1) // 2
+    A_ub = np.zeros((num_ineq, n))
+    b_ub = np.zeros(num_ineq)
+    
+    idx = 0
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = max(0.0, lim)
+        idx += 1
+        
+    # Overlap constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = max(0.0, dist)
+            idx += 1
+            
+    bounds = [(0.0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return np.maximum(res.x, 1e-8)
+    except Exception:
+        pass
+    return np.full(n, 0.04)
+
+def project_to_feasible(x):
+    """Project variables to strictly satisfy bounds."""
+    x = x.copy()
+    for i in range(N):
+        r = max(1e-6, x[3 * i + 2])
+        x[3 * i] = np.clip(x[3 * i], r, 1.0 - r)
+        x[3 * i + 1] = np.clip(x[3 * i + 1], r, 1.0 - r)
+        x[3 * i + 2] = r
+    return x
+
+def make_hex_init(r0, angle):
+    """Generates a rotated hexagonal lattice initialization."""
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < N + 10:
+        x = r0 if row % 2 == 0 else 2.0 * r0
+        while x <= 1.0 - r0 and len(pts) < N + 10:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+        
+    pts = np.array(pts[:N + 10])
+    if angle != 0.0:
+        c, s = np.cos(angle), np.sin(angle)
+        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+        
+    mask = (pts[:, 0] >= 0.01) & (pts[:, 0] <= 0.99) & (pts[:, 1] >= 0.01) & (pts[:, 1] <= 0.99)
+    pts = pts[mask]
+    while len(pts) < N:
+        pts = np.vstack([pts, np.random.uniform(0.1, 0.9, (1, 2))])
+    return pts[:N]
+
+def force_spread(centers, steps=200):
+    """Force-directed relaxation to spread points evenly and push to boundaries."""
+    pts = centers.copy()
+    for step in range(steps):
+        f = np.zeros_like(pts)
+        lr = 0.02 * (1.0 - step / steps)
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pts[j] - pts[i]
+                d = np.hypot(dx[0], dx[1])
+                if d < 0.35 and d > 1e-5:
+                    rep = 0.008 / (d**2 + 0.0005)
+                    f[i] -= dx * rep / d
+                    f[j] += dx * rep / d
+            for dim in range(2):
+                if pts[i, dim] < 0.08: f[i, dim] += 0.06
+                elif pts[i, dim] > 0.92: f[i, dim] -= 0.06
+        pts += f * lr
+        pts = np.clip(pts, 0.02, 0.98)
+    return pts
+
+def run_sa(centers, steps=2500):
+    """Simulated Annealing on center positions, evaluating objective via LP."""
+    curr_c = centers.copy()
+    curr_r = solve_lp_radii(curr_c)
+    if curr_r is None:
+        curr_r = np.full(N, 0.01)
+    best_c = curr_c.copy()
+    best_r = curr_r.copy()
+    best_sum = np.sum(curr_r)
+    curr_sum = best_sum
+    
+    temp = 0.05
+    for step in range(steps):
+        temp *= 0.9985
+        new_c = curr_c.copy()
+        
+        # Diverse perturbation strategies to escape rigid contact networks
+        p_type = np.random.randint(0, 4)
+        if p_type == 0:
+            # Translate a random subset
+            k = np.random.randint(3, 7)
+            idx = np.random.choice(N, k, replace=False)
+            new_c[idx] += np.random.normal(0, temp, (k, 2))
+        elif p_type == 1:
+            # Rotate a random subset around the center
+            k = np.random.randint(4, 9)
+            idx = np.random.choice(N, k, replace=False)
+            angle = np.random.normal(0, temp)
+            c, s = np.cos(angle), np.sin(angle)
+            rot = np.array([[c, -s], [s, c]])
+            new_c[idx] = (new_c[idx] - 0.5) @ rot + 0.5
+        elif p_type == 2:
+            # Swap two circles and perturb (highly effective for packing)
+            i, j = np.random.choice(N, 2, replace=False)
+            new_c[[i, j]] = new_c[[j, i]]
+            new_c[i] += np.random.normal(0, temp, 2)
+        else:
+            # Large local move for a single circle
+            i = np.random.randint(0, N)
+            new_c[i] += np.random.normal(0, temp * 2.0, 2)
+            
+        new_c = np.clip(new_c, 0.005, 0.995)
+        new_r = solve_lp_radii(new_c)
+        if new_r is None:
+            new_r = np.full(N, 0.01)
+        new_sum = np.sum(new_r)
+        
+        delta = new_sum - curr_sum
+        if delta > 0 or (temp > 1e-9 and np.random.rand() < np.exp(delta / (temp + 1e-10))):
+            curr_c = new_c
+            curr_r = new_r
+            curr_sum = new_sum
+            if new_sum > best_sum:
+                best_c = new_c.copy()
+                best_r = new_r.copy()
+                best_sum = new_sum
+    return best_c, best_r, best_sum
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    bounds_obj = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Phase 1: Generate Diverse Initial Configurations
+    inits = []
+    for ang in np.linspace(-0.4, 0.4, 9):
+        inits.append(make_hex_init(0.092, ang))
+        
+    for s in range(6):
+        np.random.seed(s + 200)
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        inits.append(force_spread(pts, steps=300))
+        
+    # Phase 2: Simulated Annealing on each initialization
+    for pts in inits:
+        c_sa, r_sa, s_sa = run_sa(pts, steps=2500)
+        if s_sa > best_sum:
+            best_sum = s_sa
+            x_sa = np.zeros(3 * N)
+            x_sa[0::3] = c_sa[:, 0]
+            x_sa[1::3] = c_sa[:, 1]
+            x_sa[2::3] = r_sa
+            best_x = x_sa.copy()
+            
+    # Phase 3: SLSQP Gradient Polish
+    if best_x is not None:
+        x0 = best_x.copy()
+        x0 = project_to_feasible(x0)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds_obj, constraints=cons,
+                           options={'maxiter': 15000, 'ftol': 1e-13, 'disp': False})
+            if not np.isnan(res.fun):
+                x0 = res.x.copy()
+                centers_p = np.column_stack((x0[0::3], x0[1::3]))
+                r_p = solve_lp_radii(centers_p)
+                if r_p is not None:
+                    x0[2::3] = r_p
+                    curr_sum = np.sum(r_p)
+                    if curr_sum > best_sum and np.min(constraints(x0)) >= -1e-6:
+                        best_sum = curr_sum
+                        best_x = x0.copy()
+        except Exception:
+            pass
+
+    # Phase 4: Coordinate Descent Fine-tuning
+    if best_x is not None:
+        curr_centers = np.column_stack((best_x[0::3], best_x[1::3]))
+        improved = True
+        while improved:
+            improved = False
+            for i in range(N):
+                best_local_sum = np.sum(best_x[2::3])
+                for dx in [-0.005, -0.002, -0.001, 0.001, 0.002, 0.005]:
+                    for dy in [-0.005, -0.002, -0.001, 0.001, 0.002, 0.005]:
+                        new_centers = curr_centers.copy()
+                        new_centers[i, 0] = np.clip(curr_centers[i, 0] + dx, 0.005, 0.995)
+                        new_centers[i, 1] = np.clip(curr_centers[i, 1] + dy, 0.005, 0.995)
+                        r_new = solve_lp_radii(new_centers)
+                        s_new = np.sum(r_new)
+                        if s_new > best_local_sum + 1e-7:
+                            curr_centers = new_centers
+                            best_local_sum = s_new
+                            best_x[0::3] = curr_centers[:, 0]
+                            best_x[1::3] = curr_centers[:, 1]
+                            best_x[2::3] = r_new
+                            best_sum = s_new
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+            # Refresh radii after coordinate change
+            if improved:
+                best_x[2::3] = solve_lp_radii(curr_centers)
+                best_sum = np.sum(best_x[2::3])
+
+    # Fallback (should not be reached)
+    if best_x is None:
+        best_x = np.zeros(3 * N)
+        best_x[0::3] = np.tile(np.linspace(0.1, 0.9, 5), 6)[:N]
+        best_x[1::3] = np.repeat(np.linspace(0.1, 0.9, 6), 5)[:N]
+        best_x[2::3] = 0.06
+        best_sum = np.sum(best_x[2::3])
+
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3].copy()
+
+    # Final strict validity adjustment against 1e-12 tolerance
+    for _ in range(100):
+        valid = True
+        for i in range(N):
+            if radii[i] < 0 or centers[i, 0] < radii[i] - 1e-9 or centers[i, 0] > 1.0 - radii[i] + 1e-9 or \
+               centers[i, 1] < radii[i] - 1e-9 or centers[i, 1] > 1.0 - radii[i] + 1e-9:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-9:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+            
+        # Minimal shrinkage to recover strict feasibility
+        radii *= 0.9999
+        centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+
+    return centers, radii, float(np.sum(radii))
+```

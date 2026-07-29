@@ -1,0 +1,220 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a highly effective optimization strategy that escapes local minima and precisely handles the non-smooth nature of the objective function. 
+
+1. **LP-based Exact Gradient Ascent**: The problem of maximizing $\sum r_i$ for fixed centers is a Linear Program. The dual variables (Lagrange multipliers) from this LP provide the exact subgradient of the maximum sum of radii with respect to center positions. This allows us to perform precise gradient ascent on the centers without relying on finite differences or heuristic penalty methods.
+2. **Diverse Initialization**: We generate multiple starting configurations using hexagonal lattice patterns with varying densities and random perturbations. This covers different topological arrangements that might yield better global optima.
+3. **Multi-Phase Refinement**:
+   - *Phase 1*: Gradient ascent on centers using LP duals from multiple starts.
+   - *Phase 2*: Joint SLSQP optimization on both centers and radii to polish the solution and resolve constraint tightness simultaneously.
+   - *Phase 3*: Perturbation search combined with gradient ascent to escape shallow local basins.
+4. **Strict Numerical Repair**: A final iterative shrinking/clamping pass ensures the solution strictly satisfies the validator's tolerance requirements (`1e-12`), preventing false negatives due to floating-point precision.
+5. **Vectorization & Precomputation**: Static indices for pairwise constraints are precomputed to speed up LP construction and constraint evaluation. All helper functions are top-level to comply with restrictions.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+PAIR_INDICES = np.triu_indices(N, k=1)
+n_pairs = len(PAIR_INDICES[0])
+
+def solve_lp_and_grad(centers):
+    """
+    Solves LP to maximize sum of radii for fixed centers.
+    Returns optimal radii, their sum, and the exact gradient w.r.t centers.
+    """
+    c = np.clip(centers, 1e-9, 1.0 - 1e-9)
+    
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Boundary distances
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]),
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    # Construct LP: max sum(r) s.t. r_i + r_j <= dist_ij, r_i <= boundary_dist_i
+    A_full = np.zeros((n_pairs + 4 * N, N))
+    A_full[PAIR_INDICES[0], PAIR_INDICES[1]] = 1.0
+    b_full = np.zeros(n_pairs + 4 * N)
+    b_full[:n_pairs] = dists[PAIR_INDICES[0], PAIR_INDICES[1]]
+    
+    idx = n_pairs
+    for i in range(N):
+        A_full[idx, i] = 1.0; b_full[idx] = c[i, 0]; idx += 1      # r_i <= x_i
+        A_full[idx, i] = 1.0; b_full[idx] = 1.0 - c[i, 0]; idx += 1 # r_i <= 1-x_i
+        A_full[idx, i] = 1.0; b_full[idx] = c[i, 1]; idx += 1      # r_i <= y_i
+        A_full[idx, i] = 1.0; b_full[idx] = 1.0 - c[i, 1]; idx += 1 # r_i <= 1-y_i
+        
+    res = linprog(-np.ones(N), A_ub=A_full, b_ub=b_full, bounds=(0, None), method='highs')
+    if not res.success:
+        return np.zeros(N), 0.0, np.zeros_like(c)
+        
+    radii = res.x
+    duals = res.ineqlin.marginals
+    
+    grad = np.zeros_like(c)
+    d_vals = dists[PAIR_INDICES[0], PAIR_INDICES[1]]
+    
+    # Pairwise repulsion forces from active distance constraints
+    for k in range(n_pairs):
+        lam = duals[k]
+        if lam > 1e-9:
+            d = d_vals[k]
+            if d > 1e-9:
+                i, j = PAIR_INDICES[0][k], PAIR_INDICES[1][k]
+                vec = (c[i] - c[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+                
+    # Boundary forces from active wall constraints
+    for k in range(n_pairs, n_pairs + 4 * N):
+        lam = duals[k]
+        if lam > 1e-9:
+            b_idx = k - n_pairs
+            i = b_idx // 4
+            side = b_idx % 4
+            if side == 0: grad[i, 0] += lam
+            elif side == 1: grad[i, 0] -= lam
+            elif side == 2: grad[i, 1] += lam
+            elif side == 3: grad[i, 1] -= lam
+            
+    return radii, np.sum(radii), grad
+
+def joint_obj(v):
+    """Objective for joint SLSQP optimization."""
+    return -np.sum(v[2*N:])
+
+def joint_cons(v):
+    """Inequality constraints for joint optimization (must be >= 0)."""
+    ctr = v[:2*N].reshape(N, 2)
+    rad = v[2*N:]
+    con = [ctr[:,0]-rad, 1-ctr[:,0]-rad, ctr[:,1]-rad, 1-ctr[:,1]-rad]
+    d = np.linalg.norm(ctr[PAIR_INDICES[0]] - ctr[PAIR_INDICES[1]], axis=1)
+    con.append(d - (rad[PAIR_INDICES[0]] + rad[PAIR_INDICES[1]]))
+    return np.concatenate(con)
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    # Phase 0: Generate diverse initial configurations
+    starts = []
+    pats = [[5,5,5,5,6], [5,6,5,6,4], [6,5,6,5,4], [4,6,6,6,4], [5,5,5,6,5]]
+    for pat in pats:
+        for r_est in [0.09, 0.095, 0.10, 0.105]:
+            c = []
+            y = r_est
+            for r_idx, cnt in enumerate(pat):
+                shift = r_est if r_idx % 2 == 1 else 0.0
+                x = r_est + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x + rng.normal(0, 0.002), y + rng.normal(0, 0.002)])
+                    x += 2.0 * r_est
+                y += r_est * np.sqrt(3)
+            starts.append(np.array(c[:N]))
+            
+    for _ in range(10):
+        starts.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    # Phase 1: Gradient ascent on centers using LP duals
+    for c_init in starts:
+        c_curr = c_init.copy()
+        c_best_local = c_curr.copy()
+        s_best_local = -1.0
+        
+        step = 0.006
+        for it in range(600):
+            r, s, g = solve_lp_and_grad(c_curr)
+            if s > s_best_local:
+                s_best_local = s
+                c_best_local = c_curr.copy()
+                
+            g_norm = np.linalg.norm(g)
+            if g_norm > 1e-9:
+                c_curr += step * g / g_norm
+            c_curr = np.clip(c_curr, 0.02, 0.98)
+            
+            if it % 100 == 0:
+                step *= 0.85
+                
+        if s_best_local > best_sum:
+            best_sum = s_best_local
+            best_c = c_best_local.copy()
+            
+    # Phase 2: Joint SLSQP refinement
+    if best_c is not None:
+        r_lp, s_lp, _ = solve_lp_and_grad(best_c)
+        
+        v0 = np.concatenate([best_c.flatten(), r_lp])
+        bounds_j = [(0,1)]*(2*N) + [(0, 0.5)]*N
+        
+        try:
+            res = minimize(joint_obj, v0, method='SLSQP', bounds=bounds_j,
+                          constraints={'type':'ineq', 'fun': joint_cons},
+                          options={'maxiter': 5000, 'ftol': 1e-12})
+            if np.min(joint_cons(res.x)) >= -1e-8:
+                s_res = np.sum(res.x[2*N:])
+                if s_res > best_sum:
+                    best_sum = s_res
+                    best_c = res.x[:2*N].reshape(N,2)
+                    r_lp = res.x[2*N:]
+        except Exception:
+            pass
+        
+        # Phase 3: Perturbation & Gradient Ascent to escape local minima
+        for _ in range(15):
+            c_pert = best_c + rng.normal(0, 0.004, best_c.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            c_temp = c_pert.copy()
+            step_p = 0.003
+            for _ in range(400):
+                _, s_temp, g_temp = solve_lp_and_grad(c_temp)
+                g_n = np.linalg.norm(g_temp)
+                if g_n > 1e-9:
+                    c_temp += step_p * g_temp / g_n
+                c_temp = np.clip(c_temp, 0.02, 0.98)
+                step_p *= 0.998
+                
+            r_temp, s_temp, _ = solve_lp_and_grad(c_temp)
+            if s_temp > best_sum:
+                best_sum = s_temp
+                best_c = c_temp.copy()
+                r_lp, _, _ = solve_lp_and_grad(best_c)
+                
+        best_r = r_lp
+    else:
+        best_c = starts[0]
+        best_r, best_sum, _ = solve_lp_and_grad(best_c)
+        
+    # Phase 4: Strict Numerical Repair for Validator Compliance
+    centers = best_c.copy()
+    radii = best_r.copy()
+    
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                if d < radii[i] + radii[j] - 1e-12:
+                    shrink = (radii[i] + radii[j] - d)/2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed: break
+        
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,144 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we formulate this as a non-linear optimization problem. The decision variables are the coordinates $(x_i, y_i)$ and radii $r_i$ for each circle. The objective is to maximize $\sum r_i$, subject to:
+1. Boundary constraints: $r_i \le x_i \le 1-r_i$ and $r_i \le y_i \le 1-r_i$
+2. Non-overlap constraints: $\sqrt{(x_i-x_j)^2 + (y_i-y_j)^2} \ge r_i + r_j$ for all $i < j$
+3. Non-negativity: $r_i \ge 0$
+
+We solve this using `scipy.optimize.minimize` with the SLSQP method, which handles non-linear inequality constraints effectively. To avoid poor local minima, we run the optimizer from multiple initial configurations based on hexagonal lattice packings (which are known to be highly efficient for circle packing). Each run starts with a valid configuration where radii are set to a fraction of the minimum clearance to boundaries and neighbors. After optimization, we apply a lightweight safety clamp to ensure all constraints are strictly satisfied within numerical tolerance, as required by the validation function. Vectorized numpy operations are used for constraint evaluation to keep each iteration fast despite the ~430 constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def generate_initial_guess(n, seed=0):
+    """Generates a feasible initial packing using a hexagonal grid with perturbation."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    # Generate hexagonal lattice points
+    for i in range(6):
+        for j in range(6):
+            x = j * 0.18 + (i % 2) * 0.09
+            y = i * 0.18 * np.sqrt(3) / 2
+            pts.append([x, y])
+    
+    pts = np.array(pts[:n])
+    
+    # Center and scale to fit inside [0,1]^2 with margin
+    mx, my = pts.mean(axis=0)
+    pts -= mx
+    scale = np.max(np.abs(pts))
+    pts /= scale * 1.3
+    pts += 0.5
+    
+    # Add small random perturbation to break symmetry
+    pts += rng.uniform(-0.015, 0.015, size=pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    
+    # Compute initial radii based on clearances
+    dists = np.ones(n) * np.inf
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(pts[i, 0] - pts[j, 0], pts[i, 1] - pts[j, 1])
+            dists[i] = min(dists[i], d)
+            dists[j] = min(dists[j], d)
+            
+    dists = np.minimum(dists, np.minimum(pts[:, 0], 1.0 - pts[:, 0]))
+    dists = np.minimum(dists, np.minimum(pts[:, 1], 1.0 - pts[:, 1]))
+    
+    # Conservative initial radii (40% of clearance)
+    radii = 0.4 * dists
+    
+    v0 = np.zeros(3 * n)
+    v0[0::3] = pts[:, 0]
+    v0[1::3] = pts[:, 1]
+    v0[2::3] = radii
+    return v0
+
+def objective(x):
+    """Objective function: negative sum of radii (for minimization)."""
+    return -np.sum(x[2::3])
+
+def constraints_func(x):
+    """Evaluates all inequality constraints: returns array where all elements should be >= 0."""
+    n = len(x) // 3
+    centers = x[:2 * n].reshape(n, 2)
+    radii = x[2 * n:]
+    
+    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, etc.
+    c_bound = np.concatenate([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ])
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    # Vectorized computation for efficiency
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Extract upper triangular part (i < j)
+    triu_idx = np.triu_indices(n, k=1)
+    c_pairs = dist_sq[triu_idx] - r_sum[triu_idx]**2
+    
+    return np.concatenate([c_bound, c_pairs])
+
+def run_packing():
+    """Runs the optimization to find the packing that maximizes sum of radii."""
+    n = 26
+    bounds = [(0.0, 1.0) if i % 3 != 2 else (1e-6, 0.5) for i in range(3 * n)]
+    constraint = {'type': 'ineq', 'fun': constraints_func}
+    
+    best_val = -np.inf
+    best_x = None
+    
+    # Multi-start optimization from different hexagonal initializations
+    for seed in range(8):
+        v0 = generate_initial_guess(n, seed=seed)
+        try:
+            res = minimize(
+                objective, 
+                v0, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraint,
+                options={'maxiter': 3000, 'ftol': 1e-10, 'disp': False}
+            )
+            # Accept if converged or significantly better, and roughly feasible
+            c_val = constraints_func(res.x)
+            if np.all(c_val >= -1e-6):
+                current_sum = -res.fun
+                if current_sum > best_val:
+                    best_val = current_sum
+                    best_x = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback if optimization completely fails
+    if best_x is None:
+        best_x = generate_initial_guess(n, seed=42)
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3].copy()
+    
+    # Final safety adjustment to strictly satisfy constraints within tolerance
+    # Reduce radii slightly if they violate constraints due to numerical drift
+    for _ in range(2):
+        for i in range(n):
+            r = radii[i]
+            x, y = centers[i]
+            # Check boundaries
+            r = min(r, x, 1.0 - x, y, 1.0 - y)
+            # Check pairwise
+            for j in range(n):
+                if i != j:
+                    d = np.hypot(x - centers[j, 0], y - centers[j, 1])
+                    r = min(r, d - radii[j])
+            radii[i] = max(1e-6, r)
+            
+    return centers, radii, float(np.sum(radii))
+```

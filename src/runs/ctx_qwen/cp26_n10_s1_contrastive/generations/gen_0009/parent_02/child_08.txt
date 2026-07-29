@@ -1,0 +1,258 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.627 towards the 2.636 target, we need a more robust global search combined with precise local refinement. The previous approaches relied heavily on SLSQP with a boundary-safe parameterization `(r, u, v)`, which is excellent for local polishing but prone to local minima from poor starts.
+
+Key improvements implemented:
+1. **LP-Driven Simulated Annealing (SA) on Centers**: Instead of directly optimizing continuous variables, we optimize circle centers while treating radii as optimally computed via Linear Programming (`linprog` with `method='highs'`). This decouples the complex non-convex constraint landscape into a smooth(er) objective `f(C) = max ∑r_i` subject to fixed centers, which is much more amenable to stochastic global search.
+2. **Precomputed LP Constraint Matrix**: The constraint matrix `A_ub` for the LP is constant in structure; only `b_ub` (boundary distances and pairwise Euclidean distances) changes. We precompute `A_ub` once, making each LP evaluation extremely fast, enabling thousands of SA iterations.
+3. **Diverse & Robust Initializations**: Combine hexagonal lattices (with varied row counts, rotations, scales, and jitter), force-directed repulsion layouts, and sequential Voronoi-like packing to cover the solution space thoroughly.
+4. **Move & Swap Operations in SA**: Randomly moving single circles helps fine-tune positions, while swapping circles helps rearrange global topology to escape structural local minima.
+5. **SLSQP High-Precision Polish**: After SA finds a strong configuration, we map it to the `(r, u, v)` parameterization and run SLSQP to squeeze out the last micro-units of radius sum, ensuring strict constraint satisfaction.
+6. **Final LP Consistency Check**: After SLSQP, we re-run the LP on the optimized centers to guarantee the returned radii are exactly maximal for those coordinates.
+
+This hybrid approach leverages the speed of LP for radii evaluation, the exploration power of SA for centers, and the precision of SLSQP for final convergence.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(I_IDX)
+NUM_BOUND = 4 * N
+NUM_CONS = NUM_BOUND + NUM_PAIRS
+
+# Precompute constant part of LP constraint matrix
+A_ub_base = np.zeros((NUM_CONS, N))
+for i in range(N):
+    A_ub_base[4*i, i] = 1.0
+    A_ub_base[4*i+1, i] = 1.0
+    A_ub_base[4*i+2, i] = 1.0
+    A_ub_base[4*i+3, i] = 1.0
+for k, (i, j) in enumerate(zip(I_IDX, J_IDX)):
+    A_ub_base[NUM_BOUND + k, i] = 1.0
+    A_ub_base[NUM_BOUND + k, j] = 1.0
+
+c_obj = -np.ones(N)
+bounds_r = [(0.0, None)] * N
+
+def solve_lp_fast(centers):
+    """Solves LP to find optimal radii for fixed centers efficiently."""
+    b_ub = np.empty(NUM_CONS)
+    x = centers[:, 0]
+    y = centers[:, 1]
+    
+    # Boundary constraints bounds
+    b_ub[:NUM_BOUND:4] = x
+    b_ub[1:NUM_BOUND:4] = 1.0 - x
+    b_ub[2:NUM_BOUND:4] = y
+    b_ub[3:NUM_BOUND:4] = 1.0 - y
+    
+    # Pairwise distance bounds
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dists = np.sqrt(dx**2 + dy**2)
+    b_ub[NUM_BOUND:] = dists[I_IDX, J_IDX]
+    
+    res = linprog(c_obj, A_ub=A_ub_base, b_ub=b_ub, bounds=bounds_r, method='highs')
+    if res.success:
+        return res.x, -res.fun
+    return np.full(N, 1e-6), 0.0
+
+def constraints_slqp(params):
+    """Inequality constraints for SLSQP using (r, u, v) parameterization."""
+    r = params[:N]
+    u = params[N:2*N]
+    v = params[2*N:3*N]
+    
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, None] + r[None, :]
+    return dist_sq[I_IDX, J_IDX] - r_sum[I_IDX, J_IDX]**2
+
+def objective_slqp(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[:N])
+
+def make_params(centers, radii):
+    """Map physical centers/radii to (r, u, v) optimization parameters."""
+    r = radii.copy()
+    d = 1.0 - 2.0 * r
+    d = np.clip(d, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r) / d, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / d, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def gen_hex(row_counts, rot, scale, jitter, seed):
+    """Generate a hexagonal lattice initialization."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    for cnt in row_counts:
+        x_start = r_est if row % 2 == 0 else 2.0 * r_est
+        for _ in range(cnt):
+            pts.append([x_start, y])
+            x_start += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    pts = np.array(pts[:N])
+    
+    pts -= 0.5
+    pts *= scale
+    pts += 0.5
+    
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        R = np.array([[c, -s], [s, c]])
+        pts = pts @ R.T
+        pts -= pts.mean(axis=0)
+        pts += 0.5
+        
+    pts += rng.uniform(-jitter, jitter, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def gen_force(seed):
+    """Spread points using force-directed repulsion."""
+    rng = np.random.RandomState(seed)
+    pts = rng.rand(N, 2)
+    for _ in range(150):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2)) + 1e-5
+        forces = np.sum(diff / dists[:, :, None] / dists[:, :, None], axis=1)
+        pts += 0.015 * forces
+        pts = np.clip(pts, 0.05, 0.95)
+    return pts
+
+def gen_seq(seed):
+    """Sequential packing initialization."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    for _ in range(N):
+        samples = rng.uniform(0.05, 0.95, (1500, 2))
+        d_bound = np.minimum(np.minimum(samples[:, 0], 1.0 - samples[:, 0]), 
+                             np.minimum(samples[:, 1], 1.0 - samples[:, 1]))
+        d_pts = np.full_like(d_bound, 10.0)
+        for p in pts:
+            d_pts = np.minimum(d_pts, np.linalg.norm(samples - p, axis=1))
+        min_d = np.minimum(d_bound, d_pts)
+        pts.append(samples[np.argmax(min_d)])
+    return np.array(pts)
+
+def run_sa(centers, rng, n_iter=4000):
+    """LP-Driven Simulated Annealing on circle centers."""
+    r_curr, sum_curr = solve_lp_fast(centers)
+    best_c = centers.copy()
+    best_r = r_curr.copy()
+    best_sum = sum_curr
+    
+    temp = 0.045
+    step = 0.03
+    
+    for it in range(n_iter):
+        is_move = rng.random() < 0.7
+        if is_move:
+            idx = rng.integers(N)
+            old_pos = centers[idx].copy()
+            centers[idx] += rng.normal(0, step, 2)
+            centers[idx] = np.clip(centers[idx], 0.01, 0.99)
+        else:
+            i, j = rng.choice(N, 2, replace=False)
+            centers[i], centers[j] = centers[j].copy(), centers[i].copy()
+            
+        r_new, sum_new = solve_lp_fast(centers)
+        delta = sum_new - sum_curr
+        
+        if delta > 0 or (rng.random() < np.exp(delta / temp)):
+            sum_curr = sum_new
+            r_curr = r_new
+            if sum_new > best_sum:
+                best_sum = sum_new
+                best_c = centers.copy()
+                best_r = r_curr.copy()
+        else:
+            if is_move:
+                centers[idx] = old_pos
+            else:
+                centers[i], centers[j] = centers[j].copy(), centers[i].copy()
+                
+        temp *= 0.9994
+        step = max(0.0015, step * 0.9996)
+        
+    return best_c, best_r, best_sum
+
+def run_packing():
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [7,6,6,7], 
+        [8,6,6,6], [5,5,5,5,6], [6,4,6,5,5], [4,5,6,5,6],
+        [5,7,5,7], [6,6,6,6,2], [7,5,6,6,2], [6,5,5,5,5]
+    ]
+    
+    inits = []
+    for pat in patterns:
+        for _ in range(3):
+            rot = rng.uniform(-0.45, 0.45)
+            scale = rng.uniform(0.85, 1.15)
+            jitt = rng.uniform(0.01, 0.035)
+            inits.append(gen_hex(pat, rot=rot, scale=scale, jitter=jitt, seed=int(rng.integers(100000))))
+            
+    for s in range(10):
+        inits.append(gen_force(int(s)))
+    for s in range(5):
+        inits.append(gen_seq(int(s)))
+        
+    best_c = None
+    best_r = None
+    best_sum = -np.inf
+    
+    # Phase 1: Diverse SA search
+    for pts in inits:
+        c, r, s = run_sa(pts, rng, n_iter=3500)
+        if s > best_sum:
+            best_sum = s
+            best_c = c
+            best_r = r
+            
+    # Phase 2: SLSQP Polish
+    bounds_slqp = [(1e-6, 0.49)]*N + [(0.0, 1.0)]*N + [(0.0, 1.0)]*N
+    cons_slqp = {'type': 'ineq', 'fun': constraints_slqp}
+    
+    r_init = np.maximum(best_r * 0.995, 1e-6)
+    p0 = make_params(best_c, r_init)
+    
+    try:
+        res = minimize(objective_slqp, p0, method='SLSQP', bounds=bounds_slqp,
+                       constraints=cons_slqp, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+        if res.success:
+            c_val = constraints_slqp(res.x)
+            if np.min(c_val) >= -1e-7:
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    r_opt = res.x[:N]
+                    u_opt = res.x[N:2*N]
+                    v_opt = res.x[2*N:3*N]
+                    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+                    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+                    best_c = np.column_stack([x_opt, y_opt])
+                    best_r = r_opt
+    except Exception:
+        pass
+        
+    # Phase 3: Final LP consistency check
+    best_r, final_sum = solve_lp_fast(best_c)
+    best_r = np.maximum(best_r, 0.0)
+    
+    return best_c, best_r, float(final_sum)
+```

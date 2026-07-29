@@ -1,0 +1,213 @@
+
+
+<strategy>
+To bridge the gap to the target sum of radii (2.636), I will implement a more robust and diverse optimization pipeline:
+
+1. **Enhanced Initialization Diversity**: Instead of relying mainly on hexagonal lattices, I will combine multiple initialization strategies: hexagonal (with varying densities and jitter), force-directed layouts (to naturally spread points), grid-based patterns, and purely random placements. This increases the chance of landing in basins of attraction for higher-quality packings.
+
+2. **Two-Phase Optimization with Topology Swaps**: SLSQP can get trapped in local minima where circle orderings are suboptimal. I will introduce a perturbation phase that not only adds Gaussian noise to positions and radii but also randomly swaps the parameters of two circles. This helps break artificial symmetries and allows the solver to explore different topological arrangements.
+
+3. **Strict Feasibility Enforcement**: I will compute initial radii conservatively (scaling down by a factor of 0.45 relative to nearest neighbors and boundaries) to guarantee strict feasibility at the start of each SLSQP run. This prevents early solver rejection due to constraint violations.
+
+4. **High-Precision Polishing**: After finding the best candidate, I will run a final optimization pass with tighter tolerances (`ftol=1e-14`) and higher iteration limits (`maxiter=10000`) to squeeze out the last bits of precision, ensuring numerical stability.
+
+5. **Vectorized & Efficient Constraint Evaluation**: Precompute triangle indices and use full numpy broadcasting for distance calculations to keep constraint evaluation fast and memory-efficient for N=26.
+
+This combination of diverse starts, topology-breaking perturbations, and rigorous polishing is designed to systematically escape local minima and push the sum of radii beyond 2.636.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[2::3])
+
+def constraints(vars_vec):
+    """
+    Computes inequality constraints g(vars_vec) >= 0.
+    Includes boundary containment and pairwise non-overlap.
+    """
+    x = vars_vec[0::3]
+    y = vars_vec[1::3]
+    r = vars_vec[2::3]
+    
+    c = []
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist2 = dx**2 + dy**2
+    
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    c.append(dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2)
+    
+    return np.concatenate(c)
+
+def get_safe_radii(centers):
+    """Computes strictly feasible initial radii for given centers."""
+    # Distance to boundaries
+    db = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    # Pairwise distances using broadcasting
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    dp = np.min(dists, axis=1)
+    
+    # Conservative scaling to guarantee strict feasibility
+    r = 0.45 * np.minimum(db, dp / 2.0)
+    return np.maximum(r, 1e-5)
+
+def make_hex_init(r0, seed):
+    """Generates a hexagonal lattice initialization with controlled jitter."""
+    np.random.seed(seed)
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < N:
+        x_off = (row % 2) * r0
+        x = r0 + x_off
+        while x <= 1.0 - r0 and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+        
+    pts = np.array(pts[:N])
+    pts += np.random.uniform(-0.015, 0.015, (N, 2))
+    pts = np.clip(pts, 0.02, 0.98)
+    return pts
+
+def make_force_init(seed):
+    """Generates a force-directed layout initialization to naturally spread points."""
+    np.random.seed(seed)
+    pts = np.random.rand(N, 2) * 0.8 + 0.1
+    
+    for _ in range(400):
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-10)
+        
+        # Soft repulsion force
+        f_mag = np.where(dists < 0.35, 1.0 / (dists**2), 0.0)
+        f_mag = np.clip(f_mag, 0, 40.0)
+        
+        forces = np.sum(f_mag[:, :, np.newaxis] * diff / dists[:, :, np.newaxis], axis=1)
+        pts += 0.004 * forces
+        pts = np.clip(pts, 0.05, 0.95)
+    return pts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Solves the circle packing problem for N=26 in a unit square.
+    Returns (centers, radii, sum_radii).
+    """
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_x = None
+    best_val = -np.inf
+    
+    inits = []
+    np.random.seed(42)
+    
+    # 1. Diverse hexagonal initializations
+    for r0 in [0.06, 0.08, 0.095, 0.11, 0.13]:
+        for s in range(3):
+            pts = make_hex_init(r0, s)
+            inits.append(np.concatenate([pts.flatten(), get_safe_radii(pts)]))
+            
+    # 2. Force-directed layouts
+    for s in range(12):
+        pts = make_force_init(s)
+        inits.append(np.concatenate([pts.flatten(), get_safe_radii(pts)]))
+        
+    # 3. Structured grid initialization
+    g_pts = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)] + [[0.5, 0.5]])
+    inits.append(np.concatenate([g_pts.flatten(), get_safe_radii(g_pts)]))
+    
+    # 4. Random placements
+    for s in range(15):
+        np.random.seed(s)
+        pts = np.random.rand(N, 2) * 0.8 + 0.1
+        inits.append(np.concatenate([pts.flatten(), get_safe_radii(pts)]))
+
+    # Phase 1: Broad search from diverse configurations
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            
+            # Accept even if not formally successful if constraints are satisfied
+            if np.min(constraints(res.x)) >= -1e-8:
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_x = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Perturbation & Topology Exploration
+    if best_x is not None:
+        for k in range(60):
+            x0 = best_x.copy()
+            
+            # Add controlled Gaussian noise
+            x0[0::3] += np.random.randn(N) * 0.008
+            x0[1::3] += np.random.randn(N) * 0.008
+            x0[2::3] += np.random.randn(N) * 0.003
+            
+            # Swap two circles occasionally to break symmetry and explore different orderings
+            if k % 4 == 0:
+                i1, i2 = np.random.choice(N, 2, replace=False)
+                temp = x0[3*i1 : 3*i1+3].copy()
+                x0[3*i1 : 3*i1+3] = x0[3*i2 : 3*i2+3]
+                x0[3*i2 : 3*i2+3] = temp
+                
+            # Enforce bounds
+            x0[0::3] = np.clip(x0[0::3], 0.01, 0.99)
+            x0[1::3] = np.clip(x0[1::3], 0.01, 0.99)
+            x0[2::3] = np.clip(x0[2::3], 1e-6, 0.49)
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                if np.min(constraints(res.x)) >= -1e-8:
+                    val = -res.fun
+                    if val > best_val:
+                        best_val = val
+                        best_x = res.x.copy()
+            except Exception:
+                continue
+                
+        # Phase 3: High-precision polynomial-time polish
+        try:
+            res = minimize(objective, best_x, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraints(res.x)) >= -1e-9:
+                best_x = res.x
+                best_val = -res.fun
+        except Exception:
+            pass
+
+    # Fallback configuration (should rarely be reached)
+    if best_x is None:
+        best_x = inits[0]
+        best_val = -np.sum(best_x[2::3])
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(best_val)
+```

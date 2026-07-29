@@ -1,0 +1,193 @@
+# sol_000050 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000034 (state 93f7f230) state=45dd8ce6 sum of radii=2.625219 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def unpack(vars):
+    """Converts flat optimization vector to centers and radii arrays."""
+    return vars[:2*N].reshape(N, 2), vars[2*N:]
+
+def objective(vars):
+    """Objective to minimize: negative sum of radii."""
+    return -np.sum(vars[2*N:])
+
+def constraint_func(vars):
+    """Returns array of constraint values g(x) >= 0."""
+    centers, radii = unpack(vars)
+    x, y = centers[:, 0], centers[:, 1]
+    r = radii
+    
+    # Boundary constraints: circle inside [0,1]x[0,1]
+    b = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    tri = np.tril_indices(N, -1)
+    o = dx[tri]**2 + dy[tri]**2 - dr[tri]**2
+    
+    return np.concatenate([b, o])
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [1e-4, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0)])
+    for _ in range(N):
+        b.append((1e-4, 0.5))
+    return b
+
+def force_relax(centers, radii, steps=200):
+    """Quick physics-based relaxation to spread circles and resolve overlaps."""
+    for _ in range(steps):
+        forces = np.zeros((N, 2))
+        for i in range(N):
+            for j in range(i+1, N):
+                dx = centers[j,0] - centers[i,0]
+                dy = centers[j,1] - centers[i,1]
+                d = np.hypot(dx, dy)
+                if d < radii[i] + radii[j] and d > 1e-6:
+                    f = (radii[i] + radii[j] - d) / d
+                    forces[i] -= [dx*f, dy*f]
+                    forces[j] += [dx*f, dy*f]
+        for i in range(N):
+            if centers[i,0] < radii[i]: forces[i,0] += (radii[i] - centers[i,0]) * 5.0
+            elif centers[i,0] > 1.0 - radii[i]: forces[i,0] -= (centers[i,0] - (1.0 - radii[i])) * 5.0
+            if centers[i,1] < radii[i]: forces[i,1] += (radii[i] - centers[i,1]) * 5.0
+            elif centers[i,1] > 1.0 - radii[i]: forces[i,1] -= (centers[i,1] - (1.0 - radii[i])) * 5.0
+        centers += forces * 0.15
+        centers = np.clip(centers, 0.001, 0.999)
+    return centers
+
+def hex_init(rows, r_start=0.085):
+    """Generates a hexagonal lattice initialization based on row counts."""
+    centers = np.zeros((N, 2))
+    radii = np.full(N, r_start)
+    idx = 0
+    y = r_start
+    dy = np.sqrt(3) * r_start
+    for i, cnt in enumerate(rows):
+        x_start = r_start + (r_start if i % 2 == 1 else 0)
+        for k in range(cnt):
+            if idx < N:
+                centers[idx] = [x_start + k * 2 * r_start, y]
+                idx += 1
+        y += dy
+    while idx < N:
+        centers[idx] = np.random.uniform(r_start, 1.0-r_start, 2)
+        idx += 1
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    best_sum = -1.0
+    best_vars = None
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [5, 5, 5, 5, 6],
+        [4, 6, 6, 6, 4], [6, 6, 4, 5, 5], [5, 6, 6, 4, 5],
+        [4, 5, 6, 6, 5], [5, 5, 6, 5, 5], [6, 4, 6, 5, 5]
+    ]
+    
+    inits = []
+    # Structured hexagonal starts with rotations
+    for pat in patterns:
+        c, r = hex_init(pat, 0.085)
+        inits.append((c, r))
+        for angle in [0.1, -0.1, 0.2]:
+            cx, cy = 0.5, 0.5
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            c_rot = np.zeros_like(c)
+            for i in range(N):
+                dx, dy = c[i,0]-cx, c[i,1]-cy
+                c_rot[i] = [dx*cos_a - dy*sin_a + cx, dx*sin_a + dy*cos_a + cy]
+            inits.append((c_rot, r.copy()))
+            
+    # Random starts with force relaxation
+    for seed in range(10):
+        np.random.seed(seed)
+        c = np.random.uniform(0.15, 0.85, (N, 2))
+        r = np.full(N, 0.06 + np.random.uniform(0, 0.02))
+        c = force_relax(c, r, steps=200)
+        inits.append((c, r))
+        
+    # Main optimization loop
+    for c_init, r_init in inits:
+        x0 = np.zeros(3*N)
+        x0[:2*N] = c_init.flatten()
+        x0[2*N:] = r_init
+        
+        # Project to bounds to ensure initial feasibility
+        for i in range(N):
+            r_val = x0[2*N+i]
+            x0[2*i] = np.clip(x0[2*i], r_val, 1.0-r_val)
+            x0[2*i+1] = np.clip(x0[2*i+1], r_val, 1.0-r_val)
+            
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 15000, 'ftol': 1e-12, 'disp': False})
+            if not np.isnan(res.fun):
+                s = -res.fun
+                if s > best_sum:
+                    vals = constraint_func(res.x)
+                    if np.all(vals >= -1e-7):
+                        best_sum = s
+                        best_vars = res.x.copy()
+        except:
+            pass
+            
+    # Refinement phase: perturb best solution and re-optimize
+    if best_vars is not None:
+        for _ in range(5):
+            x0 = best_vars + np.random.normal(0, 1e-4, 3*N)
+            for i in range(N):
+                r_val = x0[2*N+i]
+                x0[2*i] = np.clip(x0[2*i], r_val, 1.0-r_val)
+                x0[2*i+1] = np.clip(x0[2*i+1], r_val, 1.0-r_val)
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 15000, 'ftol': 1e-13})
+                if not np.isnan(res.fun) and -res.fun > best_sum:
+                    vals = constraint_func(res.x)
+                    if np.all(vals >= -1e-7):
+                        best_sum = -res.fun
+                        best_vars = res.x.copy()
+            except:
+                break
+                
+    # Fallback
+    if best_vars is None:
+        c, r = hex_init([6, 5, 6, 5, 4], 0.08)
+        best_vars = np.concatenate([c.flatten(), r])
+        best_sum = np.sum(r)
+        
+    centers = best_vars[:2*N].reshape(N, 2)
+    radii = best_vars[2*N:]
+    
+    # Safety shrinkage to guarantee strict validity against numerical drift
+    for _ in range(50):
+        valid = True
+        for i in range(N):
+            if centers[i,0]-radii[i] < -1e-10 or centers[i,0]+radii[i] > 1+1e-10 or \
+               centers[i,1]-radii[i] < -1e-10 or centers[i,1]+radii[i] > 1+1e-10:
+                valid = False; break
+        if valid:
+            for i in range(N):
+                for j in range(i+1, N):
+                    d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                    if d < radii[i]+radii[j]-1e-10:
+                        valid = False; break
+                if not valid: break
+        if valid: break
+        radii *= 0.995
+        
+    return centers, radii, float(np.sum(radii))

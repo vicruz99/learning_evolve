@@ -1,0 +1,168 @@
+# sol_000042 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000002 (state 2c120403) state=d97b48db sum of radii=2.340000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_constraints(p):
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3]
+    
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c_bound = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dr = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    dist_sq = dx**2 + dy**2
+    sum_r_sq = dr**2
+    
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c_overlap = (dist_sq - sum_r_sq)[mask]
+    
+    return np.concatenate([c_bound, c_overlap])
+
+def objective(p):
+    return -np.sum(p[2::3])
+
+def get_bounds():
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def generate_hex_init(seed=0):
+    rng = np.random.default_rng(seed)
+    p = np.zeros(N * 3)
+    idx = 0
+    r = 0.085
+    y = r
+    row = 0
+    while idx < N:
+        start_x = r + rng.uniform(-0.01, 0.01) if row % 2 == 0 else 2 * r + rng.uniform(-0.01, 0.01)
+        x = start_x
+        while x + r <= 1.0 + 1e-9 and idx < N:
+            p[3*idx] = np.clip(x, r, 1.0 - r)
+            p[3*idx+1] = np.clip(y, r, 1.0 - r)
+            p[3*idx+2] = r
+            idx += 1
+            x += 2 * r
+        y += np.sqrt(3) * r
+        row += 1
+    return p
+
+def generate_random_init(seed):
+    rng = np.random.default_rng(seed)
+    p = np.zeros(N * 3)
+    centers = rng.uniform(0.15, 0.85, (N, 2))
+    radii = np.full(N, 0.06)
+    p[0::3] = centers[:, 0]
+    p[1::3] = centers[:, 1]
+    p[2::3] = radii
+    return p
+
+def repair_packing(centers, radii):
+    centers = centers.copy()
+    radii = radii.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            x, y = centers[i]
+            r = radii[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            if r > max_r + 1e-9:
+                radii[i] = max_r
+                changed = True
+        
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                sum_r = radii[i] + radii[j]
+                if d < sum_r - 1e-9:
+                    ov = sum_r - d
+                    radii[i] -= ov / 2.0
+                    radii[j] -= ov / 2.0
+                    changed = True
+        if not changed:
+            break
+    return centers, radii
+
+def run_packing():
+    bounds = get_bounds()
+    best_p = None
+    best_sum = -1.0
+    
+    # Generate diverse initial configurations
+    inits = [generate_hex_init(s) for s in range(5)]
+    inits.extend([generate_random_init(s) for s in range(25)])
+    
+    for p0 in inits:
+        try:
+            res = minimize(objective, p0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': compute_constraints},
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            p_opt = res.x
+            current_sum = -res.fun
+            
+            centers = p_opt[0::3].reshape(N, 2)
+            radii = p_opt[2::3].copy()
+            
+            centers, radii = repair_packing(centers, radii)
+            s = np.sum(radii)
+            
+            if s > best_sum:
+                # Rigorous validity check
+                valid = True
+                for i in range(N):
+                    x, y = centers[i]
+                    r = radii[i]
+                    if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                        valid = False
+                        break
+                if valid:
+                    for i in range(N):
+                        for j in range(i + 1, N):
+                            d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                            if d < radii[i] + radii[j] - 1e-12:
+                                valid = False
+                                break
+                        if not valid: break
+                if valid:
+                    best_sum = s
+                    best_p = np.concatenate([centers.flatten(), radii])
+        except Exception:
+            continue
+            
+    if best_p is not None:
+        centers = best_p[:2*N].reshape(N, 2)
+        radii = best_p[2*N:]
+    else:
+        # Fallback valid packing
+        centers = np.zeros((N, 2))
+        radii = np.full(N, 0.09)
+        idx = 0
+        r = 0.09
+        y = r
+        row = 0
+        while idx < N:
+            x = r if row % 2 == 0 else 2 * r
+            while x + r <= 1.0 and idx < N:
+                centers[idx] = [x, y]
+                idx += 1
+                x += 2 * r
+            y += np.sqrt(3) * r
+            row += 1
+        centers = centers[:N]
+        radii = radii[:N]
+        
+    return centers, radii, float(np.sum(radii))

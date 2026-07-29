@@ -1,211 +1,130 @@
 # sol_000045 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state ff99986a) state=bbe4ba84 sum of radii=2.026029 correctness=1.0
+# generation=0 parent=seed (state 1f1389a1) state=c8b86381 sum of radii=0.523900 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
+# Final Code
 import numpy as np
-from scipy.optimize import minimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Returns (centers, radii, sum_radii) for 26 circles in a unit square.
-    Uses a heuristic initialization followed by local optimization to maximize sum of radii.
-    """
+def run_packing():
     n = 26
-    np.random.seed(42)  # For reproducibility
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
     
-    # 1. Initialize centers using a perturbed hexagonal grid
-    centers = np.zeros((n, 2))
-    idx = 0
+    # Configurations to try
+    configs = []
     
-    # Hexagonal packing parameters
-    # We want to fit 26 circles. A rough estimate for equal circles is r ~ 0.1.
-    # Row spacing ~ r * sqrt(3) ~ 0.173. Column spacing ~ 2r ~ 0.2.
-    # We can fit about 5-6 rows.
+    # 1. Random
+    configs.append(np.random.uniform(0.1, 0.9, (n, 2)))
     
-    rows = []
-    # Let's try to arrange them in rows of 5 and 6
-    # 5, 5, 5, 5, 5, 1 -> 26? No.
-    # 6, 5, 5, 5, 5 -> 26.
-    row_counts = [6, 5, 6, 5, 4] # Total 26. 
-    # Actually 6+5+6+5+4 = 26.
-    # Let's verify if this fits.
-    # Width for 6 circles: approx 1.0. Height for 5 rows: approx 1.0.
-    
-    current_y = 0.1
-    row_idx = 0
-    
-    # Better initialization: random valid positions
-    # But structured is better for optimization start.
-    # Let's use a grid that is slightly compressed.
-    
-    # Simple grid init: 5x5 + 1
-    # 25 circles in 5x5 grid, 1 in center of a gap?
-    # Grid centers: 0.1, 0.3, 0.5, 0.7, 0.9
-    grid_coords = []
+    # 2. Grid
+    grid_c = []
     for r in range(5):
         for c in range(5):
-            grid_coords.append([0.1 + 0.2*r, 0.1 + 0.2*c])
-    # Add one more in a gap, e.g., (0.2, 0.2)
-    grid_coords.append([0.2, 0.2])
+            grid_c.append([0.1 + c*0.18, 0.1 + r*0.18])
+    grid_c.append([0.5, 0.5])
+    configs.append(np.array(grid_c))
     
-    # Shuffle to avoid symmetry bias during optimization
-    centers = np.array(grid_coords)
-    np.random.shuffle(centers)
+    # 3. Hexagonal
+    hex_c = []
+    y = 0.08
+    row = 0
+    while len(hex_c) < n:
+        x = 0.08
+        shift = 0.08 * (row % 2)
+        while x < 0.92 and len(hex_c) < n:
+            hex_c.append([x + shift, y])
+            x += 0.16
+        y += 0.08 * np.sqrt(3)
+        row += 1
+    configs.append(np.array(hex_c))
     
-    # Initial radii: small valid radius
-    radii = np.full(n, 0.01)
-
-    # 2. Optimization Loop
-    # We will iteratively try to expand radii and move centers to relieve pressure.
+    # Parameters
+    dt = 0.002
+    growth_step = 0.00015
+    force_k = 100.0
+    wall_k = 200.0
+    max_iter = 5000
     
-    for iteration in range(200):
-        # Calculate constraints for each circle
-        # r_i <= min(
-        #    x_i, 1-x_i, y_i, 1-y_i,
-        #    min_j (dist(i,j) - r_j)
-        # )
-        # This is a system of inequalities. We can solve it by iteration (Jacobi method).
+    for config in configs:
+        current_centers = config.copy()
+        current_centers += np.random.uniform(-0.01, 0.01, (n, 2))
+        current_centers = np.clip(current_centers, 0.02, 0.98)
         
-        # Copy current radii
-        old_radii = radii.copy()
+        current_radii = np.ones(n) * 0.02
         
-        for i in range(n):
-            # Boundary constraints
-            max_r = min(centers[i, 0], 1 - centers[i, 0], 
-                        centers[i, 1], 1 - centers[i, 1])
+        for step in range(max_iter):
+            current_radii += growth_step
             
-            # Neighbor constraints
-            for j in range(n):
-                if i == j: continue
-                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                # r_i + r_j <= dist  => r_i <= dist - r_j
-                # We use the 'old' radii or current? 
-                # Using current radii of neighbors might be too restrictive if they are shrinking.
-                # But for expansion, we assume neighbors stay fixed for a moment.
-                # Actually, let's use the radii from the start of this iteration for neighbors?
-                # Or just use the current radii array.
-                # To be safe and convergent, let's use old_radii for neighbors.
-                constraint = dist - old_radii[j]
-                if constraint < max_r:
-                    max_r = constraint
+            # Forces
+            c1 = current_centers[:, np.newaxis, :]
+            c2 = current_centers[np.newaxis, :, :]
+            diffs = c1 - c2
+            dists_sq = np.sum(diffs**2, axis=2)
+            dists = np.sqrt(dists_sq)
+            dists_safe = np.where(dists_sq > 1e-10, dists, 1e-5)
+            dirs = diffs / dists_safe[:, :, np.newaxis]
             
-            # Ensure non-negative
-            max_r = max(0, max_r)
-            radii[i] = max_r
+            min_dists = current_radii[:, np.newaxis] + current_radii[np.newaxis, :]
+            overlaps = min_dists - dists
+            force_mags = np.maximum(0, overlaps) * force_k
+            force_vectors = force_mags[:, :, np.newaxis] * dirs
+            forces = np.sum(force_vectors, axis=1)
             
-        # Check convergence
-        if np.max(np.abs(radii - old_radii)) < 1e-6:
-            # Radii converged for fixed centers.
-            # Now try to move centers to improve sum.
-            pass
+            x = current_centers[:, 0]
+            y = current_centers[:, 1]
+            r = current_radii
             
-        # Perturb centers to escape local minima and increase sum
-        # Simple gradient-free move: move circles away from their closest constraints
-        if iteration % 2 == 0:
-            for i in range(n):
-                # Find closest neighbor or wall
-                min_dist = float('inf')
-                push_vec = np.array([0.0, 0.0])
+            forces[:, 0] += wall_k * np.maximum(0, r - x)
+            forces[:, 0] -= wall_k * np.maximum(0, x - (1.0 - r))
+            forces[:, 1] += wall_k * np.maximum(0, r - y)
+            forces[:, 1] -= wall_k * np.maximum(0, y - (1.0 - r))
+            
+            current_centers += forces * dt
+            current_centers = np.clip(current_centers, 0.0, 1.0)
+            
+            if step % 600 == 0 and step > 0:
+                current_centers += np.random.uniform(-0.005, 0.005, (n, 2))
+                current_centers = np.clip(current_centers, 0.01, 0.99)
+
+            # Check validity
+            if step % 500 == 0:
+                dists_f = np.sqrt(np.sum((current_centers[:, np.newaxis, :] - current_centers[np.newaxis, :, :])**2, axis=2))
+                min_dists_f = current_radii[:, np.newaxis] + current_radii[np.newaxis, :]
+                overlaps_f = min_dists_f - dists_f
+                np.fill_diagonal(overlaps_f, 0)
+                max_ov = np.max(overlaps_f)
                 
-                # Check walls
-                walls = [
-                    (centers[i, 0], -1, 0),      # Left wall, push right
-                    (1 - centers[i, 0], 1, 0),   # Right wall, push left (vector -1) -> actually push away from wall
-                    (centers[i, 0], 0, 0), # Wait, simpler:
-                ]
-                # Let's just check distance to walls and push away
-                d_left = centers[i, 0]
-                d_right = 1 - centers[i, 0]
-                d_down = centers[i, 1]
-                d_up = 1 - centers[i, 1]
+                w_ov = np.maximum(0, current_radii - current_centers[:, 0])
+                w_ov += np.maximum(0, current_centers[:, 0] - (1.0 - current_radii))
+                w_ov += np.maximum(0, current_radii - current_centers[:, 1])
+                w_ov += np.maximum(0, current_centers[:, 1] - (1.0 - current_radii))
+                max_w_ov = np.max(w_ov)
                 
-                # We want to move away from the closest wall if it's constraining the radius
-                # Radius is limited by min(d_left, d_right, d_down, d_up)
-                # If r_i is close to min_dist, we should move away from that wall.
-                
-                min_wall_dist = min(d_left, d_right, d_down, d_up)
-                if min_wall_dist <= radii[i] + 0.001: # Close to wall constraint
-                    if d_left == min_wall_dist:
-                        push_vec = np.array([0.1, 0]) # Move right
-                    elif d_right == min_wall_dist:
-                        push_vec = np.array([-0.1, 0]) # Move left
-                    elif d_down == min_wall_dist:
-                        push_vec = np.array([0, 0.1]) # Move up
-                    elif d_up == min_wall_dist:
-                        push_vec = np.array([0, -0.1]) # Move down
-                        
-                    # Apply small move
-                    centers[i] += push_vec * 0.1 # Small step
-                    # Clamp
-                    centers[i] = np.clip(centers[i], radii[i], 1 - radii[i])
+                if max_ov < 1e-5 and max_w_ov < 1e-5:
+                    s = np.sum(current_radii)
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = current_centers.copy()
+                        best_radii = current_radii.copy()
 
-                # Check neighbors
-                for j in range(n):
-                    if i == j: continue
-                    dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                    required_dist = radii[i] + radii[j]
-                    if dist < required_dist + 0.001: # Overlapping or touching
-                        # Push i away from j
-                        vec = centers[i] - centers[j]
-                        if np.linalg.norm(vec) > 1e-9:
-                            vec = vec / np.linalg.norm(vec)
-                            centers[i] += vec * 0.05 # Small repulsion
-                            # Clamp
-                            centers[i] = np.clip(centers[i], radii[i], 1 - radii[i])
+    if best_centers is None:
+        r = 0.08
+        centers = np.zeros((n, 2))
+        idx = 0
+        y = r
+        while idx < n:
+            x = r
+            while x < 1.0 - r and idx < n:
+                centers[idx] = [x, y]
+                x += 2*r
+                idx += 1
+            y += 2*r
+        radii = np.ones(n) * r
+        best_sum = np.sum(radii)
+        best_centers = centers
+        best_radii = radii
 
-    # Final validation and clipping
-    # Re-calculate max possible radii one last time with fixed centers
-    for i in range(n):
-        max_r = min(centers[i, 0], 1 - centers[i, 0], 
-                    centers[i, 1], 1 - centers[i, 1])
-        for j in range(n):
-            if i == j: continue
-            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            max_r = min(max_r, dist - radii[j])
-        radii[i] = max(0, max_r)
-
-    # Ensure centers are valid for the calculated radii
-    # Sometimes optimization moves centers such that r > dist_to_wall
-    # Clip radii to fit centers
-    for i in range(n):
-        max_r = min(centers[i, 0], 1 - centers[i, 0], 
-                    centers[i, 1], 1 - centers[i, 1])
-        radii[i] = min(radii[i], max_r)
-        
-    # One final check for overlaps and reduce radii if needed
-    # This is a simple iterative reduction
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n):
-            for j in range(i+1, n):
-                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                if dist < radii[i] + radii[j] - 1e-12:
-                    # Overlap. Reduce radii proportionally or equally?
-                    # To maximize sum, reduce the smaller one less? 
-                    # Actually, reducing sum is bad. But we must be valid.
-                    # Just split the deficit.
-                    excess = radii[i] + radii[j] - dist
-                    r_i_new = radii[i] - excess / 2
-                    r_j_new = radii[j] - excess / 2
-                    # Ensure non-negative
-                    if r_i_new < 0: r_i_new = 0
-                    if r_j_new < 0: r_j_new = 0
-                    
-                    radii[i] = r_i_new
-                    radii[j] = r_j_new
-                    changed = True
-
-    sum_radii = np.sum(radii)
-    return centers, radii, sum_radii
-
-# Helper to run the function
-if __name__ == "__main__":
-    c, r, s = run_packing()
-    print(f"Sum of radii: {s}")
-    print(f"Centers shape: {c.shape}, Radii shape: {r.shape}")
-    # Basic validation print
-    # import validate_packing
-    # print(validate_packing(c, r))
+    return best_centers, best_radii, float(best_sum)

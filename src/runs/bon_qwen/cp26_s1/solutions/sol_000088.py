@@ -1,110 +1,233 @@
 # sol_000088 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9821b492) state=d99d2dcb sum of radii=2.635983 correctness=1.0
+# generation=0 parent=seed (state e9cb3956) state=7227696e sum of radii=2.482076 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize, NonlinearConstraint
-import math
+from scipy.optimize import linprog
+import warnings
 
-def obj_func(p):
-    """Objective function: minimize negative sum of radii."""
-    return -np.sum(p[2::3])
+# Suppress warnings from scipy
+warnings.filterwarnings("ignore")
 
-def con_func(p):
-    """Constraint function: boundary and non-overlap constraints."""
-    n = 26
-    x = p[0::3]
-    y = p[1::3]
-    r = p[2::3]
-    
-    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
-    c_boundary = np.concatenate([
-        x - r,
-        1.0 - x - r,
-        y - r,
-        1.0 - y - r
-    ])
-    
-    # Overlap constraints: (x_i - x_j)^2 + (y_i - y_j)^2 >= (r_i + r_j)^2
-    ii, jj = np.triu_indices(n, k=1)
-    dx = x[ii] - x[jj]
-    dy = y[ii] - y[jj]
-    dr = r[ii] + r[jj]
-    c_overlap = dx**2 + dy**2 - dr**2
-    
-    return np.concatenate([c_boundary, c_overlap])
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Returns (centers, radii, sum_radii) for an optimized packing of 26 circles.
+    """
+    N = 26
+    best_sum_radii = 0.0
+    best_centers = None
+    best_radii = None
 
-def run_packing():
-    n = 26
-    cons = NonlinearConstraint(con_func, 0, np.inf)
-    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    # --- 1. Initialization: Hexagonal Packing Layout ---
+    centers = np.zeros((N, 2))
     
-    best_p = None
-    best_val = -np.inf
+    # Configuration: 6 rows.
+    # Rows 0, 2, 4 have 5 circles.
+    # Rows 1, 3, 5 have 4 circles.
+    # Total: 5+4+5+4+5+4 = 27 circles. We need 26.
+    # We will remove one circle later or just pick the first 26.
     
-    # Multi-start optimization
-    for seed in range(10):
-        np.random.seed(seed)
+    row_configs = [5, 4, 5, 4, 5, 4] # 6 rows
+    idx = 0
+    base_y = 0.0
+    # We estimate a radius to scale the initial hex layout
+    # For 6 rows, height constraint is roughly 2r + 5*sqrt(3)r <= 1
+    # r ~ 0.09. Let's use a scaling factor.
+    r_est = 0.09
+    dx = 2 * r_est
+    dy = np.sqrt(3) * r_est
+    
+    current_idx = 0
+    for row_idx, count in enumerate(row_configs):
+        if current_idx >= N:
+            break
+            
+        # y coordinate for this row
+        y = r_est + row_idx * dy
         
-        # Hexagonal lattice initialization
-        pts = []
-        step = 0.22
-        y = step * 0.5
-        row = 0
-        while y < 1.0 - step * 0.5:
-            x = step * 0.5
-            offset = (step * math.sqrt(3) / 2) if row % 2 else 0
-            while x < 1.0 - step * 0.5:
-                pts.append((x + offset, y))
-                x += step * math.sqrt(3)
-            y += step * 0.5 * math.sqrt(3)
-            row += 1
-            if len(pts) >= n:
+        # x coordinates
+        # Even rows (0, 2, 4) start at r_est
+        # Odd rows (1, 3, 5) start at r_est + dx/2 (staggered)
+        start_x = r_est
+        if row_idx % 2 == 1:
+            start_x += dx / 2.0
+            
+        for col_idx in range(count):
+            if current_idx >= N:
                 break
-        
-        # Fill remaining points randomly if needed
-        while len(pts) < n:
-            pts.append((np.random.rand() * 0.6 + 0.2, np.random.rand() * 0.6 + 0.2))
-        pts = pts[:n]
-        
-        p0 = np.zeros(3 * n)
-        p0[0::3] = [p[0] for p in pts]
-        p0[1::3] = [p[1] for p in pts]
-        p0[2::3] = np.full(n, 0.04)
-        
-        # Add small random perturbations to break symmetry
-        p0[0::3] += np.random.uniform(-0.02, 0.02, n)
-        p0[1::3] += np.random.uniform(-0.02, 0.02, n)
-        p0[0::3] = np.clip(p0[0::3], 0.05, 0.95)
-        p0[1::3] = np.clip(p0[1::3], 0.05, 0.95)
-        
-        try:
-            res = minimize(obj_func, p0, method='SLSQP', bounds=bounds, constraints=[cons],
-                           options={'ftol': 1e-10, 'maxiter': 2000, 'disp': False})
-            val = -res.fun
-            if val > best_val:
-                best_val = val
-                best_p = res.x.copy()
-        except Exception:
-            continue
+            x = start_x + col_idx * dx
+            centers[current_idx] = [x, y]
+            current_idx += 1
 
-    if best_p is None:
-        best_p = p0.copy()
-        best_val = -obj_func(p0)
+    # If we generated fewer than N (unlikely with 27 capacity), fill rest randomly
+    while current_idx < N:
+        centers[current_idx] = [0.5, 0.5]
+        current_idx += 1
         
-    # Polishing phase to refine the best solution found
-    try:
-        res2 = minimize(obj_func, best_p, method='SLSQP', bounds=bounds, constraints=[cons],
-                        options={'ftol': 1e-12, 'maxiter': 3000, 'disp': False})
-        if -res2.fun > best_val:
-            best_val = -res2.fun
-            best_p = res2.x.copy()
-    except Exception:
-        pass
+    # Add small random perturbation to avoid perfect symmetry issues
+    centers += np.random.uniform(-0.001, 0.001, size=centers.shape)
+    # Clip to valid range strictly inside to start
+    centers = np.clip(centers, 0.01, 0.99)
 
-    centers = np.column_stack((best_p[0::3], best_p[1::3]))
-    radii = best_p[2::3]
+    # --- 2. Optimization Loop ---
+    # We will iterate to improve the packing.
+    # In each step:
+    # 1. Solve LP to find max radii for current centers.
+    # 2. Compute repulsive forces based on active constraints.
+    # 3. Move centers.
     
-    return centers, radii, best_val
+    max_iters = 300
+    step_size = 0.05
+    decay = 0.995
+    
+    # Precompute pair indices for LP constraints
+    pair_indices = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            pair_indices.append((i, j))
+    num_pairs = len(pair_indices)
+    
+    # LP setup structures
+    # Variables: r_0, ..., r_25
+    c_obj = -np.ones(N) # Maximize sum r_i => Minimize -sum r_i
+    
+    # Constraints A_ub @ r <= b_ub
+    # 1. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    # 2. Pairwise constraints: r_i + r_j <= dist(i, j)
+    
+    num_boundary_constraints = N * 4
+    A_ub = np.zeros((num_boundary_constraints + num_pairs, N))
+    
+    # Fill boundary constraints
+    for i in range(N):
+        # r_i <= x_i  => 1*r_i <= x_i
+        A_ub[i*4, i] = 1.0
+        # r_i <= 1-x_i => 1*r_i <= 1-x_i
+        A_ub[i*4 + 1, i] = 1.0
+        # r_i <= y_i => 1*r_i <= y_i
+        A_ub[i*4 + 2, i] = 1.0
+        # r_i <= 1-y_i => 1*r_i <= 1-y_i
+        A_ub[i*4 + 3, i] = 1.0
+        
+    # Fill pairwise constraints
+    for k, (i, j) in enumerate(pair_indices):
+        row = num_boundary_constraints + k
+        A_ub[row, i] = 1.0
+        A_ub[row, j] = 1.0
+
+    bounds = [(0, None) for _ in range(N)]
+    
+    for iteration in range(max_iters):
+        # 1. Compute distances and RHS for pairwise constraints
+        b_ub = np.zeros(num_boundary_constraints + num_pairs)
+        
+        # Boundary RHS
+        for i in range(N):
+            x, y = centers[i]
+            b_ub[i*4] = x
+            b_ub[i*4 + 1] = 1.0 - x
+            b_ub[i*4 + 2] = y
+            b_ub[i*4 + 3] = 1.0 - y
+            
+        # Pairwise RHS (distances)
+        dists = np.zeros(num_pairs)
+        for k, (i, j) in enumerate(pair_indices):
+            diff = centers[i] - centers[j]
+            d = np.sqrt(np.sum(diff**2))
+            dists[k] = d
+            b_ub[num_boundary_constraints + k] = d
+            
+        # 2. Solve LP
+        # Using 'highs' method is usually robust
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                radii = res.x
+            else:
+                # Fallback if LP fails
+                radii = np.zeros(N)
+        except Exception:
+            radii = np.zeros(N)
+            
+        current_sum = np.sum(radii)
+        if current_sum > best_sum_radii:
+            best_sum_radii = current_sum
+            best_radii = radii.copy()
+            best_centers = centers.copy()
+            
+        # 3. Compute Forces
+        forces = np.zeros_like(centers)
+        
+        # Force magnitude scaling
+        # We only apply force if constraint is active (slack is small)
+        tol = 1e-6 
+        
+        # Pairwise forces
+        for k, (i, j) in enumerate(pair_indices):
+            # Slack = dist - (r_i + r_j)
+            # We use the radii from the LP solution
+            r_i = radii[i]
+            r_j = radii[j]
+            d = dists[k]
+            
+            if d > 1e-9:
+                if (r_i + r_j) > d - tol:
+                    # Active constraint: repel
+                    vec = centers[i] - centers[j]
+                    # Normalize
+                    norm = np.linalg.norm(vec)
+                    if norm > 1e-9:
+                        f_vec = vec / norm
+                        forces[i] += f_vec
+                        forces[j] -= f_vec
+
+        # Boundary forces
+        for i in range(N):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left wall: r <= x
+            if r > x - tol:
+                forces[i, 0] += 1.0
+            # Right wall: r <= 1-x
+            if r > (1.0 - x) - tol:
+                forces[i, 0] -= 1.0
+            # Bottom wall: r <= y
+            if r > y - tol:
+                forces[i, 1] += 1.0
+            # Top wall: r <= 1-y
+            if r > (1.0 - y) - tol:
+                forces[i, 1] -= 1.0
+                
+        # 4. Update Centers
+        # Normalize forces to prevent exploding gradients?
+        # Or just use step_size.
+        # Adding some noise to escape local minima
+        noise = np.random.uniform(-step_size*0.1, step_size*0.1, size=centers.shape)
+        centers += step_size * forces + noise
+        
+        # Project centers to [0, 1] strictly? 
+        # Actually, validation allows touching boundaries, but strictly inside is safer for numerical stability
+        # But optimization might push them to boundary.
+        # Let's clip to [1e-5, 1-1e-5] to ensure valid centers for next LP
+        # However, optimal solution might have center at r.
+        # If we clip too hard, we lose optimality.
+        # Let's just clip to [0, 1]. The LP handles r <= x.
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Decay step size
+        step_size *= decay
+        
+    # Return best found
+    # Ensure returned radii are valid for the returned centers
+    # The best_radii corresponds to best_centers from the iteration where sum was max.
+    # However, due to floating point, we might want to re-verify or just trust LP.
+    # Let's just return the best found.
+    
+    # Final validation check (mental)
+    # The LP guarantees r_i + r_j <= dist and r_i <= bounds.
+    # So it should be valid.
+    
+    return best_centers, best_radii, best_sum_radii

@@ -1,0 +1,190 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.626, I will employ a hybrid global-local optimization strategy:
+
+1. **LP Oracle for Radii**: For any fixed set of centers, the problem of maximizing the sum of radii subject to non-overlap and boundary constraints is a Linear Programming problem. I will use `scipy.optimize.linprog` with the HiGHS solver to instantly compute the optimal radii and their sum for any given center configuration. This is exact and numerically stable.
+
+2. **Basin Hopping on Centers**: The sum of optimal radii is a non-smooth, multi-modal function of the centers. I will use `scipy.optimize.basinhopping` with `L-BFGS-B` as the local minimizer to explore the center configuration space globally. The objective for basin hopping will be the negative of the LP-computed sum of radii. This efficiently navigates toward high-density center arrangements.
+
+3. **Joint SLSQP Refinement**: After basin hopping finds a promising center layout, I will run a joint constrained optimization (`SLSQP`) on both centers and radii simultaneously. This allows fine-tuning where the LP oracle's piecewise-linear landscape might trap the basin hopper. The constraints use `np.hypot` for numerically stable distance calculations.
+
+4. **Diverse Initialization**: I will seed the process with multiple structured hexagonal patterns, grid variations, and random placements to ensure broad coverage of the configuration space.
+
+5. **Strict Post-Processing**: Finally, I will enforce boundary constraints strictly and iteratively resolve any remaining numerical overlaps by symmetrically shrinking radii, guaranteeing a valid configuration that passes the validator.
+
+This approach decouples the hard non-convex geometry into a tractable LP oracle explored by robust global optimization, followed by precise local polishing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, basinhopping
+import math
+
+N = 26
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+NUM_PAIRS = len(PAIRS_I)
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    A_ub = np.zeros((NUM_PAIRS, n))
+    A_ub[np.arange(NUM_PAIRS), PAIRS_I] = 1.0
+    A_ub[np.arange(NUM_PAIRS), PAIRS_J] = 1.0
+    
+    dx = centers[PAIRS_I, 0] - centers[PAIRS_J, 0]
+    dy = centers[PAIRS_I, 1] - centers[PAIRS_J, 1]
+    b_ub = np.sqrt(dx**2 + dy**2)
+    
+    bounds_r = []
+    for i in range(n):
+        x, y = centers[i]
+        mx = min(x, 1.0 - x, y, 1.0 - y)
+        bounds_r.append((0.0, max(0.0, mx)))
+        
+    for method in ['highs', 'interior-point']:
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method=method)
+            if res.success and np.all(res.x >= -1e-9):
+                return np.sum(res.x), np.maximum(res.x, 0.0)
+        except Exception:
+            continue
+    return 0.0, np.zeros(n)
+
+def objective_joint(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints_joint(x):
+    """Inequality constraints: boundary clearance and pairwise non-overlap."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    c = np.empty(4*N + NUM_PAIRS)
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[PAIRS_I] - cx[PAIRS_J]
+    dy = cy[PAIRS_I] - cy[PAIRS_J]
+    dist = np.hypot(dx, dy)
+    c[4*N:] = dist - (r[PAIRS_I] + r[PAIRS_J])
+    return c
+
+def lp_obj_for_bh(x_flat):
+    """Objective for basin hopping: negative of LP-optimal sum of radii."""
+    c = x_flat.reshape(N, 2)
+    c = np.clip(c, 0.01, 0.99)
+    s, _ = solve_lp_radii(c)
+    return -s
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds_opt = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons_opt = {'type': 'ineq', 'fun': constraints_joint}
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse initial configurations
+    inits = []
+    rng = np.random.RandomState(42)
+    
+    patterns = [[6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [7, 6, 5, 4, 4], 
+                [4, 5, 6, 5, 6], [8, 5, 5, 5, 3], [6, 6, 6, 6, 2]]
+    for pat in patterns:
+        pts = []
+        y = 0.08
+        dy = 0.16
+        for r_idx, cnt in enumerate(pat):
+            shift = 0.0 if r_idx % 2 == 0 else 0.08
+            x = 0.08 + shift
+            for _ in range(cnt):
+                if len(pts) < N:
+                    pts.append([x, y])
+                x += 0.16
+            y += dy
+        while len(pts) < N:
+            pts.append([0.5, 0.5])
+        inits.append(np.array(pts[:N]))
+        
+    for _ in range(6):
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    bh_bounds = [(0.02, 0.98)] * (2*N)
+    minimizer_kwargs = {
+        "method": "L-BFGS-B",
+        "bounds": bh_bounds,
+        "options": {"ftol": 1e-13, "gtol": 1e-12, "maxiter": 3000}
+    }
+    
+    # Global search using Basin Hopping on the LP oracle
+    for init_c in inits:
+        try:
+            bh = basinhopping(lp_obj_for_bh, init_c.ravel(), minimizer_kwargs=minimizer_kwargs,
+                              niter=18, stepsize=0.04)
+            
+            c_bh = bh.x.reshape(N, 2)
+            s_lp, r_lp = solve_lp_radii(c_bh)
+            
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_centers = c_bh
+                best_radii = r_lp
+                
+            # Joint refinement with SLSQP
+            x0 = np.zeros(3*N)
+            x0[0::3] = c_bh[:, 0]
+            x0[1::3] = c_bh[:, 1]
+            x0[2::3] = r_lp * 0.995
+            
+            try:
+                res = minimize(objective_joint, x0, method='SLSQP', bounds=bounds_opt,
+                               constraints=cons_opt, options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+                if res.success:
+                    c_opt = res.x[:2*N].reshape(N, 2)
+                    s_opt, r_opt = solve_lp_radii(c_opt)
+                    if s_opt > best_sum:
+                        best_sum = s_opt
+                        best_centers = c_opt.copy()
+                        best_radii = r_opt.copy()
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    # Fallback
+    if best_centers is None:
+        best_centers = inits[0]
+        _, best_radii = solve_lp_radii(best_centers)
+        best_sum = np.sum(best_radii)
+        
+    # Strict numerical validation and adjustment
+    c_final = best_centers.copy()
+    r_final = best_radii.copy()
+    
+    for i in range(N):
+        mx, my = c_final[i]
+        r_final[i] = min(r_final[i], mx, 1.0-mx, my, 1.0-my, 0.5)
+        r_final[i] = max(0.0, r_final[i])
+        
+    for _ in range(50):
+        changed = False
+        for k in range(NUM_PAIRS):
+            i, j = PAIRS_I[k], PAIRS_J[k]
+            d = np.hypot(c_final[i,0]-c_final[j,0], c_final[i,1]-c_final[j,1])
+            if d < r_final[i] + r_final[j] - 1e-12:
+                exc = r_final[i] + r_final[j] - d
+                r_final[i] -= exc * 0.5
+                r_final[j] -= exc * 0.5
+                r_final[i] = max(0.0, r_final[i])
+                r_final[j] = max(0.0, r_final[j])
+                changed = True
+        if not changed:
+            break
+            
+    return c_final, r_final, float(np.sum(r_final))
+```

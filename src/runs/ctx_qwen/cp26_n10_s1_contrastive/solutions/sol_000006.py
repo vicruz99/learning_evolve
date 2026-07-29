@@ -1,0 +1,258 @@
+# sol_000006 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 92133c71) state=1103014d sum of radii=2.533282 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_hexagonal_init(n):
+    """
+    Generates initial centers and radii for n circles in a hexagonal packing.
+    """
+    pts = []
+    # Estimated initial radius to fit n circles
+    # Area approx n * pi * r^2 <= 1 -> r ~ 0.1
+    # We start slightly smaller to allow optimization to grow them
+    r_init = 0.06
+    
+    # Hexagonal parameters
+    # Horizontal spacing
+    dx = 2.0 * r_init * 1.1 
+    # Vertical spacing (sqrt(3)/2 * diameter)
+    dy = np.sqrt(3) * r_init * 1.1
+    
+    y = r_init
+    row = 0
+    
+    while len(pts) < n:
+        x = r_init
+        if row % 2 == 1:
+            x += dx / 2.0
+            
+        while x <= 1.0 - r_init and len(pts) < n:
+            pts.append((x, y))
+            x += dx
+        y += dy
+        row += 1
+        
+    centers = np.array(pts[:n])
+    radii = np.full(n, r_init)
+    return centers, radii
+
+def prepare_constraints_and_bounds(n, vars_arr):
+    """
+    Prepares constraint function and bounds for scipy.optimize.
+    vars_arr is not used here but structure matches requirements if needed.
+    """
+    # We return a closure-like structure but implemented via a class or nested logic 
+    # if allowed, but strictly top-level functions are required.
+    # We will define the constraint function inside the optimization call logic 
+    # by passing n and bounds directly or defining them inline in the main function.
+    # However, to keep helpers top-level, we define a factory or just use the logic in run_packing.
+    pass
+
+def objective(vars_vec, n):
+    """
+    Objective function: Negative sum of radii (to maximize sum).
+    vars_vec layout: [x0, y0, r0, x1, y1, r1, ...]
+    """
+    radii = vars_vec[2::3]
+    return -np.sum(radii)
+
+def constraint_bounds(vars_vec, n):
+    """
+    Returns array of boundary constraint values (must be >= 0).
+    """
+    constraints = []
+    for i in range(n):
+        x = vars_vec[3*i]
+        y = vars_vec[3*i+1]
+        r = vars_vec[3*i+2]
+        
+        # x - r >= 0
+        constraints.append(x - r)
+        # 1 - (x + r) >= 0
+        constraints.append(1.0 - (x + r))
+        # y - r >= 0
+        constraints.append(y - r)
+        # 1 - (y + r) >= 0
+        constraints.append(1.0 - (y + r))
+    return np.array(constraints)
+
+def constraint_overlap(vars_vec, n):
+    """
+    Returns array of overlap constraint values (dist >= r_i + r_j => dist^2 - (r_i+r_j)^2 >= 0).
+    """
+    constraints = []
+    for i in range(n):
+        xi = vars_vec[3*i]
+        yi = vars_vec[3*i+1]
+        ri = vars_vec[3*i+2]
+        
+        for j in range(i + 1, n):
+            xj = vars_vec[3*j]
+            yj = vars_vec[3*j+1]
+            rj = vars_vec[3*j+2]
+            
+            dist_sq = (xi - xj)**2 + (yi - yj)**2
+            rad_sum = ri + rj
+            # Using squared distance constraint to avoid sqrt non-smoothness at 0
+            # dist >= rad_sum <=> dist^2 >= rad_sum^2 (since both positive)
+            constraints.append(dist_sq - rad_sum**2)
+    return np.array(constraints)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # Number of circles
+    n = 26
+    
+    # 1. Initialize
+    centers_init, radii_init = get_hexagonal_init(n)
+    
+    # Flatten into optimization vector
+    # Order: x0, y0, r0, x1, y1, r1, ...
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers_init[i, 0]
+        x0[3*i+1] = centers_init[i, 1]
+        x0[3*i+2] = radii_init[i]
+        
+    # 2. Define Bounds
+    # x in [0, 1], y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+        
+    # 3. Define Constraints
+    # We need to pass n to the constraint functions. 
+    # Since we cannot use closures that capture n from run_packing scope directly in top-level funcs 
+    # without passing it, we will define the constraints inside run_packing or pass n.
+    # The prompt says "Make all helper functions top level... Don't use any lambda functions."
+    # It doesn't forbid defining functions inside run_packing if they don't use closures from nesting 
+    # (wait, "no closures from function nesting" usually means don't use outer scope variables).
+    # But to be safe and strictly top-level, we can pass 'n' as an argument.
+    
+    # However, scipy minimize expects constraint fun to take (x,) only.
+    # So we have to define a specific function for this 'n'.
+    # But we cannot define functions inside run_packing if they must be top-level?
+    # "Make all helper functions top level" implies we can't define `my_constraint` inside `run_packing`.
+    # So we must use the pre-defined `constraint_bounds` and `constraint_overlap` which take `n` as arg.
+    # But scipy needs `fun(vars)`.
+    # Solution: We can use `functools.partial`? No, that's a closure/lambda equivalent.
+    # We can define a class? No.
+    # We can just use a loop in run_packing to call minimize?
+    # Or we can define the constraint functions inside run_packing but they don't capture variables?
+    # Actually, "no closures from function nesting" means a function defined inside shouldn't use variables 
+    # from the enclosing function's scope. If we pass `n` as an argument, it's not a closure.
+    # But scipy's minimize interface requires `fun(x)`.
+    # We can work around this by creating a wrapper function inside run_packing?
+    # "Make all helper functions top level" - this likely refers to the structure of the solution.
+    # If I define `inner_constraint` inside `run_packing`, it is not top level.
+    
+    # Let's re-read carefully: "Make all helper functions top level and have no closures from function nesting."
+    # This implies I should not define functions inside `run_packing`.
+    # I must define `constraint_func(vars)` at top level.
+    # But `constraint_func` needs to know `n`.
+    # I can hardcode `n=26` in the top level functions or pass it.
+    # But `minimize` passes only `vars`.
+    # I will use a top-level function that uses a global or hardcoded n, or better, 
+    # I will implement the optimization logic manually or use a trick.
+    # Actually, I can just define the constraints inside `run_packing` as a list of dicts?
+    # No, that's verbose.
+    
+    # Best approach: Define top-level functions that take `n` as a second argument?
+    # No, scipy optimize calls `fun(x)`.
+    # I can define a specific function `constraint_func_26(x)` at top level.
+    # Since n is fixed at 26 for the task, this is acceptable.
+    
+    # Let's define specific constraint functions for n=26 at top level.
+    
+    # However, to keep code clean and reusable logic, I will define a generic solver inside run_packing
+    # but I need to respect the rules.
+    # "Make all helper functions top level" -> I will put the constraint logic in top level functions.
+    # "have no closures from function nesting" -> They won't capture `run_packing` vars.
+    # "Don't use any lambda functions".
+    
+    # I will define `constraint_func_26` and `objective_26` at top level.
+    
+    # Optimization
+    cons = []
+    
+    # Boundary constraints
+    cons.append({
+        'type': 'ineq',
+        'fun': constraint_bounds_26
+    })
+    
+    # Overlap constraints
+    cons.append({
+        'type': 'ineq',
+        'fun': constraint_overlap_26
+    })
+    
+    # Run optimization
+    # We might run multiple times with different inits to ensure global optimum
+    best_vars = x0
+    best_score = -np.sum(radii_init)
+    
+    # Run SLSQP
+    result = minimize(
+        objective_26,
+        x0,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=cons,
+        options={'maxiter': 1000, 'ftol': 1e-9}
+    )
+    
+    if result.success and result.fun < best_score: # fun is negative sum
+        best_vars = result.x
+        best_score = result.fun
+        
+    # Extract results
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i, 0] = best_vars[3*i]
+        centers[i, 1] = best_vars[3*i+1]
+        radii[i] = best_vars[3*i+2]
+        
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii
+
+# Top level helpers for n=26
+def objective_26(vars_vec):
+    n = 26
+    return -np.sum(vars_vec[2::3])
+
+def constraint_bounds_26(vars_vec):
+    n = 26
+    c = []
+    for i in range(n):
+        x = vars_vec[3*i]
+        y = vars_vec[3*i+1]
+        r = vars_vec[3*i+2]
+        c.append(x - r)
+        c.append(1.0 - (x + r))
+        c.append(y - r)
+        c.append(1.0 - (y + r))
+    return np.array(c)
+
+def constraint_overlap_26(vars_vec):
+    n = 26
+    c = []
+    for i in range(n):
+        xi = vars_vec[3*i]
+        yi = vars_vec[3*i+1]
+        ri = vars_vec[3*i+2]
+        for j in range(i + 1, n):
+            xj = vars_vec[3*j]
+            yj = vars_vec[3*j+1]
+            rj = vars_vec[3*j+2]
+            dist_sq = (xi - xj)**2 + (yi - yj)**2
+            rad_sum = ri + rj
+            c.append(dist_sq - rad_sum**2)
+    return np.array(c)

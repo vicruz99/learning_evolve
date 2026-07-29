@@ -1,0 +1,239 @@
+# sol_000332 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 3d780474) state=9f3123a4 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        return False
+    if np.isnan(radii).any():
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        elif np.isnan(radii[i]):
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+
+    return True
+
+def objective(p, n):
+    """
+    Objective function: negative sum of radii + penalty terms.
+    p is a vector of length 3*n: [x1, y1, r1, x2, y2, r2, ...]
+    """
+    centers = p[:2*n].reshape((n, 2))
+    radii = p[2*n:]
+    
+    cost = -np.sum(radii)
+    penalty_weight = 1000.0
+    
+    # Boundary penalties
+    # x >= r, x <= 1-r  => r <= x <= 1-r
+    # Violation: max(0, r - x) + max(0, x - (1-r))
+    # Similarly for y
+    
+    # Vectorized boundary check
+    x = centers[:, 0]
+    y = centers[:, 1]
+    r = radii
+    
+    # Lower bound violations: r > x => x - r < 0
+    viol_x_low = np.maximum(0, r - x)
+    viol_x_high = np.maximum(0, x - (1 - r))
+    viol_y_low = np.maximum(0, r - y)
+    viol_y_high = np.maximum(0, y - (1 - r))
+    
+    boundary_viol = np.sum(viol_x_low**2 + viol_x_high**2 + viol_y_low**2 + viol_y_high**2)
+    
+    # Overlap penalties
+    # dist(i, j) >= r_i + r_j
+    # Violation: max(0, r_i + r_j - dist(i, j))
+    
+    # Compute pairwise distances
+    # centers shape (n, 2)
+    # diff shape (n, n, 2)
+    # dist_sq shape (n, n)
+    
+    # Efficient distance calculation
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :] # (n, n, 2)
+    dist_sq = np.sum(diff**2, axis=2) # (n, n)
+    
+    # Avoid self-distance (diagonal)
+    # np.fill_diagonal(dist_sq, np.inf) # Not needed if we mask
+    
+    # Sum of radii matrix
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :] # (n, n)
+    
+    # Overlap violation
+    # Only consider upper triangle to avoid double counting
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    
+    # dist = sqrt(dist_sq)
+    # But we can work with squared forms?
+    # (r_i + r_j)^2 vs dist_sq?
+    # Constraint: dist >= r_i + r_j  <=> dist^2 >= (r_i + r_j)^2 (since both positive)
+    # Violation: max(0, (r_i + r_j)^2 - dist^2)
+    # However, gradient might be better with linear violation?
+    # Let's stick to linear violation for smoother optimization, using sqrt.
+    
+    dist = np.sqrt(dist_sq)
+    overlap_viol_dist = r_sum - dist
+    overlap_viol_dist[~mask] = 0
+    
+    overlap_viol = np.sum(np.maximum(0, overlap_viol_dist)**2)
+    
+    cost += penalty_weight * (boundary_viol + overlap_viol)
+    
+    return cost
+
+def run_packing():
+    n = 26
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple restarts
+    num_restarts = 10
+    
+    for seed in range(num_restarts):
+        np.random.seed(seed)
+        
+        # Initialization strategy
+        # 1. Grid based (5x5 + 1)
+        if seed < 5:
+            centers_init = []
+            radii_init = []
+            # 5x5 grid with some spacing
+            # To fit 25 circles, radius 0.1 fits exactly. 
+            # Let's start smaller to allow movement.
+            r_init = 0.04
+            
+            # 5x5 grid
+            for i in range(5):
+                for j in range(5):
+                    cx = 0.1 + i * 0.2
+                    cy = 0.1 + j * 0.2
+                    centers_init.append([cx, cy])
+                    radii_init.append(r_init)
+            
+            # 26th circle in center gap?
+            # Center of square is (0.5, 0.5)
+            # In 5x5 grid, centers are at 0.1, 0.3, 0.5, 0.7, 0.9
+            # (0.5, 0.5) is occupied by the center circle of the grid.
+            # The grid has a circle at (0.5, 0.5).
+            # We need to displace it or add another.
+            # Let's shift the grid slightly or add 26th at a different spot.
+            # Or just randomize the 26th.
+            
+            # Let's perturb the grid to make space
+            centers_init = np.array(centers_init)
+            centers_init += np.random.normal(0, 0.01, centers_init.shape)
+            centers_init = np.clip(centers_init, 0.05, 0.95)
+            
+            # Add 26th circle
+            # Place it randomly in a gap?
+            # Just random position
+            cx_26 = np.random.uniform(0.1, 0.9)
+            cy_26 = np.random.uniform(0.1, 0.9)
+            centers_init = np.vstack([centers_init, [cx_26, cy_26]])
+            radii_init = np.append(radii_init, r_init)
+            
+        else:
+            # Random initialization
+            centers_init = np.random.uniform(0.15, 0.85, size=(n, 2))
+            radii_init = np.full(n, 0.03)
+        
+        # Flatten parameters
+        x0 = np.hstack([centers_init.flatten(), radii_init])
+        
+        # Bounds: x, y in [0, 1], r in [0, 0.5]
+        bounds = []
+        for i in range(n):
+            bounds.extend([(0, 1), (0, 1)]) # x, y
+            bounds.extend([(0, 0.5)])       # r
+        
+        # Optimization
+        res = minimize(objective, x0, args=(n,), method='L-BFGS-B', bounds=bounds, 
+                       options={'maxiter': 5000, 'ftol': 1e-9})
+        
+        if res.success or res.nit == 5000:
+            p_opt = res.x
+            centers_opt = p_opt[:2*n].reshape((n, 2))
+            radii_opt = p_opt[2*n:]
+            
+            # Clean up tiny negative radii
+            radii_opt = np.maximum(radii_opt, 0)
+            
+            # Calculate sum
+            current_sum = np.sum(radii_opt)
+            
+            # Check validity
+            if validate_packing(centers_opt, radii_opt):
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = centers_opt.copy()
+                    best_radii = radii_opt.copy()
+            else:
+                # If invalid, try to fix by shrinking radii slightly
+                # Find min violation
+                # This is a fallback, but ideally optimizer handles it
+                # For robustness, we can clamp to valid
+                # But if it's invalid, we might discard or try to fix
+                pass
+
+    # If we found nothing valid (unlikely), return a safe default
+    if best_centers is None:
+        # Default 5x5 grid + 1 small
+        centers = []
+        radii = []
+        for i in range(5):
+            for j in range(5):
+                centers.append([0.1 + i*0.2, 0.1 + j*0.2])
+                radii.append(0.09) # Slightly less than 0.1
+        centers.append([0.5, 0.5]) # Overlap?
+        # Better default:
+        centers = np.random.uniform(0.1, 0.9, (26, 2))
+        radii = np.full(26, 0.01)
+        # Ensure non-overlap roughly
+        # Just return something valid
+        return np.zeros((26, 2)), np.zeros(26), 0.0
+
+    # Final verification and slight adjustment if needed
+    # The optimizer might produce radii that are theoretically valid but numerically slightly off due to tolerance
+    # The validate function has 1e-12 tolerance.
+    
+    # However, we might want to shrink radii slightly to be safe if close to boundary
+    # But we want to maximize sum.
+    # Let's just return the best valid found.
+    
+    # One last check: are there any overlaps within tolerance?
+    # The validate function handles 1e-12.
+    
+    return best_centers, best_radii, best_sum

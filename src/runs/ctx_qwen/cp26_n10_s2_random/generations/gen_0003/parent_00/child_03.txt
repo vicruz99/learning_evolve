@@ -1,0 +1,191 @@
+
+
+<strategy>
+To improve the sum of radii beyond the current 2.628, we need a more robust global search combined with high-precision local optimization. The previous attempts using SLSQP got stuck in local minima due to insufficient exploration of the configuration space and constraint scaling issues.
+
+Key improvements in this strategy:
+1. **Diverse & Structured Initializations**: Generate multiple hexagonal lattices with varied shifts, dense random distributions, and perturbed grids. This covers both symmetric and asymmetric packing topologies.
+2. **Feasible Starting Points**: For each configuration, compute strictly feasible radii (`0.92 * max_possible`) to ensure SLSQP starts from a valid point, dramatically improving convergence speed and success rate.
+3. **High-Precision SLSQP**: Use tighter tolerances (`ftol=1e-13`) and higher iteration limits (`maxiter=8000`) for the main passes, allowing the solver to push constraints to their true limits.
+4. **Basin-Hopping Refinement**: After finding the best solution, perform iterative perturbations with decaying step sizes to escape shallow local minima and refine the packing.
+5. **Robust Repair Phase**: A deterministic post-processing step that slightly scales radii if necessary to strictly satisfy the `1e-12` tolerance of the validator without significantly sacrificing the objective value.
+6. **Vectorized Constraints**: Use squared Euclidean distances for overlap constraints (`dx^2 + dy^2 - (r_i + r_j)^2 >= 0`) to maintain smooth gradients and avoid square-root singularities, which improves SLSQP's numerical stability.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_max_radii(centers):
+    """Computes the maximum valid radius for each circle given fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)
+    
+    r_pair = 0.5 * np.min(dist, axis=1)
+    return np.minimum(r_bound, r_pair)
+
+def objective_func(v):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(v[2 * N:])
+
+def constraint_func(v):
+    """Computes all boundary and non-overlap constraints. Returns array >= 0 for feasibility."""
+    centers = v[:2 * N].reshape(N, 2)
+    radii = v[2 * N:]
+    
+    con = []
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    con.append(centers[:, 0] - radii)
+    con.append(1.0 - centers[:, 0] - radii)
+    con.append(centers[:, 1] - radii)
+    con.append(1.0 - centers[:, 1] - radii)
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    idx_i, idx_j = np.triu_indices(N, k=1)
+    dx = centers[idx_i, 0] - centers[idx_j, 0]
+    dy = centers[idx_i, 1] - centers[idx_j, 1]
+    dr = radii[idx_i] + radii[idx_j]
+    con.append(dx**2 + dy**2 - dr**2)
+    
+    return np.concatenate(con)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Packs 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2 * N) + [(1e-7, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_v = None
+    best_sum = -np.inf
+    
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. Hexagonal lattice variations with different spacing/shifts
+    for r_shift in [0.0, 0.015, -0.015]:
+        for y_shift in [0.0, 0.01]:
+            hex_c = []
+            y = 0.11 + y_shift
+            row = 0
+            while len(hex_c) < N:
+                x = 0.11 + (0.1 if row % 2 == 1 else 0.0) + r_shift
+                count = 6 if row % 2 == 1 else 5
+                for _ in range(count):
+                    if len(hex_c) < N:
+                        hex_c.append([x, y])
+                    x += 0.195
+                y += 0.17
+                row += 1
+            configs.append(np.array(hex_c[:N]))
+            
+    # 2. Random dense configurations
+    for _ in range(8):
+        rc = np.random.uniform(0.15, 0.85, (N, 2))
+        configs.append(rc)
+        
+    # 3. Structured grid-like configurations
+    for _ in range(5):
+        gc = []
+        rng = np.random.default_rng()
+        for i in range(5):
+            for j in range(5):
+                gc.append([0.15 + 0.17 * i + rng.uniform(-0.005, 0.005), 
+                           0.15 + 0.17 * j + rng.uniform(-0.005, 0.005)])
+        gc.append([0.5 + rng.uniform(-0.01, 0.01), 0.5 + rng.uniform(-0.01, 0.01)])
+        configs.append(np.array(gc[:N]))
+        
+    # Main optimization loop
+    for cfg in configs:
+        c_init = np.clip(cfg, 0.05, 0.95)
+        # Start with strictly feasible radii to help SLSQP converge
+        r_init = compute_max_radii(c_init) * 0.92
+        v0 = np.concatenate([c_init.flatten(), r_init])
+        
+        # Multiple perturbations per config to escape local minima
+        for _ in range(2):
+            v_start = v0 + np.random.normal(0, 0.0015, 3 * N)
+            v_start = np.clip(v_start, 1e-4, 1.0 - 1e-4)
+            v_start[2 * N:] = np.clip(v_start[2 * N:], 1e-5, 0.4)
+            
+            try:
+                res = minimize(objective_func, v_start, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+                
+                curr_sum = -res.fun
+                c_val = constraint_func(res.x)
+                if np.min(c_val) > -1e-5:
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    if best_v is None:
+        # Fallback to first config if all optimizations failed
+        c_fb = np.clip(configs[0], 0.05, 0.95)
+        r_fb = compute_max_radii(c_fb) * 0.5
+        best_v = np.concatenate([c_fb.flatten(), r_fb])
+        best_sum = np.sum(r_fb)
+        
+    centers = best_v[:2 * N].reshape(N, 2)
+    radii = best_v[2 * N:].copy()
+    
+    # Local refinement via perturbation (Basin Hopping style)
+    for step in range(25):
+        scale = 0.0012 * (0.92 ** step)
+        v_pert = centers.flatten().copy()
+        v_pert += np.random.normal(0, scale, 2 * N)
+        v_pert = np.clip(v_pert, 1e-4, 1.0 - 1e-4)
+        
+        r_pert = radii.copy()
+        r_pert *= (0.995 + np.random.uniform(0, 0.01))
+        v_pert_full = np.concatenate([v_pert, r_pert])
+        
+        try:
+            res = minimize(objective_func, v_pert_full, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13})
+            curr_sum = -res.fun
+            c_val = constraint_func(res.x)
+            if np.min(c_val) > -1e-5:
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_v = res.x.copy()
+                    centers = best_v[:2 * N].reshape(N, 2)
+                    radii = best_v[2 * N:].copy()
+        except Exception:
+            pass
+            
+    # Final strict repair to guarantee validation passes within tolerance
+    for _ in range(50):
+        valid = True
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                valid = False
+                break
+        if not valid:
+            radii *= 0.9995
+            continue
+            
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            break
+        radii *= 0.9995
+        
+    return centers, radii, float(np.sum(radii))
+```

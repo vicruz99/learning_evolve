@@ -1,0 +1,73 @@
+# sol_000376 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 469c683e) state=97a41886 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing():
+    n = 26
+    best_r = 0.0
+    best_centers = np.zeros((n, 2))
+    
+    # Run multiple simulations with different initial perturbations
+    for seed in range(10):
+        np.random.seed(seed)
+        
+        # Initialize in a dense grid-like pattern with one extra circle
+        pts = []
+        for row in range(5):
+            for col in range(5):
+                pts.append([0.1 + col * 0.2, 0.1 + row * 0.2])
+        pts.append([0.5, 0.5])  # 26th circle
+        centers = np.array(pts[:n]) + np.random.randn(n, 2) * 0.01
+        
+        r = 0.05
+        dt = 0.05
+        strength = 5.0
+        
+        for step in range(10000):
+            # Vectorized pairwise differences and distances
+            diff = centers[:, None] - centers[None, :]
+            dist = np.sqrt(np.sum(diff**2, axis=2))
+            np.fill_diagonal(dist, np.inf)
+            
+            # Calculate overlap and repulsive forces
+            overlap = np.maximum(2*r - dist, 0)
+            forces = np.zeros((n, 2))
+            
+            if np.any(overlap > 0):
+                safe_dist = np.where(dist < 1e-8, 1e-8, dist)
+                dir_vec = diff / safe_dist[:, :, np.newaxis]
+                forces += np.sum(dir_vec * overlap[:, :, np.newaxis], axis=1)
+                
+            # Boundary repulsion forces
+            for i in range(n):
+                cx, cy = centers[i]
+                if cx < r:
+                    forces[i, 0] += (r - cx) * 10.0
+                if cx > 1.0 - r:
+                    forces[i, 0] -= (cx - (1.0 - r)) * 10.0
+                if cy < r:
+                    forces[i, 1] += (r - cy) * 10.0
+                if cy > 1.0 - r:
+                    forces[i, 1] -= (cy - (1.0 - r)) * 10.0
+                    
+            # Update positions
+            centers += forces * strength * dt
+            centers = np.clip(centers, r, 1.0 - r)
+            
+            # Slowly grow the radius
+            if step % 5 == 0:
+                r += 0.00005
+                
+            # Check if current configuration is valid and record if better
+            min_d = np.min(dist)
+            if min_d >= 2*r - 1e-6:
+                if r > best_r:
+                    best_r = r
+                    best_centers = centers.copy()
+                    
+    radii = np.full(n, best_r)
+    return best_centers, radii, np.sum(radii)

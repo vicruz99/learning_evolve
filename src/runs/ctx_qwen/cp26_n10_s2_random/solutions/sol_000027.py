@@ -1,0 +1,177 @@
+# sol_000027 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000016 (state 3dc87422) state=f475a7bb sum of radii=2.502207 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars_flat):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_flat[2::3])
+
+def constraint_boundary(vars_flat):
+    """Boundary constraints: circles must stay within [0,1]x[0,1]."""
+    X = vars_flat.reshape(N_CIRCLES, 3)
+    # x >= r, 1-x >= r, y >= r, 1-y >= r
+    return np.concatenate([
+        X[:, 0] - X[:, 2],
+        1.0 - X[:, 0] - X[:, 2],
+        X[:, 1] - X[:, 2],
+        1.0 - X[:, 1] - X[:, 2]
+    ])
+
+def constraint_overlap(vars_flat):
+    """Non-overlap constraints: squared distance >= squared sum of radii."""
+    X = vars_flat.reshape(N_CIRCLES, 3)
+    # Broadcast differences
+    dx = X[:, 0:1] - X[:, 0:1].T
+    dy = X[:, 1:2] - X[:, 1:2].T
+    dr = X[:, 2:3] + X[:, 2:3].T
+    
+    dist_sq = dx**2 + dy**2
+    min_dist_sq = dr**2
+    
+    # Extract unique pair constraints (upper triangle)
+    triu_idx = np.triu_indices(N_CIRCLES, k=1)
+    return dist_sq[triu_idx] - min_dist_sq[triu_idx]
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    constraints = [
+        {'type': 'ineq', 'fun': constraint_boundary},
+        {'type': 'ineq', 'fun': constraint_overlap}
+    ]
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate initial hexagonal configuration with small radii for feasibility
+    def get_initial_config():
+        r0 = 0.06  # Start small to guarantee initial constraint satisfaction
+        centers = []
+        radii = []
+        y = r0
+        row = 0
+        while y < 1.0 - r0 and len(centers) < n:
+            shift = r0 if row % 2 == 1 else 0.0
+            x = r0 + shift
+            while x < 1.0 - r0 and len(centers) < n:
+                centers.append([x, y])
+                radii.append(r0)
+                x += 2 * r0
+            y += r0 * np.sqrt(3)
+            row += 1
+        
+        # Fill remaining if any
+        while len(centers) < n:
+            cx = np.random.uniform(r0, 1.0 - r0)
+            cy = np.random.uniform(r0, 1.0 - r0)
+            centers.append([cx, cy])
+            radii.append(r0)
+            
+        return np.array(centers[:n]), np.array(radii[:n])
+
+    # Multi-start optimization with perturbation
+    num_restarts = 20
+    for restart in range(num_restarts):
+        np.random.seed(restart * 97 + 13)
+        
+        if restart == 0:
+            c_init, r_init = get_initial_config()
+        else:
+            # Perturb best known solution to escape local minima
+            if best_centers is not None:
+                c_init = best_centers + np.random.normal(0, 0.004, best_centers.shape)
+                r_init = best_radii + np.random.normal(0, 0.002, best_radii.shape)
+                r_init = np.clip(r_init, 0.02, 0.45)
+            else:
+                c_init, r_init = get_initial_config()
+                
+        # Ensure centers are safely inside boundaries for current radii
+        c_init[:, 0] = np.clip(c_init[:, 0], r_init, 1.0 - r_init)
+        c_init[:, 1] = np.clip(c_init[:, 1], r_init, 1.0 - r_init)
+        
+        # Flatten to 1D variable vector [x1, y1, r1, x2, y2, r2, ...]
+        x0 = np.zeros(n * 3)
+        x0[0::3] = c_init[:, 0]
+        x0[1::3] = c_init[:, 1]
+        x0[2::3] = r_init
+        
+        try:
+            res = minimize(
+                objective, 
+                x0, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraints,
+                options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False}
+            )
+            
+            if res.success:
+                curr_sum = -res.fun
+                X_opt = res.x.reshape(n, 3)
+                
+                # Quick validity check
+                valid = True
+                if np.any(X_opt[:, 2] < 1e-7):
+                    valid = False
+                elif np.any(X_opt[:, 0] < X_opt[:, 2] - 1e-9) or np.any(X_opt[:, 0] > 1.0 - X_opt[:, 2] + 1e-9):
+                    valid = False
+                elif np.any(X_opt[:, 1] < X_opt[:, 2] - 1e-9) or np.any(X_opt[:, 1] > 1.0 - X_opt[:, 2] + 1e-9):
+                    valid = False
+                
+                # Check overlaps
+                if valid:
+                    dists = np.linalg.norm(X_opt[:, 0:2][:, None, :] - X_opt[:, 0:2][None, :, :], axis=2)
+                    min_dists = X_opt[:, 2:3] + X_opt[:, 2:3].T
+                    np.fill_diagonal(dists, np.inf)
+                    if np.any(dists < min_dists - 1e-9):
+                        valid = False
+
+                if valid and curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_centers = X_opt[:, :2].copy()
+                    best_radii = X_opt[:, 2].copy()
+        except Exception:
+            continue
+
+    # Fallback if optimization completely failed
+    if best_centers is None:
+        best_centers, best_radii = get_initial_config()
+        best_sum = float(np.sum(best_radii))
+    else:
+        centers = best_centers
+        radii = best_radii
+        
+        # Strict projection to guarantee validation passes within 1e-12 tolerance
+        # 1. Clamp centers to boundaries
+        for i in range(n):
+            centers[i, 0] = np.clip(centers[i, 0], radii[i], 1.0 - radii[i])
+            centers[i, 1] = np.clip(centers[i, 1], radii[i], 1.0 - radii[i])
+            
+        # 2. Iteratively resolve any microscopic overlaps by shrinking radii minimally
+        for _ in range(50):
+            overlap_found = False
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    req = radii[i] + radii[j]
+                    if d < req - 1e-12:
+                        # Shrink proportionally to resolve overlap + small margin
+                        shrink = (req - d) / 2.0 + 1e-6
+                        radii[i] -= shrink
+                        radii[j] -= shrink
+                        overlap_found = True
+            if not overlap_found:
+                break
+                
+        radii = np.maximum(radii, 1e-7)
+        best_sum = float(np.sum(radii))
+
+    return best_centers, best_radii, best_sum

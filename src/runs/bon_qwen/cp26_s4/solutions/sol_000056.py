@@ -1,0 +1,138 @@
+# sol_000056 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 26e3ad40) state=b82baf0a sum of radii=2.613026 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns centers, radii, and sum_radii.
+    """
+    n = 26
+    
+    # 1. Initial Configuration: Hexagonal Lattice
+    # Pattern: 5, 5, 6, 5, 5 circles per row (Total 26)
+    # This allows for a denser packing than a square grid.
+    # Initial radius estimate based on hexagonal packing density.
+    # Height of 5 rows in hexagonal packing: 2r + 4r*sqrt(3) approx 8.93r <= 1 => r <= 0.112
+    # Width constraint for 6 circles: 12r <= 1 => r <= 0.0833. 
+    # We start with a safe radius and let the optimizer expand.
+    
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    r_start = 0.095 
+    
+    row_y = 0
+    current_row_idx = 0
+    # Row configurations: (count, shift_x)
+    # 5 circles (unshifted), 5 circles (shifted), 6 circles (unshifted), 5 circles (shifted), 5 circles (unshifted)
+    # Actually, standard hex packing alternates shifts.
+    # Let's define y-coordinates based on hex spacing.
+    
+    num_rows = 5
+    row_counts = [5, 5, 6, 5, 5]
+    
+    # Calculate row y-positions for hexagonal packing
+    # Vertical distance between rows is r * sqrt(3)
+    # However, r is variable, so we fix y positions relative to a base r and scale later?
+    # Better to just place them and let optimizer move them.
+    
+    idx = 0
+    for i in range(num_rows):
+        count = row_counts[i]
+        # y position
+        centers[idx:idx+count, 1] = r_start + i * (r_start * np.sqrt(3))
+        
+        # x positions
+        # If row index is odd, shift by r_start to nestle in gaps
+        shift = r_start if i % 2 == 1 else 0
+        
+        # Distribute count circles in width 1
+        # Center of the row cluster
+        row_width = (count - 1) * 2 * r_start
+        start_x = (1.0 - row_width) / 2.0 + shift
+        
+        for j in range(count):
+            centers[idx, 0] = start_x + j * 2 * r_start
+            centers[idx, 1] = centers[idx, 1] # already set
+            radii[idx] = r_start
+            idx += 1
+
+    # Ensure we handled all 26
+    assert idx == n
+
+    # 2. Optimization Function
+    def objective(x):
+        # x contains flattened centers (2*n) and radii (n)
+        # We want to maximize sum of radii, so minimize negative sum
+        r = x[2*n:]
+        return -np.sum(r)
+
+    def constraint_boundary(x):
+        # x: [x_coords, y_coords, radii]
+        # Centers
+        cx = x[:n]
+        cy = x[n:2*n]
+        r = x[2*n:]
+        
+        # x - r >= 0
+        # x + r <= 1
+        # y - r >= 0
+        # y + r <= 1
+        return np.concatenate([
+            cx - r,
+            1.0 - (cx + r),
+            cy - r,
+            1.0 - (cy + r)
+        ])
+
+    def constraint_no_overlap(x):
+        # (xi - xj)^2 + (yi - yj)^2 >= (ri + rj)^2
+        # ri + rj - dist <= 0
+        cx = x[:n]
+        cy = x[n:2*n]
+        r = x[2*n:]
+        
+        constraints = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt((cx[i] - cx[j])**2 + (cy[i] - cy[j])**2)
+                constraints.append(r[i] + r[j] - dist)
+        return -np.array(constraints) # Must be <= 0, so -(r+r-dist) <= 0 => dist >= r+r
+
+    # Initial vector for optimizer
+    x0 = np.concatenate([centers[:, 0], centers[:, 1], radii])
+
+    # Constraints setup
+    cons = [
+        {'type': 'ineq', 'fun': constraint_boundary},
+        {'type': 'ineq', 'fun': constraint_no_overlap}
+    ]
+    
+    # Bounds: radii >= 0, centers in [0, 1]
+    # Centers are handled by boundary constraints, but bounds help
+    bounds = []
+    for _ in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+    for _ in range(n):
+        bounds.append((0, 0.5)) # radius (max possible is 0.5)
+
+    # 3. Run Optimization
+    # Using SLSQP which supports constraints
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+
+    # Extract results
+    final_cx = res.x[:n]
+    final_cy = res.x[n:2*n]
+    final_r = res.x[2*n:]
+    
+    final_centers = np.column_stack((final_cx, final_cy))
+    sum_radii = np.sum(final_r)
+    
+    return final_centers, final_r, sum_radii

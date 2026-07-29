@@ -1,0 +1,166 @@
+
+
+<strategy>
+The problem of maximizing the sum of radii for 26 circles in a unit square is a classic circle packing problem. Known optimal packings for $N=26$ typically follow a deformed hexagonal lattice (often with row counts like 6-5-6-5-4) and achieve a sum of radii around $\approx 2.669$ for equal circles. The current best is $\approx 2.627$, leaving room for improvement.
+
+To robustly surpass the target of 2.636, I will employ a two-phase optimization strategy combined with a precise polishing step:
+1. **Linear Programming for Radii**: For any fixed set of centers, finding the maximal radii that satisfy non-overlap and boundary constraints is a Linear Program (LP). This is exact, fast, and avoids the non-convex quadratic constraints in the main optimizer.
+2. **Center Optimization**: I will optimize the 52 center coordinates using derivative-free methods (`Nelder-Mead` for broad search, `COBYLA` for precise local refinement) to maximize the LP-derived sum of radii. This decouples the problem into a smoother landscape.
+3. **Diverse Initializations**: I will generate multiple starting configurations including the theoretical optimal hexagonal topology (6-5-6-5-4), a structured grid, random starts, and perturbed variants to escape local minima.
+4. **SLSQP Polish**: Finally, I will run `SLSQP` on the full $(x, y, r)$ variable space starting from the LP-optimal configuration. This resolves exact contact constraints and fine-tunes the packing to numerical precision.
+
+This hybrid LP+GlobalSearch+LocalPolish approach is highly effective for circle packing and adheres strictly to the provided rules (top-level functions, no closures, no lambdas).
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+
+def get_optimal_radii(centers):
+    """Solves an LP to find maximal radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    n_con = 4*n + n*(n-1)//2
+    A_ub = np.zeros((n_con, n))
+    b_ub = np.zeros(n_con)
+    
+    idx = 0
+    # Boundary constraints: r_i <= dist_to_wall
+    for i in range(n):
+        A_ub[idx, i] = 1.0; b_ub[idx] = centers[i, 0]; idx += 1
+        A_ub[idx, i] = 1.0; b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        A_ub[idx, i] = 1.0; b_ub[idx] = centers[i, 1]; idx += 1
+        A_ub[idx, i] = 1.0; b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    for k in range(len(i_idx)):
+        i, j = i_idx[k], j_idx[k]
+        d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+        A_ub[idx, i] = 1.0
+        A_ub[idx, j] = 1.0
+        b_ub[idx] = d
+        idx += 1
+        
+    bounds = [(0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    except Exception:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds)
+        
+    if res.success:
+        return -res.fun, res.x
+    else:
+        r = np.full(n, 0.005)
+        return np.sum(r), r
+
+def objective_centers(centers_flat):
+    """Objective for center optimization: negative sum of optimal radii."""
+    centers = centers_flat.reshape(N_CIRCLES, 2)
+    centers = np.clip(centers, 0.0, 1.0)
+    s, _ = get_optimal_radii(centers)
+    return -s
+
+def full_objective(v):
+    """Objective for full SLSQP polish."""
+    return -np.sum(v[2::3])
+
+def full_constraints(v):
+    """Constraints for full SLSQP polish."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    mask = np.triu(np.ones((N_CIRCLES, N_CIRCLES), dtype=bool), k=1)
+    c.append(d2[mask] - rs[mask]**2)
+    return np.concatenate(c)
+
+def run_packing():
+    best_sum = -np.inf
+    best_x_c = None
+    
+    inits = []
+    
+    # 1. Hexagonal 6-5-6-5-4 lattice (known near-optimal topology)
+    pts = []
+    r_est = 0.102
+    y = r_est
+    row = 0
+    while len(pts) < N_CIRCLES:
+        x_off = (row % 2) * r_est
+        x = r_est + x_off
+        while x <= 1.0 - r_est and len(pts) < N_CIRCLES:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    inits.append(np.array(pts[:N_CIRCLES]).flatten())
+    
+    # 2. Structured Grid 5x5 + 1
+    g = []
+    for i in range(5):
+        for j in range(5):
+            g.append([0.1 + i*0.2, 0.1 + j*0.2])
+    g.append([0.5, 0.5])
+    inits.append(np.array(g[:N_CIRCLES]).flatten())
+    
+    # 3. Random starts for diversity
+    np.random.seed(42)
+    for s in range(25):
+        inits.append(np.random.uniform(0.05, 0.95, (N_CIRCLES, 2)).flatten())
+        
+    # 4. Perturbed structured starts
+    for base in [inits[0], inits[1]]:
+        for s in range(15):
+            p = base.reshape(N_CIRCLES, 2) + np.random.uniform(-0.02, 0.02, (N_CIRCLES, 2))
+            p = np.clip(p, 0.02, 0.98)
+            inits.append(p.flatten())
+            
+    # Phase 1: Broad search with Nelder-Mead
+    for init_c in inits:
+        res = minimize(objective_centers, init_c, method='Nelder-Mead',
+                       options={'maxiter': 1200, 'xatol': 1e-6, 'fatol': 1e-6})
+        curr = -res.fun
+        if curr > best_sum:
+            best_sum = curr
+            best_x_c = res.x
+            
+    # Phase 2: Precise refinement with COBYLA
+    if best_x_c is not None:
+        res2 = minimize(objective_centers, best_x_c, method='COBYLA',
+                        options={'maxiter': 3000, 'rhobeg': 0.005, 'rhoend': 1e-5})
+        curr2 = -res2.fun
+        if curr2 > best_sum:
+            best_sum = curr2
+            best_x_c = res2.x
+            
+    best_centers = np.clip(best_x_c.reshape(N_CIRCLES, 2), 0, 1)
+    _, best_radii = get_optimal_radii(best_centers)
+    
+    # Phase 3: SLSQP polynomial on full (x,y,r) space to resolve exact contacts
+    x0 = np.zeros(3 * N_CIRCLES)
+    x0[0::3] = best_centers[:, 0]
+    x0[1::3] = best_centers[:, 1]
+    x0[2::3] = best_radii
+    
+    bounds_full = [(0, 1), (0, 1), (0, 0.5)] * N_CIRCLES
+    res_final = minimize(full_objective, x0, method='SLSQP', bounds=bounds_full,
+                         constraints={'type': 'ineq', 'fun': full_constraints},
+                         options={'maxiter': 4000, 'ftol': 1e-12})
+                         
+    if res_final.success:
+        c_val = full_constraints(res_final.x)
+        if np.min(c_val) >= -1e-7:
+            best_centers = np.column_stack((res_final.x[0::3], res_final.x[1::3]))
+            best_radii = res_final.x[2::3]
+            best_sum = np.sum(best_radii)
+            
+    best_radii = np.maximum(best_radii, 0.0)
+    return best_centers, best_radii, float(best_sum)
+```

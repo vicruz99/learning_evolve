@@ -1,0 +1,187 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a robust multi-phase optimization strategy that avoids the pitfalls of standard constraint-based solvers (like SLSQP getting stuck or violating tolerances). 
+
+1. **Radius Computation as Implicit Constraint**: Instead of treating radii as optimization variables with explicit non-overlap constraints, we compute the maximum valid radius for each circle given fixed centers: `r_i = min(dist_to_boundary, 0.5 * min_dist_to_neighbors)`. This formulation mathematically guarantees non-overlap (`r_i + r_j <= d_ij`) and boundary containment, transforming the problem into optimizing a single non-smooth objective: maximize `sum(radii(centers))`.
+2. **Diverse High-Quality Initializations**: We generate candidates from:
+   - Hexagonal lattices with varying base radii and shift patterns (known to approach optimal density).
+   - Vectorized force-directed relaxation simulations that physically push circles apart while gradually growing their sizes, producing highly compressed, realistic packings.
+   - Random perturbations to explore non-lattice optima.
+3. **Derivative-Free Local Optimization**: We use `Powell`'s method to optimize centers. It handles the non-smooth `min` operations in radius computation gracefully and doesn't require explicit constraint jacobians.
+4. **Basin-Hopping Refinement**: After finding the best configuration, we run a perturbation loop to escape shallow local minima, followed by a strict validation pass that slightly shrinks radii only if numerical tolerance is breached.
+5. **Strict Validation Compliance**: The final output is explicitly checked against the validator's `1e-12` tolerance, with a safety shrink mechanism to guarantee `True` returns.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_radii(centers):
+    """
+    Computes the maximum valid radius for each circle given fixed centers.
+    r_i = min(dist to boundary, 0.5 * dist to nearest neighbor)
+    This formulation guarantees non-overlap and boundary containment.
+    """
+    n = centers.shape[0]
+    # Distance to boundaries
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)  # Ignore self-distance
+    
+    # Radius limited by half the distance to the nearest neighbor
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(centers_flat):
+    """
+    Objective function for minimization: maximize sum of radii.
+    Clips centers to stay strictly inside the unit square.
+    """
+    centers = np.clip(centers_flat.reshape(-1, 2), 1e-6, 1.0 - 1e-6)
+    radii = compute_radii(centers)
+    return -np.sum(radii)
+
+def force_relax_init(n, seed, steps=2000):
+    """Generates a densely packed configuration via vectorized force-directed relaxation."""
+    rng = np.random.default_rng(seed)
+    centers = rng.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.04)
+    
+    for _ in range(steps):
+        radii *= 1.0005
+        forces = np.zeros_like(centers)
+        
+        diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        np.fill_diagonal(dists, np.inf)
+        
+        req = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlap = np.maximum(0, req - dists)
+        
+        safe_dists = np.where(dists < 1e-9, 1e-9, dists)
+        dirs = diffs / safe_dists[:, :, np.newaxis]
+        
+        f_mag = overlap * 80.0
+        forces += np.sum(f_mag[:, :, np.newaxis] * dirs, axis=1)
+        
+        # Boundary repulsion
+        for dim in range(2):
+            if centers[:, dim] < radii:
+                forces[:, dim] += 200.0 * (radii - centers[:, dim])
+            if centers[:, dim] > 1.0 - radii:
+                forces[:, dim] -= 200.0 * (centers[:, dim] - (1.0 - radii))
+                
+        centers += forces * 0.003
+        centers = np.clip(centers, 0.01, 0.99)
+        
+    return centers
+
+def hex_init(n, r, shift_pattern, seed):
+    """Generates a hexagonal lattice initialization with specified row structure."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    y = r
+    row = 0
+    while len(pts) < n:
+        shift = shift_pattern[row % 2] * r
+        x = r + shift
+        while x + r <= 1.0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2 * r
+        y += np.sqrt(3) * r
+        row += 1
+        
+    # Fallback if lattice doesn't fill N spots
+    if len(pts) < n:
+        while len(pts) < n:
+            pts.append([rng.uniform(r, 1.0 - r), rng.uniform(r, 1.0 - r)])
+            
+    pts = np.array(pts[:n]) + rng.normal(0, 0.002, (n, 2))
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    best_val = np.inf
+    best_centers = None
+    
+    candidates = []
+    
+    # 1. Hexagonal lattice initializations with various densities and shifts
+    for r in [0.095, 0.100, 0.105, 0.108]:
+        for sp in [[0.0, 0.5], [0.0, 0.0], [0.5, 0.0]]:
+            for s in range(3):
+                candidates.append(hex_init(N, r, sp, s).flatten())
+                
+    # 2. Force relaxation initializations (produces highly compressed, realistic packs)
+    for s in range(8):
+        c = force_relax_init(N, s, steps=2000)
+        candidates.append(c.flatten())
+        
+    # 3. Random starts
+    for s in range(10):
+        candidates.append(np.random.uniform(0.1, 0.9, (2 * N)))
+        
+    # Primary optimization phase
+    for x0 in candidates:
+        try:
+            res = minimize(objective, x0, method='Powell',
+                           options={'maxiter': 5000, 'ftol': 1e-15, 'xtol': 1e-15})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_centers = res.x.reshape(-1, 2)
+        except Exception:
+            continue
+            
+    # Refinement phase: Basin-hopping style perturbation to escape local minima
+    if best_centers is not None:
+        for _ in range(30):
+            pert = best_centers + np.random.normal(0, 0.0008, best_centers.shape)
+            pert = np.clip(pert, 1e-5, 1.0 - 1e-5)
+            try:
+                res = minimize(objective, pert.flatten(), method='Powell',
+                               options={'maxiter': 3000, 'ftol': 1e-15})
+                if res.fun < best_val:
+                    best_val = res.fun
+                    best_centers = res.x.reshape(-1, 2)
+            except Exception:
+                continue
+                
+    # Compute final radii exactly for the optimized centers
+    radii = compute_radii(best_centers)
+    
+    # Final strict validation check & safety shrink to guarantee validator passes
+    for _ in range(10):
+        valid = True
+        for i in range(N):
+            x, y = best_centers[i]
+            r = radii[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                                 best_centers[i, 1] - best_centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-12:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+        radii *= 0.999999
+        
+    sum_radii = float(np.sum(radii))
+    return best_centers, radii, sum_radii
+```

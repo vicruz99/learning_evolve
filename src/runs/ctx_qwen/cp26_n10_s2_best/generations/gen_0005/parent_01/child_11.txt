@@ -1,0 +1,240 @@
+
+
+<strategy>
+To improve upon the current packing sum of ~2.6307, I will employ a two-phase optimization strategy:
+1. **Equal-Radius Pre-Optimization**: The landscape for equal radii is significantly simpler and less prone to shallow local minima. I will first optimize for a single shared radius using SLSQP, starting from densely sampled rotated hexagonal lattices. This reliably finds configurations near the theoretical optimum for 26 equal circles (~2.648 sum).
+2. **Unequal-Radius Refinement**: The best equal-radius configuration will then be used as a high-quality starting point for the full unequal-radius problem. Allowing radii to vary can squeeze out additional sum by adapting to boundary gaps and local curvature.
+3. **Aggressive Perturbation & Feasibility Enforcement**: I will implement a robust perturbation loop that shrinks radii, jitters centers, and re-optimizes to escape any remaining local minima. A strict post-processing step guarantees validator compliance by iteratively resolving boundary and overlap violations with a safety margin.
+4. **Vectorized & Stable Constraints**: Constraints use squared distances for smooth gradients. Initial configurations are carefully clipped and feasibility-checked before optimization to prevent SLSQP from stalling on infeasible starts.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective_unequal(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints_unequal(v):
+    """Compute inequality constraints: boundaries and squared non-overlap."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    return c
+
+def objective_equal(v):
+    """Objective function: minimize negative single radius."""
+    return -v[-1]
+
+def constraints_equal(v):
+    """Compute inequality constraints for equal radii configuration."""
+    cx = v[:N]
+    cy = v[N:2*N]
+    r = v[-1]
+    
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[PAIR_I] - cx[PAIR_J]
+    dy = cy[PAIR_I] - cy[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (2.0*r)**2
+    return c
+
+def make_hex_centers(r0, angle=0.0, shift_x=0.0, shift_y=0.0):
+    """Generates a hexagonal lattice configuration."""
+    centers = []
+    y = r0 + shift_y
+    row = 0
+    while len(centers) < N + 5:
+        x_start = r0 + shift_x + (row % 2) * r0
+        x = x_start
+        while x <= 1.0 - r0 and len(centers) < N + 5:
+            centers.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+        
+    centers = np.array(centers[:N])
+    if angle != 0.0:
+        c_val, s_val = np.cos(angle), np.sin(angle)
+        centers = (centers - 0.5) @ np.array([[c_val, -s_val], [s_val, c_val]]) + 0.5
+    return np.clip(centers, 0.01, 0.99)
+
+def make_feasible_unequal(v, tol=1e-9):
+    """Iteratively adjusts radii to guarantee strict feasibility."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:].copy()
+    
+    r = np.minimum(r, np.minimum(x, 1.0 - x))
+    r = np.minimum(r, np.minimum(y, 1.0 - y))
+    
+    for _ in range(15):
+        dx = x[PAIR_I] - x[PAIR_J]
+        dy = y[PAIR_I] - y[PAIR_J]
+        dist = np.hypot(dx, dy)
+        overlap = (r[PAIR_I] + r[PAIR_J]) - dist
+        if np.max(overlap) < tol:
+            break
+        shrink = np.maximum(0.0, overlap) / 2.0 + tol
+        r[PAIR_I] = np.maximum(0.0, r[PAIR_I] - shrink)
+        r[PAIR_J] = np.maximum(0.0, r[PAIR_J] - shrink)
+        
+    return np.concatenate([x, y, r])
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    bounds_eq = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)]
+    bounds_uneq = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    
+    cons_eq = {'type': 'ineq', 'fun': constraints_equal}
+    cons_uneq = {'type': 'ineq', 'fun': constraints_unequal}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    # Phase 1: Equal radius optimization with diverse starts
+    inits_eq = []
+    for r0 in np.linspace(0.08, 0.13, 12):
+        for ang in np.linspace(-0.4, 0.4, 20):
+            cx = make_hex_centers(r0, ang)
+            r_init = np.min(np.minimum(cx, 1.0 - cx)) * 0.6
+            inits_eq.append(np.concatenate([cx[:, 0], cx[:, 1], [r_init]]))
+            
+    for v0 in inits_eq:
+        try:
+            res = minimize(objective_equal, v0, method='SLSQP', bounds=bounds_eq,
+                           constraints=cons_eq, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            
+            if -res.fun > 0.05:
+                v_uneq = np.concatenate([res.x[:-1], res.x[-1] * np.ones(N)])
+                if np.min(constraints_unequal(v_uneq)) >= -1e-6:
+                    curr_sum = N * (-res.fun)
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_v = v_uneq.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Unequal radius optimization from best equal + perturbations
+    inits_uneq = []
+    if best_v is not None:
+        inits_uneq.append(best_v)
+        
+        for _ in range(12):
+            np.random.seed(_ + 100)
+            v_p = best_v.copy()
+            v_p[:2*N] += np.random.uniform(-0.004, 0.004, 2*N)
+            v_p[:2*N] = np.clip(v_p[:2*N], 0.01, 0.99)
+            v_p[2*N:] *= 0.96
+            inits_uneq.append(make_feasible_unequal(v_p))
+            
+    # Force-relaxed random starts for robustness
+    for seed in range(10):
+        np.random.seed(seed + 200)
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        for _ in range(80):
+            forces = np.zeros_like(pts)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.linalg.norm(pts[i] - pts[j])
+                    if d < 0.2 and d > 1e-5:
+                        f = (0.2 - d) * 5.0 / d
+                        diff = pts[i] - pts[j]
+                        forces[i] += f * diff
+                        forces[j] -= f * diff
+            pts += forces * 0.01
+            pts = np.clip(pts, 0.05, 0.95)
+            
+        r_init = np.full(N, 0.035)
+        inits_uneq.append(make_feasible_unequal(np.concatenate([pts[:, 0], pts[:, 1], r_init])))
+        
+    current_v = best_v.copy() if best_v is not None else inits_uneq[0]
+    
+    for v0 in inits_uneq:
+        try:
+            res = minimize(objective_unequal, v0, method='SLSQP', bounds=bounds_uneq,
+                           constraints=cons_uneq, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            
+            s = -res.fun
+            if np.min(constraints_unequal(res.x)) >= -1e-6 and s > best_sum:
+                best_sum = s
+                best_v = res.x.copy()
+                current_v = best_v.copy()
+        except Exception:
+            continue
+            
+    # Phase 3: Iterative perturbation refinement to escape shallow local minima
+    if best_v is not None:
+        curr = best_v.copy()
+        for step in range(25):
+            np.random.seed(step + 300)
+            v_p = curr.copy()
+            
+            noise = 0.004 * (1.0 - step / 25.0)
+            v_p[:2*N] += np.random.uniform(-noise, noise, 2*N)
+            v_p[:2*N] = np.clip(v_p[:2*N], 0.01, 0.99)
+            
+            v_p[2*N:] *= 0.97
+            v_p = make_feasible_unequal(v_p)
+            
+            try:
+                res = minimize(objective_unequal, v_p, method='SLSQP', bounds=bounds_uneq,
+                               constraints=cons_uneq, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+                
+                s = -res.fun
+                if np.min(constraints_unequal(res.x)) >= -1e-6 and s > best_sum:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    curr = best_v.copy()
+            except Exception:
+                continue
+                
+    # Extract final configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    
+    # Phase 4: Strict Post-Processing for Validator Compliance
+    eps = 1e-8
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    cr = np.maximum(cr, 0.0)
+    
+    for _ in range(25):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                if cr[i] + cr[j] > d - eps:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + eps
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    centers = np.column_stack((cx, cy))
+    return centers, cr, float(np.sum(cr))
+```

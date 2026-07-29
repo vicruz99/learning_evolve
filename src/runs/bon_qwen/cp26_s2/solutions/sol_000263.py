@@ -1,0 +1,144 @@
+# sol_000263 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 3433cac4) state=092a9f09 sum of radii=2.610526 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses SLSQP optimization starting from a grid-based initialization.
+    """
+    n = 26
+    
+    # 1. Initialization
+    # Start with a 5x5 grid of circles with radius 0.1 (25 circles)
+    # This fits perfectly: centers at 0.1, 0.3, 0.5, 0.7, 0.9
+    # Add a 26th circle in a gap to make it feasible.
+    
+    centers = []
+    radii = []
+    
+    grid_coords = [0.1, 0.3, 0.5, 0.7, 0.9]
+    
+    # Fill 25 circles
+    for x in grid_coords:
+        for y in grid_coords:
+            centers.append([x, y])
+            radii.append(0.1)
+            
+    # Add 26th circle in a gap, e.g., at (0.2, 0.2) with small radius
+    # Distance to nearest grid points (0.1,0.1), (0.3,0.1), etc. is sqrt(0.02) approx 0.1414.
+    # r_new + 0.1 <= 0.1414 => r_new <= 0.0414. Let's use 0.04.
+    centers.append([0.2, 0.2])
+    radii.append(0.04)
+    
+    # Convert to numpy arrays for initial guess
+    init_centers = np.array(centers)
+    init_radii = np.array(radii)
+    
+    # Flatten variables: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = init_centers[i, 0]
+        x0[3*i+1] = init_centers[i, 1]
+        x0[3*i+2] = init_radii[i]
+        
+    # Bounds for variables
+    # x, y in [0, 1], r in [1e-9, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.extend([(0, 1), (0, 1), (1e-9, 0.5)])
+
+    # Objective function: Maximize sum of radii -> Minimize negative sum
+    def objective(x):
+        r = x[2::3]
+        return -np.sum(r)
+
+    # Constraint function
+    # Returns an array of constraint values, all must be >= 0
+    def constraints_func(x):
+        # Extract centers and radii
+        # x is shape (78,)
+        # centers shape (26, 2)
+        # radii shape (26,)
+        
+        # Reshape logic
+        # x[0::3] are x-coords, x[1::3] are y-coords, x[2::3] are radii
+        cs_x = x[0::3]
+        cs_y = x[1::3]
+        rs = x[2::3]
+        
+        con = []
+        
+        # 1. Boundary Constraints
+        # x - r >= 0
+        con.extend(cs_x - rs)
+        # 1 - x - r >= 0
+        con.extend(1.0 - cs_x - rs)
+        # y - r >= 0
+        con.extend(cs_y - rs)
+        # 1 - y - r >= 0
+        con.extend(1.0 - cs_y - rs)
+        
+        # 2. Non-overlap Constraints
+        # dist^2 - (r_i + r_j)^2 >= 0
+        # We compute this for all pairs i < j
+        # Vectorized computation might be faster but loop is clearer and acceptable for n=26
+        
+        # Number of pairs = 26*25/2 = 325
+        # Preallocate
+        pair_constraints = np.zeros(325)
+        idx = 0
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = cs_x[i] - cs_x[j]
+                dy = cs_y[i] - cs_y[j]
+                dist_sq = dx*dx + dy*dy
+                r_sum = rs[i] + rs[j]
+                val = dist_sq - r_sum*r_sum
+                pair_constraints[idx] = val
+                idx += 1
+        
+        con.extend(pair_constraints)
+        
+        return np.array(con)
+
+    # Define constraints for scipy
+    # type 'ineq' means fun(x) >= 0
+    cons = ({'type': 'ineq', 'fun': constraints_func})
+
+    # Run optimization
+    # SLSQP is suitable for non-linear constraints
+    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                      options={'maxiter': 500, 'ftol': 1e-9})
+
+    # Extract results
+    optimal_x = result.x
+    optimal_centers = np.zeros((n, 2))
+    optimal_radii = np.zeros(n)
+    
+    for i in range(n):
+        optimal_centers[i, 0] = optimal_x[3*i]
+        optimal_centers[i, 1] = optimal_x[3*i+1]
+        optimal_radii[i] = optimal_x[3*i+2]
+        
+    sum_radii = np.sum(optimal_radii)
+    
+    # Safety check: Ensure strict validity within tolerance
+    # Although optimizer should satisfy constraints, numerical errors might occur.
+    # We can slightly shrink radii if necessary, but usually not needed if tol is tight.
+    # Let's just return the result. The validation function allows 1e-12 error.
+    
+    return optimal_centers, optimal_radii, sum_radii
+
+# To test locally
+if __name__ == "__main__":
+    centers, radii, total = run_packing()
+    print(f"Sum of radii: {total}")
+    # print(centers)
+    # print(radii)

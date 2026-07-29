@@ -1,0 +1,231 @@
+# sol_000239 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 5b918207) state=6dfdead9 sum of radii=2.382595 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def get_optimal_radii(centers):
+    """
+    Given fixed centers, solve LP to maximize sum of radii.
+    
+    Variables: r_0, ..., r_25 (26 variables)
+    Objective: Maximize sum(r_i) => Minimize -sum(r_i)
+    
+    Constraints:
+    1. r_i >= 0
+    2. r_i + r_j <= dist(i, j) for all pairs i < j
+    3. r_i <= x_i
+    4. r_i <= 1 - x_i
+    5. r_i <= y_i
+    6. r_i <= 1 - y_i
+    """
+    n = len(centers)
+    
+    # Objective: minimize -sum(r)
+    c_obj = -np.ones(n)
+    
+    # Inequality constraints A_ub @ r <= b_ub
+    # Constraints are of form r_i + r_j <= d_ij
+    # and r_i <= bound
+    
+    # We will build the matrix A_ub and vector b_ub
+    # Total constraints: n*(n-1)/2 (pairwise) + 4*n (boundaries)
+    
+    n_constraints = (n * (n - 1)) // 2 + 4 * n
+    A_ub = np.zeros((n_constraints, n))
+    b_ub = np.zeros(n_constraints)
+    
+    constraint_idx = 0
+    
+    # Pairwise constraints
+    for i in range(n):
+        xi, yi = centers[i]
+        # Boundary constraints for circle i
+        # r_i <= xi
+        A_ub[constraint_idx, i] = 1.0
+        b_ub[constraint_idx] = xi
+        constraint_idx += 1
+        
+        # r_i <= 1 - xi
+        A_ub[constraint_idx, i] = 1.0
+        b_ub[constraint_idx] = 1.0 - xi
+        constraint_idx += 1
+        
+        # r_i <= yi
+        A_ub[constraint_idx, i] = 1.0
+        b_ub[constraint_idx] = yi
+        constraint_idx += 1
+        
+        # r_i <= 1 - yi
+        A_ub[constraint_idx, i] = 1.0
+        b_ub[constraint_idx] = 1.0 - yi
+        constraint_idx += 1
+        
+        # Pairwise constraints with j > i
+        for j in range(i + 1, n):
+            dist = np.sqrt((xi - centers[j, 0])**2 + (yi - centers[j, 1])**2)
+            A_ub[constraint_idx, i] = 1.0
+            A_ub[constraint_idx, j] = 1.0
+            b_ub[constraint_idx] = dist
+            constraint_idx += 1
+            
+    # Bounds for r_i: 0 <= r_i
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        radii = res.x
+        return radii, np.sum(radii)
+    else:
+        # Fallback: small radii if LP fails (unlikely for valid centers)
+        return np.full(n, 1e-9), 0.0
+
+def run_packing():
+    """
+    Runs optimization to pack 26 circles.
+    """
+    n_circles = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Number of random restarts
+    n_restarts = 20
+    
+    # Random seed for reproducibility (optional, but good for debugging)
+    np.random.seed(42)
+    
+    for _ in range(n_restarts):
+        # 1. Initialize centers
+        # Try a mix of random and grid-like initialization
+        if np.random.rand() > 0.5:
+            # Random initialization with some padding
+            centers = np.random.rand(n_circles, 2)
+            # Ensure they are not too close initially to allow growth
+            # Actually, random is fine, LP will handle small radii
+        else:
+            # Hexagonal-ish initialization
+            centers = np.zeros((n_circles, 2))
+            idx = 0
+            row = 0
+            col = 0
+            # Approximate radius 0.1, spacing 0.2
+            # 5x5 grid is 25, we need 26. 
+            # Let's place in a grid and perturb
+            y = 0.1
+            while idx < n_circles:
+                x = 0.1
+                offset = (row % 2) * 0.1 # Stagger
+                while x < 1.0 and idx < n_circles:
+                    centers[idx, 0] = x + offset
+                    centers[idx, 1] = y
+                    idx += 1
+                    x += 0.2
+                row += 1
+                y += 0.1732 # sqrt(3)/2 * 0.2 approx
+            
+        # 2. Local Optimization of Centers
+        # We will perform random walks / hill climbing on centers
+        # to maximize the sum of radii returned by LP.
+        
+        current_centers = centers.copy()
+        current_radii, current_sum = get_optimal_radii(current_centers)
+        
+        # Simple local search: try perturbing each circle
+        # Since n=26 is small, we can do a few passes.
+        # We want to move centers apart to increase radii.
+        
+        # Learning rate / step size for center movement
+        step_size = 0.05
+        
+        # Iterate to refine positions
+        for iter_step in range(100): # 100 local steps per restart
+            improved = False
+            for i in range(n_circles):
+                # Try moving circle i in 4 directions
+                best_move = None
+                best_move_sum = current_sum
+                
+                # Directions: up, down, left, right
+                directions = [(0, 0.1), (0, -0.1), (0.1, 0), (-0.1, 0)]
+                
+                for dx, dy in directions:
+                    temp_centers = current_centers.copy()
+                    new_x = np.clip(temp_centers[i, 0] + dx, 0, 1)
+                    new_y = np.clip(temp_centers[i, 1] + dy, 0, 1)
+                    temp_centers[i] = [new_x, new_y]
+                    
+                    # Solve LP for new configuration
+                    # Note: LP is expensive, maybe approximate?
+                    # But with 26 vars, it's fast.
+                    r_temp, s_temp = get_optimal_radii(temp_centers)
+                    
+                    if s_temp > best_move_sum:
+                        best_move_sum = s_temp
+                        best_move = temp_centers
+                
+                if best_move is not None:
+                    current_centers = best_move
+                    current_radii, current_sum = get_optimal_radii(current_centers)
+                    improved = True
+            
+            if not improved:
+                break
+        
+        # Update global best
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = current_centers
+            best_radii = current_radii
+
+    # Final validation and safety check
+    # Ensure radii are consistent with centers
+    # The LP guarantees r_i + r_j <= dist, but due to float precision, 
+    # we might need to slightly shrink if needed, but LP should be tight.
+    
+    # Just to be safe, re-run LP one last time on best centers
+    best_radii, best_sum = get_optimal_radii(best_centers)
+    
+    return best_centers, best_radii, best_sum
+
+if __name__ == "__main__":
+    # Run the packing
+    centers, radii, sum_r = run_packing()
+    
+    # Basic validation logic included in the prompt's validate_packing
+    # but we can check here
+    n = centers.shape[0]
+    valid = True
+    
+    # Check radii non-negative
+    if np.any(radii < -1e-9):
+        valid = False
+        
+    # Check boundaries
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-9 or x + r > 1 + 1e-9 or y - r < -1e-9 or y + r > 1 + 1e-9:
+            valid = False
+            break
+            
+    # Check overlaps
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+            if dist < radii[i] + radii[j] - 1e-9:
+                valid = False
+                break
+        if not valid: break
+        
+    print(f"Sum of radii: {sum_r}")
+    print(f"Valid: {valid}")
+    if not valid:
+        print("Error detected in generated packing.")
+    else:
+        print("Packing is valid.")

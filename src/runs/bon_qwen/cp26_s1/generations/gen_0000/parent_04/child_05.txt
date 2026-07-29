@@ -1,125 +1,226 @@
 
 
 <strategy>
-To pack 26 circles in a unit square and maximize the sum of radii, we utilize a numerical optimization approach. Since the objective function (sum of radii) and constraints (non-overlap and boundary conditions) define a non-convex problem, we use the Sequential Least Squares Programming (SLSQP) algorithm. To mitigate the risk of converging to poor local optima, the strategy involves multiple optimization runs initialized from diverse valid configurations (including grid and hexagonal patterns). The solution is validated by checking for constraint violations and ensuring the configuration is within the unit square.
+The problem asks to maximize the sum of radii of 26 circles packed in a unit square. This is a continuous optimization problem with non-convex constraints.
+
+**Strategy:**
+1.  **Formulation:** The problem can be viewed as maximizing $\sum r_i$ subject to $r_i \le \text{dist}(C_i, \text{boundary})$ and $r_i + r_j \le \text{dist}(C_i, C_j)$.
+2.  **Dependent Variables:** For any fixed configuration of centers $C = \{C_1, \dots, C_{26}\}$, the optimal radii $r_i$ are uniquely determined by the available space: $r_i = \min(\text{dist}(C_i, \text{boundary}), \min_{j \ne i} 0.5 \cdot \text{dist}(C_i, C_j))$. Thus, the problem reduces to optimizing the centers $C$ to maximize $\sum r_i(C)$.
+3.  **Algorithm:** A Gradient Ascent approach on the center coordinates is effective.
+    *   Initialize centers randomly or on a grid.
+    *   In each iteration, calculate the optimal radii for the current centers.
+    *   Compute a "force" (gradient direction) for each circle to increase its radius. If a circle is constrained by a neighbor, it should move away from that neighbor. If constrained by a wall, it should move inward.
+    *   Update centers by moving them along these force directions.
+    *   To escape local minima and ensure robustness, perform multiple random restarts.
+4.  **Refinement:** 
+    *   Use a vectorized distance calculation for efficiency.
+    *   Include a boundary check to ensure circles stay within $[0, 1]$.
+    *   Use a decaying step size or a fixed small step size for stability.
+    *   Perform a final check and adjustment to ensure strict validity according to the provided `validate_packing` function (handling floating point tolerances).
+
+**Implementation Details:**
+*   **Initialization:** Random positions inside the square.
+*   **Radius Calculation:** Vectorized computation of distances to walls and other circles.
+*   **Gradient/Force Calculation:** Identify the limiting constraint (closest wall or neighbor) for each circle and determine the direction to move away from it.
+*   **Optimization Loop:** Iterate 10,000 times, updating centers.
+*   **Multiple Restarts:** Run the optimizer 5 times with different random seeds and pick the best result.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize
-import math
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    n = 26
+def compute_radii(centers):
+    """
+    Computes the maximum feasible radius for each circle given their centers.
+    Constraints:
+    1. Circle must be inside [0, 1]x[0, 1] -> r <= min(x, 1-x, y, 1-y)
+    2. Circles must not overlap -> r_i + r_j <= dist(i, j) -> r_i <= 0.5 * dist(i, j)
+    """
+    n = centers.shape[0]
+    # Initialize radii with a large value
+    radii = np.full(n, np.inf)
     
-    def unpack(vars):
-        centers = np.zeros((n, 2))
-        radii = np.zeros(n)
-        for i in range(n):
-            centers[i, 0] = vars[3*i]
-            centers[i, 1] = vars[3*i+1]
-            radii[i] = vars[3*i+2]
-        return centers, radii
+    # 1. Wall constraints
+    # Distance to left wall (x=0)
+    radii = np.minimum(radii, centers[:, 0])
+    # Distance to right wall (x=1)
+    radii = np.minimum(radii, 1.0 - centers[:, 0])
+    # Distance to bottom wall (y=0)
+    radii = np.minimum(radii, centers[:, 1])
+    # Distance to top wall (y=1)
+    radii = np.minimum(radii, 1.0 - centers[:, 1])
+    
+    # 2. Neighbor constraints
+    # Compute pairwise distances
+    # diff shape: (n, n, 2)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Set diagonal to infinity (distance to self)
+    np.fill_diagonal(dists, np.inf)
+    
+    # For each circle, the max radius is limited by half the distance to the nearest neighbor
+    min_dists = np.min(dists, axis=1)
+    radii = np.minimum(radii, min_dists / 2.0)
+    
+    return radii
 
-    def objective(vars):
-        _, radii = unpack(vars)
-        return -np.sum(radii)
+def compute_forces(centers, radii):
+    """
+    Computes a force vector for each center to help increase the sum of radii.
+    Heuristic: Move away from the constraint that limits the radius.
+    """
+    n = centers.shape[0]
+    forces = np.zeros_like(centers)
     
-    def make_constraints():
-        cons = []
-        for i in range(n):
-            # x >= r => x - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: v[3*idx] - v[3*idx+2]})
-            # x <= 1-r => 1 - x - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: 1.0 - v[3*idx] - v[3*idx+2]})
-            # y >= r => y - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: v[3*idx+1] - v[3*idx+2]})
-            # y <= 1-r => 1 - y - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: 1.0 - v[3*idx+1] - v[3*idx+2]})
+    # We need to identify which constraint is active for each circle.
+    # A constraint is active if dist to constraint is approx equal to current radius.
+    # Tolerance for checking active constraints
+    tol = 1e-4 
+    
+    # Precompute distances for efficiency
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Check wall constraints
+    # Left wall (x=0)
+    mask_left = np.abs(centers[:, 0] - radii) < tol
+    forces[mask_left, 0] += 1.0
+    
+    # Right wall (x=1)
+    mask_right = np.abs((1.0 - centers[:, 0]) - radii) < tol
+    forces[mask_right, 0] -= 1.0
+    
+    # Bottom wall (y=0)
+    mask_bottom = np.abs(centers[:, 1] - radii) < tol
+    forces[mask_bottom, 1] += 1.0
+    
+    # Top wall (y=1)
+    mask_top = np.abs((1.0 - centers[:, 1]) - radii) < tol
+    forces[mask_top, 1] -= 1.0
+    
+    # Check neighbor constraints
+    # If r_i + r_j approx dist(i, j), they are touching.
+    # We want to push i away from j.
+    # Vector from j to i is (centers[i] - centers[j])
+    # Normalized vector is direction to move i away from j.
+    
+    # We can vectorize this check
+    # Condition: dists[i, j] <= radii[i] + radii[j] + tol
+    # Actually, with our radius calculation, dists[i,j] >= radii[i] + radii[j] is guaranteed.
+    # Equality holds if constraint is active.
+    
+    sum_radii_ij = radii[:, np.newaxis] + radii[np.newaxis, :]
+    # Identify touching pairs
+    touching = dists < sum_radii_ij + tol
+    
+    # For each pair (i, j) that is touching, add repulsive force
+    # Force on i: direction (centers[i] - centers[j]) normalized
+    # Force on j: direction (centers[j] - centers[i]) normalized
+    
+    # To avoid division by zero, add small epsilon to dists where 0 (though diagonal is inf)
+    safe_dists = np.where(dists < 1e-9, 1e-9, dists)
+    unit_vecs = diff / safe_dists[:, :, np.newaxis] # (n, n, 2)
+    
+    # Accumulate forces
+    # If touching, push away.
+    # We can sum the unit vectors for all touching neighbors.
+    for i in range(n):
+        # Find neighbors j touching i
+        neighbors = np.where(touching[i, :])[0]
+        if len(neighbors) > 0:
+            # Sum of unit vectors pointing away from neighbors
+            # unit_vecs[i, j] is vector from j to i.
+            # So adding this pushes i away from j.
+            f_sum = np.sum(unit_vecs[i, neighbors, :], axis=0)
+            forces[i] += f_sum
+
+    return forces
+
+def run_packing():
+    n_circles = 26
+    best_sum_radii = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Number of restarts
+    n_restarts = 20
+    
+    # Optimization parameters
+    step_size = 0.002
+    n_iterations = 5000
+    
+    for restart in range(n_restarts):
+        # 1. Initialize centers randomly
+        # Ensure they are somewhat inside to start with valid radii
+        centers = np.random.rand(n_circles, 2) * 0.8 + 0.1
+        
+        # 2. Optimization Loop (Gradient Ascent)
+        for _ in range(n_iterations):
+            # Compute current radii
+            radii = compute_radii(centers)
             
-        for i in range(n):
-            for j in range(i + 1, n):
-                cons.append({
-                    'type': 'ineq',
-                    'fun': lambda v, i=i, j=j: math.sqrt((v[3*i] - v[3*j])**2 + (v[3*i+1] - v[3*j+1])**2) - (v[3*i+2] + v[3*j+2])
-                })
-        return cons
+            # Compute forces
+            forces = compute_forces(centers, radii)
+            
+            # Normalize forces to have similar magnitude (optional, but helps stability)
+            # Or just clamp them
+            norms = np.linalg.norm(forces, axis=1, keepdims=True)
+            # Avoid division by zero
+            norms = np.where(norms < 1e-9, 1.0, norms)
+            # Limit max force magnitude to prevent exploding steps
+            max_force = 2.0
+            force_scale = np.minimum(norms, max_force)
+            normalized_forces = forces / norms * force_scale # Not strictly unit, but bounded
+            
+            # Actually, let's just use raw forces but clamp magnitude
+            raw_norms = np.linalg.norm(forces, axis=1)
+            clamped_norms = np.clip(raw_norms, 0, 2.0) # Max force magnitude 2
+            # Rescale forces to clamped norms
+            # Handle zero vector
+            mask = raw_norms > 1e-9
+            centers[mask] += step_size * (forces[mask] / raw_norms[mask, np.newaxis]) * clamped_norms[mask, np.newaxis]
+            
+            # Apply step
+            centers += step_size * forces
+            
+            # 3. Boundary constraints for centers
+            # Centers must be in [0, 1] strictly? 
+            # If center is at 0, radius must be 0. 
+            # It's better to keep centers inside [epsilon, 1-epsilon]
+            # But strictly, center at 0 is allowed if r=0.
+            # However, for optimization, keeping them strictly inside helps.
+            # Let's clip to [0, 1]
+            centers = np.clip(centers, 0.0, 1.0)
+            
+            # Optional: If radius becomes too small, maybe perturb?
+            # Not strictly necessary if gradient works.
 
-    bounds = []
-    for _ in range(n):
-        bounds.append((0.0, 1.0))
-        bounds.append((0.0, 1.0))
-        bounds.append((0.0, 0.5))
+        # Final check
+        final_radii = compute_radii(centers)
+        current_sum = np.sum(final_radii)
+        
+        if current_sum > best_sum_radii:
+            best_sum_radii = current_sum
+            best_centers = centers.copy()
+            best_radii = final_radii.copy()
 
-    best_res = None
-    best_sum = -1.0
+    # Post-processing: Ensure strict validity with tolerance
+    # The compute_radii function ensures validity, but let's double check
+    # and maybe tighten radii slightly to be safe against floating point errors in validation
+    # Validation uses -1e-12 tolerance.
+    # Our radii are calculated as min(...), so they should be exact.
+    # However, due to float precision, x-r might be -1e-16.
+    # Let's clamp radii to be safe.
     
-    # 1. Grid Initialization
-    np.random.seed(42)
-    centers_init = np.random.uniform(0.15, 0.85, size=(n, 2))
-    radii_init = np.full(n, 0.02)
-    x0 = np.zeros(3*n)
-    for i in range(n):
-        x0[3*i] = centers_init[i, 0]
-        x0[3*i+1] = centers_init[i, 1]
-        x0[3*i+2] = radii_init[i]
-        
-    constraints = make_constraints()
-    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 500})
-    if res.success and -res.fun > best_sum:
-        best_res = res
-        best_sum = -res.fun
-
-    # 2. Dense Grid Initialization
-    centers_init = np.zeros((n, 2))
-    idx = 0
-    for i in range(6):
-        for j in range(6):
-            if idx < n:
-                centers_init[idx, 0] = 0.1 + j * 0.15
-                centers_init[idx, 1] = 0.1 + i * 0.15
-                idx += 1
-    radii_init = np.full(n, 0.02)
-    x0 = np.zeros(3*n)
-    for i in range(n):
-        x0[3*i] = centers_init[i, 0]
-        x0[3*i+1] = centers_init[i, 1]
-        x0[3*i+2] = radii_init[i]
-        
-    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 500})
-    if res.success and -res.fun > best_sum:
-        best_res = res
-        best_sum = -res.fun
-
-    # 3. Hexagonal-like Initialization
-    centers_init = np.zeros((n, 2))
-    idx = 0
-    r_init = 0.03
-    for i in range(7):
-        for j in range(7):
-            if idx < n:
-                x = 0.15 + j * 0.12 + (0.06 if i % 2 == 1 else 0.0)
-                y = 0.15 + i * 0.10
-                centers_init[idx, 0] = x
-                centers_init[idx, 1] = y
-                idx += 1
-    radii_init = np.full(n, 0.02)
-    x0 = np.zeros(3*n)
-    for i in range(n):
-        x0[3*i] = centers_init[i, 0]
-        x0[3*i+1] = centers_init[i, 1]
-        x0[3*i+2] = radii_init[i]
-        
-    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 500})
-    if res.success and -res.fun > best_sum:
-        best_res = res
-        best_sum = -res.fun
-
-    centers, radii = unpack(best_res.x)
-    # Ensure strict validity and non-negative radii
-    radii = np.maximum(radii, 0.0)
-    centers[:, 0] = np.clip(centers[:, 0], 0.0, 1.0)
-    centers[:, 1] = np.clip(centers[:, 1], 0.0, 1.0)
+    # Recalculate radii with a tiny safety margin?
+    # No, the validation function allows 1e-12 slack.
+    # Our computed radii are mathematically feasible.
     
-    return centers, radii, float(np.sum(radii))
+    # Just to be absolutely sure, we can reduce radii by a tiny epsilon if they are very close to limit?
+    # No, we want to maximize.
+    
+    return best_centers, best_radii, best_sum_radii
+
 ```

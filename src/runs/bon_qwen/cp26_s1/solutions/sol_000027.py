@@ -1,103 +1,367 @@
 # sol_000027 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 27de0ea1) state=1a18139f sum of radii=1.153614 correctness=1.0
+# generation=0 parent=seed (state cc549794) state=8a39f63f sum of radii=2.596489 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
+import scipy.optimize as opt
+import math
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    np.random.seed(42)
-    n = 26
-    centers = np.zeros((n, 2))
+def get_hex_grid(n):
+    """
+    Generates initial centers for n circles in a hexagonal grid pattern.
+    """
+    # Estimate grid dimensions
+    # Approximate area per circle ~ (sqrt(3)/2) * (2r)^2 ? No.
+    # Let's just fit into square.
+    # Try to fit in rows.
+    # 26 circles. 
+    # 5 rows: 5, 6, 5, 6, 4? Or 6, 5, 6, 5, 4?
+    # Let's try 6 rows: 5, 5, 5, 5, 5, 1? No.
+    # 5x5 = 25. Add 1.
     
-    # 1. Initial placement: 5x5 grid + 1 extra circle, slightly perturbed
-    grid = np.linspace(0.1, 0.9, 5)
-    idx = 0
-    for i in range(5):
-        for j in range(5):
-            centers[idx] = [grid[j], grid[i]]
-            idx += 1
-    centers[25] = [0.5, 0.5]
-    centers += np.random.uniform(-0.02, 0.02, centers.shape)
-    centers = np.clip(centers, 0.05, 0.95)
+    centers = []
+    # Try a dense packing grid
+    # Number of columns roughly sqrt(26) ~ 5.1
+    cols = 6
+    rows = 5
     
-    r = 0.02
-    dt = 0.02
-    force_scale = 30.0
-    boundary_scale = 80.0
-    max_iter = 12000
+    # Calculate spacing to fit in [0, 1]
+    # We want to maximize radius, so we want centers to be as far apart as possible 
+    # but constrained by the square. Actually, for the initialization, 
+    # just putting them in a valid grid is enough.
+    # We will leave margins for radii.
     
-    for step in range(max_iter):
-        # 2. Vectorized pairwise repulsive forces
-        diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diffs**2, axis=2))
-        
-        # Identify overlapping pairs
-        overlap_mask = dists < 2*r + 1e-8
-        safe_dists = np.where(dists < 1e-8, 1e-8, dists)
-        
-        # Compute repulsion magnitude and vector
-        f_mag = np.where(overlap_mask, (2*r - dists) * force_scale, 0.0)
-        f_vecs = diffs / safe_dists[:, :, np.newaxis] * f_mag[:, :, np.newaxis]
-        
-        # Sum forces for each particle (antisymmetry ensures correct net force)
-        forces = np.sum(f_vecs, axis=1)
-        
-        # 3. Boundary repulsive forces
-        # Left wall
-        mask_left = centers[:, 0] < r
-        forces[mask_left, 0] += (r - centers[mask_left, 0]) * boundary_scale
-        # Right wall
-        mask_right = centers[:, 0] > 1 - r
-        forces[mask_right, 0] -= (centers[mask_right, 0] - (1 - r)) * boundary_scale
-        # Bottom wall
-        mask_bottom = centers[:, 1] < r
-        forces[mask_bottom, 1] += (r - centers[mask_bottom, 1]) * boundary_scale
-        # Top wall
-        mask_top = centers[:, 1] > 1 - r
-        forces[mask_top, 1] -= (centers[mask_top, 1] - (1 - r)) * boundary_scale
-        
-        # Update positions
-        centers += dt * forces
-        centers = np.clip(centers, 0, 1)
-        
-        # 4. Adaptive radius growth with validation
-        if step % 10 == 0:
-            valid = True
-            # Check boundaries
-            if np.any(centers[:, 0] < r - 1e-5) or np.any(centers[:, 0] > 1 - r + 1e-5) or \
-               np.any(centers[:, 1] < r - 1e-5) or np.any(centers[:, 1] > 1 - r + 1e-5):
-                valid = False
-            # Check overlaps
-            if valid:
-                for i in range(n):
-                    for j in range(i+1, n):
-                        d = np.sqrt(np.sum((centers[i]-centers[j])**2))
-                        if d < 2*r - 1e-5:
-                            valid = False
-                            break
-                    if not valid: break
-                    
-            if valid:
-                r += 0.0003
-            else:
-                r += 0.00001 # Slow creep to explore boundaries
-                
-        # Decay learning rate for stability
-        dt *= 0.9997
-        
-    # 5. Final extraction of feasible radius
-    min_d = 2.0
+    # Let's place them with a safe spacing first, say 0.2
+    # Then the optimizer will expand them.
+    
+    # Better: Place them to fill the square assuming a target radius r=0.1
+    # Spacing dx = 0.2, dy = 0.1732
+    
+    # Let's just generate points and scale them to fit well.
+    # Hex lattice basis vectors
+    v1 = np.array([1.0, 0.0])
+    v2 = np.array([0.5, math.sqrt(3)/2])
+    
+    # Try to fit grid
+    # We need to select indices (u, v) such that we have n points.
+    points = []
+    u = 0
+    while len(points) < n:
+        v = 0
+        while len(points) < n:
+            # Check if point fits in a bounding box roughly
+            # We will normalize later
+            pos = u * v1 + v * v2
+            points.append(pos)
+            v += 1
+            if v > 8: break # safety
+        u += 1
+        if u > 8: break
+    
+    # Normalize points to fit in [0, 1] x [0, 1] with some margin
+    # Find min/max x, y
+    pts = np.array(points)
+    min_x, min_y = pts.min(axis=0)
+    max_x, max_y = pts.max(axis=0)
+    
+    # Center and scale
+    pts -= np.array([min_x, min_y])
+    range_x = max_x - min_x
+    range_y = max_y - min_y
+    max_range = max(range_x, range_y)
+    if max_range > 0:
+        pts /= max_range
+    
+    # Scale to leave 10% margin for radii (arbitrary)
+    margin = 0.1
+    pts *= (1 - 2 * margin)
+    pts += margin
+    
+    # If we have more points than n, take first n
+    pts = pts[:n]
+    
+    return pts
+
+def solve_lp_radii(centers):
+    """
+    Given centers, solve LP to find radii maximizing sum.
+    Maximize sum(r_i)
+    s.t.
+      r_i + r_j <= dist(i, j)
+      r_i <= x_i
+      r_i <= 1 - x_i
+      r_i <= y_i
+      r_i <= 1 - y_i
+      r_i >= 0
+    """
+    n = len(centers)
+    c = np.ones(n) * -1.0  # Maximize sum r => Minimize -sum r
+    
+    # Constraints A_ub r <= b_ub
+    # We need to build A_ub and b_ub
+    # This can be large, but n=26 is small.
+    
+    constraints = []
+    rhs = []
+    
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    # Only needed for pairs that are close? 
+    # To be safe and exact, include all. 
+    # 26*25/2 = 325 constraints. Manageable.
+    
+    # Optimization: Only include pairs that are reasonably close?
+    # But we don't know which ones will become active.
+    # Let's include all.
+    
+    # Matrix construction
+    # Number of variables = n
+    # Number of constraints = n_pairs + 4*n
+    
+    # Let's build lists of rows
+    rows = []
+    vals = []
+    cols = []
+    b_list = []
+    
+    # Pairwise
     for i in range(n):
-        for j in range(i+1, n):
-            d = np.sqrt(np.sum((centers[i]-centers[j])**2))
-            if d < min_d: min_d = d
-        d_b = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
-        if d_b < min_d: min_d = d_b
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            # Constraint: r_i + r_j <= dist
+            # Row i: 1, Row j: 1
+            rows.append([i, j])
+            vals.append([1.0, 1.0])
+            b_list.append(dist)
+            
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        # r_i <= x
+        rows.append([i])
+        vals.append([1.0])
+        b_list.append(x)
         
-    # Subtract small epsilon to satisfy strict validation constraints
-    r_final = min_d / 2.0 - 1e-6
-    radii = np.full(n, r_final)
+        # r_i <= 1 - x
+        rows.append([i])
+        vals.append([1.0])
+        b_list.append(1.0 - x)
+        
+        # r_i <= y
+        rows.append([i])
+        vals.append([1.0])
+        b_list.append(y)
+        
+        # r_i <= 1 - y
+        rows.append([i])
+        vals.append([1.0])
+        b_list.append(1.0 - y)
+        
+    # r_i >= 0 is handled by bounds in linprog
     
-    return centers, radii, float(np.sum(radii))
+    num_constraints = len(b_list)
+    A = np.zeros((num_constraints, n))
+    for idx, row_indices in enumerate(rows):
+        for k, col_idx in enumerate(row_indices):
+            A[idx, col_idx] = vals[idx][k]
+            
+    b = np.array(b_list)
+    
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve
+    # Use high performance method if available
+    try:
+        res = opt.linprog(c, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+    except:
+        # Fallback
+        res = opt.linprog(c, A_ub=A, b_ub=b, bounds=bounds, method='simplex')
+        
+    if not res.success:
+        # If LP fails (unlikely), return 0 radii
+        return np.zeros(n), None
+        
+    radii = res.x
+    slack = b - A @ radii
+    
+    return radii, slack, A
+
+def run_packing():
+    n = 26
+    
+    # 1. Initialization
+    centers = get_hex_grid(n)
+    
+    # 2. Iterative Force-Directed Optimization
+    # We will run this loop to expand radii
+    num_iters = 200
+    alpha = 0.05  # Step size for center updates
+    
+    for it in range(num_iters):
+        # Solve LP for current centers
+        try:
+            radii, slack, A = solve_lp_radii(centers)
+        except:
+            break
+            
+        # Check slack to identify active constraints
+        # Slack = RHS - (A @ x). Slack >= 0.
+        # If slack is small (<= epsilon), constraint is active.
+        epsilon = 1e-5
+        active_mask = slack <= epsilon
+        
+        # Calculate forces
+        forces = np.zeros_like(centers)
+        
+        # Constraints are ordered:
+        # First n_pairs constraints are pairwise
+        # Next 4*n are boundaries
+        
+        n_pairs = n * (n - 1) // 2
+        
+        # Pairwise active constraints
+        # We need to map constraint index back to pair (i, j)
+        # Since we built them in order, we can reconstruct or store mapping.
+        # Reconstructing is O(N^2), cheap for N=26.
+        
+        pair_idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if pair_idx < len(active_mask) and active_mask[pair_idx]:
+                    # Active constraint between i and j
+                    # Push apart
+                    diff = centers[i] - centers[j]
+                    dist = np.linalg.norm(diff)
+                    if dist > 1e-9:
+                        direction = diff / dist
+                        # Force proportional to how active? 
+                        # Just unit force for now
+                        forces[i] += direction * 0.5
+                        forces[j] -= direction * 0.5
+                pair_idx += 1
+        
+        # Boundary active constraints
+        # For each circle i, 4 constraints: x, 1-x, y, 1-y
+        # Indices: n_pairs + 4*i to n_pairs + 4*i + 3
+        
+        for i in range(n):
+            base_idx = n_pairs + 4 * i
+            
+            # r_i <= x_i (Left wall)
+            if base_idx < len(active_mask) and active_mask[base_idx]:
+                # Touching left wall, need to move right (increase x)
+                forces[i, 0] += 0.5
+                
+            # r_i <= 1 - x_i (Right wall)
+            if base_idx + 1 < len(active_mask) and active_mask[base_idx + 1]:
+                # Touching right wall, need to move left (decrease x)
+                forces[i, 0] -= 0.5
+                
+            # r_i <= y_i (Bottom wall)
+            if base_idx + 2 < len(active_mask) and active_mask[base_idx + 2]:
+                # Touching bottom wall, need to move up (increase y)
+                forces[i, 1] += 0.5
+                
+            # r_i <= 1 - y_i (Top wall)
+            if base_idx + 3 < len(active_mask) and active_mask[base_idx + 3]:
+                # Touching top wall, need to move down (decrease y)
+                forces[i, 1] -= 0.5
+
+        # Update centers
+        # Normalize forces to prevent exploding steps
+        max_force = np.linalg.norm(forces)
+        if max_force > 0:
+            centers += (forces / max_force) * alpha
+        
+        # Project back to [0, 1]
+        centers = np.clip(centers, 0.0, 1.0)
+
+    # 3. Final Optimization using SciPy
+    # Variables: [x0, y0, r0, x1, y1, r1, ...]
+    # Or separate arrays? Scipy takes 1D array.
+    
+    def objective(vars_flat):
+        # vars_flat: [x0, y0, r0, x1, y1, r1, ...]
+        # We want to maximize sum of radii => minimize -sum radii
+        radii = vars_flat[2::3]
+        return -np.sum(radii)
+
+    def constraint_pairwise(vars_flat, i, j):
+        # dist >= r_i + r_j => dist^2 >= (r_i + r_j)^2
+        # Or just dist - (r_i + r_j) >= 0
+        xi, yi, ri = vars_flat[3*i], vars_flat[3*i+1], vars_flat[3*i+2]
+        xj, yj, rj = vars_flat[3*j], vars_flat[3*j+1], vars_flat[3*j+2]
+        
+        dx = xi - xj
+        dy = yi - yj
+        dist = np.sqrt(dx*dx + dy*dy)
+        return dist - (ri + rj)
+
+    def constraint_boundary_left(vars_flat, i):
+        xi, ri = vars_flat[3*i], vars_flat[3*i+2]
+        return xi - ri  # >= 0
+
+    def constraint_boundary_right(vars_flat, i):
+        xi, ri = vars_flat[3*i], vars_flat[3*i+2]
+        return 1.0 - xi - ri  # >= 0
+
+    def constraint_boundary_bottom(vars_flat, i):
+        yi, ri = vars_flat[3*i+1], vars_flat[3*i+2]
+        return yi - ri  # >= 0
+
+    def constraint_boundary_top(vars_flat, i):
+        yi, ri = vars_flat[3*i+1], vars_flat[3*i+2]
+        return 1.0 - yi - ri  # >= 0
+
+    # Initial guess
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = 0.1 # Guess radius
+
+    # Bounds
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+
+    # Constraints list
+    cons = []
+    
+    # Pairwise constraints
+    for i in range(n):
+        for j in range(i + 1, n):
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i, j=j: constraint_pairwise(v, i, j)})
+            
+    # Boundary constraints
+    for i in range(n):
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: constraint_boundary_left(v, i)})
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: constraint_boundary_right(v, i)})
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: constraint_boundary_bottom(v, i)})
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: constraint_boundary_top(v, i)})
+
+    # Run optimizer
+    # SLSQP is good for nonlinear constraints
+    res = opt.minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter': 1000, 'ftol': 1e-9})
+    
+    # Extract results
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i, 0] = res.x[3*i]
+        final_centers[i, 1] = res.x[3*i+1]
+        final_radii[i] = res.x[3*i+2]
+        
+    sum_r = np.sum(final_radii)
+    
+    # Validate and return
+    # Ensure no NaN or negatives
+    if np.any(np.isnan(final_radii)) or np.any(final_radii < 0):
+        # Fallback to previous if failed
+        return centers, np.zeros(n), 0.0 # This would be invalid, but just safety
+        
+    return final_centers, final_radii, sum_r

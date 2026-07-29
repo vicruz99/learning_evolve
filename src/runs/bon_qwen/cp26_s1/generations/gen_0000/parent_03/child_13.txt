@@ -1,199 +1,169 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, I will implement a robust computational optimization strategy that combines geometric initialization with local optimization.
+To pack 26 circles in a unit square maximizing the sum of radii, we employ a non-linear optimization approach with a penalty method. 
 
-1.  **Pattern Initialization**: Since 26 circles don't form a perfect square ($5 \times 5 = 25$), I will generate multiple high-density initial patterns. These will include a hexagonal lattice (which is the densest 2D packing), a perturbed $5 \times 5$ grid with an extra circle, and a "staggered rows" configuration.
-2.  **Feasible Radii Calculation (LP)**: For any fixed set of centers, the maximum possible radii for non-overlapping circles can be found by solving a Linear Programming (LP) problem. The constraints are $r_i + r_j \le \text{distance}(c_i, c_j)$ and $r_i \le \text{distance to boundary}$. Using `scipy.optimize.linprog` ensures we find the mathematically optimal radii for any given configuration.
-3.  **Local Optimization**: I will use a randomized local search (Hill Climbing) to perturb the centers. By moving circles slightly, we can often increase the distances between them, allowing the LP solver to assign larger radii.
-4.  **Direct Constraint Optimization**: I will also run a direct `SLSQP` optimization on the variables $(x, y, r)$ to find a local maximum, using a penalty term for overlaps.
-5.  **Validation**: The final configuration will be validated against the provided `validate_packing` function to ensure it is strictly within the unit square and non-overlapping.
-
-This hybrid approach leverages the density of hexagonal lattices, the flexibility of variable radii, and the precision of numerical optimization.
+1. **Formulation**: We maximize the sum of radii $\sum r_i$ subject to non-overlap ($r_i + r_j \le \|c_i - c_j\|$) and boundary constraints ($r_i \le x_i, 1-x_i, y_i, 1-y_i$).
+2. **Objective Function**: A penalty-based objective is used where $L = -\sum r_i + \mu \sum \text{violations}^2$. The violations are defined by squared softplus terms of boundary distances and overlap gaps.
+3. **Initialization**: Since 26 is slightly larger than the 25 circles in a perfect $5 \times 5$ grid ($r=0.1$), we initialize centers using a perturbed hexagonal lattice to find a high-density starting configuration. 
+4. **Optimization**: We use `scipy.optimize.minimize` (L-BFGS-B) to simultaneously optimize the 78 variables (26 centers and 26 radii). Multiple restarts from different initial positions ensure we explore the non-convex landscape effectively.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import linprog, minimize
+from scipy.optimize import minimize
 
-def generate_hex_lattice(n, w=1.0, h=1.0):
-    """Generates a hexagonal lattice of n points."""
-    points = []
-    rows = int(np.ceil(np.sqrt(n * 2 / np.sqrt(3))))
-    for i in range(rows):
-        y = (i + 1) * h / (rows + 1)
-        x_offset = (i % 2) * 0.5
-        cols = int(np.ceil(np.sqrt(n / 1.5)))
-        for j in range(cols):
-            x = (j + 1 + x_offset) * w / (cols + 1)
-            if x <= 1.0 and y <= 1.0:
-                points.append([x, y])
-            if len(points) >= n:
-                break
-        if len(points) >= n:
-            break
-    return np.array(points[:n])
+def compute_loss_and_grad(vars, n, penalty_weight):
+    """
+    Computes the objective function value and its gradient for the packing problem.
+    Objective: Minimize -sum(radii) + penalty_weight * sum(violations^2)
+    """
+    centers = vars[:n * 2].reshape(n, 2)
+    radii = vars[n * 2:]
 
-def generate_grid_perturbed(n, w=1.0, h=1.0):
-    """Generates a grid-like layout and perturbs it."""
-    cols = int(np.ceil(np.sqrt(n)))
-    rows = int(np.ceil(n / cols))
-    points = []
-    for i in range(rows):
-        for j in range(cols):
-            if len(points) < n:
-                y = (i + 1) * h / (rows + 1)
-                x = (j + 1) * w / (cols + 1)
-                points.append([x, y])
-    pts = np.array(points)
-    pts += np.random.uniform(-0.02, 0.02, pts.shape)
-    pts = np.clip(pts, 0.0, 1.0)
-    return pts
+    # Objective: negative sum of radii
+    loss = -np.sum(radii)
 
-def compute_max_radii(centers):
-    """Solves LP to find max sum of radii for fixed centers."""
-    n = centers.shape[0]
-    dists = np.zeros((n, n))
+    # Gradient initialization
+    grad = np.zeros_like(vars)
+    grad[n * 2:] = -1.0  # d(loss)/d(radii) from -sum(radii)
+
+    # Helper to calculate smooth max(x)^2 and its derivative
+    def smooth_penalty(val):
+        if val > 0:
+            return val**2, 2 * val
+        return 0.0, 0.0
+
+    # 1. Boundary Constraints
     for i in range(n):
-        for j in range(i + 1, n):
-            dists[i, j] = np.linalg.norm(centers[i] - centers[j])
-            dists[j, i] = dists[i, j]
-    
-    # Objective: max sum(r) => min -sum(r)
-    c_obj = -np.ones(n)
-    
-    A_ub = []
-    b_ub = []
-    
-    # Pairwise constraints: r_i + r_j <= dist_ij
-    for i in range(n):
-        for j in range(i + 1, n):
-            row = np.zeros(n)
-            row[i] = 1
-            row[j] = 1
-            A_ub.append(row)
-            b_ub.append(dists[i, j])
-            
-    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
-    for i in range(n):
-        r_max = min(centers[i, 0], 1 - centers[i, 0], 
-                    centers[i, 1], 1 - centers[i, 1])
-        row = np.zeros(n)
-        row[i] = 1
-        A_ub.append(row)
-        b_ub.append(r_max)
+        x, y = centers[i]
+        r = radii[i]
         
-    A_ub = np.array(A_ub)
-    b_ub = np.array(b_ub)
-    bounds = [(0, None) for _ in range(n)]
-    
-    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-    if res.success:
-        return -res.fun, -res.x
-    return 0.0, np.zeros(n)
+        # Constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+        # Violations: r - x > 0, etc.
+        boundaries = [r - x, r - (1 - x), r - y, r - (1 - y)]
+        
+        for b in boundaries:
+            p, gp = smooth_penalty(b)
+            loss += penalty_weight * p
+            # d(loss)/d(r) += weight * 2b
+            grad[n * 2 + i] += penalty_weight * gp
+            # d(loss)/d(x) or d(y)
+            if b == r - x:
+                grad[2 * i] -= penalty_weight * gp
+            elif b == r - (1 - x):
+                grad[2 * i] += penalty_weight * gp
+            elif b == r - y:
+                grad[2 * i + 1] -= penalty_weight * gp
+            elif b == r - (1 - y):
+                grad[2 * i + 1] += penalty_weight * gp
 
-def validate_and_adjust(centers, radii):
-    """Ensures strict validity by shrinking radii slightly if needed."""
-    n = centers.shape[0]
-    adjusted_radii = radii.copy()
-    
-    # Boundary adjustment
-    for i in range(n):
-        min_dist_to_edge = min(centers[i, 0], 1 - centers[i, 0], 
-                               centers[i, 1], 1 - centers[i, 1])
-        if adjusted_radii[i] > min_dist_to_edge - 1e-7:
-            adjusted_radii[i] = max(0, min_dist_to_edge - 1e-7)
-            
-    # Overlap adjustment
+    # 2. Overlap Constraints
     for i in range(n):
         for j in range(i + 1, n):
-            dist = np.linalg.norm(centers[i] - centers[j])
-            if dist < adjusted_radii[i] + adjusted_radii[j] - 1e-7:
-                total_r = adjusted_radii[i] + adjusted_radii[j]
-                overlap = total_r - dist
-                # Reduce both radii by half the overlap
-                adjusted_radii[i] -= overlap / 2
-                adjusted_radii[j] -= overlap / 2
-                
-    return adjusted_radii
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist_sq = dx**2 + dy**2
+            dist = np.sqrt(dist_sq + 1e-12) # Small epsilon to avoid div by zero
+            
+            r_sum = radii[i] + radii[j]
+            violation = r_sum - dist
+            
+            p, gp = smooth_penalty(violation)
+            loss += penalty_weight * p
+            
+            # Gradients for radii
+            grad[n * 2 + i] += penalty_weight * gp
+            grad[n * 2 + j] += penalty_weight * gp
+            
+            # Gradients for centers (chain rule through dist)
+            # d(violation)/d(x_i) = -d(dist)/d(x_i) = -(dx / dist)
+            # d(loss)/d(x_i) = weight * gp * (-dx/dist)
+            factor = -penalty_weight * gp / dist
+            grad[2 * i] += factor * dx
+            grad[2 * j] -= factor * dx
+            grad[2 * i + 1] += factor * dy
+            grad[2 * j + 1] -= factor * dy
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    best_sum = 0.0
-    best_centers = None
-    best_radii = None
+    return loss, grad
+
+def run_packing():
+    n = 26
     
-    # 1. Try Hexagonal Lattice
-    c_init = generate_hex_lattice(26)
-    s, r = compute_max_radii(c_init)
-    if s > best_sum:
-        best_sum, best_centers, best_radii = s, c_init.copy(), r.copy()
+    # We will run multiple restarts to find a good global configuration
+    best_loss = np.inf
+    best_vars = None
+    
+    num_restarts = 10
+    penalty_weight = 1000.0
+    
+    for _ in range(num_restarts):
+        # 1. Initialize Centers (Hexagonal Lattice)
+        centers_init = []
+        # Hex grid parameters
+        s = 0.18  # Spacing
+        x_off = s / 2
+        y_off = s * np.sqrt(3) / 2
         
-    # 2. Try Grid Perturbed
-    for _ in range(5):
-        c_init = generate_grid_perturbed(26)
-        s, r = compute_max_radii(c_init)
-        if s > best_sum:
-            best_sum, best_centers, best_radii = s, c_init.copy(), r.copy()
+        y = 0
+        while y < 1.0:
+            x = x_off if int(y / y_off) % 2 == 1 else 0
+            while x < 1.0:
+                centers_init.append([x, y])
+                x += s
+            y += y_off
             
-    # 3. Local Search on Centers
-    c_curr = best_centers.copy()
-    for iteration in range(100):
-        c_new = c_curr + np.random.uniform(-0.01, 0.01, c_curr.shape)
-        c_new = np.clip(c_new, 0.0, 1.0)
-        s, r = compute_max_radii(c_new)
-        if s > best_sum:
-            best_sum = s
-            best_centers = c_new
-            best_radii = r
-            c_curr = c_new
+        centers_init = np.array(centers_init)
+        
+        # Shuffle and pick 26, or just take first 26 if we have enough
+        np.random.shuffle(centers_init)
+        if len(centers_init) < n:
+            # Fallback: random placement if grid too sparse
+            centers_init = np.random.uniform(0, 1, (n, 2))
+        else:
+            centers_init = centers_init[:n]
             
-    # 4. Direct Optimization with SLSQP
-    def objective(x):
-        centers = x[:52].reshape(26, 2)
-        radii = x[52:]
-        # Penalize overlaps and boundary violations heavily
-        penalty = 0.0
-        for i in range(26):
-            penalty += max(0, radii[i] - centers[i, 0])**2
-            penalty += max(0, radii[i] - (1 - centers[i, 0]))**2
-            penalty += max(0, radii[i] - centers[i, 1])**2
-            penalty += max(0, radii[i] - (1 - centers[i, 1]))**2
-        for i in range(26):
-            for j in range(i + 1, 26):
-                dist = np.linalg.norm(centers[i] - centers[j])
-                penalty += max(0, radii[i] + radii[j] - dist)**2
-        return -np.sum(radii) - 10 * penalty
+        # 2. Initialize Radii
+        radii_init = np.full(n, 0.05)
+        
+        # 3. Flatten to 1D array for optimizer
+        vars_init = np.concatenate([centers_init.flatten(), radii_init])
+        
+        # 4. Optimization
+        bounds = [(0, 1)] * (n * 2) + [(0, 0.5)] * n
+        
+        res = minimize(
+            compute_loss_and_grad,
+            vars_init,
+            args=(n, penalty_weight),
+            method='L-BFGS-B',
+            jac=True,
+            bounds=bounds,
+            options={'maxiter': 2000, 'ftol': 1e-12}
+        )
+        
+        # Check if this solution is better
+        if res.fun < best_loss:
+            # Check if it's actually a valid packing (penalty should be near zero)
+            # We check the sum of radii directly from the result
+            curr_radii = res.x[n * 2:]
+            curr_sum = np.sum(curr_radii)
+            if curr_sum > 2.0: # Basic sanity check to avoid stuck local minima with tiny radii
+                best_loss = res.fun
+                best_vars = res.x
 
-    # Initialize with best found so far
-    x0 = np.concatenate([best_centers.flatten(), best_radii])
+    # 5. Extract best solution
+    if best_vars is not None:
+        centers = best_vars[:n * 2].reshape(n, 2)
+        radii = best_vars[n * 2:]
+        
+        # Final validation pass to ensure no NaN or negative radii
+        radii = np.maximum(radii, 0)
+        sum_radii = np.sum(radii)
+        return centers, radii, sum_radii
     
-    # Bounds: centers in [0,1], radii >= 0
-    bounds = [(0, 1) for _ in range(52)] + [(0, 1) for _ in range(26)]
-    
-    res = minimize(objective, x0, method='SLSQP', bounds=bounds, options={'maxiter': 200})
-    if not res.success and res.fun < -best_sum - 0.1:
-        # If it found a significantly better point despite non-convergence
-        centers_opt = res.x[:52].reshape(26, 2)
-        radii_opt = res.x[52:]
-        # Re-calculate radii properly for these centers to be safe
-        _, radii_opt = compute_max_radii(centers_opt)
-        s = np.sum(radii_opt)
-        if s > best_sum:
-            best_sum = s
-            best_centers = centers_opt
-            best_radii = radii_opt
-
-    # Final Validation and Adjustment
-    best_radii = validate_and_adjust(best_centers, best_radii)
-    final_sum = np.sum(best_radii)
-    
-    return best_centers, best_radii, final_sum
-
-if __name__ == "__main__":
-    centers, radii, sum_radii = run_packing()
-    
-    # Import validate_packing here for local testing if needed
-    # def validate_packing(centers, radii): ... 
-    
-    print(f"Sum of radii: {sum_radii}")
+    # Fallback if optimization failed completely
+    centers = np.random.uniform(0.1, 0.9, (n, 2))
+    radii = np.full(n, 0.01)
+    return centers, radii, np.sum(radii)
 ```

@@ -1,0 +1,154 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we must utilize space efficiently, likely exceeding the capacity of a standard square grid (which limits radius to 0.1 for 25 circles). A pure equal-radius hexagonal packing in a square suffers from boundary inefficiencies. Therefore, an unequal-radius configuration or a perturbed packing is likely optimal.
+
+I will implement a robust, vectorized **Jostling Algorithm**. This simulation-based approach is highly effective for circle packing:
+1.  **Initialization**: Centers are placed in a perturbed hexagonal lattice to start with a high-density configuration.
+2.  **Iterative Growth**: Radii are uniformly increased. When overlaps occur or circles hit boundaries, repulsive forces push centers apart.
+3.  **Optimization**: This process effectively "inflates" the circles until they are jammed, naturally maximizing their sizes within the constraints.
+4.  **Refinement**: A final local optimization pass using `scipy.optimize` with a penalty function cleans up any minor overlaps and fine-tunes the result.
+</strategy>
+
+```python
+import numpy as np
+import scipy.optimize as opt
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+
+    # 1. Initialization: Perturbed Hexagonal Lattice
+    # Arrange in 6 rows. Rows 0,2,4 have 5 circles; rows 1,3,5 have 5 circles.
+    # Staggered x-coordinates for hexagonal density.
+    row_counts = [5, 5, 5, 5, 5, 1]
+    idx = 0
+    for r_idx, count in enumerate(row_counts):
+        y_pos = 0.1 + r_idx * (0.8 / 5.0)
+        if r_idx % 2 == 1:
+            # Offset rows
+            x_start = 0.1 + (1 / 10.0)
+            spacing = 1.0 / (count - 1 + 1) # Approx
+            # Better: distribute evenly in [0.1, 0.9] but shifted
+            # For 5 circles in [0.15, 0.95] range approx?
+            # Let's just use linspace
+            x_positions = np.linspace(0.1 + 0.1, 0.9 + 0.1, count) # Shifted
+            # Ensure bounds: 0.2 to 1.0 is too much.
+            # Standard hex: row 0 at 0.1, 0.3... row 1 at 0.2, 0.4...
+            x_positions = np.array([0.1 + 0.2*k + 0.1 for k in range(count)]) 
+            # If count=5: 0.2, 0.4, 0.6, 0.8, 1.0 -> 1.0 is boundary.
+            # Let's just use a standard grid and offset
+            x_positions = np.linspace(0.1 + 0.1, 0.9 + 0.1, count) # 0.2 to 1.0
+            # Adjust to fit strictly inside
+            if count == 5:
+                x_positions = np.array([0.2, 0.4, 0.6, 0.8, 0.9]) # 0.9+0.1=1.0 ok
+        else:
+            x_positions = np.linspace(0.1, 0.9, count) # 0.1, 0.3, 0.5, 0.7, 0.9
+            
+        for c_idx in range(count):
+            centers[idx, 0] = x_positions[c_idx]
+            centers[idx, 1] = y_pos
+            radii[idx] = 0.01 # Start small
+            idx += 1
+            
+    # 2. Jostling Simulation (Vectorized)
+    dt = 0.001
+    growth_rate = 0.0002
+    
+    # Run simulation for a fixed number of steps
+    for step in range(3000):
+        # Compute distance matrix
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, np.inf) # Ignore self
+        
+        # Compute overlaps: max(0, r_i + r_j - dist)
+        r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlaps = np.maximum(0, r_sum - dists)
+        
+        # Compute forces from overlaps
+        # Force vector = overlap * direction
+        # direction = diff / dist
+        dirs = diff / dists[:, :, np.newaxis]
+        forces = overlaps[:, :, np.newaxis] * dirs
+        
+        # Sum forces for each particle (symmetric, so take upper triangle sum or just half of sum)
+        # F_i = sum_{j} F_{ij}
+        F = np.sum(forces, axis=1)
+        
+        # Boundary forces
+        # x < r -> push +x. x > 1-r -> push -x.
+        # y < r -> push +y. y > 1-r -> push -y.
+        F_x = np.maximum(0, radii - centers[:, 0]) - np.maximum(0, centers[:, 0] + radii - 1)
+        F_y = np.maximum(0, radii - centers[:, 1]) - np.maximum(0, centers[:, 1] + radii - 1)
+        F[:, 0] += F_x
+        F[:, 1] += F_y
+        
+        # Update centers
+        centers += dt * F
+        centers = np.clip(centers, 0, 1) # Hard boundary clamp
+        
+        # Grow radii
+        radii += growth_rate
+        
+        # Clamp radii to not violate boundaries immediately (center must be >= r)
+        # If center is too close to edge, reduce radius
+        min_x = centers[:, 0]
+        min_y = centers[:, 1]
+        max_x = 1 - centers[:, 0]
+        max_y = 1 - centers[:, 1]
+        radii = np.minimum(radii, np.minimum(np.minimum(min_x, max_x), np.minimum(min_y, max_y)))
+        radii = np.maximum(radii, 1e-6) # Prevent zero/negative
+        
+        # Reduce growth rate slowly to settle
+        if step > 2000:
+            growth_rate *= 0.999
+
+    # 3. Refinement with SciPy Optimizer
+    # Flatten parameters
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    def objective(vars):
+        c = vars[:2*n].reshape(n, 2)
+        r = vars[2*n:]
+        # Penalty for overlap and boundary
+        penalty = 0.0
+        # Boundary penalty
+        # x-r >= 0, x+r <= 1, y-r >= 0, y+r <= 1
+        viol_x1 = np.maximum(0, r - c[:, 0])
+        viol_x2 = np.maximum(0, c[:, 0] + r - 1)
+        viol_y1 = np.maximum(0, r - c[:, 1])
+        viol_y2 = np.maximum(0, c[:, 1] + r - 1)
+        penalty += 100 * (np.sum(viol_x1**2) + np.sum(viol_x2**2) + np.sum(viol_y1**2) + np.sum(viol_y2**2))
+        
+        # Overlap penalty
+        dists = np.sqrt(((c[:, None, :] - c[None, :, :])**2).sum(axis=2))
+        np.fill_diagonal(dists, np.inf)
+        r_sum = r[:, None] + r[None, :]
+        overlap = np.maximum(0, r_sum - dists)
+        penalty += 100 * np.sum(overlap**2)
+        
+        # Objective: maximize sum of radii -> minimize negative sum
+        return -np.sum(r) + penalty
+
+    # Bounds
+    bounds = []
+    for i in range(n):
+        bounds.extend([(0, 1), (0, 1)]) # x, y
+        bounds.extend([(0, 0.5)])        # r
+    
+    result = opt.minimize(objective, x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': 2000})
+    
+    final_centers = result.x[:2*n].reshape(n, 2)
+    final_radii = result.x[2*n:]
+    
+    # Ensure validity
+    final_radii = np.maximum(final_radii, 0)
+    final_centers = np.clip(final_centers, final_radii[:, None], 1 - final_radii[:, None])
+    
+    total_sum = np.sum(final_radii)
+    
+    return final_centers, final_radii, total_sum
+
+```

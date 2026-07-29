@@ -1,0 +1,255 @@
+# sol_000026 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 9233b6dc) state=ac7b7fb8 sum of radii=0.088860 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    
+    Strategy:
+    1. Initialize centers in a perturbed hexagonal lattice.
+    2. Use a repulsion-based optimization to spread centers out, maximizing the minimum distance.
+    3. Set radii based on the resulting configuration (half the distance to nearest constraint).
+    """
+    np.random.seed(42)
+    N = 26
+    centers = np.zeros((N, 2))
+
+    # 1. Initialization: Perturbed Hexagonal Lattice
+    # We want to fit 26 points. A 6x5 hexagonal pattern is a good candidate.
+    # Row lengths alternating 5, 6, 5, 6, 5, 4? Or just fill a grid and shift.
+    # Let's use a triangular packing layout scaled to fit in [0.1, 0.9] initially.
+    row_counts = [5, 6, 5, 6, 5] # Sum = 27, we will drop one or fit 26. 
+    # Let's try 5, 5, 5, 5, 5, 1? No, let's just use a standard hex grid logic.
+    
+    # Generate points in a hex grid
+    points = []
+    row_idx = 0
+    # Approximate spacing for 26 circles in unit square
+    # 5x5 grid spacing is 0.2. Hex is denser.
+    # Let's try to fit them in a triangle/hexagon shape.
+    
+    # Simple approach: Generate a grid and shift odd rows
+    cols = 6
+    rows = 5
+    count = 0
+    for r in range(rows):
+        for c in range(cols):
+            if count >= N:
+                break
+            x = 0.1 + c * 0.18
+            y = 0.1 + r * 0.15
+            # Shift odd rows
+            if r % 2 == 1:
+                x += 0.09
+            points.append([x, y])
+            count += 1
+        if count >= N:
+            break
+    
+    centers = np.array(points[:N])
+    
+    # Add random perturbation to avoid symmetry traps
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    # Clip to valid range for centers (must be at least radius away from boundary, initially assume r=0.05)
+    centers = np.clip(centers, 0.05, 0.95)
+
+    # 2. Optimization: Maximize the minimum distance
+    # We define a function that returns the negative of the minimum distance.
+    # Minimizing this maximizes the min distance.
+    
+    def objective(c_flat):
+        c = c_flat.reshape(-1, 2)
+        min_dist = float('inf')
+        
+        # Check distance to boundaries
+        # Constraint: center >= r, 1-center >= r => center in [r, 1-r]
+        # In the optimization of points, we assume we are finding the "skeleton" 
+        # and r is derived later. But to prevent points from hitting the wall too close,
+        # we can penalize proximity to boundary.
+        # However, for "maximize min distance" problem, we just need points in [0,1]^2.
+        # The radius is determined by min(dist_to_wall, dist_to_neighbor/2).
+        
+        # To make it robust, let's just maximize the minimum separation between points 
+        # and implicitly handle boundaries by keeping points inside [0.01, 0.99].
+        
+        # 1. Inter-point distances
+        # Vectorized distance calculation
+        diff = c[:, np.newaxis, :] - c[np.newaxis, :, :] # (N, N, 2)
+        dists = np.sqrt(np.sum(diff**2, axis=2)) # (N, N)
+        np.fill_diagonal(dists, float('inf'))
+        current_min_dist = np.min(dists)
+        
+        # 2. Distance to boundary (simplified)
+        # We want points to be away from edges.
+        # The "effective" distance to boundary for a circle of radius r is r.
+        # If we just maximize min_dist between points, we can later set r = min_dist/2.
+        # But we also need r <= min(x, 1-x, y, 1-y).
+        # So the actual radius will be min(min_dist/2, min_boundary_dist).
+        
+        # Let's penalize closeness to boundary strongly in the objective to encourage 
+        # the configuration to stay in the center, or just clip.
+        # Actually, optimal packing usually touches boundaries.
+        # So we should allow touching.
+        # But the objective for "max radius" is: max r s.t. dist_ij >= 2r, x_i >= r, etc.
+        # This is equivalent to: max D s.t. dist_ij >= D, x_i >= D/2, etc.
+        # Let's optimize for D.
+        
+        # We will use a penalty method.
+        penalty = 0
+        if current_min_dist < 0.2: # Target scale
+             pass 
+            
+        return -current_min_dist
+
+    # Since scipy minimize works on flat arrays, we use a wrapper.
+    # However, 'minimize' with simple bounds might not handle the 'min' objective well.
+    # A repulsion-based force simulation is often more stable for packing.
+    
+    # --- Force-directed Relaxation ---
+    learning_rate = 0.01
+    repulsion_strength = 1.0
+    boundary_repulsion = 10.0
+    
+    centers_opt = centers.copy()
+    
+    for step in range(1000):
+        forces = np.zeros_like(centers_opt)
+        
+        # Repulsion between circles
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = centers_opt[i, 0] - centers_opt[j, 0]
+                dy = centers_opt[i, 1] - centers_opt[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                
+                if dist < 1e-5:
+                    dist = 1e-5
+                    dx = np.random.uniform(-0.01, 0.01)
+                    dy = np.random.uniform(-0.01, 0.01)
+                
+                # Ideal distance is roughly 0.2. If closer, push apart.
+                # We want to maximize min distance, so push if dist < target.
+                # But target is unknown. Let's just push if dist is small.
+                # Force ~ 1/dist^2
+                
+                if dist < 0.3: # Interaction radius
+                    force = repulsion_strength / (dist**2)
+                    fx = (dx / dist) * force
+                    fy = (dy / dist) * force
+                    
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+        
+        # Boundary repulsion (push towards center if too close)
+        # We want centers to be at least r away. 
+        # Since r is unknown, let's just keep them inside [0.01, 0.99].
+        # Actually, for max radius, they should touch boundaries.
+        # But repulsion from each other will push them to boundaries naturally if we don't penalize boundaries.
+        # However, we need to ensure they don't escape [0,1].
+        
+        for i in range(N):
+            # Soft boundary constraints
+            x, y = centers_opt[i]
+            if x < 0.01:
+                forces[i, 0] += boundary_repulsion * (0.01 - x)
+            if x > 0.99:
+                forces[i, 0] -= boundary_repulsion * (x - 0.99)
+            if y < 0.01:
+                forces[i, 1] += boundary_repulsion * (0.01 - y)
+            if y > 0.99:
+                forces[i, 1] -= boundary_repulsion * (y - 0.99)
+
+        # Apply forces
+        centers_opt += learning_rate * forces
+        
+        # Hard clamp to prevent explosion
+        centers_opt = np.clip(centers_opt, 0.001, 0.999)
+        
+        # Decay learning rate
+        learning_rate *= 0.995
+
+    # 3. Calculate Radii
+    # For each circle, the radius is limited by:
+    # 1. Distance to other circles (must not overlap) -> r_i + r_j <= dist_ij
+    # 2. Distance to boundaries -> r_i <= x_i, r_i <= 1-x_i, etc.
+    
+    # Since we optimized for spreading, we can now find the max uniform radius r 
+    # such that r <= 0.5 * min_dist_ij and r <= min_boundary_dist.
+    # However, the problem allows unequal radii. 
+    # But as discussed, equal radii is likely optimal or near-optimal for sum.
+    # Let's calculate the max possible radius for each circle individually in this fixed configuration.
+    # r_i = min( dist_to_boundary_i, min_{j!=i} (dist_ij / 2) )
+    
+    radii = np.zeros(N)
+    for i in range(N):
+        # Distance to boundaries
+        db = min(centers_opt[i, 0], 1 - centers_opt[i, 0], 
+                 centers_opt[i, 1], 1 - centers_opt[i, 1])
+        
+        # Distance to other centers
+        dists_to_others = []
+        for j in range(N):
+            if i != j:
+                d = np.sqrt(np.sum((centers_opt[i] - centers_opt[j])**2))
+                dists_to_others.append(d)
+        
+        min_dist_to_other = min(dists_to_others)
+        
+        # Radius is limited by half the distance to the nearest neighbor
+        # and the distance to the boundary.
+        radii[i] = min(db, min_dist_to_other / 2.0)
+        
+    # Ensure no overlaps with the calculated radii (numerical safety)
+    # The calculation above ensures r_i + r_j <= dist_ij?
+    # r_i <= dist_ij / 2 and r_j <= dist_ij / 2 => r_i + r_j <= dist_ij. Yes.
+    
+    sum_radii = np.sum(radii)
+    
+    # Verify and clamp if needed
+    # Re-check and slightly reduce if overlaps exist due to float precision
+    for i in range(N):
+        for j in range(i+1, N):
+            dist = np.sqrt(np.sum((centers_opt[i] - centers_opt[j])**2))
+            if radii[i] + radii[j] > dist:
+                # Reduce both slightly
+                excess = (radii[i] + radii[j] - dist) / 2.0 + 1e-12
+                radii[i] -= excess
+                radii[j] -= excess
+
+    # Ensure boundaries
+    for i in range(N):
+        x, y = centers_opt[i]
+        r = radii[i]
+        max_r_boundary = min(x, 1-x, y, 1-y)
+        if r > max_r_boundary:
+            radii[i] = max_r_boundary
+
+    return centers_opt, radii, np.sum(radii)
+
+# Execute
+if __name__ == "__main__":
+    centers, radii, total = run_packing()
+    print(f"Sum of radii: {total}")
+    # Validate locally
+    import numpy as np
+    def validate(centers, radii):
+        n = centers.shape[0]
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                return False
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist < radii[i] + radii[j] - 1e-12:
+                    return False
+        return True
+    print(f"Valid: {validate(centers, radii)}")

@@ -1,0 +1,194 @@
+
+
+<strategy>
+To improve upon the current packing sum of radii (2.634292), I will employ a more robust optimization strategy focusing on:
+1. **Parameterized Coordinates**: Map $(x, y)$ to $(r, u, v)$ where $x = r + u(1-2r)$ and $y = r + v(1-2r)$ with $u, v \in [0, 1]$. This automatically satisfies all boundary constraints, reducing the constraint set to only pairwise non-overlap conditions. This significantly stabilizes SLSQP and prevents boundary violations.
+2. **Diverse Structural Initializations**: Generate dozens of initial configurations using hexagonal lattices with varying row distributions, random rotations, and scaling factors. Hexagonal packing is known to be near-optimal for dense circle arrangements.
+3. **Multi-Phase Refinement**: 
+   - Phase 1: Run SLSQP from each diverse initialization.
+   - Phase 2: Perform localized random perturbations in parameter space to escape shallow local minima.
+   - Phase 3: Implement a "shrink-and-grow" escape technique: temporarily shrink radii to relieve constraints, let the optimizer reposition centers to find new topological configurations, then expand radii again.
+   - Phase 4: High-precision final polishing with tight tolerances.
+4. **Strict Feasibility Handling**: Ensure all intermediate steps maintain strict feasibility within numerical tolerances, and clip parameters to safe bounds to prevent division by zero or invalid transformations.
+
+This combination leverages the mathematical structure of the problem, explores the configuration space thoroughly, and uses robust local search to push the sum of radii beyond the target of 2.636.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def obj(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[:N])
+
+def cons(params):
+    """Inequality constraints: pairwise non-overlap. Boundaries handled by parameterization."""
+    r = params[:N]
+    u = params[N:2*N]
+    v = params[2*N:3*N]
+    
+    # Parameterization guarantees r <= x <= 1-r and r <= y <= 1-r when u,v in [0,1]
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    
+    rs = r[:, None] + r[None, :]
+    return d2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2
+
+def make_params(c, r):
+    """Map physical centers/radii to (r, u, v) optimization parameters."""
+    d = np.clip(1.0 - 2.0 * r, 1e-6, 1.0)
+    u = np.clip((c[:, 0] - r) / d, 0.0, 1.0)
+    v = np.clip((c[:, 1] - r) / d, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def get_safe_radii(centers):
+    """Compute strictly feasible initial radii for given centers."""
+    n = centers.shape[0]
+    r = np.full(n, 0.1)
+    for _ in range(5):
+        for i in range(n):
+            mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt(np.sum((centers[i]-centers[j])**2))
+                    if d/2.0 < mx:
+                        mx = d/2.0
+            r[i] = mx * 0.95
+    return np.maximum(r, 1e-5)
+
+def hex_init(rows, seed=0, rot=0.0, sc=1.0):
+    """Generate a hexagonal lattice initialization with specified parameters."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    re = 0.095
+    y = re
+    for i, cnt in enumerate(rows):
+        sh = (i % 2) * re
+        x = re + sh
+        for _ in range(cnt):
+            pts.append([x, y])
+            x += 2.0 * re
+        y += np.sqrt(3.0) * re
+    pts = np.array(pts[:N])
+    pts = (pts - 0.5) * sc + 0.5
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+    pts += rng.uniform(-0.015, 0.015, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing():
+    np.random.seed(42)
+    bounds = [(1e-6, 0.499)]*N + [(0.0, 1.0)]*(2*N)
+    cons_dict = {'type': 'ineq', 'fun': cons}
+    
+    best_sum = -1.0
+    best_p = None
+    
+    # Diverse hexagonal row patterns for N=26
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [5,5,5,5,6], [6,4,6,5,5],
+        [7,5,5,5,4], [4,5,5,5,7], [5,5,7,5,4], [6,6,5,5,4], [8,5,5,5,3],
+        [5,5,5,5,5,1], [6,6,6,4,4], [7,6,5,5,3], [5,7,6,4,4], [6,5,7,5,3],
+        [4,5,6,6,5], [5,6,4,6,5], [5,6,6,4,5], [6,7,5,5,3], [5,5,6,5,5]
+    ]
+    
+    inits = []
+    for pat in patterns:
+        for s in range(6):
+            rot = np.random.uniform(-0.25, 0.25)
+            sc = np.random.uniform(0.88, 1.12)
+            pts = hex_init(pat, seed=s, rot=rot, sc=sc)
+            r_init = get_safe_radii(pts)
+            inits.append(make_params(pts, r_init))
+            
+    # Add purely random starts for topological diversity
+    for s in range(12):
+        rng = np.random.RandomState(s+100)
+        pts = rng.rand(N, 2)
+        pts += rng.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        r_init = get_safe_radii(pts)
+        inits.append(make_params(pts, r_init))
+        
+    # Phase 1: Broad search from diverse initializations
+    for p0 in inits:
+        try:
+            res = minimize(obj, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict, options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if res.success:
+                cv = cons(res.x)
+                if np.min(cv) >= -1e-8:
+                    s_val = -res.fun
+                    if s_val > best_sum:
+                        best_sum = s_val
+                        best_p = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_p is None:
+        best_p = inits[0]
+        best_sum = -obj(best_p)
+        
+    # Phase 2: Local perturbation refinement to escape local minima
+    for _ in range(35):
+        p0 = best_p.copy()
+        p0 += np.random.randn(3*N) * 0.004
+        p0[0::3] = np.clip(p0[0::3], 1e-6, 0.499)
+        p0[1::3] = np.clip(p0[1::3], 0.0, 1.0)
+        p0[2::3] = np.clip(p0[2::3], 0.0, 1.0)
+        
+        try:
+            res = minimize(obj, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict, options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+            if res.success and np.min(cons(res.x)) >= -1e-8:
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_p = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 3: Shrink-and-grow escape to find new topological configurations
+    for _ in range(20):
+        p0 = best_p.copy()
+        p0[:N] *= 0.94  # Shrink radii to relieve constraints
+        try:
+            res = minimize(obj, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict, options={'maxiter': 2500, 'ftol': 1e-12, 'disp': False})
+            if res.success and np.min(cons(res.x)) >= -1e-8:
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_p = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 4: High-precision polish
+    try:
+        res = minimize(obj, best_p, method='SLSQP', bounds=bounds,
+                       constraints=cons_dict, options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+        if res.success and np.min(cons(res.x)) >= -1e-9:
+            best_p = res.x
+            best_sum = -res.fun
+    except Exception:
+        pass
+        
+    # Reconstruct physical coordinates
+    r_opt = best_p[:N]
+    u_opt = best_p[N:2*N]
+    v_opt = best_p[2*N:3*N]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    radii = np.maximum(r_opt, 0.0)
+    return centers, radii, float(best_sum)
+```

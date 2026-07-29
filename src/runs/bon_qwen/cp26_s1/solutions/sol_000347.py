@@ -1,0 +1,168 @@
+# sol_000347 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2c580e0d) state=39ee1cd4 sum of radii=2.273021 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Returns centers, radii, and sum_radii.
+    """
+    n = 26
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+
+    # --- Helper Function: Solve LP for fixed centers ---
+    def get_optimal_radii(centers):
+        """
+        Given fixed centers, solve LP to maximize sum of radii.
+        """
+        c = -np.ones(n) # Minimize -sum(r)
+        
+        # Bounds for radii based on distance to boundaries
+        bounds = []
+        for i in range(n):
+            x, y = centers[i]
+            margin = min(x, 1.0 - x, y, 1.0 - y)
+            # Ensure non-negative bounds even if margin is slightly negative due to error
+            upper = max(0.0, margin)
+            bounds.append((0.0, upper))
+        
+        # Constraints: r_i + r_j <= dist(i, j)
+        num_constraints = n * (n - 1) // 2
+        A_ub = np.zeros((num_constraints, n))
+        b_ub = np.zeros(num_constraints)
+        
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                A_ub[idx, i] = 1.0
+                A_ub[idx, j] = 1.0
+                b_ub[idx] = dist
+                idx += 1
+        
+        try:
+            # Use HiGHS solver for efficiency
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                return -res.fun, res.x
+            else:
+                # Fallback to small radii if LP fails
+                return 0.0, np.zeros(n)
+        except Exception:
+            return 0.0, np.zeros(n)
+
+    # --- Initialization: Hexagonal Lattice ---
+    def init_hexagonal():
+        centers = np.zeros((n, 2))
+        # Attempt to place 26 points in a hexagonal grid
+        # Approximate radius for 26 circles ~ 0.1
+        # Diameter ~ 0.2
+        # Row spacing ~ 0.1732
+        
+        row_count = 5
+        row_heights = []
+        # 5, 6, 5, 6, 4 distribution fits well in unit square?
+        # Let's just fill a grid and trim
+        row_configs = [6, 5, 6, 5, 4] # Total 26
+        
+        current_y = 0.0
+        # Vertical spacing for hex packing with diameter d=0.2 is sqrt(3)/2 * 0.2 ~ 0.1732
+        # But we scale later. Let's just place them.
+        # Actually, let's place them uniformly first to cover space
+        
+        # Better heuristic: Spiral or simple grid perturbation
+        # Let's use a grid that is slightly perturbed
+        grid_x = np.linspace(0.1, 0.9, 5)
+        grid_y = np.linspace(0.1, 0.9, 5)
+        
+        # 5x5 grid gives 25 points. We need 26.
+        # Add one in the middle? No, center is 0.5, 0.5.
+        # Just generate random points in [0.1, 0.9] to avoid boundaries initially
+        centers = np.random.uniform(0.15, 0.85, (n, 2))
+        
+        # Sort by x then y to make it deterministic-ish if needed, 
+        # but random is fine for SA start.
+        return centers
+
+    # --- Simulated Annealing Optimization ---
+    def optimize_centers():
+        # Initialization
+        centers = init_hexagonal()
+        current_sum, _ = get_optimal_radii(centers)
+        best_centers = centers.copy()
+        best_sum = current_sum
+        
+        # SA Parameters
+        temp = 1.0
+        min_temp = 1e-10
+        alpha = 0.995
+        move_size = 0.05
+        
+        iterations = 0
+        max_iterations = 2000 # Limit iterations for runtime safety
+        
+        while temp > min_temp and iterations < max_iterations:
+            # Perturbation
+            new_centers = centers.copy()
+            # Randomly select a subset of circles to move
+            # Moving fewer circles helps local refinement
+            num_movers = np.random.randint(1, 6) 
+            indices = np.random.choice(n, num_movers, replace=False)
+            
+            for idx in indices:
+                # Gaussian perturbation
+                dx = np.random.normal(0, move_size)
+                dy = np.random.normal(0, move_size)
+                new_centers[idx][0] += dx
+                new_centers[idx][1] += dy
+                
+                # Clip to valid range [0, 1]
+                new_centers[idx][0] = np.clip(new_centers[idx][0], 0.01, 0.99)
+                new_centers[idx][1] = np.clip(new_centers[idx][1], 0.01, 0.99)
+            
+            new_sum, _ = get_optimal_radii(new_centers)
+            
+            # Acceptance criterion
+            delta = new_sum - current_sum
+            if delta > 0:
+                current_sum = new_sum
+                centers = new_centers
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = centers.copy()
+            else:
+                # Accept bad move with probability exp(delta / temp)
+                if np.random.rand() < np.exp(delta / temp):
+                    current_sum = new_sum
+                    centers = new_centers
+            
+            # Cooling
+            temp *= alpha
+            move_size *= 0.999 # Reduce step size slightly
+            iterations += 1
+            
+        return best_centers, best_sum
+
+    # Run optimization
+    # Multiple restarts could help, but time is limited. 
+    # One long SA run is usually sufficient for 26 variables.
+    final_centers, final_sum = optimize_centers()
+    
+    # Final radii calculation
+    _, final_radii = get_optimal_radii(final_centers)
+    
+    # Validation check (sanity)
+    # Ensure no negative radii due to numerical issues
+    final_radii = np.maximum(final_radii, 0.0)
+    
+    # Re-calculate sum
+    calculated_sum = np.sum(final_radii)
+    
+    return final_centers, final_radii, calculated_sum

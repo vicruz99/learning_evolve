@@ -1,210 +1,103 @@
 # sol_000007 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 6882cd8b) state=6130cc24 sum of radii=0.514899 correctness=1.0
+# generation=0 parent=seed (state e6663bde) state=70db8fc3 sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
+from scipy.optimize import minimize
 
+def objective(vars):
+    radii = vars[2::3]
+    return -np.sum(radii)
 
-def validate_internal(centers, radii):
-    """Internal validation with stricter tolerance"""
-    n = centers.shape[0]
+def constraint_func(vars):
+    n = 26
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    b1 = vars[0::3] - vars[2::3]
+    b2 = 1.0 - vars[0::3] - vars[2::3]
+    b3 = vars[1::3] - vars[2::3]
+    b4 = 1.0 - vars[1::3] - vars[2::3]
+    
+    centers = vars[:2*n].reshape(n, 2)
+    radii = vars[2*n:]
+    
+    # Overlap constraints: dist^2 >= (r1+r2)^2
+    overlap_cons = []
     for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -1e-14 or x + r > 1 + 1e-14 or y - r < -1e-14 or y + r > 1 + 1e-14:
-            return False
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-14:
-                return False
-    return True
-
-
-def optimize_packing(centers, radii, max_epochs=4000):
-    """Iterative growing and relaxation optimization"""
-    n = len(radii)
-    
-    for epoch in range(max_epochs):
-        # Adaptive growth rate - slower as we converge
-        progress = epoch / max_epochs
-        growth = 0.000008 * max(0.05, 1.0 - progress * 0.95)
-        
-        # Grow all radii
-        radii += growth
-        
-        # Relax positions to resolve overlaps
-        for step in range(4000):
-            forces = np.zeros_like(centers)
-            max_f = 0.0
+        for j in range(i+1, n):
+            dx = centers[i,0] - centers[j,0]
+            dy = centers[i,1] - centers[j,1]
+            dr = radii[i] + radii[j]
+            overlap_cons.append(dx*dx + dy*dy - dr*dr)
             
-            # Circle-circle repulsion
-            for i in range(n):
-                for j in range(i + 1, n):
-                    dx = centers[i, 0] - centers[j, 0]
-                    dy = centers[i, 1] - centers[j, 1]
-                    dist = np.sqrt(dx * dx + dy * dy + 1e-24)
-                    min_dist = radii[i] + radii[j]
-                    
-                    if dist < min_dist:
-                        overlap = min_dist - dist
-                        # Nonlinear repulsion for stronger push when deeply overlapped
-                        f = overlap * 800.0
-                        fx = f * dx / dist
-                        fy = f * dy / dist
-                        forces[i, 0] += fx
-                        forces[i, 1] += fy
-                        forces[j, 0] -= fx
-                        forces[j, 1] -= fy
-                        if f > max_f:
-                            max_f = f
-            
-            # Boundary repulsion
-            for i in range(n):
-                x, y = centers[i]
-                r = radii[i]
-                
-                if x - r < 0:
-                    f = (r - x) * 800.0
-                    forces[i, 0] += f
-                    if f > max_f:
-                        max_f = f
-                if x + r > 1:
-                    f = (x + r - 1) * 800.0
-                    forces[i, 0] -= f
-                    if f > max_f:
-                        max_f = f
-                if y - r < 0:
-                    f = (r - y) * 800.0
-                    forces[i, 1] += f
-                    if f > max_f:
-                        max_f = f
-                if y + r > 1:
-                    f = (y + r - 1) * 800.0
-                    forces[i, 1] -= f
-                    if f > max_f:
-                        max_f = f
-            
-            # Adaptive step size
-            alpha = 0.015 / (1.0 + max_f * 0.0005)
-            centers = centers + forces * alpha
-            
-            # Project to feasible region
-            for i in range(n):
-                centers[i, 0] = max(radii[i] + 1e-13, min(1.0 - radii[i] - 1e-13, centers[i, 0]))
-                centers[i, 1] = max(radii[i] + 1e-13, min(1.0 - radii[i] - 1e-13, centers[i, 1]))
-            
-            # Early stopping if converged
-            if max_f < 1e-18:
-                break
-        
-        # Check if configuration is valid
-        valid = validate_internal(centers, radii)
-        
-        if not valid:
-            # Back off
-            radii = radii - growth * 2.0
-            radii = np.maximum(radii, 0.001)
-    
-    return centers, radii
+    return np.concatenate([b1, b2, b3, b4, np.array(overlap_cons)])
 
+def generate_initial_guess(n_circles=26):
+    centers = []
+    base_x = np.linspace(0.2, 0.8, 5)
+    base_y = np.linspace(0.2, 0.8, 5)
+    for x in base_x:
+        for y in base_y:
+            centers.append((x, y))
+    centers.extend([(0.5, 0.1), (0.5, 0.9), (0.1, 0.5), (0.9, 0.5)])
+    np.random.shuffle(centers)
+    centers = np.array(centers[:n_circles])
+    centers += np.random.uniform(-0.05, 0.05, size=centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    radii = np.full(n_circles, 0.04)
 
-def create_hexagonal_config(n, row_counts, y_spacing, x_spacing, y_start, x_start):
-    """Create a hexagonal grid configuration"""
-    centers = np.zeros((n, 2))
-    idx = 0
-    
-    for row_i, count in enumerate(row_counts):
-        y = y_start + row_i * y_spacing
-        x_offset = x_start if row_i % 2 == 0 else x_start + x_spacing / 2.0
-        for col_j in range(count):
-            x = x_offset + col_j * x_spacing
-            centers[idx, 0] = x
-            centers[idx, 1] = y
-            idx += 1
-    
-    return centers
+    # Ensure initial feasibility by shrinking overlapping circles
+    for _ in range(100):
+        changed = False
+        for i in range(n_circles):
+            for j in range(i+1, n_circles):
+                dist = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                if dist < radii[i] + radii[j]:
+                    new_r = dist / 2.0
+                    radii[i] = min(radii[i], new_r)
+                    radii[j] = min(radii[j], new_r)
+                    changed = True
+        if not changed:
+            break
 
+    vars_init = np.zeros(3 * n_circles)
+    for i in range(n_circles):
+        vars_init[3*i] = centers[i,0]
+        vars_init[3*i+1] = centers[i,1]
+        vars_init[3*i+2] = radii[i]
+    return vars_init
 
 def run_packing():
     n = 26
-    
-    best_sum = 0.0
-    best_centers = np.zeros((n, 2))
-    best_radii = np.full(n, 0.01)
-    
-    # Define multiple initial configurations to try
-    configs = []
-    
-    # Config 1: Rows [5,5,5,5,4,2]
-    configs.append(create_hexagonal_config(n, [5, 5, 5, 5, 4, 2], 
-                                          y_spacing=0.112, x_spacing=0.133, 
-                                          y_start=0.06, x_start=0.035))
-    
-    # Config 2: Rows [6,5,5,5,4,1]
-    configs.append(create_hexagonal_config(n, [6, 5, 5, 5, 4, 1], 
-                                          y_spacing=0.115, x_spacing=0.130, 
-                                          y_start=0.055, x_start=0.028))
-    
-    # Config 3: Rows [5,5,5,5,5,1]
-    configs.append(create_hexagonal_config(n, [5, 5, 5, 5, 5, 1], 
-                                          y_spacing=0.118, x_spacing=0.135, 
-                                          y_start=0.055, x_start=0.030))
-    
-    # Config 4: Rows [4,5,5,5,5,2]
-    configs.append(create_hexagonal_config(n, [4, 5, 5, 5, 5, 2], 
-                                          y_spacing=0.115, x_spacing=0.138, 
-                                          y_start=0.06, x_start=0.05))
-    
-    # Config 5: Rows [5,5,5,5,3,3]
-    configs.append(create_hexagonal_config(n, [5, 5, 5, 5, 3, 3], 
-                                          y_spacing=0.113, x_spacing=0.140, 
-                                          y_start=0.058, x_start=0.040))
-    
-    # Config 6: Rows [4,5,5,5,4,3]
-    configs.append(create_hexagonal_config(n, [4, 5, 5, 5, 4, 3], 
-                                          y_spacing=0.112, x_spacing=0.142, 
-                                          y_start=0.060, x_start=0.055))
-    
-    # Config 7: Rows [5,5,5,4,4,3]
-    configs.append(create_hexagonal_config(n, [5, 5, 5, 4, 4, 3], 
-                                          y_spacing=0.118, x_spacing=0.145, 
-                                          y_start=0.055, x_start=0.035))
-    
-    # Config 8: Rows [3,5,5,5,5,3]
-    configs.append(create_hexagonal_config(n, [3, 5, 5, 5, 5, 3], 
-                                          y_spacing=0.113, x_spacing=0.150, 
-                                          y_start=0.058, x_start=0.060))
-    
-    # Config 9: Rows [5,5,5,5,5,1] with tighter spacing
-    configs.append(create_hexagonal_config(n, [5, 5, 5, 5, 5, 1], 
-                                          y_spacing=0.110, x_spacing=0.128, 
-                                          y_start=0.065, x_start=0.038))
-    
-    # Config 10: Rows [6,5,5,5,5]
-    configs.append(create_hexagonal_config(n, [6, 5, 5, 5, 5], 
-                                          y_spacing=0.125, x_spacing=0.135, 
-                                          y_start=0.060, x_start=0.030))
-    
-    for config_idx, init_centers in enumerate(configs):
-        centers = init_centers.copy()
-        radii = np.full(n, 0.003)
-        
-        # Run optimization
-        centers, radii = optimize_packing(centers, radii, max_epochs=4000)
-        
-        current_sum = np.sum(radii)
-        
-        if current_sum > best_sum:
-            best_sum = current_sum
-            best_centers = centers.copy()
-            best_radii = radii.copy()
-    
-    # Final cleanup: ensure strict validity with margin
-    for i in range(n):
-        best_centers[i, 0] = max(best_radii[i] + 1e-10, min(1.0 - best_radii[i] - 1e-10, best_centers[i, 0]))
-        best_centers[i, 1] = max(best_radii[i] + 1e-10, min(1.0 - best_radii[i] - 1e-10, best_centers[i, 1]))
-    
-    return best_centers, best_radii, np.sum(best_radii)
+    best_x = None
+    best_val = -np.inf
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+
+    for seed in range(15):
+        np.random.seed(seed)
+        x0 = generate_initial_guess(n)
+        try:
+            res = minimize(objective, x0, method='SLSQP',
+                           constraints={'type': 'ineq', 'fun': constraint_func},
+                           bounds=bounds,
+                           options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            if not np.isnan(res.fun) and -res.fun > best_val:
+                best_val = -res.fun
+                best_x = res.x.copy()
+        except Exception:
+            continue
+
+    if best_x is None:
+        best_x = generate_initial_guess(n)
+        best_val = -objective(best_x)
+
+    centers = best_x[:2*n].reshape(n, 2)
+    radii = best_x[2*n:]
+
+    # Final safety clipping to handle numerical drift
+    radii = np.clip(radii, 0.0, None)
+    centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+    centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+
+    return centers, radii, float(best_val)

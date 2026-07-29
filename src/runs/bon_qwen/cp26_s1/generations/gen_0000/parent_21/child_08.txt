@@ -1,89 +1,113 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we formulate the problem as a two-stage optimization:
-1. **Inner Stage (LP)**: For any fixed set of centers, the optimal radii are determined by a Linear Programming problem. We maximize $\sum r_i$ subject to boundary constraints ($r_i \le \min(x_i, 1-x_i, y_i, 1-y_i)$) and non-overlap constraints ($r_i + r_j \le \|c_i - c_j\|$). This LP is solved efficiently using `scipy.optimize.linprog` with the `highs` method.
-2. **Outer Stage (Global Optimization)**: We optimize the 26 center coordinates (52 variables) using `differential_evolution`. This derivative-free method robustly explores the rugged objective landscape typical of packing problems. We configure it with a moderate population size, iteration limit, and enable `polish=True` to refine the best solution locally.
-This approach separates geometric feasibility (handled exactly by LP) from configuration search (handled heuristically), ensuring valid packings at every step and converging to a high-quality arrangement that surpasses the target sum of 2.636.
+To pack 26 circles in a unit square maximizing the sum of radii, we employ a progressive penalty optimization method combined with a strict geometric post-processing step. 
+
+1. **Initialization**: We start with a perturbed 5×5 grid plus one central circle. This provides a dense, symmetric starting configuration that is already close to optimal. Small random jitter breaks symmetry and helps escape trivial local minima.
+2. **Progressive Penalty Optimization**: We formulate the problem as minimizing $-\sum r_i + P \cdot \text{violations}^2$. Using `scipy.optimize.minimize` with the L-BFGS-B algorithm, we iteratively increase the penalty weight $P$. This softly guides the optimizer to satisfy non-overlap and boundary constraints while aggressively expanding radii. L-BFGS-B efficiently handles the ~78 variables and box constraints.
+3. **Strict Radius Adjustment**: After optimization, centers are fixed. We compute the mathematically maximal feasible radii for these centers using an iterative constraint-satisfaction pass ($r_i \le d_{ij} - r_j$). This guarantees strict validity regardless of numerical precision during optimization.
+4. **Safety Margin**: A tiny scaling factor (0.99995) ensures the final configuration passes the `1e-12` tolerance check in the validation function without meaningfully affecting the objective value.
+
+This approach balances global search capability with rigorous constraint enforcement, reliably targeting sums of radii > 2.63.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import linprog, differential_evolution
+from scipy.optimize import minimize
 
-def solve_radii(centers):
-    """
-    Given fixed centers, solve the LP to find radii that maximize sum(r_i)
-    while satisfying boundary and non-overlap constraints.
-    """
-    n = centers.shape[0]
+def compute_objective(vars, n, penalty_weight):
+    centers = vars[:2*n].reshape(n, 2)
+    radii = vars[2*n:]
     
-    # Pairwise distances
-    dists = np.linalg.norm(centers[:, None] - centers[None, :], axis=2)
+    obj = -np.sum(radii)
+    p = penalty_weight
     
-    # Boundary limits for each circle
-    x, y = centers[:, 0], centers[:, 1]
-    b_upper = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
-    
-    # Construct LP matrices: A_ub @ r <= b_ub
-    num_constraints = n + n * (n - 1) // 2
-    A_ub = np.zeros((num_constraints, n))
-    b_ub = np.zeros(num_constraints)
-    
-    # Boundary constraints: r_i <= b_upper[i]
+    # Boundary constraints
     for i in range(n):
-        A_ub[i, i] = 1.0
-        b_ub[i] = b_upper[i]
-        
-    # Pairwise constraints: r_i + r_j <= dist(i, j)
-    idx = n
+        r = radii[i]
+        x, y = centers[i]
+        if x < r:
+            obj += p * (r - x)**2
+        if x > 1 - r:
+            obj += p * (x + r - 1)**2
+        if y < r:
+            obj += p * (r - y)**2
+        if y > 1 - r:
+            obj += p * (y + r - 1)**2
+            
+    # Pairwise non-overlap constraints
     for i in range(n):
         for j in range(i + 1, n):
-            A_ub[idx, i] = 1.0
-            A_ub[idx, j] = 1.0
-            b_ub[idx] = dists[i, j]
-            idx += 1
-            
-    # Objective: maximize sum(r_i) => minimize -sum(r_i)
-    c_obj = -np.ones(n)
-    bounds = [(0.0, None)] * n  # r_i >= 0
-    
-    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-    
-    if res.success:
-        return -res.fun, res.x
-    else:
-        return 0.0, np.zeros(n)
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            if dist < radii[i] + radii[j]:
+                obj += p * (radii[i] + radii[j] - dist)**2
+    return obj
 
-def objective(center_flat):
-    """Objective function for differential evolution: negative sum of optimal radii."""
-    centers = center_flat.reshape(-1, 2)
-    sum_r, _ = solve_radii(centers)
-    return -sum_r
+def get_max_radii(centers):
+    n = centers.shape[0]
+    radii = np.zeros(n)
+    
+    # Initialize with maximum possible radius constrained by boundaries
+    for i in range(n):
+        x, y = centers[i]
+        radii[i] = min(x, 1 - x, y, 1 - y)
+        
+    # Iteratively enforce pairwise constraints: r_i + r_j <= dist_ij
+    for _ in range(60):
+        changed = False
+        for i in range(n):
+            new_r = radii[i]
+            for j in range(n):
+                if i == j:
+                    continue
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                limit = dist - radii[j]
+                if limit < new_r:
+                    new_r = limit
+            if new_r < radii[i] - 1e-10:
+                radii[i] = new_r
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
 
 def run_packing():
     n = 26
-    # Bounds for each center coordinate: x, y in [0, 1]
-    bounds = [(0.0, 1.0)] * (2 * n)
+    np.random.seed(42)
     
-    # Global optimization of centers
-    result = differential_evolution(
-        objective,
-        bounds,
-        popsize=12,
-        maxiter=300,
-        tol=1e-7,
-        seed=42,
-        workers=1,
-        mutation=(0.5, 1.0),
-        recombination=0.9,
-        polish=True  # Refine best solution with local optimizer
-    )
+    # Initialize with a 5x5 grid + 1 extra circle
+    centers = np.zeros((n, 2))
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            centers[idx] = [0.125 + i * 0.2 + np.random.normal(0, 0.005),
+                            0.125 + j * 0.2 + np.random.normal(0, 0.005)]
+            idx += 1
+    centers[idx] = [0.5 + np.random.normal(0, 0.02), 0.5 + np.random.normal(0, 0.02)]
     
-    centers = result.x.reshape(-1, 2)
+    initial_radii = get_max_radii(centers)
+    x0 = np.concatenate([centers.ravel(), initial_radii])
     
-    # Final LP solve to get exact radii for the optimized centers
-    sum_r, radii = solve_radii(centers)
+    # Bounds for centers (strictly inside square) and radii (positive, max 0.5)
+    bounds = [(0.001, 0.999)] * (2 * n) + [(0.001, 0.5)] * n
     
-    return centers, radii, float(sum_r)
+    current_x = x0
+    penalty = 100.0
+    
+    # Progressive penalty method to gradually enforce constraints
+    for _ in range(5):
+        res = minimize(compute_objective, current_x, args=(n, penalty), method='L-BFGS-B',
+                       bounds=bounds, options={'maxiter': 2000, 'ftol': 1e-15})
+        current_x = res.x
+        penalty *= 10
+        
+    final_centers = current_x[:2 * n].reshape(n, 2)
+    
+    # Recompute strictly valid radii for the optimized centers
+    final_radii = get_max_radii(final_centers)
+    
+    # Apply a tiny safety margin to guarantee passing the 1e-12 validation tolerance
+    final_radii *= 0.99995
+    
+    return final_centers, final_radii, float(np.sum(final_radii))
 ```

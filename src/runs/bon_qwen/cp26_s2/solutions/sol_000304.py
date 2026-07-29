@@ -1,0 +1,163 @@
+# sol_000304 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 525683f8) state=8383feed sum of radii=2.524406 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square [0,1]x[0,1] to maximize sum of radii.
+    Uses iterative local optimization (growing circles into free space).
+    """
+    n = 26
+    
+    # 1. Initialization: Hexagonal Packing
+    # Estimate a starting radius. 
+    # For 25 circles in 5x5 grid, r=0.1. For 26, slightly less or similar with hex packing.
+    # Let's try to fit them in a hex grid.
+    
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Hexagonal grid generation
+    # Rows and columns
+    # Approximate radius 0.1
+    r_est = 0.1
+    dx = 2.0 * r_est
+    dy = math.sqrt(3) * r_est
+    
+    # Try to fit in rows
+    # 5 rows of 5 circles = 25, plus 1
+    # Or 6 rows?
+    # Let's try a dense arrangement.
+    # 5 circles per row requires width 5*2r = 1.0. Too tight.
+    # Let's aim for radius ~0.101
+    
+    # Let's generate centers in a hex pattern and then scale/adjust
+    row_count = 6
+    # Distribution: 4, 5, 4, 5, 4, 4 -> 26? No, 4+5+4+5+4+4 = 26.
+    # Row counts: [5, 5, 5, 5, 4, 2]?
+    # Let's just place them in a grid and let optimizer fix it.
+    
+    # Simple 5x5 grid + 1 extra
+    # Coordinates for 5x5 grid with spacing 0.2
+    # To fit 5 circles of diameter 0.2, need width 1.0.
+    # Centers at 0.1, 0.3, 0.5, 0.7, 0.9
+    xs = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    ys = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    
+    idx = 0
+    # Fill 5x5 grid
+    for r in range(5):
+        for c in range(5):
+            if idx < n:
+                centers[idx] = [xs[c], ys[r]]
+                radii[idx] = 0.1
+                idx += 1
+    
+    # The 26th circle (index 25)
+    # Place it in a corner or center gap?
+    # Center is (0.5, 0.5). Occupied by circle at index 12 (middle).
+    # Maybe shift the last one?
+    # Actually, the optimizer will move it.
+    # Let's place it at (0.5, 0.5) initially with small radius?
+    # But (0.5, 0.5) is occupied.
+    # Let's place it at (0.5, 0.1) - occupied? No, (0.5, 0.1) is index 2.
+    # Let's just duplicate one or place near center.
+    if idx < n:
+        # Place near center but slightly offset
+        centers[idx] = [0.5, 0.5]
+        radii[idx] = 0.01 # Small radius to avoid huge overlap initially
+        
+    # 2. Optimization
+    # We want to maximize sum(radii).
+    # We will iterate: for each circle, find best position to maximize its radius
+    # given fixed neighbors.
+    
+    # Helper to compute max radius at (x,y) given other circles
+    def max_radius_at(pos, c_i_idx, current_centers, current_radii):
+        x, y = pos
+        r_max = min(x, 1-x, y, 1-y) # Boundary constraints
+        
+        for j in range(len(current_radii)):
+            if j == c_i_idx:
+                continue
+            cx, cy = current_centers[j]
+            rj = current_radii[j]
+            dist = math.sqrt((x - cx)**2 + (y - cy)**2)
+            # Constraint: dist >= r_i + r_j => r_i <= dist - r_j
+            r_limit = dist - rj
+            if r_limit < r_max:
+                r_max = r_limit
+        
+        return max(0.0, r_max)
+
+    # Function to optimize for circle i
+    # We want to maximize r_i.
+    # r_i(x,y) = max_radius_at((x,y), ...)
+    # We minimize -r_i(x,y)
+    def objective(pos, c_i_idx, current_centers, current_radii):
+        return -max_radius_at(pos, c_i_idx, current_centers, current_radii)
+
+    # Run iterations
+    num_epochs = 20
+    
+    for epoch in range(num_epochs):
+        # Randomize order to avoid bias
+        indices = np.random.permutation(n)
+        
+        for i in indices:
+            # Optimize position for circle i
+            # Current position
+            x0 = centers[i]
+            
+            # Use Nelder-Mead to find best position
+            # Bounds for x, y are [0, 1] but we can restrict slightly to avoid boundary issues?
+            # Actually Nelder-Mead handles bounds if we use bounds, but standard doesn't.
+            # We can use 'L-BFGS-B' with bounds, but objective is non-smooth.
+            # Nelder-Mead is robust for non-smooth. We just need to ensure pos stays in [0,1].
+            # We can wrap the objective to return penalty if out of bounds.
+            
+            def bounded_obj(pos):
+                # Check bounds
+                if pos[0] < 0 or pos[0] > 1 or pos[1] < 0 or pos[1] > 1:
+                    return 1e6 # Large penalty
+                return objective(pos, i, centers, radii)
+
+            # Multi-start might be needed, but let's try single start from current pos
+            # Initial simplex size
+            res = minimize(bounded_obj, x0, method='Nelder-Mead', 
+                           options={'xatol': 1e-6, 'fatol': 1e-6, 'maxiter': 200})
+            
+            best_pos = res.x
+            best_r = -res.fun
+            
+            # Update
+            centers[i] = best_pos
+            radii[i] = best_r
+            
+        # After one epoch, sum radii
+        # Optional: print progress
+        # print(f"Epoch {epoch}: Sum radii = {np.sum(radii):.5f}")
+
+    # Final clean up: ensure no overlaps due to numerical noise
+    # Re-calculate radii based on final positions to be safe
+    # Although the loop ensures valid radii, floating point errors might cause slight issues.
+    # Let's re-verify and clip radii.
+    
+    # However, the logic inside max_radius_at ensures r <= dist - rj.
+    # So r_i + r_j <= dist.
+    # It should be valid.
+    
+    # Just to be absolutely sure and maybe squeeze a bit more?
+    # The radii calculated are the maximal possible for that position.
+    # So they are tight.
+    
+    sum_r = np.sum(radii)
+    
+    # Return
+    return centers, radii, sum_r

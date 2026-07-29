@@ -1,0 +1,224 @@
+
+
+<strategy>
+To improve upon the current packing sum of radii (~2.625), I will implement a multi-phase optimization pipeline that combines global search, exact radius calculation, and joint geometric sizing:
+
+1. **Global Exploration (Differential Evolution)**: Use `differential_evolution` to search the 52-dimensional space of circle centers. The objective function computes the maximum sum of radii for fixed centers using Linear Programming (LP), which correctly handles variable radii and boundary constraints.
+2. **Structured & Random Refinement (Powell)**: Run derivative-free optimization from multiple high-quality starting points (hexagonal lattices with varying densities, plus random seeds) to find robust local optima that DE might miss.
+3. **Hill-Climbing Local Search**: Perform an iterative coordinate-wise perturbation search. Moving one circle at a time and re-optimizing radii via LP allows the system to escape shallow local minima and tighten contacts effectively.
+4. **Joint Optimization (SLSQP)**: Use `SLSQP` to simultaneously optimize centers and radii with explicit boundary and non-overlap constraints. This phase fine-tunes the continuous geometry and sizes together, often pushing past the LP-fixed-center limit.
+5. **Final LP & Numerical Repair**: Re-solve the LP on the best-found centers to guarantee radii are mathematically maximal for that geometry, followed by a strict repair pass to clamp boundary violations and resolve sub-1e-10 overlaps, ensuring the validation function passes cleanly.
+
+This strategy leverages the speed of `highs` LP solver, the robustness of derivative-free methods for non-convex landscapes, and the precision of constrained gradient-based optimization for the final polish.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+N = 26
+
+def get_lp_radii_and_sum(centers):
+    """Computes optimal radii and their sum for fixed centers using LP."""
+    c = np.clip(centers, 0.005, 0.995)
+    xb = np.minimum(c[:, 0], 1.0 - c[:, 0])
+    yb = np.minimum(c[:, 1], 1.0 - c[:, 1])
+    ub = np.minimum(xb, yb)
+    
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    n_pairs = N * (N - 1) // 2
+    A_ub = np.zeros((n_pairs + N, N))
+    b_ub = np.zeros(n_pairs + N)
+    
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+    for i in range(N):
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = ub[i]
+        idx += 1
+        
+    res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)] * N, method='highs')
+    if res.success:
+        return res.x, -res.fun
+    return np.full(N, 1e-9), 1e-9
+
+def obj_centers(v):
+    """Objective for center optimization: negative sum of optimal radii."""
+    c = v.reshape(N, 2)
+    _, s = get_lp_radii_and_sum(c)
+    return -s
+
+def constraint_fun(p):
+    """Boundary and non-overlap constraints for SLSQP (must be >= 0)."""
+    x, y, r = p[0::3], p[1::3], p[2::3]
+    con = []
+    con.append(x - r)
+    con.append(1.0 - x - r)
+    con.append(y - r)
+    con.append(1.0 - y - r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    dists = np.hypot(dx, dy)
+    
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    con.append(dists[mask] - dr[mask])
+    
+    return np.concatenate(con)
+
+def objective_fun(p):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(p[2::3])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Differential Evolution for global exploration
+    bounds_de = [(0.05, 0.95)] * (2 * N)
+    try:
+        res_de = differential_evolution(obj_centers, bounds_de, seed=42, 
+                                        maxiter=50, popsize=8, tol=1e-7, 
+                                        mutation=(0.5, 1.0), recombination=0.9, 
+                                        polish=False)
+        c_de = res_de.x.reshape(N, 2)
+        r_de, s_de = get_lp_radii_and_sum(c_de)
+        best_sum = s_de
+        best_centers = c_de
+        best_radii = r_de
+    except Exception:
+        pass
+
+    # Phase 2: Structured & Random Starts with Powell
+    starts = []
+    for r0 in [0.08, 0.09, 0.10, 0.105]:
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x = r0 if row % 2 == 0 else 2 * r0
+            while x + r0 <= 1.0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        pts = np.array(pts[:N]) + np.random.normal(0, 0.002, (N, 2))
+        starts.append(pts.flatten())
+        
+    for _ in range(8):
+        starts.append(np.random.uniform(0.1, 0.9, (N, 2)).flatten())
+        
+    bounds_p = [(0.02, 0.98)] * (2 * N)
+    
+    for s in starts:
+        try:
+            res = minimize(obj_centers, s, method='Powell', bounds=bounds_p,
+                           options={'maxiter': 1500, 'ftol': 1e-12, 'xtol': 1e-12})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_centers = res.x.reshape(N, 2)
+                best_radii, _ = get_lp_radii_and_sum(best_centers)
+        except Exception:
+            continue
+
+    # Phase 3: Hill-Climbing Local Search
+    curr_centers = best_centers.copy()
+    curr_radii = best_radii.copy()
+    curr_sum = best_sum
+    
+    step = 0.02
+    for epoch in range(25):
+        improved = False
+        for i in range(N):
+            best_local = curr_sum
+            best_local_c = curr_centers[i].copy()
+            
+            for _ in range(15):
+                candidate = curr_centers[i] + np.random.normal(0, step, 2)
+                candidate = np.clip(candidate, 0.02, 0.98)
+                temp_c = curr_centers.copy()
+                temp_c[i] = candidate
+                _, s = get_lp_radii_and_sum(temp_c)
+                if s > best_local:
+                    best_local = s
+                    best_local_c = candidate
+            
+            if best_local > curr_sum + 1e-7:
+                curr_centers[i] = best_local_c
+                curr_sum = best_local
+                curr_radii, _ = get_lp_radii_and_sum(curr_centers)
+                improved = True
+        
+        if not improved:
+            step *= 0.8
+        else:
+            step *= 1.05
+            step = min(step, 0.05)
+            
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = curr_centers.copy()
+            best_radii = curr_radii.copy()
+
+    # Phase 4: Joint SLSQP Optimization
+    p0 = np.zeros(3 * N)
+    p0[0::3] = best_centers[:, 0]
+    p0[1::3] = best_centers[:, 1]
+    p0[2::3] = best_radii * 0.995
+    
+    bounds_opt = []
+    for _ in range(N):
+        bounds_opt.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = {'type': 'ineq', 'fun': constraint_fun}
+    
+    try:
+        res = minimize(objective_fun, p0, method='SLSQP', bounds=bounds_opt,
+                       constraints=cons, options={'maxiter': 6000, 'ftol': 1e-14})
+        if -res.fun > best_sum:
+            best_sum = -res.fun
+            best_centers = res.x[:2*N].reshape(N, 2)
+            best_radii = res.x[2*N:].copy()
+    except Exception:
+        pass
+
+    # Phase 5: Final LP Refinement & Numerical Repair
+    radii = get_lp_radii_and_sum(best_centers)[0]
+    
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            max_r = min(best_centers[i, 0], 1.0 - best_centers[i, 0],
+                        best_centers[i, 1], 1.0 - best_centers[i, 1])
+            if radii[i] > max_r - 1e-10:
+                radii[i] = max_r
+                changed = True
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                             best_centers[i, 1] - best_centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    ov = radii[i] + radii[j] - d
+                    radii[i] -= ov * 0.5
+                    radii[j] -= ov * 0.5
+                    changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    
+    return best_centers, radii, final_sum
+```

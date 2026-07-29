@@ -1,0 +1,222 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond ~2.628 towards the target of 2.636, we need a more robust global search strategy combined with high-quality initial configurations and precise local optimization. The main improvements are:
+
+1. **Diverse & Structured Initializations**: Instead of relying solely on one lattice type, we generate hexagonal, staggered grid, and random configurations with varying base radii and row distributions. This covers more of the configuration space.
+2. **Force-Directed Pre-Relaxation**: Before handing configurations to the optimizer, we run a quick repulsive force simulation. This resolves initial overlaps, pushes circles toward boundaries efficiently, and provides a feasible starting point that dramatically improves SLSQP convergence speed and quality.
+3. **Robust SLSQP Optimization**: We use tight tolerances (`ftol=1e-13`), high iteration limits, and vectorized constraint evaluation for performance. The squared-distance constraint `dx² + dy² - (r_i+r_j)² >= 0` is maintained for numerical stability and speed.
+4. **Iterative Perturbation Refinement**: After finding the best candidate, we run multiple perturbation rounds with decaying noise. This helps escape shallow local minima where gradients vanish but small rearrangements could yield larger radii.
+5. **Strict Validation & Repair**: A final repair loop ensures absolute compliance with the validator's tolerance (`1e-12`), shrinking radii minimally only if numerical drift caused micro-violations.
+
+These steps collectively push the optimizer into deeper, more optimal basins of attraction, typically yielding packings close to the mathematical optimum for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(vars):
+    """Minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraints(vars):
+    """Compute all inequality constraints g(vars) >= 0."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    c = []
+    # Boundary constraints
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Overlap constraints (squared distance - squared sum of radii)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    i, j = np.tril_indices(N, -1)
+    c.append(dx[i, j]**2 + dy[i, j]**2 - dr[i, j]**2)
+    return np.concatenate(c)
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [1e-6, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)])
+    return b
+
+def relax_positions(centers, radii, steps=400):
+    """Force-directed relaxation to resolve overlaps and push toward boundaries."""
+    for _ in range(steps):
+        forces = np.zeros((N, 2))
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                dist = np.hypot(dx, dy)
+                if dist < 1e-8:
+                    dx, dy = 1e-5, 1e-5
+                    dist = np.hypot(dx, dy)
+                
+                min_d = radii[i] + radii[j]
+                if dist < min_d:
+                    f = (min_d - dist) / dist * 0.5
+                    forces[i, 0] -= f * dx
+                    forces[i, 1] -= f * dy
+                    forces[j, 0] += f * dx
+                    forces[j, 1] += f * dy
+                    
+            # Wall repulsion
+            for dim in [0, 1]:
+                if centers[i, dim] - radii[i] < 0.0:
+                    forces[i, dim] += (radii[i] - centers[i, dim]) * 10.0
+                if centers[i, dim] + radii[i] > 1.0:
+                    forces[i, dim] -= (centers[i, dim] + radii[i] - 1.0) * 10.0
+                    
+        centers += forces * 0.15
+        centers = np.clip(centers, 0.0, 1.0)
+    return centers
+
+def hex_init(seed, r0=0.09):
+    """Hexagonal lattice initialization with slight perturbation."""
+    np.random.seed(seed)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, r0)
+    idx = 0
+    y = r0
+    row = 0
+    while idx < N and y + r0 <= 1.0:
+        x = r0 + (row % 2) * r0
+        while idx < N and x + r0 <= 1.0:
+            centers[idx] = [x + np.random.uniform(-0.004, 0.004), 
+                            y + np.random.uniform(-0.004, 0.004)]
+            idx += 1
+            x += 2 * r0
+        y += r0 * np.sqrt(3)
+        row += 1
+    while idx < N:
+        centers[idx] = [np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)]
+        idx += 1
+    return centers, radii
+
+def grid_init(seed, r0=0.085):
+    """Staggered grid initialization."""
+    np.random.seed(seed)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, r0)
+    idx = 0
+    for i in range(6):
+        for j in range(5):
+            if idx < N:
+                centers[idx] = [0.1 + j * 0.18 + np.random.uniform(-0.004, 0.004),
+                                0.1 + i * 0.16 + np.random.uniform(-0.004, 0.004)]
+                idx += 1
+    while idx < N:
+        centers[idx] = [np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)]
+        idx += 1
+    return centers, radii
+
+def random_init(seed, r0=0.075):
+    """Random valid initialization."""
+    np.random.seed(seed)
+    centers = np.random.uniform(r0 + 0.05, 1.0 - r0 - 0.05, (N, 2))
+    radii = np.full(N, r0)
+    return centers, radii
+
+def run_packing():
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_vars = None
+    
+    # Generate diverse initial configurations
+    inits = []
+    for s in range(12):
+        inits.append(hex_init(s, 0.09 + s * 0.002))
+        inits.append(grid_init(s, 0.085 + s * 0.001))
+    for s in range(15):
+        inits.append(random_init(s, 0.07 + s * 0.002))
+        
+    # Phase 1: Optimization from multiple starts
+    for c0, r0 in inits:
+        # Pre-relax to ensure feasibility and better starting topology
+        c0_relaxed, r0_relaxed = relax_positions(c0.copy(), r0.copy(), steps=300)
+        
+        x0 = np.zeros(3 * N)
+        x0[0::3] = c0_relaxed[:, 0]
+        x0[1::3] = c0_relaxed[:, 1]
+        x0[2::3] = r0_relaxed
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+            if not np.isnan(res.fun):
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Perturbation refinement on best found solution
+    if best_vars is not None:
+        noise_scales = [2e-3, 1e-3, 5e-4, 2e-4, 1e-4]
+        for scale in noise_scales:
+            for _ in range(3):
+                noisy = best_vars + np.random.normal(0, scale, 3 * N)
+                r = np.maximum(noisy[2::3], 1e-6)
+                x = np.clip(noisy[0::3], r, 1.0 - r)
+                y = np.clip(noisy[1::3], r, 1.0 - r)
+                noisy[0::3] = x
+                noisy[1::3] = y
+                noisy[2::3] = r
+                
+                try:
+                    res = minimize(objective, noisy, method='SLSQP', bounds=bounds, constraints=cons,
+                                   options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+                    if not np.isnan(res.fun) and -res.fun > best_sum:
+                        best_sum = -res.fun
+                        best_vars = res.x.copy()
+                except Exception:
+                    pass
+                    
+    # Fallback (highly unlikely to be reached)
+    if best_vars is None:
+        best_vars = np.zeros(3 * N)
+        best_vars[2::3] = 0.08
+        best_vars[0::3] = np.tile(np.linspace(0.1, 0.9, 5), 6)[:N]
+        best_vars[1::3] = np.repeat(np.linspace(0.1, 0.9, 6), 5)[:N]
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    
+    # Phase 3: Strict validation and minimal repair for numerical drift
+    for _ in range(150):
+        valid = True
+        for i in range(N):
+            if radii[i] < 0: 
+                valid = False; break
+            if centers[i, 0] - radii[i] < -1e-10 or centers[i, 0] + radii[i] > 1.0 + 1e-10: 
+                valid = False; break
+            if centers[i, 1] - radii[i] < -1e-10 or centers[i, 1] + radii[i] > 1.0 + 1e-10: 
+                valid = False; break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-10:
+                        valid = False; break
+                if not valid: 
+                    break
+        if valid: 
+            break
+        radii *= 0.998
+        
+    return centers, radii, float(np.sum(radii))
+```

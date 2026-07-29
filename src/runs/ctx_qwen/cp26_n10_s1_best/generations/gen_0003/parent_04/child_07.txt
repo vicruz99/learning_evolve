@@ -1,0 +1,395 @@
+
+
+Looking at the current state and past solutions, I need to implement a more sophisticated approach to escape local minima and find better packings. The key insight is that alternating between optimizing centers (NLP) and radii (LP for fixed centers) can escape local minima that SLSQP alone cannot.
+
+<strategy>
+1. Use a two-phase alternating optimization: 
+   - Phase A: Fix centers, solve LP to find optimal radii (maximize sum with r_i + r_j <= dist(i,j) and boundary constraints)
+   - Phase B: Fix radii, use SLSQP to optimize centers
+   This alternation can escape local minima that pure NLP gets stuck in.
+
+2. Generate diverse initial configurations:
+   - Multiple rotated hexagonal lattices with varying densities
+   - Force-directed layouts to find non-lattice structures
+   - Perturbed versions of the best known solutions
+
+3. Use constraint relaxation and careful feasibility restoration
+
+4. Implement a final polishing phase with aggressive local search
+
+5. Use vectorized computations for efficiency to allow more optimization iterations
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import math
+
+N_CIRCLES = 26
+
+def objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Compute all boundary and non-overlap constraints as a vector >= 0."""
+    cx = x[0::3]
+    cy = x[1::3]
+    cr = x[2::3]
+    
+    # Boundary constraints: 4 * N
+    b = np.concatenate([cx - cr, 1.0 - cx - cr, cy - cr, 1.0 - cy - cr])
+    
+    # Overlap constraints: N*(N-1)/2
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dr = cr[:, None] + cr[None, :]
+    
+    idx = np.tril_indices(N_CIRCLES, -1)
+    o = dx[idx]**2 + dy[idx]**2 - dr[idx]**2
+    
+    return np.concatenate([b, o])
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [0, 0.5]."""
+    return [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N_CIRCLES
+
+def solve_lp_radii(centers):
+    """Optimally solve for radii given fixed centers using LP."""
+    n = N_CIRCLES
+    c_obj = -np.ones(n)
+    
+    n_ineq = n + n * (n - 1) // 2
+    A_ub = np.zeros((n_ineq, n))
+    b_ub = np.zeros(n_ineq)
+    
+    idx = 0
+    for i in range(n):
+        x_val, y_val = centers[i]
+        bound = min(x_val, 1.0 - x_val, y_val, 1.0 - y_val)
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = bound
+        idx += 1
+        
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dist
+            idx += 1
+            
+    bounds = [(0.0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return None
+
+def hex_init(r0, seed):
+    """Generate a perturbed hexagonal lattice initialization."""
+    np.random.seed(seed)
+    x = np.zeros(3 * N_CIRCLES)
+    count = 0
+    y = r0
+    row = 0
+    while count < N_CIRCLES and y + r0 <= 1.0:
+        x_start = r0 + (r0 if row % 2 == 1 else 0.0)
+        col = 0
+        while count < N_CIRCLES:
+            cx = x_start + col * 2 * r0
+            if cx + r0 > 1.0:
+                break
+            x[3*count] = cx + np.random.uniform(-0.002, 0.002)
+            x[3*count+1] = y + np.random.uniform(-0.002, 0.002)
+            x[3*count+2] = r0
+            count += 1
+            col += 1
+        y += math.sqrt(3.0) * r0
+        row += 1
+    while count < N_CIRCLES:
+        x[3*count] = np.random.uniform(0.15, 0.85)
+        x[3*count+1] = np.random.uniform(0.15, 0.85)
+        x[3*count+2] = 0.05
+        count += 1
+    return x
+
+def rotated_hex_init(r0, angle, seed):
+    """Generate a rotated hexagonal lattice initialization."""
+    np.random.seed(seed)
+    centers = np.zeros((N_CIRCLES, 2))
+    count = 0
+    y = r0
+    row = 0
+    while count < N_CIRCLES and y + r0 <= 1.0:
+        x_start = r0 + (r0 if row % 2 == 1 else 0.0)
+        col = 0
+        while count < N_CIRCLES:
+            cx = x_start + col * 2 * r0
+            if cx + r0 > 1.0:
+                break
+            centers[count] = [cx, y]
+            count += 1
+            col += 1
+        y += math.sqrt(3.0) * r0
+        row += 1
+    
+    while count < N_CIRCLES:
+        centers[count] = [np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)]
+        count += 1
+    
+    # Rotate around center
+    cx_center, cy_center = 0.5, 0.5
+    cos_a, sin_a = math.cos(angle), math.sin(angle)
+    for i in range(N_CIRCLES):
+        dx = centers[i, 0] - cx_center
+        dy = centers[i, 1] - cy_center
+        centers[i, 0] = dx * cos_a - dy * sin_a + cx_center + np.random.uniform(-0.003, 0.003)
+        centers[i, 1] = dx * sin_a + dy * cos_a + cy_center + np.random.uniform(-0.003, 0.003)
+    
+    centers = np.clip(centers, r0 + 0.001, 1.0 - r0 - 0.001)
+    
+    x = np.zeros(3 * N_CIRCLES)
+    x[0::3] = centers[:, 0]
+    x[1::3] = centers[:, 1]
+    x[2::3] = r0
+    return x
+
+def force_init(seed):
+    """Generate a dense initial configuration using repulsive force simulation."""
+    np.random.seed(seed)
+    cx = np.random.uniform(0.15, 0.85, N_CIRCLES)
+    cy = np.random.uniform(0.15, 0.85, N_CIRCLES)
+    cr = np.full(N_CIRCLES, 0.09)
+    
+    for step in range(1500):
+        dx = cx[:, None] - cx[None, :]
+        dy = cy[:, None] - cy[None, :]
+        d2 = dx**2 + dy**2
+        d = np.sqrt(d2)
+        
+        mask = (d < 0.28) & (d > 1e-6)
+        f = np.zeros_like(d2)
+        f[mask] = 0.015 / d2[mask]
+        
+        fx = np.sum(f * dx, axis=1)
+        fy = np.sum(f * dy, axis=1)
+        
+        w = 0.1
+        fx += np.where(cx < cr, w, 0.0) - np.where(cx > 1.0 - cr, w, 0.0)
+        fy += np.where(cy < cr, w, 0.0) - np.where(cy > 1.0 - cr, w, 0.0)
+        
+        alpha = 0.03 * (1.0 - step / 1500.0)
+        cx += fx * alpha
+        cy += fy * alpha
+        
+        cx = np.clip(cx, cr, 1.0 - cr)
+        cy = np.clip(cy, cr, 1.0 - cr)
+        
+    x = np.zeros(3 * N_CIRCLES)
+    x[0::3] = cx
+    x[1::3] = cy
+    x[2::3] = cr
+    return x
+
+def alternating_opt(centers, radii, max_iter=8):
+    """Alternating optimization: LP for radii, NLP for centers."""
+    n = N_CIRCLES
+    bnds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    for it in range(max_iter):
+        # Step 1: LP for radii given centers
+        new_radii = solve_lp_radii(centers)
+        if new_radii is not None and np.sum(new_radii) > np.sum(radii) - 1e-10:
+            radii = new_radii.copy()
+        
+        # Step 2: NLP for centers given radii
+        x = np.zeros(3 * n)
+        x[0::3] = centers[:, 0]
+        x[1::3] = centers[:, 1]
+        x[2::3] = radii
+        
+        try:
+            res = minimize(objective, x, method='SLSQP', bounds=bnds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            if not np.isnan(res.fun):
+                c_vals = constraints(res.x)
+                if np.min(c_vals) >= -1e-6:
+                    centers = np.column_stack((res.x[0::3], res.x[1::3]))
+                    radii = res.x[2::3].copy()
+        except Exception:
+            pass
+            
+    return centers, radii
+
+def run_packing():
+    n = N_CIRCLES
+    bnds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Phase 1: Generate diverse initial configurations
+    inits = []
+    
+    # Rotated hexagonal lattices with various angles and densities
+    for angle in [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]:
+        for r0 in [0.088, 0.092, 0.096, 0.100, 0.105]:
+            inits.append(rotated_hex_init(r0, angle, seed=int(angle*1000)))
+    
+    # Standard hexagonal lattices
+    for s in range(20):
+        r0 = 0.085 + s * 0.002
+        inits.append(hex_init(r0, seed=s))
+    
+    # Force-directed starts
+    for s in range(10):
+        inits.append(force_init(seed=s))
+    
+    # Phase 2: Multi-start optimization with alternating approach
+    for x0 in inits:
+        centers = np.column_stack((x0[0::3], x0[1::3]))
+        radii = x0[2::3].copy()
+        
+        # Run alternating optimization
+        centers, radii = alternating_opt(centers, radii, max_iter=10)
+        curr_sum = np.sum(radii)
+        
+        if curr_sum > best_sum:
+            # Validate
+            valid = True
+            for i in range(n):
+                r = radii[i]
+                if r < 0 or centers[i,0] < r - 1e-9 or centers[i,0] > 1.0 - r + 1e-9 or \
+                   centers[i,1] < r - 1e-9 or centers[i,1] > 1.0 - r + 1e-9:
+                    valid = False
+                    break
+            if valid:
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                        if d < radii[i] + radii[j] - 1e-9:
+                            valid = False
+                            break
+                    if not valid:
+                        break
+            if valid:
+                best_sum = curr_sum
+                best_x = np.zeros(3 * n)
+                best_x[0::3] = centers[:, 0]
+                best_x[1::3] = centers[:, 1]
+                best_x[2::3] = radii
+    
+    # Phase 3: Local refinement with perturbation on best solution
+    if best_x is not None:
+        for it in range(10):
+            noise_scale = 2e-3 * (0.75 ** it)
+            x0 = best_x + np.random.normal(0, noise_scale, 3 * n)
+            
+            for k in range(n):
+                r = np.clip(x0[3*k + 2], 0.01, 0.5)
+                x0[3*k] = np.clip(x0[3*k], r, 1.0 - r)
+                x0[3*k + 1] = np.clip(x0[3*k + 1], r, 1.0 - r)
+                x0[3*k + 2] = r
+            
+            centers = np.column_stack((x0[0::3], x0[1::3]))
+            radii = x0[2::3]
+            
+            # Alternating optimization from perturbed state
+            centers, radii = alternating_opt(centers, radii, max_iter=8)
+            curr_sum = np.sum(radii)
+            
+            if curr_sum > best_sum:
+                valid = True
+                for i in range(n):
+                    r = radii[i]
+                    if r < 0 or centers[i,0] < r - 1e-9 or centers[i,0] > 1.0 - r + 1e-9 or \
+                       centers[i,1] < r - 1e-9 or centers[i,1] > 1.0 - r + 1e-9:
+                        valid = False
+                        break
+                if valid:
+                    for i in range(n):
+                        for j in range(i + 1, n):
+                            d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                            if d < radii[i] + radii[j] - 1e-9:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                if valid:
+                    best_sum = curr_sum
+                    best_x = np.zeros(3 * n)
+                    best_x[0::3] = centers[:, 0]
+                    best_x[1::3] = centers[:, 1]
+                    best_x[2::3] = radii
+    
+    # Phase 4: Direct SLSQP from best alternating result
+    if best_x is not None:
+        for _ in range(3):
+            x0 = best_x + np.random.normal(0, 1e-4, 3 * n)
+            for k in range(n):
+                r = np.clip(x0[3*k + 2], 0.01, 0.5)
+                x0[3*k] = np.clip(x0[3*k], r, 1.0 - r)
+                x0[3*k + 1] = np.clip(x0[3*k + 1], r, 1.0 - r)
+                x0[3*k + 2] = r
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bnds, constraints=cons,
+                               options={'maxiter': 20000, 'ftol': 1e-13, 'disp': False})
+                curr_sum = -res.fun
+                c_vals = constraints(res.x)
+                if np.min(c_vals) >= -1e-6 and curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_x = res.x.copy()
+            except Exception:
+                pass
+    
+    # Extract and validate
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i, 0] = best_x[3*i]
+        centers[i, 1] = best_x[3*i+1]
+        radii[i] = best_x[3*i+2]
+    
+    # Final safety check and repair
+    valid = True
+    for i in range(n):
+        if (radii[i] < 0 or 
+            centers[i, 0] < radii[i] - 1e-10 or centers[i, 0] > 1.0 - radii[i] + 1e-10 or 
+            centers[i, 1] < radii[i] - 1e-10 or centers[i, 1] > 1.0 - radii[i] + 1e-10):
+            valid = False
+            break
+    if valid:
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    valid = False
+                    break
+            if not valid:
+                break
+                
+    if not valid:
+        for _ in range(100):
+            radii *= 0.995
+            centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+            centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+            
+            ok = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1]) < radii[i] + radii[j] - 1e-12:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                break
+    
+    return centers, radii, float(np.sum(radii))
+```

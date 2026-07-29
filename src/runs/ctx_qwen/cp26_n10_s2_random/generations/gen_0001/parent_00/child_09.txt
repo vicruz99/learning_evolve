@@ -1,0 +1,166 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.621 and approach the 2.636 target, we need a more robust optimization strategy that escapes local minima while maintaining strict feasibility. The previous approaches used SLSQP with standard restarts, which often gets trapped in symmetric or grid-like local optima.
+
+Key improvements in this solution:
+1. **Diverse High-Quality Initializations**: We generate multiple hexagonal lattice configurations with controlled perturbations. Hexagonal packing is asymptotically optimal, and starting close to it significantly reduces the basin of attraction for poor local minima.
+2. **Iterative Perturbation & Annealing-like Refinement**: After finding an initial optimum, we run a refinement loop that applies Gaussian noise to centers with a decaying step size. This mimics simulated annealing, allowing the optimizer to explore neighboring configurations and escape shallow local minima.
+3. **Controlled Radius Expansion**: Between optimization steps, we slightly grow all radii (`* 1.0015`) and re-optimize positions. This forces the optimizer to continuously push the boundary of feasibility, preventing it from stagnating at a suboptimal radius configuration.
+4. **Strict Feasibility Checking**: We verify constraint satisfaction (`>= -1e-7`) after every optimization run before accepting results. This prevents numerical drift from corrupting the best solution.
+5. **Efficient Constraint Formulation**: Constraints are vectorized using `np.triu_indices` and squared distances to avoid `sqrt` operations and maintain smoothness, which accelerates gradient computations in SLSQP.
+6. **Robust Fallback**: If optimization fails or degrades, a geometrically valid fallback configuration ensures the function always returns a valid packing.
+
+This hybrid approach combines global exploration (via perturbations and radius growth) with local exploitation (SLSQP refinement), effectively navigating the non-convex landscape of circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_constraints(vars_flat):
+    """Computes all boundary and non-overlap constraints for the packing."""
+    X = vars_flat.reshape(N, 3)
+    xs, ys, rs = X[:, 0], X[:, 1], X[:, 2]
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c1 = xs - rs
+    c2 = 1.0 - xs - rs
+    c3 = ys - rs
+    c4 = 1.0 - ys - rs
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    idx = np.triu_indices(N, k=1)
+    dx = xs[idx[0]] - xs[idx[1]]
+    dy = ys[idx[0]] - ys[idx[1]]
+    dr = rs[idx[0]] + rs[idx[1]]
+    c5 = dx**2 + dy**2 - dr**2
+    
+    return np.concatenate([c1, c2, c3, c4, c5])
+
+def compute_objective(vars_flat):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars_flat[2::3])
+
+def get_bounds():
+    """Returns variable bounds for x, y, r."""
+    b = []
+    for _ in range(N):
+        b.append((0.0, 1.0))
+        b.append((0.0, 1.0))
+        b.append((0.0, 0.5))
+    return b
+
+def generate_init_config(seed):
+    """Generates a feasible initial configuration using a perturbed hexagonal lattice."""
+    rng = np.random.default_rng(seed)
+    centers = np.zeros((N, 2))
+    r_est = 0.095
+    rows = [5, 4, 5, 4, 5, 3]
+    y = r_est
+    idx = 0
+    for i, count in enumerate(rows):
+        shift = r_est if i % 2 == 1 else 0.0
+        x = r_est + shift
+        for _ in range(count):
+            if idx < N:
+                centers[idx] = [x + rng.uniform(-0.01, 0.01), y + rng.uniform(-0.01, 0.01)]
+                idx += 1
+            x += 2 * r_est
+        y += r_est * np.sqrt(3)
+    while idx < N:
+        centers[idx] = rng.uniform(0.1, 0.9, 2)
+        idx += 1
+    return centers
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_vars = None
+    best_obj = -np.inf
+    rng = np.random.default_rng(42)
+    
+    # Phase 1: Multiple diverse starts from hexagonal patterns
+    for seed in [0, 42, 123, 256, 999]:
+        centers_init = generate_init_config(seed)
+        x0 = np.zeros(N * 3)
+        for i in range(N):
+            x0[3*i] = centers_init[i, 0]
+            x0[3*i+1] = centers_init[i, 1]
+            x0[3*i+2] = 0.09
+            
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12})
+            c_vals = compute_constraints(res.x)
+            if np.all(c_vals >= -1e-7):
+                curr_obj = -res.fun
+                if curr_obj > best_obj:
+                    best_obj = curr_obj
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Iterative refinement with decaying perturbations and radius expansion
+    if best_vars is not None:
+        for step in range(40):
+            step_size = 0.03 * (0.95 ** step)
+            curr_centers = best_vars.reshape(N, 3)[:, :2]
+            curr_radii = best_vars.reshape(N, 3)[:, 2]
+            
+            # Perturb centers to escape local minima
+            perturbed = curr_centers + rng.normal(0, step_size, curr_centers.shape)
+            perturbed = np.clip(perturbed, curr_radii[:, None] + 0.0005, 1.0 - curr_radii[:, None] - 0.0005)
+            
+            x0 = np.zeros(N * 3)
+            for i in range(N):
+                x0[3*i] = perturbed[i, 0]
+                x0[3*i+1] = perturbed[i, 1]
+                x0[3*i+2] = curr_radii[i]
+                
+            try:
+                res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+                c_vals = compute_constraints(res.x)
+                if np.all(c_vals >= -1e-7):
+                    curr_obj = -res.fun
+                    if curr_obj > best_obj:
+                        best_obj = curr_obj
+                        best_vars = res.x.copy()
+            except Exception:
+                pass
+                
+            # Try growing radii slightly to push the optimization boundary
+            x0_grow = best_vars.copy()
+            x0_grow[2::3] *= 1.0015
+            try:
+                res2 = minimize(compute_objective, x0_grow, method='SLSQP', bounds=bounds,
+                                constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+                c_vals2 = compute_constraints(res2.x)
+                if np.all(c_vals2 >= -1e-7):
+                    curr_obj2 = -res2.fun
+                    if curr_obj2 > best_obj:
+                        best_obj = curr_obj2
+                        best_vars = res2.x.copy()
+            except Exception:
+                pass
+
+    # Fallback if optimization fails entirely
+    if best_vars is None:
+        centers_fb = generate_init_config(0)
+        best_vars = np.zeros(N*3)
+        for i in range(N):
+            best_vars[3*i] = centers_fb[i, 0]
+            best_vars[3*i+1] = centers_fb[i, 1]
+            best_vars[3*i+2] = 0.08
+
+    centers = best_vars.reshape(N, 3)[:, :2]
+    radii = best_vars.reshape(N, 3)[:, 2]
+    radii = np.maximum(radii, 0.0)
+    sum_r = float(np.sum(radii))
+    
+    return centers, radii, sum_r
+```

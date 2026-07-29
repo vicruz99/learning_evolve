@@ -1,0 +1,125 @@
+# sol_000073 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000026 (state f081a56f) state=c33447f1 sum of radii=2.619713 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+# Precompute pairwise indices for efficiency (upper triangle)
+PAIR_I, PAIR_J = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N_CIRCLES:])
+
+def constraints(v):
+    """
+    Vectorized inequality constraints.
+    Returns a flat array where all elements must be >= 0.
+    """
+    xs = v[:N_CIRCLES]
+    ys = v[N_CIRCLES:2*N_CIRCLES]
+    rs = v[2*N_CIRCLES:]
+
+    # 1. Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c_bound = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+
+    # 2. Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    xi, yi, ri = xs[PAIR_I], ys[PAIR_I], rs[PAIR_I]
+    xj, yj, rj = xs[PAIR_J], ys[PAIR_J], rs[PAIR_J]
+
+    dx = xi - xj
+    dy = yi - yj
+    dist_sq = dx**2 + dy**2
+    r_sum_sq = (ri + rj)**2
+
+    return np.concatenate([c_bound, dist_sq - r_sum_sq])
+
+def generate_initial_guess(seed, r_base):
+    """Generates a feasible hexagonal-like initial configuration."""
+    np.random.seed(seed)
+    centers = []
+    y = r_base
+    row = 0
+    
+    # Generate hexagonal points until we have enough
+    while len(centers) < N_CIRCLES + 5:
+        x_start = r_base + (row % 2) * r_base
+        x = x_start
+        while x <= 1.0 - r_base:
+            centers.append([x, y])
+            x += 2.0 * r_base
+        y += np.sqrt(3.0) * r_base
+        row += 1
+
+    centers = np.array(centers[:N_CIRCLES])
+    
+    # Add controlled jitter to break symmetry and explore landscape
+    centers += np.random.uniform(-0.015, 0.015, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    # Start with smaller radii to guarantee initial feasibility
+    r_init = np.full(N_CIRCLES, r_base * 0.75)
+    
+    return np.concatenate([centers[:, 0], centers[:, 1], r_init])
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square.
+    Returns (centers, radii, sum_radii).
+    """
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+
+    best_sum = -1.0
+    best_v = None
+
+    # Multi-start strategy with varying base densities
+    seeds = range(30)
+    r_bases = [0.085, 0.090, 0.095, 0.100, 0.105]
+
+    for seed in seeds:
+        for rb in r_bases:
+            x0 = generate_initial_guess(seed, rb)
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                               constraints=cons_dict,
+                               options={'maxiter': 4000, 'ftol': 1e-11})
+                
+                if res.success:
+                    current_sum = -res.fun
+                    if current_sum > best_sum:
+                        # Verify feasibility with a strict tolerance
+                        if np.all(constraints(res.x) >= -1e-7):
+                            best_sum = current_sum
+                            best_v = res.x.copy()
+            except Exception:
+                continue
+
+    # Extract best solution or fallback to a safe grid
+    if best_v is not None:
+        centers = np.column_stack((best_v[:n], best_v[n:2*n]))
+        radii = best_v[2*n:]
+    else:
+        # Fallback: 5x5 grid + 1 extra
+        coords = np.linspace(0.1, 0.9, 5)
+        centers = np.array([[x, y] for y in coords for x in coords] + [[0.05, 0.05]])
+        radii = np.full(26, 0.04)
+
+    # Post-processing to strictly satisfy validator tolerance (1e-12)
+    # Negligible shrink ensures no numerical drift violates constraints
+    radii *= 0.9996
+    centers = np.clip(centers, 1e-9, 1.0 - 1e-9)
+    radii = np.maximum(radii, 0.0)
+
+    return centers, radii, float(np.sum(radii))

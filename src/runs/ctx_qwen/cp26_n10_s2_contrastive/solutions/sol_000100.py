@@ -1,0 +1,241 @@
+# sol_000100 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000090 (state 81009fa6) state=b7995607 sum of radii=2.602146 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+import random
+
+N = 26
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+NUM_PAIRS = len(PAIRS_I)
+
+def objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Inequality constraints: boundary clearance and pairwise non-overlap (>= 0)."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    c = np.empty(4*N + NUM_PAIRS)
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[PAIRS_I] - cx[PAIRS_J]
+    dy = cy[PAIRS_I] - cy[PAIRS_J]
+    c[4*N:] = np.hypot(dx, dy) - (r[PAIRS_I] + r[PAIRS_J])
+    return c
+
+def get_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii subject to constraints."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    A_ub = np.zeros((NUM_PAIRS, n))
+    b_ub = np.zeros(NUM_PAIRS)
+    
+    for k in range(NUM_PAIRS):
+        i, j = PAIRS_I[k], PAIRS_J[k]
+        d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+        A_ub[k, i] = 1.0
+        A_ub[k, j] = 1.0
+        b_ub[k] = d
+        
+    bounds = []
+    for i in range(n):
+        mx, my = centers[i]
+        ub = min(mx, 1.0-mx, my, 1.0-my)
+        bounds.append((0.0, max(0.0, ub)))
+        
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return np.maximum(res.x, 0.0)
+    except Exception:
+        pass
+    return np.full(n, 0.01)
+
+def force_grow(centers, radii, steps=80, rate=0.0002):
+    """Force-directed layout: grow radii globally and push overlapping circles apart."""
+    c = centers.copy()
+    r = radii.copy()
+    for _ in range(steps):
+        r *= (1.0 + rate)
+        for i in range(N):
+            for j in range(i+1, N):
+                dx = c[i,0] - c[j,0]
+                dy = c[i,1] - c[j,1]
+                d = np.hypot(dx, dy)
+                if d < r[i] + r[j] and d > 1e-9:
+                    shift = (r[i] + r[j] - d) / 2.0
+                    nx, ny = dx/d, dy/d
+                    c[i,0] += nx * shift
+                    c[i,1] += ny * shift
+                    c[j,0] -= nx * shift
+                    c[j,1] -= ny * shift
+        # Enforce boundary constraints strictly
+        c[:,0] = np.clip(c[:,0], r + 1e-8, 1.0 - r - 1e-8)
+        c[:,1] = np.clip(c[:,1], r + 1e-8, 1.0 - r - 1e-8)
+    return c, r
+
+def polish(c0, r0, maxiter=8000):
+    """Joint SLSQP optimization with two-pass refinement."""
+    x0 = np.zeros(3*N)
+    x0[0::3] = c0[:, 0]
+    x0[1::3] = c0[:, 1]
+    x0[2::3] = r0
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if res.success:
+            c_opt = np.column_stack((res.x[0::3], res.x[1::3]))
+            # Second pass for higher precision
+            x0[2::3] = get_lp_radii(c_opt) * 0.99
+            res2 = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                            constraints=cons, options={'maxiter': maxiter, 'ftol': 1e-15, 'disp': False})
+            if res2.success:
+                c_opt = np.column_stack((res2.x[0::3], res2.x[1::3]))
+            r_opt = get_lp_radii(c_opt)
+            return c_opt, r_opt
+    except Exception:
+        pass
+    return c0, get_lp_radii(c0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+
+    inits = []
+    rng = np.random.RandomState(42)
+
+    # 1. Hexagonal patterns with varying spacing and shifts
+    for sp in np.linspace(0.18, 0.24, 8):
+        for shift in [0.0, sp/2.0]:
+            c = np.zeros((N, 2))
+            idx = 0
+            y = sp/2
+            row = 0
+            while idx < N and y < 1.0 - sp/2:
+                x = sp/2 + (row % 2) * sp/2
+                while x < 1.0 - sp/2 and idx < N:
+                    c[idx] = [x + shift, y]
+                    idx += 1
+                    x += sp
+                y += sp * np.sqrt(3) / 2
+                row += 1
+            while idx < N:
+                c[idx] = rng.uniform(0.2, 0.8, 2)
+                idx += 1
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.02, 0.98)
+            inits.append(c)
+
+    # 2. Grid patterns
+    for sp in np.linspace(0.19, 0.23, 6):
+        c = np.zeros((N, 2))
+        idx = 0
+        y = sp/2
+        while y < 1.0 - sp/2 and idx < N:
+            x = sp/2
+            while x < 1.0 - sp/2 and idx < N:
+                c[idx] = [x, y]
+                idx += 1
+                x += sp
+            y += sp
+        while idx < N:
+            c[idx] = rng.uniform(0.2, 0.8, 2)
+            idx += 1
+        c += rng.normal(0, 0.002, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        inits.append(c)
+
+    # 3. Random feasible placements
+    for _ in range(20):
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+
+    # Evaluate all initial configurations
+    for c0 in inits:
+        r0 = get_lp_radii(c0) * 0.95
+        # Tighten packing via force growth
+        c_g, r_g = force_grow(c0, r0, steps=80, rate=0.0002)
+        r_g = get_lp_radii(c_g)
+        c_p, r_p = polish(c_g, r_g * 0.99)
+        s = np.sum(r_p)
+        if s > best_sum:
+            best_sum = s
+            best_c = c_p.copy()
+            best_r = r_p.copy()
+
+    # Basin hopping refinement to escape local minima
+    if best_c is not None:
+        for step in range(400):
+            rng_h = np.random.RandomState(step * 13 + 7)
+            scale = 0.015 * np.exp(-step / 200.0)
+            c_h = best_c + rng_h.normal(0, scale, best_c.shape)
+            c_h = np.clip(c_h, 0.02, 0.98)
+            r_h = get_lp_radii(c_h)
+            
+            if np.sum(r_h) > best_sum:
+                c_p, r_p = polish(c_h, r_h * 0.99)
+                s = np.sum(r_p)
+                if s > best_sum:
+                    best_sum = s
+                    best_c = c_p.copy()
+                    best_r = r_p.copy()
+                    
+            # Periodic force growth to re-tighten the configuration
+            if step % 50 == 0:
+                c_g, r_g = force_grow(best_c, best_r * 0.9, steps=60, rate=0.00015)
+                r_g = get_lp_radii(c_g)
+                if np.sum(r_g) > best_sum:
+                    c_p, r_p = polish(c_g, r_g * 0.99)
+                    s = np.sum(r_p)
+                    if s > best_sum:
+                        best_sum = s
+                        best_c = c_p.copy()
+                        best_r = r_p.copy()
+
+    # Fallback safety net
+    if best_c is None:
+        best_c = inits[0]
+        best_r = get_lp_radii(best_c)
+        best_sum = np.sum(best_r)
+
+    # Strict post-processing to guarantee validator compliance
+    c_final = best_c.copy()
+    r_final = best_r.copy()
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        mx, my = c_final[i]
+        ub = min(mx, 1.0-mx, my, 1.0-my)
+        r_final[i] = min(r_final[i], ub - 1e-9)
+        r_final[i] = max(0.0, r_final[i])
+        
+    # Iteratively resolve any remaining numerical overlaps
+    for _ in range(50):
+        changed = False
+        for k in range(NUM_PAIRS):
+            i, j = PAIRS_I[k], PAIRS_J[k]
+            d = np.hypot(c_final[i,0]-c_final[j,0], c_final[i,1]-c_final[j,1])
+            if d < r_final[i] + r_final[j] - 1e-11:
+                exc = r_final[i] + r_final[j] - d
+                r_final[i] -= exc * 0.5
+                r_final[j] -= exc * 0.5
+                r_final[i] = max(0.0, r_final[i])
+                r_final[j] = max(0.0, r_final[j])
+                changed = True
+        if not changed:
+            break
+            
+    return c_final, r_final, float(np.sum(r_final))

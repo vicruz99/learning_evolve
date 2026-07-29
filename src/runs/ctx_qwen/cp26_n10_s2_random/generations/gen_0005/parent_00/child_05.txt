@@ -1,0 +1,196 @@
+
+
+<strategy>
+The current solution uses SLSQP directly on centers and radii, which works but can get trapped in local minima due to the highly non-convex constraint landscape. To push beyond 2.633, I will adopt a hybrid optimization strategy that decouples center placement from radius assignment:
+
+1. **LP-based Inner Solver**: For any fixed set of centers, maximizing the sum of radii is a Linear Programming problem. Constraints are $r_i + r_j \le \|c_i - c_j\|$ and $r_i \le \text{dist}(c_i, \text{boundary})$. Solving this via `scipy.optimize.linprog` (method='highs') is extremely fast and exact.
+2. **Derivative-Free Center Optimization**: We wrap the LP solver in an objective function that only depends on the 52 center coordinates. We optimize this black-box function using `Powell`, which handles non-smooth landscapes well. This avoids the quadratic constraint derivatives that often confuse gradient-based methods.
+3. **Diverse Initialization**: We seed the optimizer with hexagonal lattices of varying densities, force-directed repulsion configurations, and uniform grids. This covers the search space efficiently.
+4. **SLSQP Refinement**: Once optimal centers are found, we extract the LP radii and run a few passes of SLSQP on the full 78-dimensional problem (centers + radii) to fine-tune both simultaneously and squeeze out the last bits of optimality.
+5. **Numerical Repair**: A final deterministic pass resolves any microscopic overlaps or boundary violations to guarantee the validator passes strictly.
+
+This approach separates the combinatorial geometry (centers) from the resource allocation (radii), typically yielding higher objective values for circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def _build_lp_matrix():
+    """Precompute constant structure for LP constraints matrix."""
+    A = np.zeros((N*(N-1)//2, N))
+    b_indices = []
+    idx = 0
+    for i in range(N):
+        for j in range(i+1, N):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b_indices.append((i, j))
+            idx += 1
+    return A, np.array(b_indices)
+
+A_LP, PAIR_INDICES = _build_lp_matrix()
+
+def solve_lp(centers):
+    """Compute maximum sum of radii and corresponding radii for fixed centers using LP."""
+    c = centers.reshape(N, 2)
+    # Upper bounds for each radius based on distance to square boundaries
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), 
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    # Pairwise distances between centers
+    diff = c[PAIR_INDICES[:, 0]] - c[PAIR_INDICES[:, 1]]
+    b = np.sqrt(np.sum(diff**2, axis=1))
+    
+    bounds = [(0.0, u) for u in ub]
+    try:
+        res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b, bounds=bounds, method='highs')
+        if res.success:
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.zeros(N)
+
+def obj_centers(v):
+    """Objective for center optimization: maximize sum of radii (minimize negative sum)."""
+    c = np.clip(v, 1e-6, 1.0 - 1e-6).reshape(N, 2)
+    s, _ = solve_lp(c)
+    return -s
+
+def compute_constraints(v):
+    """Computes all boundary and non-overlap constraints for SLSQP. Returns array >= 0."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = []
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    idx = np.triu_indices(N, 1)
+    d = np.linalg.norm(c[idx[0]] - c[idx[1]], axis=1)
+    con.append(d - (r[idx[0]] + r[idx[1]]))
+    return np.concatenate(con)
+
+def obj_full(v):
+    """Objective for full optimization: maximize sum of radii."""
+    return -np.sum(v[2*N:])
+
+def run_packing() -> tuple:
+    np.random.seed(42)
+    best_v_c = None
+    best_score = -np.inf
+    
+    candidates = []
+    
+    # 1. Hexagonal grids with varying densities
+    for r_est in np.linspace(0.085, 0.115, 7):
+        c = []
+        y = r_est
+        row = 0
+        while len(c) < N:
+            shift = r_est if row % 2 == 1 else 0.0
+            x = r_est + shift
+            while x + r_est <= 1.0 and len(c) < N:
+                c.append([x, y])
+                x += 2.0 * r_est
+            y += r_est * np.sqrt(3)
+            row += 1
+        candidates.append(np.array(c[:N]).flatten())
+        
+    # 2. Force-directed repulsion starts
+    for _ in range(10):
+        c = np.random.uniform(0.1, 0.9, (N, 2))
+        for _ in range(100):
+            for i in range(N):
+                for j in range(i+1, N):
+                    d = c[i] - c[j]
+                    dist = np.linalg.norm(d)
+                    if dist < 0.16:
+                        push = (0.16 - dist) * 0.4
+                        c[i] += d / dist * push
+                        c[j] -= d / dist * push
+        c = np.clip(c, 0.05, 0.95)
+        candidates.append(c.flatten())
+        
+    # 3. Structured grids
+    for sx in [5, 6]:
+        for sy in [5, 6]:
+            pts = []
+            for iy in range(sy):
+                for ix in range(sx):
+                    if len(pts) >= N: break
+                    x = (ix + 0.5) / sx
+                    y = (iy + 0.5) / sy
+                    pts.append([x, y])
+            candidates.append(np.array(pts[:N]).flatten())
+            
+    bounds_c = [(0.0, 1.0)] * (2 * N)
+    
+    # Phase 1: Optimize centers using Powell with LP objective
+    for c0 in candidates:
+        try:
+            res = minimize(obj_centers, c0, method='Powell', bounds=bounds_c,
+                           options={'maxiter': 1200, 'ftol': 1e-11, 'xtol': 1e-11})
+            if -res.fun > best_score:
+                best_score = -res.fun
+                best_v_c = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v_c is None:
+        best_v_c = candidates[0]
+        
+    final_c = best_v_c.reshape(N, 2)
+    _, lp_r = solve_lp(final_c)
+    v0 = np.concatenate([final_c.flatten(), lp_r])
+    
+    # Phase 2: Refine with SLSQP on full variables (centers + radii)
+    bounds_full = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_v = v0
+    best_full_score = -np.sum(v0[2*N:])
+    
+    for _ in range(3):
+        try:
+            res = minimize(obj_full, v0, method='SLSQP', bounds=bounds_full,
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-14})
+            if -res.fun > best_full_score:
+                best_full_score = -res.fun
+                best_v = res.x
+            # Perturb best solution to explore nearby landscape
+            v0 = best_v + np.random.normal(0, 0.002, best_v.shape)
+            v0 = np.clip(v0, 0.0, 1.0)
+        except Exception:
+            pass
+            
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:].copy()
+    
+    # Phase 3: Strict numerical repair to guarantee validation passes
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            mx = min(x, 1.0-x, y, 1.0-y)
+            if r > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

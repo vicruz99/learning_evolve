@@ -1,0 +1,144 @@
+# sol_000046 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000016 (state 585439f0) state=901a36d0 sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute pairwise indices for efficiency
+IX, JX = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Minimize negative sum of radii -> maximize sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraint_fun(v):
+    """
+    Computes all inequality constraints: boundaries and non-overlap.
+    Returns array where values >= 0 indicate satisfied constraints.
+    """
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = []
+    # Boundary constraints: x +/- r in [0, 1], y +/- r in [0, 1]
+    c.extend(x - r)
+    c.extend(1.0 - x - r)
+    c.extend(y - r)
+    c.extend(1.0 - y - r)
+    
+    # Pairwise non-overlap: dist >= r_i + r_j
+    # Vectorized using precomputed indices
+    dx = x[IX] - x[JX]
+    dy = y[IX] - y[JX]
+    dist = np.sqrt(dx**2 + dy**2)
+    dr = r[IX] + r[JX]
+    c.extend(dist - dr)
+    
+    return np.array(c)
+
+def compute_initial_radii(centers):
+    """
+    Computes a feasible initial radius for each circle based on center positions.
+    Ensures starting point is strictly inside the feasible region.
+    """
+    n = centers.shape[0]
+    r = np.full(n, 0.1)
+    for i in range(n):
+        # Max radius limited by boundaries
+        max_r = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        # Max radius limited by neighbors (assume equal radii for conservative estimate)
+        for j in range(n):
+            if i != j:
+                dx = centers[i,0] - centers[j,0]
+                dy = centers[i,1] - centers[j,1]
+                d = np.sqrt(dx*dx + dy*dy)
+                if d / 2.0 < max_r:
+                    max_r = d / 2.0
+        r[i] = max_r
+    # Scale down slightly to guarantee strict initial feasibility for SLSQP
+    return r * 0.95
+
+def run_packing():
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraint_fun}
+    
+    best_sum = 0.0
+    best_v = None
+    
+    configs = []
+    
+    # 1. Hexagonal lattice variations (optimal for infinite plane, good for square)
+    for phase_x in [0.0, 0.05, 0.1]:
+        for phase_y in [0.0, 0.05]:
+            pts = []
+            y = 0.08 + phase_y
+            row = 0
+            while len(pts) < N:
+                x_start = 0.08 + phase_x + (row % 2) * 0.09
+                x = x_start
+                while x <= 0.92 and len(pts) < N:
+                    pts.append([x, y])
+                    x += 0.18
+                y += 0.155
+                row += 1
+            configs.append(np.array(pts[:N]))
+            
+    # 2. Random valid starts to explore different topologies
+    for _ in range(8):
+        configs.append(np.random.uniform(0.15, 0.85, (N, 2)))
+        
+    for pts in configs:
+        r0 = compute_initial_radii(pts)
+        v0 = np.concatenate([pts[:, 0], pts[:, 1], r0])
+        
+        try:
+            # Primary optimization
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-12, 'disp': False})
+            
+            cur_sum = -res.fun
+            if cur_sum > best_sum:
+                if np.all(constraint_fun(res.x) >= -1e-9):
+                    best_sum = cur_sum
+                    best_v = res.x.copy()
+                    
+                    # Iterated Local Search: perturb and re-optimize to escape local minima
+                    for _ in range(3):
+                        pert = np.random.uniform(-0.005, 0.005, size=best_v.shape)
+                        v_pert = best_v + pert
+                        v_pert[:N] = np.clip(v_pert[:N], 0, 1)
+                        v_pert[N:2*N] = np.clip(v_pert[N:2*N], 0, 1)
+                        v_pert[2*N:] = np.clip(v_pert[2*N:], 0, 0.5)
+                        
+                        res2 = minimize(objective, v_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                                        options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+                        if -res2.fun > best_sum and np.all(constraint_fun(res2.x) >= -1e-9):
+                            best_sum = -res2.fun
+                            best_v = res2.x.copy()
+        except Exception:
+            continue
+            
+    if best_v is not None:
+        centers = np.column_stack((best_v[:N], best_v[N:2*N]))
+        radii = best_v[2*N:]
+        radii = np.maximum(radii, 0.0)
+        
+        # Final strict feasibility adjustment to pass validator's 1e-12 tolerance
+        c_vals = constraint_fun(best_v)
+        min_val = np.min(c_vals)
+        if min_val < -1e-10:
+            scale = 1.0 + min_val / np.max(radii)
+            radii *= max(0.0, scale)
+            
+        return centers, radii, float(np.sum(radii))
+        
+    # Fallback (should not be reached)
+    centers = np.random.uniform(0.1, 0.9, (N, 2))
+    radii = np.full(N, 0.05)
+    return centers, radii, float(np.sum(radii))

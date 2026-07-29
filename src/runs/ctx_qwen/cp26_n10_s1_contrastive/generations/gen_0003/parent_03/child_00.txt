@@ -1,0 +1,222 @@
+
+
+<strategy>
+To improve upon the current sum of radii (~2.6306) and aim for the target of 2.636, we need a more robust and precise optimization strategy. Key improvements include:
+
+1. **Analytical Jacobian**: The constraint function will return both constraint values and their analytical gradients. This significantly accelerates `SLSQP` convergence and improves numerical stability, allowing the solver to navigate the highly nonlinear pairwise distance constraints more accurately.
+2. **Diverse Initializations**: We will generate a wide variety of starting configurations:
+   - Perturbed hexagonal lattices with varying densities
+   - Grid-based layouts with random jitter
+   - Force-directed layouts that naturally spread points to maximize minimum distances
+3. **Strict Feasibility Initialization**: Initial radii are computed as 94% of the theoretical maximum feasible radius for each circle, ensuring strict feasibility for the interior-point steps of SLSQP.
+4. **Iterative Perturbation & Polishing**: After finding the best solution from initial restarts, we perform multiple local perturbations (adding controlled noise to positions and radii) followed by high-precision polishing runs with tight tolerances (`ftol=1e-14`). This helps escape shallow local minima and squeeze out extra radius in tightly packed configurations.
+5. **Vectorized Computations**: All distance and constraint calculations are fully vectorized to keep per-iteration overhead low, enabling more restarts and perturbation steps within the time limit.
+
+This combination of exact gradients, topology diversity, and aggressive local search is highly effective for circle packing problems and should reliably push the sum of radii closer to the theoretical optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+NUM_BOUND = 4 * N
+NUM_PAIR = N * (N - 1) // 2
+TOTAL_CONST = NUM_BOUND + NUM_PAIR
+i_idx, j_idx = np.triu_indices(N, k=1)
+
+def cons_and_jac(vars_vec):
+    """Computes constraint values and their analytical Jacobian matrix."""
+    xc = vars_vec[0::3]
+    yc = vars_vec[1::3]
+    r = vars_vec[2::3]
+    
+    c = np.empty(TOTAL_CONST)
+    c[:N] = xc - r
+    c[N:2*N] = 1.0 - xc - r
+    c[2*N:3*N] = yc - r
+    c[3*N:4*N] = 1.0 - yc - r
+    
+    dx = xc[:, None] - xc[None, :]
+    dy = yc[:, None] - yc[None, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    c[4*N:] = dist2[i_idx, j_idx] - rs[i_idx, j_idx]**2
+    
+    jac = np.zeros((TOTAL_CONST, 3 * N))
+    
+    # Boundary constraints jacobian
+    for i in range(N):
+        jac[i, 3*i] = 1.0
+        jac[i, 3*i+2] = -1.0
+        jac[N+i, 3*i] = -1.0
+        jac[N+i, 3*i+2] = -1.0
+        jac[2*N+i, 3*i+1] = 1.0
+        jac[2*N+i, 3*i+2] = -1.0
+        jac[3*N+i, 3*i+1] = -1.0
+        jac[3*N+i, 3*i+2] = -1.0
+        
+    # Pairwise constraints jacobian
+    dx_ij = dx[i_idx, j_idx]
+    dy_ij = dy[i_idx, j_idx]
+    rs_ij = rs[i_idx, j_idx]
+    
+    for k in range(NUM_PAIR):
+        i = i_idx[k]
+        j = j_idx[k]
+        row = 4*N + k
+        
+        jac[row, 3*i] = 2.0 * dx_ij[k]
+        jac[row, 3*i+1] = 2.0 * dy_ij[k]
+        jac[row, 3*i+2] = -2.0 * rs_ij[k]
+        
+        jac[row, 3*j] = -2.0 * dx_ij[k]
+        jac[row, 3*j+1] = -2.0 * dy_ij[k]
+        jac[row, 3*j+2] = -2.0 * rs_ij[k]
+        
+    return c, jac
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[2::3])
+
+def get_feasible_radii(centers):
+    """Computes strictly feasible initial radii for given centers."""
+    r = np.zeros(N)
+    for i in range(N):
+        db = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+        diffs = centers[i] - centers
+        dists = np.sqrt(np.sum(diffs**2, axis=1))
+        dists[i] = np.inf
+        dp = np.min(dists)
+        r[i] = 0.94 * min(db, dp / 2.0)
+    return np.maximum(r, 1e-6)
+
+def generate_inits():
+    """Generates diverse initial center configurations."""
+    inits = []
+    # Hexagonal lattice variations
+    for seed in range(25):
+        np.random.seed(seed)
+        pts = []
+        r_est = 0.07 + np.random.rand() * 0.04
+        y = r_est
+        row = 0
+        while len(pts) < N:
+            shift = (row % 2) * r_est
+            x = r_est + shift
+            while x <= 1.0 - r_est and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r_est
+            y += np.sqrt(3) * r_est
+            row += 1
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.02, 0.02, (N, 2))
+        pts = np.clip(pts, 0.04, 0.96)
+        inits.append(pts)
+        
+    # Grid-based variations
+    for seed in range(15):
+        np.random.seed(seed + 100)
+        pts = np.array([[0.1 + 0.2*i + np.random.uniform(-0.02, 0.02),
+                         0.1 + 0.2*j + np.random.uniform(-0.02, 0.02)]
+                        for i in range(5) for j in range(5)] + [[0.5, 0.5]])
+        pts = np.clip(pts, 0.04, 0.96)
+        inits.append(pts)
+        
+    # Force-directed layouts
+    for seed in range(20):
+        np.random.seed(seed + 200)
+        pts = np.random.rand(N, 2) * 0.8 + 0.1
+        for _ in range(300):
+            diff = pts[:, None, :] - pts[None, :, :]
+            d2 = np.sum(diff**2, axis=2) + 1e-6
+            d = np.sqrt(d2)
+            f = diff / (d2[:, :, None] * d[:, :, None])
+            forces = np.sum(f, axis=0)
+            for k in range(2):
+                forces[:, k] += 10.0 * (np.maximum(0, 0.05 - pts[:, k]) - np.maximum(0, pts[:, k] - 0.95))
+            pts += 0.003 * forces
+            pts = np.clip(pts, 0.02, 0.98)
+        inits.append(pts)
+    return inits
+
+def run_packing():
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': cons_and_jac}
+    
+    best_sum = -1.0
+    best_vars = None
+    
+    inits = generate_inits()
+    
+    # Phase 1: Direct optimization from diverse starts
+    for idx, centers_init in enumerate(inits):
+        r_init = get_feasible_radii(centers_init)
+        x0 = np.zeros(3 * N)
+        x0[0::3] = centers_init[:, 0]
+        x0[1::3] = centers_init[:, 1]
+        x0[2::3] = r_init
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13})
+            if res.success:
+                c_val, _ = cons_and_jac(res.x)
+                if np.min(c_val) >= -1e-7:
+                    s = -res.fun
+                    if s > best_sum:
+                        best_sum = s
+                        best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Perturbation refinement to escape local minima
+    if best_vars is not None:
+        for _ in range(50):
+            x0 = best_vars.copy()
+            x0 += np.random.randn(3 * N) * 0.004
+            x0[0::3] = np.clip(x0[0::3], 0.01, 0.99)
+            x0[1::3] = np.clip(x0[1::3], 0.01, 0.99)
+            x0[2::3] = np.clip(x0[2::3], 1e-5, 0.49)
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+                if res.success:
+                    c_val, _ = cons_and_jac(res.x)
+                    if np.min(c_val) >= -1e-7:
+                        s = -res.fun
+                        if s > best_sum:
+                            best_sum = s
+                            best_vars = res.x.copy()
+            except Exception:
+                pass
+                
+        # Phase 3: High-precision polynomial-time polish
+        try:
+            res = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+            if res.success:
+                c_val, _ = cons_and_jac(res.x)
+                if np.min(c_val) >= -1e-7:
+                    best_vars = res.x
+                    best_sum = -res.fun
+        except Exception:
+            pass
+
+    # Fallback configuration (should rarely be reached)
+    if best_vars is None:
+        centers = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)] + [[0.5, 0.5]])
+        r = np.full(N, 0.09)
+        best_vars = np.zeros(3*N)
+        best_vars[0::3] = centers[:, 0]
+        best_vars[1::3] = centers[:, 1]
+        best_vars[2::3] = r
+        best_sum = np.sum(r)
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(best_sum)
+```

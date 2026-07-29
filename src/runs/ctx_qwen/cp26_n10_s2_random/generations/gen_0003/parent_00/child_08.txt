@@ -1,0 +1,211 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we recognize that this is a non-convex optimization problem where joint optimization of centers and radii often gets stuck in local minima. A highly effective strategy is to decouple the problem:
+1. **LP-based Radius Extraction**: For any fixed set of centers, the problem of finding radii that maximize their sum subject to non-overlap and boundary constraints is a Linear Program (LP). Solving this LP gives the exact maximum possible sum of radii for those centers.
+2. **Hybrid Optimization**: Use SLSQP to find good center configurations from diverse initial patterns (hexagonal lattices, random dense, corner-focused). For each optimized configuration, extract the exact optimal radii via LP.
+3. **Local Search on Centers**: Perform a targeted local search on the center coordinates. At each step, perturb centers slightly, evaluate the LP to get the true objective value, and accept improvements. This avoids the pitfalls of joint variable optimization where radii and centers interfere with gradients.
+4. **Strict Feasibility Handling**: After finding the best configuration, clamp centers to valid regions relative to their radii and re-solve the LP one final time to guarantee strict compliance with the `1e-12` validation tolerance.
+
+This approach leverages the exactness of LP for radius assignment while using gradient-based and stochastic methods to navigate the non-convex center space, reliably surpassing the current best sum of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def compute_lp_radii(centers):
+    """
+    Solves the LP to find radii that maximize sum(r_i) for fixed centers.
+    Constraints: r_i <= dist_to_boundary, r_i + r_j <= dist(i,j), r_i >= 0
+    """
+    n = centers.shape[0]
+    
+    # Distance to boundaries
+    b_i = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                     np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    b_i = np.maximum(b_i, 1e-9)
+    
+    # Pairwise Euclidean distances
+    dx = centers[:, 0, None] - centers[None, :, 0]
+    dy = centers[:, 1, None] - centers[None, :, 1]
+    d = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(d, np.inf)
+    
+    # Build LP matrices
+    n_pairs = n * (n - 1) // 2
+    n_constraints = n + n_pairs
+    A = np.zeros((n_constraints, n))
+    b = np.zeros(n_constraints)
+    
+    idx = 0
+    # Boundary constraints: r_i <= b_i
+    for i in range(n):
+        A[idx, i] = 1.0
+        b[idx] = b_i[i]
+        idx += 1
+        
+    # Pairwise constraints: r_i + r_j <= d_ij
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = d[i, j]
+            idx += 1
+            
+    c_obj = -np.ones(n)  # Maximize sum -> minimize negative sum
+    bounds = [(0.0, 0.5)] * n
+    
+    res = linprog(c_obj, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+    if res.success:
+        return res.x, -res.fun
+    # Fallback for numerical infeasibility (rare with valid centers)
+    return np.zeros(n), 0.0
+
+def generate_initial_configs():
+    """Generates diverse starting center configurations."""
+    configs = []
+    rng = np.random.default_rng(42)
+    
+    # Hexagonal patterns with varying base radii
+    for r0 in [0.08, 0.085, 0.09, 0.095, 0.10, 0.105, 0.11]:
+        for shift_mode in [0, 1]:
+            pts = []
+            y = r0
+            row = 0
+            while len(pts) < N:
+                x_start = r0 + (shift_mode + row) * r0 * 0.5
+                x = x_start
+                while x <= 1.0 - r0 and len(pts) < N:
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+                row += 1
+            pts = np.array(pts[:N])
+            # Small perturbation to break symmetry
+            pts += rng.normal(0, 0.002, pts.shape)
+            pts = np.clip(pts, r0 * 0.5, 1.0 - r0 * 0.5)
+            configs.append(pts)
+            
+    # Dense random distributions
+    for _ in range(12):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        configs.append(c)
+        
+    # Corner-focused layouts
+    for _ in range(8):
+        c = np.zeros((N, 2))
+        c[:4] = [[0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]]
+        c[4:] = rng.uniform(0.2, 0.8, (N - 4, 2))
+        configs.append(c)
+        
+    return configs
+
+def objective_func(v):
+    return -np.sum(v[2 * N:])
+
+def compute_constraints(v):
+    centers = v[:2 * N].reshape(N, 2)
+    radii = v[2 * N:]
+    
+    con = []
+    # Boundary constraints
+    con.append(centers[:, 0] - radii)
+    con.append(1.0 - centers[:, 0] - radii)
+    con.append(centers[:, 1] - radii)
+    con.append(1.0 - centers[:, 1] - radii)
+    
+    # Overlap constraints (squared distance formulation for smoothness)
+    idx = np.triu_indices(N, k=1)
+    dx = centers[idx[0], 0] - centers[idx[1], 0]
+    dy = centers[idx[0], 1] - centers[idx[1], 1]
+    dr = radii[idx[0]] + radii[idx[1]]
+    con.append(dx**2 + dy**2 - dr**2)
+    
+    return np.concatenate(con)
+
+def run_packing():
+    np.random.seed(42)
+    
+    bounds_opt = [(0.0, 1.0)] * (2 * N) + [(1e-7, 0.5)] * N
+    constraints_opt = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_sum = -np.inf
+    best_centers = None
+    
+    init_configs = generate_initial_configs()
+    
+    # Phase 1: SLSQP from diverse starts
+    for cfg in init_configs:
+        # Compute feasible initial radii for the config
+        d_min = np.min(np.linalg.norm(cfg[:, None, :] - cfg[None, :, :], axis=2), axis=1)
+        np.fill_diagonal(d_min, np.inf)
+        r_safe = np.minimum(0.5 * d_min, np.minimum(np.minimum(cfg[:, 0], 1.0 - cfg[:, 0]), np.minimum(cfg[:, 1], 1.0 - cfg[:, 1])))
+        r_init = np.maximum(r_safe * 0.8, 1e-4)
+        
+        v0 = np.concatenate([cfg.flatten(), r_init])
+        
+        try:
+            res = minimize(objective_func, v0, method='SLSQP', bounds=bounds_opt,
+                           constraints=constraints_opt, options={'maxiter': 3000, 'ftol': 1e-12})
+            
+            c_opt = res.x[:2 * N].reshape(N, 2)
+            # Extract exact optimal radii for these centers via LP
+            r_lp, s_lp = compute_lp_radii(c_opt)
+            
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_centers = c_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local search on centers using exact LP evaluation
+    if best_centers is not None:
+        curr_c = best_centers.copy()
+        best_sum_lp = best_sum
+        step = 0.008
+        
+        for _ in range(50):
+            improved = False
+            # Try multiple perturbations per cooling step
+            for _ in range(15):
+                noise = np.random.normal(0, step, curr_c.shape)
+                c_pert = np.clip(curr_c + noise, 1e-5, 1.0 - 1e-5)
+                r_p, s_p = compute_lp_radii(c_pert)
+                
+                if s_p > best_sum_lp:
+                    best_sum_lp = s_p
+                    curr_c = c_pert.copy()
+                    improved = True
+                    
+            if not improved:
+                step *= 0.85
+                
+        best_centers = curr_c
+        
+        # Final extraction and strict feasibility enforcement
+        final_r, final_sum = compute_lp_radii(best_centers)
+        
+        # Clamp centers to strictly satisfy boundary constraints relative to final_r
+        for i in range(N):
+            x, y = best_centers[i]
+            r = final_r[i]
+            best_centers[i, 0] = np.clip(x, r, 1.0 - r)
+            best_centers[i, 1] = np.clip(y, r, 1.0 - r)
+            
+        # Re-solve LP after clamping to ensure perfect consistency
+        final_r, final_sum = compute_lp_radii(best_centers)
+        
+        # Negligible shrink to safely clear 1e-12 numerical tolerance in validator
+        final_r *= 0.99999999
+        final_sum = np.sum(final_r)
+        
+        return best_centers, final_r, float(final_sum)
+        
+    # Fallback (should not be reached)
+    c = np.random.rand(N, 2) * 0.6 + 0.2
+    r, s = compute_lp_radii(c)
+    return c, r, float(s)
+```

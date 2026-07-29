@@ -1,0 +1,180 @@
+
+
+<strategy>
+To pack 26 circles in a unit square to maximize the sum of radii, we adopt a two-phase strategy combining geometric initialization with local numerical optimization.
+
+1.  **Initialization (Hexagonal Lattice):** We start with a hexagonal grid of 26 points. Hexagonal packing is the densest packing for equal circles in 2D, providing a high-quality starting configuration closer to the optimal solution than a rectangular grid.
+2.  **Optimization (Local Refinement):** We formulate the problem as a constrained optimization task using `scipy.optimize.minimize` (SLSQP method). The goal is to maximize the sum of radii subject to non-overlap and boundary constraints.
+    - We define variables for the $x, y$ coordinates of all 26 centers and their individual radii.
+    - The objective function is the negative sum of radii.
+    - Constraints are vectorized for performance: boundary checks ensure circles remain in $[0,1]^2$, and pairwise distance checks ensure $d_{ij} \ge r_i + r_j$.
+3.  **Multi-Start Strategy:** To avoid poor local minima, we run the optimization twice: first on a dense hexagonal grid, and second on a randomized perturbation of the grid. We return the best valid result found.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = 26
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+
+    # Function to perform optimization from a given set of centers
+    def optimize_packing(initial_centers, iterations=500):
+        # Initial radii estimate (half of minimum neighbor distance or boundary dist)
+        # Start with a safe small value to ensure feasibility
+        r_init = 0.05 
+        
+        # Variables: x (n), y (n), r (n) -> total 3*n
+        # Vector: [x0, x1, ..., x25, y0, ..., y25, r0, ..., r25]
+        x0 = np.concatenate([initial_centers[:, 0], initial_centers[:, 1], np.full(n, r_init)])
+        
+        # Bounds: x, y in [0, 1], r >= 0
+        bounds = [(0, 1)] * n + [(0, 1)] * n + [(0, 0.5)] * n
+        
+        # Define constraints
+        # We will define a single function that returns an array of constraint violations
+        # Constraints:
+        # 1. x_i - r_i >= 0
+        # 2. 1 - x_i - r_i >= 0
+        # 3. y_i - r_i >= 0
+        # 4. 1 - y_i - r_i >= 0
+        # 5. (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        
+        def constraints_func(vars):
+            xs = vars[:n]
+            ys = vars[n:2*n]
+            rs = vars[2*n:]
+            
+            # Boundary constraints (4 * n)
+            c_bounds = np.concatenate([
+                xs - rs,          # x >= r
+                1.0 - xs - rs,    # 1 - x >= r
+                ys - rs,          # y >= r
+                1.0 - ys - rs     # 1 - y >= r
+            ])
+            
+            # Distance constraints (n*(n-1)/2)
+            # Vectorized computation of squared distances
+            # We only need upper triangle of distance matrix to avoid duplicates
+            # But for simplicity and vectorization, we can compute all pairs and filter, 
+            # or use broadcasting carefully.
+            
+            # Broadcasting approach:
+            # xs.shape (n,), expand to (n, 1) and (1, n)
+            dx = xs[:, np.newaxis] - xs[np.newaxis, :]
+            dy = ys[:, np.newaxis] - ys[np.newaxis, :]
+            dr = rs[:, np.newaxis] + rs[np.newaxis, :]
+            
+            dist_sq = dx**2 + dy**2
+            req_sq = dr**2
+            
+            # We need dist_sq[i, j] >= req_sq[i, j] for i < j
+            # Flatten and select upper triangle
+            triu_indices = np.triu_indices(n, k=1)
+            c_dist = dist_sq[triu_indices] - req_sq[triu_indices]
+            
+            return np.concatenate([c_bounds, c_dist])
+
+        cons = {'type': 'ineq', 'fun': constraints_func}
+
+        # Objective: Maximize sum(r) -> Minimize -sum(r)
+        def objective(vars):
+            return -np.sum(vars[2*n:])
+
+        try:
+            res = minimize(
+                objective, 
+                x0, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=cons,
+                options={'maxiter': iterations, 'ftol': 1e-10, 'disp': False}
+            )
+            
+            if res.success:
+                centers_opt = res.x[:2*n].reshape(-1, 2)
+                radii_opt = res.x[2*n:]
+                # Clip radii to non-negative just in case
+                radii_opt = np.maximum(radii_opt, 0.0)
+                return centers_opt, radii_opt, np.sum(radii_opt)
+        except Exception as e:
+            pass
+            
+        return None, None, -1.0
+
+    # Strategy 1: Hexagonal Grid Initialization
+    # Generate a hexagonal lattice
+    # Approximate spacing for 26 circles:
+    # Area per circle ~ 1/26. Hex area ~ s^2 * sqrt(3)/2.
+    # s ~ sqrt(2 / (26 * sqrt(3))) ~ 0.21
+    
+    centers_hex = []
+    spacing = 0.22 # Slightly loose to start
+    y = spacing * np.sqrt(3) / 2
+    
+    # We want to center the grid roughly in the square
+    # Estimate extent
+    # 5 rows roughly
+    
+    k = 0
+    while len(centers_hex) < n:
+        # x offset for odd rows
+        offset = (k % 2) * spacing / 2
+        
+        # Add margin to keep inside [0,1]
+        x_start = 0.05 + offset
+        x = x_start
+        
+        while len(centers_hex) < n and x < 0.95:
+            centers_hex.append([x, y])
+            x += spacing
+        
+        y += spacing * np.sqrt(3) / 2
+        k += 1
+        
+        if y > 0.95: 
+            break # Stop if out of bounds significantly
+
+    centers_hex = np.array(centers_hex[:n])
+    
+    # Optimization 1
+    c1, r1, s1 = optimize_packing(centers_hex, iterations=1000)
+    if s1 > best_sum:
+        best_centers, best_radii, best_sum = c1, r1, s1
+
+    # Strategy 2: Randomized perturbation of the grid (Multi-start)
+    # Add small noise to escape local minima
+    centers_perturbed = centers_hex + np.random.uniform(-0.02, 0.02, size=centers_hex.shape)
+    # Ensure inside bounds
+    centers_perturbed = np.clip(centers_perturbed, 0.01, 0.99)
+    
+    c2, r2, s2 = optimize_packing(centers_perturbed, iterations=1000)
+    if s2 > best_sum:
+        best_centers, best_radii, best_sum = c2, r2, s2
+
+    # Final validation check (optional but good practice)
+    if best_centers is not None and best_radii is not None:
+        # Ensure no negative radii due to numerical noise
+        best_radii = np.maximum(best_radii, 0.0)
+        
+        # Simple check to ensure we aren't returning garbage
+        # (The optimizer should handle this, but safety first)
+        # If sum is very small, fallback to a known good grid?
+        if best_sum < 2.0:
+            # Fallback to simple grid if optimization failed
+            # 5x5 grid + 1
+            grid = np.array([[i*0.2 + 0.1, j*0.2 + 0.1] for i in range(5) for j in range(5)])
+            # Add one point
+            grid = np.vstack([grid, [0.5, 0.5]])
+            r_fallback = 0.04
+            return grid, np.full(26, r_fallback), 26*r_fallback
+
+    return best_centers, best_radii, best_sum
+
+```

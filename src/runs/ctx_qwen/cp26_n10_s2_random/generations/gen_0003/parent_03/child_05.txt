@@ -1,0 +1,247 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.623, we need a more robust exploration of the configuration space followed by precise local refinement. The current approach gets stuck in local minima typical of non-convex circle packing problems.
+
+Key improvements:
+1. **Force-Directed Initialization**: Instead of purely geometric lattices, we simulate a physical repulsion process. Circles start small, repel each other and boundaries, and gradually grow. This naturally finds dense, jammed configurations that serve as excellent starting points for gradient-based optimizers.
+2. **Two-Phase Optimization**:
+   - *Phase 1 (Center Optimization)*: Fix radii to be the maximum possible given centers (`compute_radii`). Optimize centers using `Powell`, which handles the non-smooth `min` operations in radius computation effectively.
+   - *Phase 2 (Joint Refinement)*: Take the best center configuration and jointly optimize centers and radii using `SLSQP` with smooth squared-distance constraints. This fine-tunes the solution to machine precision.
+3. **Perturbation & Basin Hopping**: Between phases, we randomly perturb the best configuration and re-optimize to escape shallow local minima.
+4. **Deterministic Repair**: A final strict repair step guarantees the solution passes the validator's `1e-12` tolerance by minimally shrinking radii only where necessary.
+
+This hybrid strategy balances global exploration (force simulation + multi-start) with local exploitation (Powell + SLSQP), consistently pushing past equal-radius lattice limits by leveraging boundary effects and variable circle sizes.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+IDX_I, IDX_J = np.triu_indices(N, k=1)
+
+def compute_radii(centers):
+    """Computes maximum valid radii for fixed centers."""
+    n = centers.shape[0]
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-15)
+    np.fill_diagonal(dists, np.inf)
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective_centers(centers_flat):
+    """Objective for center optimization: maximize sum of radii."""
+    centers = centers_flat.reshape(-1, 2)
+    radii = compute_radii(centers)
+    return -np.sum(radii)
+
+def objective_joint(vars_flat):
+    """Objective for joint optimization: maximize sum of radii."""
+    return -np.sum(vars_flat[2::3])
+
+def constraint_joint(vars_flat):
+    """Boundary and non-overlap constraints for joint optimization."""
+    n = N
+    x = vars_flat[0::3]
+    y = vars_flat[1::3]
+    r = vars_flat[2::3]
+    c = []
+    # Boundary constraints
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    # Pairwise non-overlap (smooth squared form)
+    xi, xj = x[IDX_I], x[IDX_J]
+    yi, yj = y[IDX_I], y[IDX_J]
+    ri, rj = r[IDX_I], r[IDX_J]
+    c.append((xi - xj)**2 + (yi - yj)**2 - (ri + rj)**2)
+    return np.concatenate(c)
+
+def get_bounds_joint():
+    """Variable bounds for joint optimization."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def force_directed_init(seed, steps=1000):
+    """Generates initial centers via repulsion simulation."""
+    rng = np.random.default_rng(seed)
+    centers = rng.uniform(0.15, 0.85, (N, 2))
+    radii = np.full(N, 0.015)
+    
+    for _ in range(steps):
+        forces = np.zeros_like(centers)
+        diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2) + 1e-8)
+        min_d = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlap = np.maximum(0.0, min_d - dists)
+        inv_dists = np.where(dists > 1e-5, 1.0 / dists, 0.0)
+        force_mags = overlap * 5000.0
+        force_vecs = force_mags[:, :, np.newaxis] * inv_dists[:, :, np.newaxis] * diffs
+        forces += np.sum(force_vecs, axis=1)
+        
+        for i in range(N):
+            r = radii[i]
+            if centers[i, 0] < r: forces[i, 0] += (r - centers[i, 0]) * 5000.0
+            if centers[i, 0] > 1.0 - r: forces[i, 0] -= (centers[i, 0] - (1.0 - r)) * 5000.0
+            if centers[i, 1] < r: forces[i, 1] += (r - centers[i, 1]) * 5000.0
+            if centers[i, 1] > 1.0 - r: forces[i, 1] -= (centers[i, 1] - (1.0 - r)) * 5000.0
+            
+        centers += forces * 0.0005
+        centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+        radii *= 1.0004
+        
+    return centers
+
+def hex_init(seed):
+    """Generates initial centers from a perturbed hexagonal lattice."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    rows = [5, 5, 5, 5, 5, 1]
+    y = 0.08
+    dy = 0.15
+    dx = 0.17
+    r_idx = 0
+    for count in rows:
+        shift = (0.5 if r_idx % 2 == 1 else 0.0) * dx
+        x = 0.08 + shift
+        for _ in range(count):
+            centers.append([x + rng.uniform(-0.01, 0.01), y + rng.uniform(-0.01, 0.01)])
+            x += dx
+        y += dy
+        r_idx += 1
+    return np.array(centers[:N])
+
+def optimize_centers(centers_flat):
+    """Run Powell optimization on centers."""
+    bounds = [(0.0, 1.0)] * (2 * N)
+    try:
+        res = minimize(objective_centers, centers_flat, method='Powell', bounds=bounds,
+                       options={'maxiter': 2500, 'ftol': 1e-13, 'xtol': 1e-13})
+        return res.x.reshape(-1, 2), -res.fun
+    except Exception:
+        return None, -np.inf
+
+def optimize_joint(vars_flat):
+    """Run SLSQP joint optimization on centers and radii."""
+    bounds = get_bounds_joint()
+    cons = {'type': 'ineq', 'fun': constraint_joint}
+    try:
+        res = minimize(objective_joint, vars_flat, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13})
+        return res.x, -res.fun
+    except Exception:
+        return None, -np.inf
+
+def repair_solution(centers, radii):
+    """Deterministically repair solution to strictly satisfy validation tolerances."""
+    n = centers.shape[0]
+    radii = radii.copy()
+    centers = centers.copy()
+    
+    for _ in range(30):
+        changed = False
+        for i in range(n):
+            x, y = centers[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            if radii[i] > max_r + 1e-9:
+                radii[i] = max_r
+                changed = True
+                
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+                    
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    best_c_centers = None
+    best_c_sum = -1.0
+    
+    # Phase 1: Generate diverse initial configurations
+    inits = []
+    for i in range(10):
+        inits.append(force_directed_init(i))
+    for i in range(10):
+        inits.append(hex_init(i))
+        
+    # Optimize centers with Powell
+    best_candidates = []
+    for init_c in inits:
+        c_opt, s = optimize_centers(init_c.flatten())
+        if c_opt is not None:
+            best_candidates.append((c_opt, s))
+            
+    best_candidates.sort(key=lambda x: x[1], reverse=True)
+    if best_candidates:
+        best_c_centers, best_c_sum = best_candidates[0]
+    else:
+        best_c_centers = inits[0]
+        best_c_sum = np.sum(compute_radii(best_c_centers))
+        
+    # Basin hopping: perturb best and re-optimize to escape local minima
+    for _ in range(5):
+        pert = best_c_centers.copy()
+        pert += np.random.normal(0, 0.008, pert.shape)
+        pert = np.clip(pert, 1e-4, 1.0 - 1e-4)
+        c_opt, s = optimize_centers(pert.flatten())
+        if c_opt is not None and s > best_c_sum:
+            best_c_sum = s
+            best_c_centers = c_opt
+            
+    # Phase 2: Joint refinement with SLSQP
+    best_radii = compute_radii(best_c_centers)
+    r_safe = np.minimum(best_radii, 0.5)
+    x0_joint = np.zeros(3 * N)
+    x0_joint[0::3] = best_c_centers[:, 0]
+    x0_joint[1::3] = best_c_centers[:, 1]
+    x0_joint[2::3] = r_safe
+    
+    v_opt, s_joint = optimize_joint(x0_joint)
+    best_sum = max(best_c_sum, s_joint)
+    
+    if v_opt is not None and s_joint > best_c_sum:
+        best_c_centers = v_opt[:2*N].reshape(N, 2)
+        best_radii = v_opt[2*N:]
+        
+    # Further joint perturbations
+    for _ in range(8):
+        pert_c = best_c_centers.copy() + np.random.normal(0, 0.003, (N, 2))
+        pert_c = np.clip(pert_c, 0.01, 0.99)
+        pert_r = best_radii * 0.995
+        
+        v0 = np.zeros(3*N)
+        v0[0::3] = pert_c[:, 0]
+        v0[1::3] = pert_c[:, 1]
+        v0[2::3] = pert_r
+        
+        v_opt2, s2 = optimize_joint(v0)
+        if v_opt2 is not None and s2 > best_sum:
+            best_sum = s2
+            best_c_centers = v_opt2[:2*N].reshape(N, 2)
+            best_radii = v_opt2[2*N:]
+            
+    # Phase 3: Final repair for strict validation compliance
+    best_c_centers, best_radii = repair_solution(best_c_centers, best_radii)
+    final_sum = float(np.sum(best_radii))
+    
+    return best_c_centers, best_radii, final_sum
+```

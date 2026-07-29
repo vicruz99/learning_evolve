@@ -1,0 +1,226 @@
+# sol_000302 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2823a898) state=c7043c06 sum of radii=2.119469 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    Uses a force-directed optimization approach to push circles apart and expand radii.
+    """
+    n = 26
+    # Initialize centers
+    centers = np.zeros((n, 2))
+    # Initialize radii
+    radii = np.full(n, 0.05)
+    
+    # Initialization: Hexagonal-ish pattern to start close to a good solution
+    # We want to fit 26 circles. 
+    # A 5x5 grid fits 25 circles with r=0.1. 
+    # We can try to fit 26 by perturbing a 5x5 grid + 1 or using a hex layout.
+    # Let's try a hexagonal layout with 5 rows.
+    # Rows: 5, 5, 5, 5, 6? No, width constraint.
+    # Let's just use a random initialization for robustness, or a specific grid.
+    # A 5x5 grid + 1 circle placed in center might work if we shrink r slightly initially.
+    
+    # Let's try a structured initialization:
+    # 5 rows, roughly 5 circles per row.
+    # y coordinates: 0.1, 0.3, 0.5, 0.7, 0.9 (for r=0.1)
+    # But we have 26 circles.
+    # Let's distribute 26 circles into 5 rows: 6, 5, 5, 5, 5? 
+    # Row 1: 6 circles. x: 0.08, 0.26, 0.44, 0.62, 0.80, 0.98?
+    # Spacing ~0.18. 2r = 0.2? Overlap.
+    # So r must be < 0.09 for 6 in a row.
+    # This suggests we should start with small r and grow.
+    
+    # Let's use a random initialization to avoid local minima of bad grids.
+    np.random.seed(123)
+    centers[:, 0] = np.random.uniform(0.05, 0.95, n)
+    centers[:, 1] = np.random.uniform(0.05, 0.95, n)
+    
+    current_r = 0.01
+    
+    # Optimization parameters
+    max_iterations = 2000
+    learning_rate = 0.05
+    r_step = 0.0001 # How much to increase radius per successful step
+    patience = 50 # Steps without improvement to increase r
+    
+    # We will optimize positions for a fixed radius, then increase radius.
+    # Or we can optimize radius directly.
+    # Let's try to maximize radius r (assuming equal radii for simplicity first).
+    # If we find a valid packing for r, we try r + step.
+    
+    # Better approach: Simulated Annealing or simple gradient ascent on r.
+    # But checking validity is expensive.
+    # Let's use the force method to maintain validity while increasing r.
+    
+    # Start with a valid small packing
+    r = 0.02
+    radii[:] = r
+    
+    # Run optimization
+    for step in range(max_iterations):
+        # 1. Increase radius slightly
+        # We want to maximize sum of radii. 
+        # Let's try to push r up by a tiny amount and see if we can resolve overlaps.
+        # Or just keep r constant and try to resolve overlaps, then increase.
+        
+        # Let's increase r aggressively but allow position adjustment
+        r += 0.00005
+        radii[:] = r
+        
+        # 2. Compute forces
+        force = np.zeros_like(centers)
+        
+        # Pairwise repulsion
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist_sq = dx*dx + dy*dy
+                dist = math.sqrt(dist_sq)
+                
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist:
+                    if dist < 1e-9:
+                        # Avoid division by zero, push randomly
+                        fx = np.random.uniform(-1, 1)
+                        fy = np.random.uniform(-1, 1)
+                    else:
+                        overlap = min_dist - dist
+                        # Force proportional to overlap
+                        fx = (dx / dist) * overlap
+                        fy = (dy / dist) * overlap
+                    
+                    force[i, 0] += fx
+                    force[i, 1] += fy
+                    force[j, 0] -= fx
+                    force[j, 1] -= fy
+
+        # Wall repulsion
+        for i in range(n):
+            r_i = radii[i]
+            x, y = centers[i]
+            
+            # Left wall
+            if x < r_i:
+                force[i, 0] += (r_i - x) * 10.0 # Stronger wall force
+            # Right wall
+            if x > 1.0 - r_i:
+                force[i, 0] -= (x - (1.0 - r_i)) * 10.0
+            # Bottom wall
+            if y < r_i:
+                force[i, 1] += (r_i - y) * 10.0
+            # Top wall
+            if y > 1.0 - r_i:
+                force[i, 1] -= (y - (1.0 - r_i)) * 10.0
+
+        # 3. Update positions
+        # Apply force with damping
+        centers += force * learning_rate
+        
+        # Clamp centers to stay within bounds roughly (forces should handle it)
+        # But to prevent explosion, clamp
+        centers = np.clip(centers, 0, 1)
+
+        # Periodically check if we are stuck or converging
+        # If max force is very small, we might be in a local optimum with current r.
+        # But since we keep increasing r, we force the system to move.
+        
+        # Optional: Reduce learning rate over time?
+        if step > 1000:
+            learning_rate *= 0.999
+
+    # After optimization, we might have some slight overlaps due to discrete steps.
+    # Let's do a final clean-up phase with very small steps to resolve any remaining overlaps.
+    # But for the purpose of the function, we just return what we have.
+    # However, the validation is strict.
+    # Let's ensure no overlaps.
+    
+    # If there are overlaps, the validation will fail.
+    # We need to ensure validity.
+    # Let's add a post-processing step to shrink radii slightly if overlaps exist.
+    # Or run more iterations with 0 radius increase.
+    
+    # Run 500 iterations with fixed r to resolve overlaps
+    for _ in range(500):
+        force = np.zeros_like(centers)
+        max_overlap = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist:
+                    overlap = min_dist - dist
+                    max_overlap = max(max_overlap, overlap)
+                    if dist > 1e-9:
+                        fx = (dx / dist) * overlap
+                        fy = (dy / dist) * overlap
+                    else:
+                        fx = np.random.uniform(-1, 1) * 0.1
+                        fy = np.random.uniform(-1, 1) * 0.1
+                    force[i, 0] += fx
+                    force[i, 1] += fy
+                    force[j, 0] -= fx
+                    force[j, 1] -= fy
+        
+        # Wall forces
+        for i in range(n):
+            r_i = radii[i]
+            x, y = centers[i]
+            if x < r_i: force[i, 0] += (r_i - x) * 10.0
+            if x > 1.0 - r_i: force[i, 0] -= (x - (1.0 - r_i)) * 10.0
+            if y < r_i: force[i, 1] += (r_i - y) * 10.0
+            if y > 1.0 - r_i: force[i, 1] -= (y - (1.0 - r_i)) * 10.0
+            
+        centers += force * 0.01
+        centers = np.clip(centers, 0, 1)
+        
+        if max_overlap < 1e-6:
+            break
+            
+    # If still overlaps, shrink radii globally until valid
+    # This ensures validity at the cost of score.
+    # But our optimization should have found a good r.
+    # Let's check validity manually and shrink if needed.
+    
+    # Validate and shrink
+    while True:
+        valid = True
+        for i in range(n):
+            r_i = radii[i]
+            x, y = centers[i]
+            if x - r_i < -1e-9 or x + r_i > 1 + 1e-9 or y - r_i < -1e-9 or y + r_i > 1 + 1e-9:
+                # Push center in
+                centers[i, 0] = np.clip(x, r_i, 1 - r_i)
+                centers[i, 1] = np.clip(y, r_i, 1 - r_i)
+                valid = False # Mark as needing check
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = math.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                if dist < radii[i] + radii[j] - 1e-9:
+                    # Shrink radii slightly
+                    # Shrink the larger one or both?
+                    # Shrink both equally
+                    shrink = (radii[i] + radii[j] - dist) * 0.5
+                    if radii[i] > shrink: radii[i] -= shrink
+                    if radii[j] > shrink: radii[j] -= shrink
+                    valid = False
+        
+        if valid:
+            break
+        # Prevent infinite loop
+        if np.min(radii) < 1e-5:
+            break
+
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii

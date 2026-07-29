@@ -1,5 +1,5 @@
 # sol_000055 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 2252d37f) state=21404cf4 sum of radii=0.000000 correctness=1.0
+# generation=0 parent=seed (state 50e7db78) state=c0ab670f sum of radii=2.112500 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,232 +7,94 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def validate_packing(centers, radii):
-    """
-    Validate that circles don't overlap and are inside the unit square
-    """
+def calculate_penalty(centers, radii, mu):
+    """Calculate penalty for overlaps and boundary violations."""
     n = centers.shape[0]
+    penalty = 0.0
+    
+    # Boundary violations: max(0, violation)^2
+    v_l = radii - centers[:, 0]
+    v_r = radii - (1.0 - centers[:, 0])
+    v_b = radii - centers[:, 1]
+    v_t = radii - (1.0 - centers[:, 1])
+    
+    penalty += np.sum(np.maximum(v_l, 0.0)**2)
+    penalty += np.sum(np.maximum(v_r, 0.0)**2)
+    penalty += np.sum(np.maximum(v_b, 0.0)**2)
+    penalty += np.sum(np.maximum(v_t, 0.0)**2)
+    
+    # Overlap violations: max(0, r_i + r_j - dist_ij)^2
+    # Vectorized computation
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist = np.linalg.norm(diff, axis=2)
+    
+    # Exclude self-interactions by setting diagonal to infinity
+    np.fill_diagonal(dist, np.inf)
+    
+    sum_r = radii[:, np.newaxis] + radii[np.newaxis, :]
+    violations = np.maximum(0.0, sum_r - dist)
+    
+    # Sum over upper triangle (divide by 2 to avoid double counting)
+    penalty += np.sum(violations**2) / 2.0
+    
+    return mu * penalty
 
-    # Check for NaN values
-    if np.isnan(centers).any():
-        print("NaN values detected in circle centers")
-        return False
+def objective(z, n, mu):
+    """Objective: minimize negative sum of radii + penalty."""
+    r = z[2*n:]
+    centers = np.column_stack((z[:n], z[n:2*n]))
+    return -np.sum(r) + calculate_penalty(centers, r, mu)
 
-    if np.isnan(radii).any():
-        print("NaN values detected in circle radii")
-        return False
-
-    # Check if radii are nonnegative and not nan
-    for i in range(n):
-        if radii[i] < 0:
-            print(f"Circle {i} has negative radius {radii[i]}")
-            return False
-        elif np.isnan(radii[i]):
-            print(f"Circle {i} has nan radius")
-            return False
-
-    # Check if circles are inside the unit square
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
-            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
-            return False
-
-    # Check for overlaps
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
-                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
-                return False
-
-    return True
-
-def objective_function(params, n_circles):
-    """
-    Objective function to minimize.
-    We want to maximize sum of radii, so we minimize negative sum.
-    We add penalty terms for constraints violations.
+def run_packing():
+    n = 26
     
-    Params: flattened array [x1, y1, r1, x2, y2, r2, ...]
-    """
-    penalty_weight = 1000.0
+    # 1. Initialization: Hexagonal lattice
+    centers = np.zeros((n, 2))
+    radii = np.full(n, 0.08) + np.arange(n) * 1e-4  # Small perturbation to break symmetry
     
-    # Reshape
-    x = params[0::3]
-    y = params[1::3]
-    r = params[2::3]
+    r_guess = 0.09
+    dx = 2 * r_guess
+    dy = np.sqrt(3) * r_guess
     
-    # 1. Maximize sum of radii (minimize negative sum)
-    obj = -np.sum(r)
-    
-    # 2. Boundary penalties
-    # x - r >= 0  =>  r - x <= 0
-    # x + r <= 1  =>  x + r - 1 <= 0
-    # same for y
-    
-    # Violations
-    v_left = r - x
-    v_right = x + r - 1
-    v_down = r - y
-    v_up = y + r - 1
-    
-    # Penalty is sum of squares of positive violations
-    obj += penalty_weight * (
-        np.sum(np.maximum(0, v_left)**2) +
-        np.sum(np.maximum(0, v_right)**2) +
-        np.sum(np.maximum(0, v_down)**2) +
-        np.sum(np.maximum(0, v_up)**2)
-    )
-    
-    # 3. Overlap penalties
-    # dist(i, j) >= r_i + r_j
-    # violation = r_i + r_j - dist(i, j)
-    
-    # Calculate pairwise distances
-    # Vectorized distance calculation
-    # coords shape (n, 2)
-    coords = np.column_stack((x, y))
-    
-    # Compute distance matrix
-    # diff shape (n, n, 2)
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-    dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
-    
-    # Sum of radii matrix
-    r_sum_matrix = r[:, np.newaxis] + r[np.newaxis, :]
-    
-    # Overlap violations (strictly positive means overlap)
-    overlap = r_sum_matrix - dist_matrix
-    
-    # We only care about upper triangle to avoid double counting, 
-    # but summing over all is fine for gradient direction, just scales penalty.
-    # Let's use upper triangle for efficiency and consistency.
-    mask = np.triu(np.ones((n_circles, n_circles), dtype=bool), k=1)
-    violations = overlap[mask]
-    
-    obj += penalty_weight * np.sum(np.maximum(0, violations)**2)
-    
-    return obj
-
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    n_circles = 26
-    n_vars = n_circles * 3  # x, y, r for each
-    
-    best_params = None
-    best_obj = np.inf
-    best_sum_r = 0.0
-    
-    # Multi-start optimization to find global optimum
-    n_starts = 20
-    
-    for start in range(n_starts):
-        # Random initialization
-        # Centers in [0.1, 0.9] to start safely away from boundaries
-        # Radii small initially
-        x_init = np.random.uniform(0.1, 0.9, n_circles)
-        y_init = np.random.uniform(0.1, 0.9, n_circles)
-        r_init = np.random.uniform(0.01, 0.05, n_circles) # Small initial radii
+    idx = 0
+    y = r_guess
+    for row in range(6):
+        x = r_guess + (row % 2) * (dx / 2)
+        for col in range(5):
+            if idx >= n:
+                break
+            centers[idx] = [x, y]
+            x += dx
+            idx += 1
+        y += dy
         
-        params_init = np.zeros(n_vars)
-        params_init[0::3] = x_init
-        params_init[1::3] = y_init
-        params_init[2::3] = r_init
-        
-        # Bounds: x, y in [0, 1], r in [0, 0.5] (max possible radius in unit square)
-        # Actually r can be at most 0.5.
-        bounds = []
-        for _ in range(n_circles):
-            bounds.append((0.0, 1.0)) # x
-            bounds.append((0.0, 1.0)) # y
-            bounds.append((0.0, 0.5)) # r
-            
-        try:
-            res = minimize(
-                objective_function,
-                params_init,
-                args=(n_circles,),
-                method='L-BFGS-B',
-                bounds=bounds,
-                options={'ftol': 1e-12, 'gtol': 1e-8, 'maxiter': 1000, 'disp': False}
-            )
-            
-            if res.success and res.fun < best_obj:
-                # Check validity
-                curr_x = res.x[0::3]
-                curr_y = res.x[1::3]
-                curr_r = res.x[2::3]
-                centers = np.column_stack((curr_x, curr_y))
-                
-                # Apply a small correction to ensure strict validity if close to boundary
-                # This is a safety measure, though optimizer should handle it.
-                # If any radius is negative (shouldn't be with bounds), fix it.
-                curr_r = np.maximum(curr_r, 0.0)
-                
-                # Check validation
-                if validate_packing(centers, curr_r):
-                    best_params = res.x
-                    best_obj = res.fun
-                    best_sum_r = np.sum(curr_r)
-                else:
-                    # If invalid, maybe reduce radii slightly to fix
-                    # This is a fallback
-                    pass 
-                    
-        except Exception:
-            continue
-            
-    if best_params is not None:
-        best_x = best_params[0::3]
-        best_y = best_params[1::3]
-        best_r = best_params[2::3]
-        
-        centers = np.column_stack((best_x, best_y))
-        radii = best_r
-        
-        # Final validation and slight adjustment if needed
-        if not validate_packing(centers, radii):
-            # Try to fix by slightly shrinking radii
-            # This shouldn't happen often with high penalty
-            for i in range(100):
-                if validate_packing(centers, radii):
-                    break
-                # Find max violation? Just shrink all slightly
-                radii *= 0.99
-        else:
-            # Optimization might have pushed radii to limit, 
-            # but maybe we can increase them slightly if there's slack?
-            # The optimizer maximizes sum, so it should be at limit.
-            pass
-
-        return centers, radii, float(np.sum(radii))
+    # Ensure initial points are within bounds
+    centers = np.clip(centers, 0, 1)
     
-    # Fallback to a grid if optimization fails completely (unlikely)
-    # 5x5 grid is 25 circles, we need 26.
-    # Just return a valid configuration even if suboptimal
-    centers = np.zeros((26, 2))
-    radii = np.zeros(26)
-    # 5x5 grid + 1 in center?
-    # Grid spacing 0.2
-    # Radii 0.1
-    # 25 circles at (0.1, 0.1)...(0.9, 0.9)
-    # 26th circle? Maybe shrink a bit.
-    # Let's just return random valid small circles
-    for i in range(26):
-        centers[i] = [0.5, 0.5] # All at center? No, overlap.
-        # Just return the best found so far or a safe default
-        pass
+    # Flatten to 1D array for optimizer
+    z0 = np.concatenate([centers[:, 0], centers[:, 1], radii])
+    bounds = [(0, 1)] * n + [(0, 1)] * n + [(0, 0.5)] * n
     
-    # Default safe return
-    centers = np.array([[0.5, 0.5]] * 26)
-    radii = np.zeros(26)
-    # This is invalid (overlap), but function needs to return something.
-    # With valid logic above, we should have a result.
-    return centers, radii, 0.0
-
-# Run the optimization to get the result
-if __name__ == "__main__":
-    c, r, s = run_packing()
-    print(f"Sum of radii: {s}")
-    print(validate_packing(c, r))
+    # 2. Iterative optimization with increasing penalty
+    res = None
+    # Sequence of penalty strengths to gradually enforce constraints
+    penalty_schedule = [1000, 5000, 20000, 50000]
+    
+    for mu in penalty_schedule:
+        current_z = z0 if res is None else res.x
+        res = minimize(
+            objective, 
+            current_z, 
+            args=(n, mu), 
+            method='L-BFGS-B', 
+            bounds=bounds, 
+            options={'maxiter': 10000, 'ftol': 1e-14, 'gtol': 1e-8}
+        )
+        z0 = res.x
+        
+    # 3. Extract results
+    centers_opt = np.column_stack((res.x[:n], res.x[n:2*n]))
+    radii_opt = res.x[2*n:]
+    total_sum = np.sum(radii_opt)
+    
+    return centers_opt, radii_opt, total_sum

@@ -1,0 +1,214 @@
+# sol_000054 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state a7088d37) state=c6b56575 sum of radii=2.469052 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def compute_pairwise_distances(centers):
+    """
+    Compute pairwise distances between centers.
+    Centers: (n, 2) array.
+    Returns: (n, n) distance matrix.
+    """
+    # Using broadcasting for pairwise distances
+    # (n, 1, 2) - (1, n, 2) -> (n, n, 2) -> sqrt sum -> (n, n)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    return dists
+
+def calculate_radii_and_sum(centers):
+    """
+    Given centers, calculate the maximum valid radius for each circle
+    such that they don't overlap and stay inside [0,1]x[0,1].
+    Returns the radii array and the sum of radii.
+    """
+    n = centers.shape[0]
+    radii = np.zeros(n)
+    
+    # Wall constraints
+    x = centers[:, 0]
+    y = centers[:, 1]
+    # Distance to nearest wall
+    wall_dists = np.minimum(np.minimum(x, 1 - x), np.minimum(y, 1 - y))
+    
+    # Neighbor constraints
+    # Compute pairwise distances
+    dists = compute_pairwise_distances(centers)
+    
+    # Set diagonal to infinity so we don't consider self-distance
+    np.fill_diagonal(dists, np.inf)
+    
+    # Find minimum distance to any other circle
+    min_neighbor_dists = np.min(dists, axis=1)
+    
+    # The radius is limited by half the distance to the nearest neighbor
+    neighbor_limits = min_neighbor_dists / 2.0
+    
+    # The actual radius is the minimum of wall constraint and neighbor constraint
+    radii = np.minimum(wall_dists, neighbor_limits)
+    
+    return radii, np.sum(radii)
+
+def objective_function(centers_flat):
+    """
+    Objective function to minimize (negative sum of radii).
+    Input is a flat array of size 2n.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    _, sum_radii = calculate_radii_and_sum(centers)
+    return -sum_radii
+
+def get_hexagonal_init(n):
+    """
+    Generate an initial configuration of n centers using a hexagonal lattice.
+    """
+    centers = []
+    # Approximate number of rows
+    # Area ~ n * (sqrt(3)/2 * (2r)^2) ? No.
+    # Just try to fit points.
+    # For n=26, maybe 6 rows?
+    # 5, 4, 5, 4, 5, 3 -> 26 points
+    
+    # Define rows
+    rows_config = [5, 4, 5, 4, 5, 3]
+    
+    # Total height needed for 6 rows? 
+    # Let's space y from 0.1 to 0.9 roughly.
+    y_coords = np.linspace(0.12, 0.88, len(rows_config))
+    
+    current_idx = 0
+    for r_idx, count in enumerate(rows_config):
+        y = y_coords[r_idx]
+        # x spacing
+        # For 5 points, range roughly [0.1, 0.9]
+        # For 4 points, shifted
+        if count > 0:
+            # Start x based on row index for staggering
+            if r_idx % 2 == 0:
+                # 5 points: 0.1, 0.3, 0.5, 0.7, 0.9
+                xs = np.array([0.1 + 0.2 * i for i in range(count)])
+            else:
+                # 4 points: 0.2, 0.4, 0.6, 0.8 (shifted by 0.1)
+                # Or maybe 0.15, 0.35...
+                # Let's try shifting by half step (0.1)
+                xs = np.array([0.2 + 0.2 * i for i in range(count)])
+            
+            for x in xs:
+                centers.append([x, y])
+                current_idx += 1
+                
+    # If we didn't get exactly n, just pad or trim?
+    # With [5,4,5,4,5,3] sum is 26.
+    # Let's verify sum
+    if len(centers) != n:
+        # Fallback to grid
+        centers = []
+        grid_side = math.ceil(math.sqrt(n))
+        xs = np.linspace(0.1, 0.9, grid_side)
+        ys = np.linspace(0.1, 0.9, grid_side)
+        for y in ys:
+            for x in xs:
+                if len(centers) < n:
+                    centers.append([x, y])
+    
+    return np.array(centers[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_centers = None
+    best_sum = -1.0
+    
+    # Try multiple initializations
+    inits = []
+    
+    # 1. Hexagonal grid
+    inits.append(get_hexagonal_init(n))
+    
+    # 2. Random initialization (several times)
+    np.random.seed(42)
+    for _ in range(5):
+        # Random points in [0.1, 0.9] to keep away from walls initially
+        rand_centers = np.random.uniform(0.05, 0.95, size=(n, 2))
+        inits.append(rand_centers)
+        
+    # 3. Grid initialization
+    grid_side = math.ceil(math.sqrt(n))
+    xs = np.linspace(0.1, 0.9, grid_side)
+    ys = np.linspace(0.1, 0.9, grid_side)
+    grid_centers = []
+    for y in ys:
+        for x in xs:
+            if len(grid_centers) < n:
+                grid_centers.append([x, y])
+    inits.append(np.array(grid_centers[:n]))
+
+    # Bounds for optimization: centers must be in [0, 1]
+    bounds = [(0, 1)] * (2 * n)
+    
+    # Optimization methods to try
+    methods = ['L-BFGS-B', 'Powell', 'Nelder-Mead']
+    
+    for method in methods:
+        for init_centers in inits:
+            centers_flat = init_centers.flatten()
+            
+            try:
+                # Run optimization
+                # For L-BFGS-B we can pass bounds. For others, bounds are not supported directly 
+                # but we can rely on the objective function or just hope it stays in bounds 
+                # (though L-BFGS-B is safest for bounds).
+                # However, Powell and Nelder-Mead ignore bounds. 
+                # To keep them valid, we might need to project or use a method that respects bounds.
+                # L-BFGS-B is preferred. Let's prioritize it.
+                
+                if method == 'L-BFGS-B':
+                    res = minimize(objective_function, centers_flat, method=method, bounds=bounds, 
+                                   options={'maxiter': 1000, 'ftol': 1e-9})
+                else:
+                    # For methods without bounds, we rely on the fact that pushing outside 
+                    # [0,1] reduces radius (wall distance becomes negative -> radius 0 or small).
+                    # Actually wall distance logic: min(x, 1-x). If x<0, min is negative?
+                    # Wait, radii must be non-negative.
+                    # My calculate_radii uses min(x, 1-x). If x is -0.1, min is -0.1.
+                    # Radius becomes negative?
+                    # We should clamp radii to 0 in calculation or penalize outside.
+                    # But let's trust the optimizer stays reasonable or use L-BFGS-B.
+                    res = minimize(objective_function, centers_flat, method=method, 
+                                   options={'maxiter': 1000, 'ftol': 1e-9})
+                
+                centers_opt = res.x.reshape(-1, 2)
+                radii_opt, sum_opt = calculate_radii_and_sum(centers_opt)
+                
+                # Check validity (just in case)
+                if np.any(radii_opt < -1e-6):
+                    continue # Invalid
+                    
+                if sum_opt > best_sum:
+                    best_sum = sum_opt
+                    best_centers = centers_opt
+                    best_radii = radii_opt
+                    
+            except Exception as e:
+                print(f"Optimization failed with method {method}: {e}")
+                continue
+
+    # Final validation and cleanup
+    # Ensure centers are strictly inside or on boundary
+    # And radii are non-negative
+    if best_centers is None:
+        # Fallback
+        best_centers = np.zeros((n, 2))
+        best_radii = np.zeros(n)
+        best_sum = 0.0
+
+    # One last check: recalculate radii to be exact
+    best_radii, best_sum = calculate_radii_and_sum(best_centers)
+    
+    # Ensure radii are non-negative (should be by logic, but safe to clamp)
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, best_sum

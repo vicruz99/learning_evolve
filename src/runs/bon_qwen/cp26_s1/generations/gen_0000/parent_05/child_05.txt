@@ -1,184 +1,124 @@
 
 
 <strategy>
-The problem of packing 26 circles in a unit square to maximize the sum of radii is a non-convex optimization problem. To achieve the target sum of 2.636, which implies an average radius of approximately 0.101, a highly efficient packing similar to a hexagonal lattice is required. 
+To maximize the sum of radii for 26 circles in a unit square, we formulate this as a constrained non-linear optimization problem. The objective is to maximize $\sum r_i$, subject to boundary constraints ($0 \le x_i \pm r_i \le 1$, $0 \le y_i \pm r_i \le 1$) and non-overlap constraints ($(x_i-x_j)^2 + (y_i-y_j)^2 \ge (r_i+r_j)^2$).
 
-My strategy is as follows:
-1.  **Initialization**: Start with a configuration of circles arranged in a hexagonal lattice, as this is known to be one of the densest packing structures. This provides a robust starting point for numerical optimization.
-2.  **Optimization**: Use `scipy.optimize.minimize` with the 'SLSQP' method. This solver is capable of handling the non-linear inequality constraints required to ensure circles do not overlap and remain within the square.
-3.  **Constraints**: The constraints include boundary checks ($r_i \le x_i, y_i \le 1-r_i$) and pairwise distance checks ($d_{ij} \ge r_i + r_j$).
-4.  **Refinement**: Run the optimizer with a carefully initialized state to ensure convergence to a high-quality local optimum that satisfies the target requirements.
+Given the non-convex nature of packing problems, a single local optimizer may get trapped in suboptimal configurations (like a rigid grid). We will use the `SLSQP` algorithm from `scipy.optimize`, which handles inequality constraints effectively. To improve robustness and convergence speed:
+1. **Vectorized Constraints**: Overlap constraints are computed using NumPy broadcasting to efficiently evaluate all 325 pairwise distances, avoiding slow Python loops.
+2. **Smart Initialization**: We start from perturbed hexagonal lattice configurations. Hexagonal packing naturally yields higher density than square grids, and perturbing helps the optimizer escape symmetric local minima.
+3. **Multi-Restart Strategy**: Running the optimizer from 5 different randomized seeds increases the probability of finding the global optimum near the target value of 2.636.
+4. **Strict Compliance**: All helper functions are defined at the top level without closures or lambda functions, as requested.
 </strategy>
 
 ```python
 import numpy as np
 from scipy.optimize import minimize
 
-def calculate_distance_matrix(centers):
-    """Calculates the Euclidean distance matrix between all pairs of centers."""
-    centers = np.asarray(centers)
-    n = centers.shape[0]
-    dists = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            dists[i, j] = dist
-            dists[j, i] = dist
-    return dists
+def compute_objective(v):
+    """Objective function: negative sum of radii (for minimization)"""
+    return -np.sum(v[52:])
 
-def get_constraints(centers, radii):
-    """
-    Returns the list of constraint dictionaries for the optimizer.
-    Constraints are formatted as c(x) >= 0.
-    """
-    centers = np.asarray(centers)
-    radii = np.asarray(radii)
-    n = len(radii)
+def compute_constraints(v):
+    """Computes all inequality constraints: boundaries and non-overlaps"""
+    n = 26
+    centers = v[:52].reshape(n, 2)
+    radii = v[52:]
     
-    cons = []
+    # 1. Boundary constraints: 4*n
+    # x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    c = np.zeros(4 * n)
+    c[:n] = centers[:, 0] - radii
+    c[n:2*n] = 1.0 - centers[:, 0] - radii
+    c[2*n:3*n] = centers[:, 1] - radii
+    c[3*n:4*n] = 1.0 - centers[:, 1] - radii
     
-    # Boundary constraints: r <= x <= 1-r and r <= y <= 1-r
-    for i in range(n):
-        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2*n + i] - v[2*i]})
-        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2*i] + v[2*n + i] - 1.0})
-        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2*n + i] - v[2*i + 1]})
-        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2*i + 1] + v[2*n + i] - 1.0})
-        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2*n + i]}) # r >= 0
+    # 2. Overlap constraints: n*(n-1)/2
+    # (xi-xj)^2 + (yi-yj)^2 - (ri+rj)^2 >= 0
+    cx = centers[:, 0]
+    cy = centers[:, 1]
+    
+    # Vectorized pairwise distances and radius sums
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist_sq = dx**2 + dy**2
+    sum_r = radii[:, None] + radii[None, :]
+    
+    # Extract strict upper triangle to avoid duplicates and self-pairs
+    mask = np.triu(np.ones((n, n)), k=1).astype(bool)
+    overlap_constraints = dist_sq[mask] - sum_r[mask]**2
+    
+    return np.concatenate([c, overlap_constraints])
 
-    # Pairwise non-overlap constraints: dist >= r_i + r_j
-    dist_matrix = calculate_distance_matrix(centers)
-    for i in range(n):
-        for j in range(i + 1, n):
-            d_ij = dist_matrix[i, j]
-            # If initial distance is very small, we might need a different approach, 
-            # but for valid init it should be fine.
-            cons.append({
-                'type': 'ineq',
-                'fun': lambda v, i=i, j=j, d=d_ij: d - (v[2*n + i] + v[2*n + j])
-            })
+def generate_initial_guess(seed):
+    """Generates a structured hexagonal lattice initialization with random perturbation"""
+    rng = np.random.default_rng(seed)
+    n = 26
+    r0 = 0.095
+    centers = np.zeros((n, 2))
+    idx = 0
+    
+    # Build hexagonal rows
+    for row in range(8):
+        y = r0 + row * np.sqrt(3) * r0
+        cols = 5 if row % 2 == 0 else 4
+        if idx + cols > n:
+            cols = n - idx
+        shift = (row % 2) * r0
+        for k in range(cols):
+            centers[idx] = [r0 + k * 2 * r0 + shift, y]
+            idx += 1
             
-    return cons
+    # Normalize positions to fit comfortably within [0.02, 0.98]
+    for d in range(2):
+        min_val, max_val = centers[:, d].min(), centers[:, d].max()
+        span = max_val - min_val
+        if span > 1e-9:
+            centers[:, d] = 0.02 + (centers[:, d] - min_val) * 0.96 / span
+            
+    # Add small random perturbation to break symmetry and avoid flat basins
+    centers += rng.uniform(-0.015, 0.015, centers.shape)
+    centers = np.clip(centers, 0.01, 0.99)
+    
+    initial_radii = np.full(n, 0.085)
+    return np.concatenate([centers.flatten(), initial_radii])
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
-    """
     n = 26
-    np.random.seed(42)
-
-    # 1. Initialization: Hexagonal Lattice
-    # We aim for a radius around 0.101 (target sum 2.636 / 26)
-    r_init = 0.10
-    centers = []
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
     
-    # Try to fit 26 circles in a hexagonal pattern. 
-    # A 5x5 grid with hexagonal spacing often works well.
-    # 5 rows, with alternating counts of 5 and 5 (shifted) might be too wide.
-    # Let's create a dense grid and prune/select.
+    # Problem setup
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    constraints = {'type': 'ineq', 'fun': compute_constraints}
     
-    rows = 6
-    cols = 5
-    # Hexagonal spacing
-    dx = 2 * r_init
-    dy = np.sqrt(3) * r_init
-    
-    y_pos = r_init
-    while len(centers) < n:
-        x_pos = r_init
-        # Shift every other row
-        if (len(centers) // cols) % 2 == 1:
-            x_pos += dx / 2
+    # Multi-restart optimization to ensure global optimum is found
+    seeds = [42, 123, 456, 789, 1024]
+    for seed in seeds:
+        try:
+            x0 = generate_initial_guess(seed)
+            res = minimize(
+                compute_objective,
+                x0,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False}
+            )
             
-        while x_pos + r_init <= 1.0 and len(centers) < n:
-            centers.append([x_pos, y_pos])
-            x_pos += dx
-        
-        y_pos += dy
-        if y_pos + r_init > 1.0:
-            break
+            current_sum = -res.fun
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = res.x[:2*n].reshape(n, 2)
+                best_radii = res.x[2*n:]
+        except Exception:
+            continue
             
-    # If we didn't get 26, or if we exceeded, we adjust. 
-    # With r=0.1, 5 cols * 2r = 1.0 width. 6 rows height approx 0.9.
-    # This should yield 30 points. We just take the first 26.
-    if len(centers) < n:
-        # Fallback to random if grid failed
-        centers = np.random.uniform(0.2, 0.8, (n, 2))
-    
-    centers = np.array(centers[:n])
-    
-    # Randomize slightly to break symmetry and help optimization
-    centers += np.random.normal(0, 0.01, centers.shape)
-    # Clip to bounds
-    centers = np.clip(centers, 0.05, 0.95)
-    
-    radii = np.ones(n) * r_init
-    
-    # Combine variables: [x1, y1, ..., x26, y26, r1, ..., r26]
-    x0 = np.concatenate([centers.flatten(), radii])
-    
-    # 2. Define Objective: Maximize sum of radii -> Minimize -sum(radii)
-    def objective(x):
-        radii_vec = x[2*n:]
-        return -np.sum(radii_vec)
-    
-    # 3. Define Constraints
-    # We define them dynamically inside the optimization loop or pass them.
-    # However, SLSQP needs a list of constraint dicts.
-    # The distance depends on x (centers), so we must update the constraint functions 
-    # or make them dynamic. SLSQP accepts functions.
-    
-    # To handle the distance constraint which depends on x, we define a function 
-    # that extracts current centers and checks all pairs.
-    
-    def all_constraints(x):
-        c = []
-        curr_centers = x[:2*n].reshape(n, 2)
-        curr_radii = x[2*n:]
+    # Safety clamping and final extraction
+    if best_centers is not None:
+        best_radii = np.maximum(best_radii, 0.0)
+        return best_centers, best_radii, float(np.sum(best_radii))
         
-        # Boundary
-        for i in range(n):
-            c.append(curr_radii[i] - curr_centers[i, 0]) # x >= r
-            c.append(curr_centers[i, 0] + curr_radii[i] - 1.0) # x <= 1-r -> 1 - x >= r -> x + r <= 1
-            c.append(curr_radii[i] - curr_centers[i, 1]) # y >= r
-            c.append(curr_centers[i, 1] + curr_radii[i] - 1.0) # y <= 1-r
-            c.append(curr_radii[i]) # r >= 0
-            
-        # Overlap
-        dist_matrix = calculate_distance_matrix(curr_centers)
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = dist_matrix[i, j]
-                c.append(d - (curr_radii[i] + curr_radii[j]))
-                
-        return np.array(c)
-
-    # SLSQP needs constraints in a specific format: {'type': 'ineq', 'fun': ...}
-    # Since 'fun' returns a vector, we can return the whole vector.
-    cons = {'type': 'ineq', 'fun': all_constraints}
-    
-    # 4. Optimization
-    # Use bounds to help
-    # x, y in [0, 1], r in [0, 0.5]
-    bounds = [(0, 1)] * (2 * n) + [(0, 0.5)] * n
-    
-    # Run optimization
-    # tol=1e-8 for high precision
-    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
-                      options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
-    
-    if result.success:
-        final_centers = result.x[:2*n].reshape(n, 2)
-        final_radii = result.x[2*n:]
-    else:
-        # Fallback if optimization fails
-        final_centers = centers
-        final_radii = radii
-        
-    # Ensure non-negative radii and valid bounds for final output
-    final_radii = np.maximum(final_radii, 0)
-    final_centers = np.clip(final_centers, final_radii.reshape(-1, 1), 1 - final_radii.reshape(-1, 1))
-    
-    sum_radii = np.sum(final_radii)
-    
-    return final_centers, final_radii, sum_radii
+    # Fallback (should not be reached given robust initialization)
+    return np.zeros((n, 2)), np.zeros(n), 0.0
 ```

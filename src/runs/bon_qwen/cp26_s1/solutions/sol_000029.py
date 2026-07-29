@@ -1,142 +1,144 @@
 # sol_000029 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 8e46300b) state=1aef7296 sum of radii=2.612882 correctness=1.0
+# generation=0 parent=seed (state b079e3ed) state=be3d96eb sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
-
-def compute_objective(z, n, i_idx, j_idx, weight):
-    """
-    Computes the objective function: -sum(radii) + penalty for constraint violations.
-    z: flattened array of [x1, y1, r1, x2, y2, r2, ...]
-    """
-    x = z[::3]
-    y = z[1::3]
-    r = z[2::3]
-    
-    # Base objective: maximize sum of radii
-    obj = -np.sum(r)
-    
-    # Boundary constraint penalties: circles must stay inside [0,1]x[0,1]
-    # x - r >= 0
-    v = np.maximum(r - x, 0.0)
-    obj += weight * np.sum(v**2)
-    # 1 - x - r >= 0
-    v = np.maximum(x + r - 1.0, 0.0)
-    obj += weight * np.sum(v**2)
-    # y - r >= 0
-    v = np.maximum(r - y, 0.0)
-    obj += weight * np.sum(v**2)
-    # 1 - y - r >= 0
-    v = np.maximum(y + r - 1.0, 0.0)
-    obj += weight * np.sum(v**2)
-    
-    # Pairwise non-overlap constraint penalties: dist^2 >= (ri + rj)^2
-    dx = x[i_idx] - x[j_idx]
-    dy = y[i_idx] - y[j_idx]
-    d_sq = dx**2 + dy**2
-    sum_r = r[i_idx] + r[j_idx]
-    v = np.maximum(sum_r**2 - d_sq, 0.0)
-    obj += weight * np.sum(v**2)
-    
-    return obj
+import math
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a growing bubbles simulation with repulsion forces.
+    """
     n = 26
-    i_idx, j_idx = np.triu_indices(n, k=1)
     
-    # Bounds: x, y in [0, 1], r in [1e-5, 1]
-    bounds = [(0.0, 1.0)] * 2 + [(1e-5, 1.0)]
-    bounds = bounds * n
+    # Initialization: Hexagonal grid to start with a dense packing
+    np.random.seed(42)
+    r_init = 0.08
+    centers = []
+    y = r_init
+    row = 0
+    # Generate hexagonal points
+    while y < 1.0 - r_init:
+        x = r_init
+        if row % 2 == 1:
+            x += r_init
+        while x < 1.0 - r_init:
+            if len(centers) < n:
+                centers.append([x, y])
+            x += 2 * r_init
+        y += r_init * math.sqrt(3)
+        row += 1
     
-    best_sum = 0.0
-    best_centers = None
-    best_radii = None
+    # Fill remaining spots if any (should not happen with r=0.08, but safety measure)
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)])
+        
+    centers = np.array(centers[:n])
+    radii = np.full(n, r_init)
     
-    # Run multiple restarts to avoid local minima
-    for seed in range(5):
-        np.random.seed(seed)
+    # Optimization loop: Grow radii and resolve overlaps
+    # We balance growth rate and relaxation steps to find a valid high-radius packing
+    growth_rate = 0.0015
+    sim_steps = 30
+    num_growth_steps = 80
+    
+    for step in range(num_growth_steps):
+        radii += growth_rate
         
-        # Initialize with a perturbed grid layout
-        x_grid = np.linspace(0.15, 0.85, 6)
-        y_grid = np.linspace(0.15, 0.85, 6)
-        pts = np.array(np.meshgrid(x_grid, y_grid)).T.reshape(-1, 2)
-        
-        idx = np.random.choice(len(pts), n, replace=False)
-        centers = pts[idx] + np.random.randn(n, 2) * 0.02
-        centers = np.clip(centers, 0.1, 0.9)
-        
-        radii = np.full(n, 0.1)
-        
-        z = np.zeros(3 * n)
-        z[::3] = centers[:, 0]
-        z[1::3] = centers[:, 1]
-        z[2::3] = radii
-        
-        # Adaptive penalty weight schedule
-        weight = 200.0
-        for _ in range(40):
-            res = minimize(
-                compute_objective, 
-                z, 
-                args=(n, i_idx, j_idx, weight), 
-                method='L-BFGS-B', 
-                bounds=bounds,
-                options={'ftol': 1e-14, 'gtol': 1e-10, 'maxiter': 2000}
-            )
-            z = res.x
+        # Relaxation steps to resolve overlaps for the new radii
+        for _ in range(sim_steps):
+            fx = np.zeros(n)
+            fy = np.zeros(n)
             
-            # Check if constraints are satisfied within tolerance
-            current_obj = compute_objective(z, n, i_idx, j_idx, 1.0)
-            base_obj = -np.sum(z[2::3])
-            if current_obj - base_obj < 1e-7:
-                break
+            for i in range(n):
+                xi, yi = centers[i]
+                ri = radii[i]
                 
-            weight *= 2.0
-            if weight > 1e7:
-                break
+                # Wall repulsion forces
+                # Left wall
+                if xi < ri:
+                    fx[i] += (ri - xi) * 50.0
+                # Right wall
+                if xi > 1.0 - ri:
+                    fx[i] -= (xi - (1.0 - ri)) * 50.0
+                # Bottom wall
+                if yi < ri:
+                    fy[i] += (ri - yi) * 50.0
+                # Top wall
+                if yi > 1.0 - ri:
+                    fy[i] -= (yi - (1.0 - ri)) * 50.0
                 
-        centers_opt = np.column_stack((z[::3], z[1::3]))
-        radii_opt = z[2::3]
-        
-        # Strictly enforce boundary constraints
-        radii_opt = np.minimum(radii_opt, np.minimum(centers_opt[:, 0], 1.0 - centers_opt[:, 0]))
-        radii_opt = np.minimum(radii_opt, np.minimum(centers_opt[:, 1], 1.0 - centers_opt[:, 1]))
-        
-        # Verify pairwise non-overlap
-        valid = True
-        for i in range(n):
-            for j in range(i + 1, n):
-                dist = np.hypot(centers_opt[i, 0] - centers_opt[j, 0], centers_opt[i, 1] - centers_opt[j, 1])
-                if dist < radii_opt[i] + radii_opt[j] - 1e-9:
-                    valid = False
-                    break
-            if not valid:
-                break
-                
-        # If slight overlaps remain due to numerical precision, scale down radii slightly
-        if not valid:
-            scale = 0.999
-            safety_iter = 0
-            while not valid and safety_iter < 100:
-                radii_opt *= scale
-                valid = True
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        dist = np.hypot(centers_opt[i, 0] - centers_opt[j, 0], centers_opt[i, 1] - centers_opt[j, 1])
-                        if dist < radii_opt[i] + radii_opt[j] - 1e-9:
-                            valid = False
-                            break
-                    if not valid:
-                        break
-                safety_iter += 1
-                
-        s = np.sum(radii_opt)
-        if s > best_sum:
-            best_sum = s
-            best_centers = centers_opt.copy()
-            best_radii = radii_opt.copy()
+                # Pairwise repulsion forces
+                for j in range(i + 1, n):
+                    xj, yj = centers[j]
+                    rj = radii[j]
+                    
+                    dx = xi - xj
+                    dy = yi - yj
+                    d_sq = dx*dx + dy*dy
+                    d = math.sqrt(d_sq)
+                    
+                    min_dist = ri + rj
+                    
+                    if d < min_dist:
+                        if d < 1e-9:
+                            # Coincident centers, push apart randomly to break symmetry
+                            angle = np.random.uniform(0, 2 * math.pi)
+                            force = 10.0
+                            fx[i] += math.cos(angle) * force
+                            fy[i] += math.sin(angle) * force
+                            fx[j] -= math.cos(angle) * force
+                            fy[j] -= math.sin(angle) * force
+                        else:
+                            # Repulsion force proportional to overlap
+                            overlap = min_dist - d
+                            f_mag = overlap * 20.0 # Stiffness
+                            nx = dx / d
+                            ny = dy / d
+                            fx[i] += nx * f_mag
+                            fy[i] += ny * f_mag
+                            fx[j] -= nx * f_mag
+                            fy[j] -= ny * f_mag
             
-    return best_centers, best_radii, float(best_sum)
+            # Update centers based on forces
+            # Using a simple Euler step with a time constant
+            centers[:, 0] += fx * 0.05
+            centers[:, 1] += fy * 0.05
+            
+            # Strictly enforce boundaries to prevent floating point drift
+            for i in range(n):
+                r = radii[i]
+                centers[i, 0] = np.clip(centers[i, 0], r, 1.0 - r)
+                centers[i, 1] = np.clip(centers[i, 1], r, 1.0 - r)
+
+    # Final repair: Scale down radii uniformly if overlaps still exist
+    # This ensures the returned packing is strictly valid.
+    s = 1.0
+    for i in range(n):
+        ri = radii[i]
+        # Check wall constraints
+        if ri > 0:
+            s = min(s, centers[i, 0] / ri)
+            s = min(s, (1.0 - centers[i, 0]) / ri)
+            s = min(s, centers[i, 1] / ri)
+            s = min(s, (1.0 - centers[i, 1]) / ri)
+        
+        # Check pairwise constraints
+        for j in range(i + 1, n):
+            rj = radii[j]
+            sum_r = ri + rj
+            if sum_r > 0:
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = math.sqrt(dx*dx + dy*dy)
+                s = min(s, d / sum_r)
+    
+    # Apply scale with a small margin to be safe against numerical errors
+    s = max(0.0, s * 0.999)
+    radii *= s
+    
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii

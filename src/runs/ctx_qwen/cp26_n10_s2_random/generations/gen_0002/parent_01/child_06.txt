@@ -1,0 +1,144 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a robust sequential penalty method combined with L-BFGS-B optimization. This approach transforms the constrained problem into a series of unconstrained (but bounded) minimization problems by adding quadratic penalty terms for boundary and overlap violations. The penalty weight is increased iteratively to drive the solution towards strict feasibility while maximizing the objective.
+
+Key improvements over past attempts:
+1. **Sequential Penalty Method**: Instead of relying solely on SLSQP which can struggle with hundreds of non-smooth constraints, we use L-BFGS-B with a penalty function. L-BFGS-B is highly efficient for bounded variables and smooth penalty landscapes. The penalty coefficient `lam` increases from 100 to 1e6 across stages, ensuring we first find good positions and then strictly enforce constraints.
+2. **Diverse Initialization**: We generate multiple starting configurations using both hexagonal lattices (which naturally pack circles efficiently) and randomized dense grids. This diversity helps escape shallow local minima that plague circle packing problems.
+3. **Vectorized Constraint Evaluation**: Pairwise distances and overlap penalties are computed using NumPy broadcasting and precomputed upper-triangle indices, significantly speeding up each optimizer iteration.
+4. **Deterministic Repair Pass**: After optimization, a fast analytical repair step clamps radii to boundary limits and proportionally shrinks overlapping pairs. This guarantees the final configuration strictly satisfies the validation function's tolerance without degrading the sum unnecessarily.
+5. **Iterative Refinement**: Small random perturbations are added between penalty stages to help the optimizer hop out of exact local minima while retaining the learned structural arrangement.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+IDX_U = np.triu_indices(N, k=1)
+
+def obj_pen(p, lam):
+    """Objective function with quadratic penalty for constraints."""
+    x, y, r = p[0::3], p[1::3], p[2::3]
+    pen = 0.0
+    
+    # Boundary penalties
+    pen += np.sum(np.maximum(0.0, r - x)**2)
+    pen += np.sum(np.maximum(0.0, x + r - 1.0)**2)
+    pen += np.sum(np.maximum(0.0, r - y)**2)
+    pen += np.sum(np.maximum(0.0, y + r - 1.0)**2)
+    
+    # Overlap penalties
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    dist = np.sqrt(dx**2 + dy**2 + 1e-18)
+    
+    overlap = dr[IDX_U] - dist[IDX_U]
+    pen += np.sum(np.maximum(0.0, overlap)**2)
+    
+    return -np.sum(r) + lam * pen
+
+def get_init_hex(seed):
+    """Generates a hexagonal lattice initialization."""
+    np.random.seed(seed)
+    r0 = 0.09
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < N:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x < 1.0 - r0 and len(pts) < N:
+            pts.append([x, y])
+            x += 2*r0
+        y += np.sqrt(3)*r0
+        row += 1
+        
+    pts = np.array(pts[:N])
+    pts += np.random.normal(0, 0.004, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    r = np.full(N, 0.085)
+    p = np.zeros(3*N)
+    p[0::3] = pts[:, 0]
+    p[1::3] = pts[:, 1]
+    p[2::3] = r
+    return p
+
+def get_init_rand(seed):
+    """Generates a randomized dense initialization."""
+    np.random.seed(seed)
+    pts = np.random.rand(N, 2) * 0.8 + 0.1
+    pts += np.random.normal(0, 0.02, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    r = np.full(N, 0.06)
+    p = np.zeros(3*N)
+    p[0::3] = pts[:, 0]
+    p[1::3] = pts[:, 1]
+    p[2::3] = r
+    return p
+
+def run_opt(p0):
+    """Runs sequential penalty optimization with L-BFGS-B."""
+    bounds = [(0.0, 1.0)]*(2*N) + [(1e-6, 0.5)]*N
+    p = p0.copy()
+    
+    # Increase penalty weight iteratively
+    for lam in [100, 1000, 10000, 100000, 1000000]:
+        res = minimize(obj_pen, p, args=(lam,), method='L-BFGS-B', 
+                       bounds=bounds, options={'maxiter': 3000, 'ftol': 1e-15})
+        p = res.x
+        # Small perturbation to escape exact local minima before tightening constraints
+        if lam < 1000000:
+            p += np.random.normal(0, 1e-4, 3*N)
+    return p
+
+def repair(p):
+    """Analytically repairs boundary and overlap violations."""
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3].copy()
+    
+    # Enforce boundaries
+    r = np.minimum(r, x)
+    r = np.minimum(r, 1.0 - x)
+    r = np.minimum(r, y)
+    r = np.minimum(r, 1.0 - y)
+    
+    # Resolve overlaps by proportional shrinking
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(x[i]-x[j], y[i]-y[j])
+                if d < r[i] + r[j] - 1e-12:
+                    shrink = (r[i] + r[j] - d) / 2.0 + 1e-9
+                    r[i] -= shrink
+                    r[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+    return r
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Main function to pack 26 circles in a unit square."""
+    best_p = None
+    best_sum = -1.0
+    
+    np.random.seed(42)
+    # Run multiple independent optimizations with diverse seeds
+    for i in range(25):
+        p0 = get_init_hex(i) if i < 15 else get_init_rand(i)
+        p_opt = run_opt(p0)
+        r_rep = repair(p_opt)
+        s = np.sum(r_rep)
+        if s > best_sum:
+            best_sum = s
+            best_p = p_opt.copy()
+            best_p[2::3] = r_rep
+            
+    # Extract final centers and radii
+    centers = np.column_stack((best_p[0::3], best_p[1::3]))
+    radii = best_p[2::3]
+    return centers, radii, float(best_sum)
+```

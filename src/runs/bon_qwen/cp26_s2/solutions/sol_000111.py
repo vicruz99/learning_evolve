@@ -1,0 +1,333 @@
+# sol_000111 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 82191eeb) state=f5553179 sum of radii=1.270971 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses numerical optimization with penalty constraints.
+    """
+    N = 26
+    
+    # Helper to compute loss and gradients
+    # We minimize: -sum(r_i) + penalty(violations)
+    
+    def objective_and_grad(variables):
+        # variables layout: [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+        # Reshape to (N, 3)
+        params = variables.reshape((N, 3))
+        centers = params[:, :2] # (N, 2)
+        radii = params[:, 2]    # (N,)
+        
+        # Objective: -sum of radii
+        val = -np.sum(radii)
+        
+        # Gradient of objective: -1 for each r, 0 for x, y
+        grad = np.zeros_like(variables)
+        grad[2::3] = -1.0 
+        
+        # Penalty terms
+        penalty_val = 0.0
+        penalty_grad = np.zeros_like(variables)
+        
+        # Weights
+        w_boundary = 1000.0
+        w_overlap = 1000.0
+        w_pos_radius = 1000.0
+        
+        # 1. Boundary constraints
+        # x - r >= 0  => r - x <= 0
+        # 1 - x - r >= 0 => x + r - 1 <= 0
+        # same for y
+        
+        # We use a smooth penalty: max(0, violation)^2 * 2 * violation derivative?
+        # Or just soft penalty: violation^2 is differentiable.
+        # But violation is only active when > 0.
+        # Let's use max(0, violation)^2.
+        
+        # Violation: x < r  ->  r - x > 0
+        viol_boundary = np.zeros(N)
+        
+        # x - r >= 0
+        viol_x1 = radii - centers[:, 0] 
+        # 1 - x - r >= 0 -> x + r - 1 <= 0
+        viol_x2 = centers[:, 0] + radii - 1.0
+        # y - r >= 0
+        viol_y1 = radii - centers[:, 1]
+        # 1 - y - r >= 0
+        viol_y2 = centers[:, 1] + radii - 1.0
+        
+        # Positive violations
+        pos_viol_x1 = np.maximum(0.0, viol_x1)
+        pos_viol_x2 = np.maximum(0.0, viol_x2)
+        pos_viol_y1 = np.maximum(0.0, viol_y1)
+        pos_viol_y2 = np.maximum(0.0, viol_y2)
+        
+        penalty_val += w_boundary * (np.sum(pos_viol_x1**2) + np.sum(pos_viol_x2**2) + 
+                                     np.sum(pos_viol_y1**2) + np.sum(pos_viol_y2**2))
+        
+        # Gradients for boundary
+        # d/dx ( (r-x)^2 ) = 2(r-x)(-1) = -2(r-x)
+        # d/dr ( (r-x)^2 ) = 2(r-x)(1) = 2(r-x)
+        
+        # For viol_x1 (r - x): active when r > x
+        mask_x1 = (viol_x1 > 0)
+        if np.any(mask_x1):
+            term = 2.0 * w_boundary * viol_x1[mask_x1]
+            # d/dx
+            penalty_grad[mask_x1, 0] -= term
+            # d/dr
+            penalty_grad[mask_x1, 2] += term
+            
+        # For viol_x2 (x + r - 1): active when x + r > 1
+        mask_x2 = (viol_x2 > 0)
+        if np.any(mask_x2):
+            term = 2.0 * w_boundary * viol_x2[mask_x2]
+            # d/dx
+            penalty_grad[mask_x2, 0] += term
+            # d/dr
+            penalty_grad[mask_x2, 2] += term
+            
+        # For viol_y1 (r - y)
+        mask_y1 = (viol_y1 > 0)
+        if np.any(mask_y1):
+            term = 2.0 * w_boundary * viol_y1[mask_y1]
+            # d/dy
+            penalty_grad[mask_y1, 1] -= term
+            # d/dr
+            penalty_grad[mask_y1, 2] += term
+            
+        # For viol_y2 (y + r - 1)
+        mask_y2 = (viol_y2 > 0)
+        if np.any(mask_y2):
+            term = 2.0 * w_boundary * viol_y2[mask_y2]
+            # d/dy
+            penalty_grad[mask_y2, 1] += term
+            # d/dr
+            penalty_grad[mask_y2, 2] += term
+
+        # 2. Overlap constraints
+        # dist(i, j) >= r_i + r_j
+        # Violation: r_i + r_j - dist > 0
+        # We iterate pairs. For N=26, 325 pairs. Manageable.
+        
+        for i in range(N):
+            for j in range(i + 1, N):
+                diff = centers[i] - centers[j]
+                dist = np.sqrt(np.sum(diff**2))
+                sum_r = radii[i] + radii[j]
+                
+                if dist < 1e-9:
+                    dist = 1e-9 # Prevent division by zero, though unlikely if initialized well
+                
+                violation = sum_r - dist
+                if violation > 0:
+                    # Penalty term: violation^2
+                    # Contribution to val
+                    p_term = w_overlap * violation**2
+                    penalty_val += p_term
+                    
+                    # Gradients
+                    # d/d(r_i) = 2 * w * violation * 1
+                    # d/d(r_j) = 2 * w * violation * 1
+                    # d/d(x_i) = 2 * w * violation * (-diff_x / dist)
+                    # d/d(x_j) = 2 * w * violation * (diff_x / dist)
+                    
+                    factor = 2.0 * w_overlap * violation
+                    
+                    # Radii gradients
+                    penalty_grad[i, 2] += factor
+                    penalty_grad[j, 2] += factor
+                    
+                    # Center gradients
+                    grad_vec = factor * (diff / dist) # Vector from j to i scaled
+                    
+                    # d/d(centers[i]) is -grad_vec (since diff = c_i - c_j, d(dist)/dc_i = diff/dist)
+                    # Wait, violation = r_i + r_j - dist.
+                    # d(violation)/dc_i = - d(dist)/dc_i = - (c_i - c_j)/dist = -diff/dist.
+                    # So gradient of violation w.r.t c_i is -diff/dist.
+                    # Gradient of penalty (violation^2) is 2*viol * (-diff/dist).
+                    
+                    term_vec = -factor * (diff / dist)
+                    penalty_grad[i, 0] += term_vec[0]
+                    penalty_grad[i, 1] += term_vec[1]
+                    
+                    term_vec_j = factor * (diff / dist) # Opposite sign
+                    penalty_grad[j, 0] += term_vec_j[0]
+                    penalty_grad[j, 1] += term_vec_j[1]
+                    
+        # 3. Non-negative radius (soft constraint)
+        neg_r = np.maximum(0.0, -radii)
+        penalty_val += w_pos_radius * np.sum(neg_r**2)
+        if np.any(radii < 0):
+            mask_neg = (radii < 0)
+            term = 2.0 * w_pos_radius * (-radii[mask_neg])
+            penalty_grad[mask_neg, 2] -= term
+
+        total_val = val + penalty_val
+        total_grad = grad + penalty_grad
+        
+        return total_val, total_grad.flatten()
+
+    def objective(variables):
+        return objective_and_grad(variables)[0]
+    
+    def gradient(variables):
+        return objective_and_grad(variables)[1]
+
+    # Function to generate initial configuration
+    def get_initial_config(seed):
+        rng = np.random.RandomState(seed)
+        
+        # Try to place circles in a hexagonal grid pattern
+        # Estimate optimal radius ~ 0.1
+        # Grid size
+        rows = 5
+        cols = 6 # 5*6 = 30, we pick 26
+        
+        # Generate grid points
+        points = []
+        for r in range(rows):
+            for c in range(cols):
+                # Hexagonal offset
+                x = c * 0.2 + (r % 2) * 0.1 + 0.1
+                y = r * 0.1732 + 0.1 # sqrt(3)/2 * 0.2 approx 0.1732
+                
+                if x <= 1.0 and y <= 1.0:
+                    points.append([x, y])
+        
+        # If we have more points than needed, select random subset
+        # If fewer, add random points
+        if len(points) > N:
+            indices = rng.choice(len(points), N, replace=False)
+            centers = np.array([points[i] for i in indices])
+        else:
+            # Pad with random
+            extra_needed = N - len(points)
+            random_pts = rng.uniform(0.2, 0.8, size=(extra_needed, 2))
+            centers = np.vstack([points, random_pts])
+            
+        # Add noise
+        centers += rng.normal(0, 0.02, size=centers.shape)
+        
+        # Initial radii
+        radii = np.full(N, 0.05)
+        
+        # Flatten: x1, y1, r1, ...
+        params = np.zeros(N * 3)
+        for i in range(N):
+            params[3*i] = centers[i, 0]
+            params[3*i+1] = centers[i, 1]
+            params[3*i+2] = radii[i]
+            
+        return params
+
+    best_val = np.inf
+    best_params = None
+    
+    # Run optimization with multiple seeds
+    seeds = [42, 123, 456, 789, 101, 202, 303, 404, 505, 606]
+    
+    for seed in seeds:
+        try:
+            x0 = get_initial_config(seed)
+            
+            # Bounds
+            # x in [0, 1], y in [0, 1], r in [0, 0.5]
+            bounds = []
+            for _ in range(N):
+                bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+            
+            # Use L-BFGS-B for speed and bound handling
+            # However, we are using penalty method, so constraints are in objective.
+            # But bounds on x,y,r are still good to have.
+            res = scipy.optimize.minimize(
+                objective,
+                x0,
+                jac=gradient,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 2000, 'ftol': 1e-12, 'gtol': 1e-8}
+            )
+            
+            if res.fun < best_val:
+                best_val = res.fun
+                best_params = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_params is None:
+        # Fallback to simple grid
+        x0 = get_initial_config(0)
+        best_params = x0
+
+    # Extract centers and radii
+    centers = np.zeros((N, 2))
+    radii = np.zeros(N)
+    for i in range(N):
+        centers[i, 0] = best_params[3*i]
+        centers[i, 1] = best_params[3*i+1]
+        radii[i] = best_params[3*i+2]
+
+    # Post-processing: Ensure strict validity by shrinking slightly if touching boundaries
+    # and fixing small numerical overlaps.
+    
+    # 1. Clamp to boundaries strictly
+    for i in range(N):
+        r = radii[i]
+        x, y = centers[i]
+        
+        # Adjust r to fit in square
+        max_r = min(x, 1-x, y, 1-y)
+        if max_r < 0: max_r = 0
+        if radii[i] > max_r:
+            radii[i] = max_r
+            # Re-center if necessary? No, just shrink radius.
+            # If radius shrinks, it stays inside.
+        
+        # Ensure x, y are valid for new radius
+        # x must be in [r, 1-r]
+        centers[i, 0] = np.clip(centers[i, 0], radii[i], 1.0 - radii[i])
+        centers[i, 1] = np.clip(centers[i, 1], radii[i], 1.0 - radii[i])
+
+    # 2. Resolve overlaps by shrinking radii
+    # Iterative shrinking
+    changed = True
+    while changed:
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                sum_r = radii[i] + radii[j]
+                if dist < sum_r - 1e-9:
+                    # Overlap detected
+                    # Reduce radii proportionally or just reduce one?
+                    # Simple strategy: reduce both to half the distance
+                    new_r_sum = dist
+                    # Keep ratio?
+                    if sum_r > 0:
+                        scale = new_r_sum / sum_r
+                        radii[i] *= scale
+                        radii[j] *= scale
+                    else:
+                        radii[i] = dist / 2.0
+                        radii[j] = dist / 2.0
+                    changed = True
+                    # Re-check boundaries after shrinking?
+                    # Shrinking helps boundary too.
+    
+    # Re-check boundaries after shrinking radii
+    for i in range(N):
+        r = radii[i]
+        centers[i, 0] = np.clip(centers[i, 0], r, 1.0 - r)
+        centers[i, 1] = np.clip(centers[i, 1], r, 1.0 - r)
+
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, float(sum_radii)

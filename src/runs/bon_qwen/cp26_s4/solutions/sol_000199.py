@@ -1,0 +1,204 @@
+# sol_000199 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 0dea8e43) state=244b3ecc sum of radii=2.599551 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_objective(x_vars):
+    """
+    Objective function to minimize: negative sum of radii.
+    x_vars is a 1D array of length 3*n containing [x1, y1, r1, x2, y2, r2, ...]
+    """
+    n = len(x_vars) // 3
+    radii = x_vars[2::3]
+    return -np.sum(radii)
+
+def get_boundary_constraints(x_vars):
+    """
+    Returns a list of constraint dictionaries for boundary conditions.
+    Constraints:
+    x_i - r_i >= 0
+    1 - (x_i + r_i) >= 0
+    y_i - r_i >= 0
+    1 - (y_i + r_i) >= 0
+    """
+    constraints = []
+    n = len(x_vars) // 3
+    for i in range(n):
+        idx_x = 3 * i
+        idx_y = 3 * i + 1
+        idx_r = 3 * i + 2
+        
+        # x_i - r_i >= 0
+        def fun_lb_x(x, i=i):
+            return x[3*i] - x[3*i + 2]
+        constraints.append({'type': 'ineq', 'fun': fun_lb_x})
+        
+        # 1 - (x_i + r_i) >= 0  => x_i + r_i <= 1
+        def fun_ub_x(x, i=i):
+            return 1.0 - (x[3*i] + x[3*i + 2])
+        constraints.append({'type': 'ineq', 'fun': fun_ub_x})
+        
+        # y_i - r_i >= 0
+        def fun_lb_y(x, i=i):
+            return x[3*i + 1] - x[3*i + 2]
+        constraints.append({'type': 'ineq', 'fun': fun_lb_y})
+        
+        # 1 - (y_i + r_i) >= 0  => y_i + r_i <= 1
+        def fun_ub_y(x, i=i):
+            return 1.0 - (x[3*i + 1] + x[3*i + 2])
+        constraints.append({'type': 'ineq', 'fun': fun_ub_y})
+        
+    return constraints
+
+def get_distance_constraints(x_vars):
+    """
+    Returns a list of constraint dictionaries for non-overlap.
+    dist(i, j) >= r_i + r_j
+    sqrt((xi-xj)^2 + (yi-yj)^2) - (ri + rj) >= 0
+    """
+    constraints = []
+    n = len(x_vars) // 3
+    for i in range(n):
+        for j in range(i + 1, n):
+            def fun_dist(x, i=i, j=j):
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                dist = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+                return dist - (ri + rj)
+            constraints.append({'type': 'ineq', 'fun': fun_dist})
+    return constraints
+
+def generate_initial_config(n):
+    """
+    Generates an initial configuration of centers and radii.
+    Uses a hexagonal lattice pattern.
+    """
+    # We want to fit n=26 circles.
+    # A hexagonal pattern with rows of 6, 5, 6, 5, 4 sums to 26.
+    # Lattice coordinates (unscaled):
+    # Row 0 (y=0): x = 1, 3, 5, 7, 9, 11 (6 points)
+    # Row 1 (y=sqrt(3)): x = 2, 4, 6, 8, 10 (5 points)
+    # Row 2 (y=2sqrt(3)): x = 1, 3, 5, 7, 9, 11 (6 points)
+    # Row 3 (y=3sqrt(3)): x = 2, 4, 6, 8, 10 (5 points)
+    # Row 4 (y=4sqrt(3)): x = 3, 5, 7, 9 (4 points)
+    
+    pts = []
+    
+    # Helper to add points
+    # Lattice unit: horizontal spacing 2, vertical spacing sqrt(3)
+    # But we just list integer coords and scale later.
+    
+    # Row 0
+    for i in range(6):
+        pts.append([1 + 2*i, 0])
+    # Row 1
+    for i in range(5):
+        pts.append([2 + 2*i, np.sqrt(3)])
+    # Row 2
+    for i in range(6):
+        pts.append([1 + 2*i, 2*np.sqrt(3)])
+    # Row 3
+    for i in range(5):
+        pts.append([2 + 2*i, 3*np.sqrt(3)])
+    # Row 4
+    for i in range(4):
+        pts.append([3 + 2*i, 4*np.sqrt(3)])
+        
+    pts = np.array(pts)
+    
+    # Normalize to fit in [0, 1] square
+    # Find bounding box
+    x_min, x_max = pts[:, 0].min(), pts[:, 0].max()
+    y_min, y_max = pts[:, 1].min(), pts[:, 1].max()
+    
+    # Add padding for radius? 
+    # Actually, let's just map the range to [0, 1] and assume small radius initially.
+    # The optimizer will move them and grow radii.
+    # But to be safe, let's fit the centers strictly inside [0, 1].
+    # Current span: x in [1, 11] (width 10), y in [0, 4sqrt(3)] (height ~6.928)
+    # We want to center this in [0, 1].
+    
+    width = x_max - x_min
+    height = y_max - y_min
+    
+    # Scale factor to fit with some margin? 
+    # If we just map min->0 and max->1, circles will touch boundaries with r=0.
+    # Let's scale slightly smaller, say to [0.05, 0.95].
+    scale = 0.9 / max(width, height)
+    
+    # Center the shape
+    center_x = (x_min + x_max) / 2
+    center_y = (y_min + y_max) / 2
+    
+    centers = (pts - np.array([center_x, center_y])) * scale + 0.5
+    
+    # Initial radius: small value, e.g., 0.05
+    # Or calculate based on scale. Lattice spacing was 2 units horizontally.
+    # Scaled spacing = 2 * scale.
+    # Radius can be approx half of min spacing / 2? No, half spacing is 1 unit -> 0.5 * scale.
+    # Let's start with r = 0.02 to be safe.
+    radii = np.full(n, 0.02)
+    
+    return centers, radii
+
+def run_packing():
+    n = 26
+    
+    # 1. Generate initial configuration
+    centers, radii = generate_initial_config(n)
+    
+    # Flatten variables
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers[i, 0]
+        x0[3 * i + 1] = centers[i, 1]
+        x0[3 * i + 2] = radii[i]
+    
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0, 1)] * (3 * n)
+    # r bounds are tighter?
+    for i in range(n):
+        bounds[3 * i + 2] = (0, 0.5)
+        
+    # 2. Define constraints
+    # Boundary constraints
+    constraints = get_boundary_constraints(x0)
+    # Distance constraints
+    # Note: 325 constraints might be heavy, but let's try.
+    # To speed up, we could filter, but let's include all for correctness.
+    constraints += get_distance_constraints(x0)
+    
+    # 3. Optimize
+    # Using SLSQP
+    result = minimize(
+        get_objective,
+        x0,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'maxiter': 1000, 'ftol': 1e-9}
+    )
+    
+    # 4. Extract results
+    if result.success:
+        x_opt = result.x
+    else:
+        # If optimization failed, return initial or best found so far?
+        # x0 might be invalid if constraints not satisfied, but we started with small radii.
+        # Let's use result.x anyway, checking validity manually later.
+        x_opt = result.x
+
+    centers_opt = np.zeros((n, 2))
+    radii_opt = np.zeros(n)
+    for i in range(n):
+        centers_opt[i, 0] = x_opt[3 * i]
+        centers_opt[i, 1] = x_opt[3 * i + 1]
+        radii_opt[i] = x_opt[3 * i + 2]
+        
+    sum_radii = np.sum(radii_opt)
+    
+    return centers_opt, radii_opt, sum_radii

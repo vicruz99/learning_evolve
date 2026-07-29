@@ -1,0 +1,164 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a hybrid optimization strategy combining local nonlinear programming with exact linear programming refinement:
+
+1. **Multi-start Initialization**: We generate initial configurations using a perturbed hexagonal lattice. Hexagonal packing is known to be near-optimal for dense circle arrangements. Multiple random seeds and perturbations help escape local minima.
+2. **Joint Nonlinear Optimization (SLSQP)**: We formulate the problem as a constrained nonlinear optimization. Variables are circle centers and radii. Constraints enforce boundary inclusion and non-overlap using squared Euclidean distances for better numerical conditioning. SLSQP efficiently handles these inequality constraints.
+3. **Linear Programming Refinement**: For any promising center configuration found by SLSQP, we fix the centers and solve an LP to exactly maximize $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and boundary limits. This guarantees radii are optimally expanded for the given geometry, often improving the sum slightly over the nonlinear solver's result.
+4. **Robustness**: We run 50 independent trials, track the best feasible result, and apply a small numerical slack in the LP to ensure strict feasibility. All helper functions are top-level with no closures or lambdas, adhering to constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def compute_constraints(v):
+    """Computes all inequality constraint values (must be >= 0)."""
+    centers = v[:2*N].reshape(N, 2)
+    radii = v[2*N:]
+    
+    c = []
+    # Boundary constraints: circle inside [0,1]x[0,1]
+    c.append(centers[:, 0] - radii)
+    c.append(1.0 - centers[:, 0] - radii)
+    c.append(centers[:, 1] - radii)
+    c.append(1.0 - centers[:, 1] - radii)
+    
+    # Pairwise non-overlap constraints: ||c_i - c_j||^2 >= (r_i + r_j)^2
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    d2 = np.sum(diff**2, axis=2)
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c.append(d2[mask] - r_sum[mask]**2)
+    
+    # Non-negative radii
+    c.append(radii)
+    
+    return np.concatenate(c)
+
+def compute_objective(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def hex_init(seed):
+    """Generates an initial configuration based on a perturbed hexagonal lattice."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    r_est = 0.1
+    dx = 2.0 * r_est
+    dy = r_est * np.sqrt(3.0)
+    y = r_est
+    row = 0
+    while len(pts) < N + 10:
+        x = r_est + (row % 2) * (dx / 2.0)
+        while x < 1.0 - r_est and len(pts) < N + 10:
+            pts.append([x, y])
+            x += dx
+        y += dy
+        row += 1
+        
+    pts = np.array(pts[:N+10])
+    # Normalize and scale to fit comfortably inside the unit square
+    min_p = pts.min(axis=0)
+    max_p = pts.max(axis=0)
+    pts = (pts - min_p) / (max_p - min_p + 1e-9)
+    pts = pts * 0.8 + 0.1
+    
+    # Add Gaussian perturbation to break symmetry and explore configuration space
+    pts += rng.normal(0, 0.02, pts.shape)
+    pts = np.clip(pts, 0.01, 0.99)
+    return pts[:N]
+
+def solve_radii_lp(centers):
+    """Given fixed centers, solve LP to maximize sum of radii exactly."""
+    c_obj = -np.ones(N)
+    rows = []
+    bounds_vec = []
+    
+    # Pairwise constraints: r_i + r_j <= distance
+    for i in range(N):
+        for j in range(i+1, N):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            row = np.zeros(N)
+            row[i] = 1.0
+            row[j] = 1.0
+            rows.append(row)
+            bounds_vec.append(dist - 1e-9) # Small slack for numerical safety
+            
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(N):
+        dists = np.array([centers[i, 0], 1.0 - centers[i, 0], 
+                          centers[i, 1], 1.0 - centers[i, 1]])
+        max_r = np.min(dists)
+        row = np.zeros(N)
+        row[i] = 1.0
+        rows.append(row)
+        bounds_vec.append(max_r - 1e-9)
+        
+    A_ub = np.array(rows)
+    b_ub = np.array(bounds_vec)
+    bounds = [(0, None)] * N
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return None
+
+def run_packing():
+    """Pack 26 circles in unit square to maximize sum of radii."""
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Multi-start optimization
+    for seed in range(50):
+        centers_init = hex_init(seed)
+        radii_init = np.full(N, 0.08)
+        x0 = np.concatenate([centers_init.flatten(), radii_init])
+        
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', 
+                           bounds=bounds, constraints=cons, 
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            
+            # Verify feasibility before accepting
+            if np.all(compute_constraints(res.x) >= -1e-7):
+                centers = res.x[:2*N].reshape(N, 2)
+                
+                # Refine radii using exact LP for these centers
+                lp_radii = solve_radii_lp(centers)
+                if lp_radii is not None:
+                    curr_sum = np.sum(lp_radii)
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_centers = centers.copy()
+                        best_radii = lp_radii.copy()
+                else:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_centers = res.x[:2*N].reshape(N, 2)
+                        best_radii = res.x[2*N:].copy()
+        except Exception:
+            continue
+            
+    # Fallback if optimization fails
+    if best_centers is None:
+        best_centers = hex_init(0)
+        best_radii = np.full(N, 0.08)
+        best_sum = np.sum(best_radii)
+        
+    # Ensure strict non-negativity
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, float(best_sum)
+```

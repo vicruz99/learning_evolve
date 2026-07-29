@@ -1,0 +1,145 @@
+# sol_000305 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state e3d19f45) state=ba9cfdf1 sum of radii=2.610342 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Solves the circle packing problem for 26 circles in a unit square
+    to maximize the sum of radii.
+    """
+    n = 26
+    
+    # 1. Generate Initial Guess
+    # Hexagonal packing pattern is optimal for density.
+    # We arrange 26 circles in rows: 5, 6, 5, 6, 4
+    row_counts = [5, 6, 5, 6, 4]
+    
+    centers = []
+    # Approximate spacing for initial layout (will be scaled later)
+    r_approx = 0.1
+    dx = 2 * r_approx
+    dy = np.sqrt(3) * r_approx
+    
+    y_curr = 0
+    for idx, count in enumerate(row_counts):
+        # Shift odd rows (1, 3) horizontally by half spacing
+        x_offset = dx / 2.0 if idx % 2 == 1 else 0.0
+        for i in range(count):
+            x = x_offset + i * dx
+            centers.append([x, y_curr])
+        y_curr += dy
+        
+    centers = np.array(centers)
+    
+    # Scale and center the initial configuration within [0,1] x [0,1]
+    # We add padding to ensure circles are initially strictly inside
+    pad = 0.05
+    x_min, x_max = centers[:, 0].min(), centers[:, 0].max()
+    y_min, y_max = centers[:, 1].min(), centers[:, 1].max()
+    
+    # Avoid division by zero
+    if x_max == x_min: x_max += 1e-5
+    if y_max == y_min: y_max += 1e-5
+    
+    centers[:, 0] = pad + (centers[:, 0] - x_min) / (x_max - x_min) * (1 - 2 * pad)
+    centers[:, 1] = pad + (centers[:, 1] - y_min) / (y_max - y_min) * (1 - 2 * pad)
+    
+    # Initial radii: small enough to ensure no overlap initially
+    # Calculate minimum distance between any pair to set safe initial radius
+    min_dist = 1.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            if d < min_dist:
+                min_dist = d
+    
+    r_init = (min_dist / 2.0) * 0.9 # 90% of half-distance to be safe
+    radii = np.ones(n) * r_init
+    
+    # 2. Setup Optimization Problem
+    # Variables: [x_0, y_0, r_0, x_1, y_1, r_1, ..., x_25, y_25, r_25]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+        
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    
+    # Constraints
+    cons = []
+    
+    # A. Boundary Constraints: Circle must be inside [0,1]x[0,1]
+    # x - r >= 0  =>  x - r >= 0
+    # x + r <= 1  =>  1 - x - r >= 0
+    # y - r >= 0  =>  y - r >= 0
+    # y + r <= 1  =>  1 - y - r >= 0
+    
+    for i in range(n):
+        # x_i - r_i >= 0
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+        # 1 - x_i - r_i >= 0
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i] - v[3*i+2]})
+        # y_i - r_i >= 0
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+        # 1 - y_i - r_i >= 0
+        cons.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i+1] - v[3*i+2]})
+
+    # B. Non-overlap Constraints: dist(i, j) >= r_i + r_j
+    # sqrt((xi-xj)^2 + (yi-yj)^2) - (ri + rj) >= 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            cons.append({
+                'type': 'ineq',
+                'fun': lambda v, i=i, j=j: np.sqrt((v[3*i]-v[3*j])**2 + (v[3*i+1]-v[3*j+1])**2) - (v[3*i+2] + v[3*j+2])
+            })
+            
+    # Objective: Maximize sum of radii => Minimize negative sum
+    def objective(v):
+        return -sum(v[3*i+2] for i in range(n))
+        
+    # 3. Run Optimization
+    try:
+        # SLSQP is suitable for this type of non-linear problem
+        res = minimize(
+            objective, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=cons, 
+            options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False}
+        )
+    except Exception:
+        # Fallback in case of optimization failure
+        return centers, radii, np.sum(radii)
+        
+    # 4. Extract and Validate Results
+    final_x = res.x
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i, 0] = final_x[3*i]
+        final_centers[i, 1] = final_x[3*i+1]
+        final_radii[i] = final_x[3*i+2]
+        
+    # Safety Post-processing
+    # Numerical solvers might return solutions slightly violating constraints due to tolerance.
+    # We shrink radii slightly to guarantee validity against the 1e-12 check.
+    # This is safe because smaller radii only relax constraints.
+    epsilon = 1e-5
+    final_radii = np.maximum(final_radii - epsilon, 0.0)
+    
+    # Clamp centers to [0,1] just in case
+    final_centers = np.clip(final_centers, 0.0, 1.0)
+    
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii

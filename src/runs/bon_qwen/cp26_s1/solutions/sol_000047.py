@@ -1,132 +1,97 @@
 # sol_000047 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state ff99986a) state=650b0204 sum of radii=2.540000 correctness=1.0
+# generation=0 parent=seed (state 1f1389a1) state=81076af0 sum of radii=2.607501 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize as opt
-import math
+from scipy.optimize import minimize
 
-N_CIRCLES = 26
-PENALTY_SCALE = 1000.0
-
-def check_overlap_and_boundary(centers, radii):
-    """
-    Calculates a penalty score for the configuration.
-    Returns (sum_radii, penalty).
-    """
-    n = centers.shape[0]
-    sum_r = np.sum(radii)
-    penalty = 0.0
-    
-    # Boundary checks
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        
-        if x < r:
-            penalty += (r - x)**2 * PENALTY_SCALE
-        elif x > 1 - r:
-            penalty += (x - (1 - r))**2 * PENALTY_SCALE
-            
-        if y < r:
-            penalty += (r - y)**2 * PENALTY_SCALE
-        elif y > 1 - r:
-            penalty += (y - (1 - r))**2 * PENALTY_SCALE
-            
-    # Overlap checks
-    for i in range(n):
-        for j in range(i + 1, n):
-            dx = centers[i, 0] - centers[j, 0]
-            dy = centers[i, 1] - centers[j, 1]
-            dist_sq = dx*dx + dy*dy
-            dist = math.sqrt(dist_sq) if dist_sq > 0 else 0.0
-            
-            min_dist = radii[i] + radii[j]
-            if dist < min_dist:
-                penalty += (min_dist - dist)**2 * PENALTY_SCALE
-                
-    return sum_r, penalty
-
-def objective_function_26(vars):
-    """
-    Objective function for scipy optimization.
-    Minimizes -sum_radii + penalty.
-    """
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     n = 26
-    centers = vars.reshape(-1, 3)[:, :2]
-    radii = vars.reshape(-1, 3)[:, 2]
-    sum_r, penalty = check_overlap_and_boundary(centers, radii)
-    return -sum_r + penalty
+    
+    # Objective: Minimize negative sum of radii (equivalent to maximizing sum)
+    def objective(x):
+        radii = x[2::3]
+        return -np.sum(radii)
 
-def get_grid_init():
-    """
-    5x5 grid + 1 circle in gap.
-    """
-    centers = []
-    radii = []
-    # 5x5 grid
+    # Constraints:
+    # 1. Boundary constraints (x, y, r within [0,1] and circle inside square)
+    # 2. Non-overlap constraints (distance >= sum of radii)
+    def constraints(x):
+        cons = []
+        centers = np.zeros((n, 2))
+        radii = np.zeros(n)
+        
+        for i in range(n):
+            centers[i, 0] = x[3*i]
+            centers[i, 1] = x[3*i + 1]
+            radii[i] = x[3*i + 2]
+            
+            # Boundary constraints: circle must be inside [0,1]x[0,1]
+            # x - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: x[3*i] - x[3*i + 2]})
+            # 1 - x - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: 1.0 - x[3*i] - x[3*i + 2]})
+            # y - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: x[3*i + 1] - x[3*i + 2]})
+            # 1 - y - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: 1.0 - x[3*i + 1] - x[3*i + 2]})
+            # r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda x, i=i: x[3*i + 2]})
+
+        # Non-overlap constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                def overlap_constraint(x, i=i, j=j):
+                    dist = np.sqrt((x[3*i] - x[3*j])**2 + (x[3*i+1] - x[3*j+1])**2)
+                    r_sum = x[3*i+2] + x[3*j+2]
+                    return dist - r_sum
+                cons.append({'type': 'ineq', 'fun': overlap_constraint})
+                
+        return cons
+
+    # Initialization: 5x5 grid + 1 circle in the center gap
+    x0 = np.zeros(3 * n)
+    # 5x5 Grid for first 25 circles
     for i in range(5):
         for j in range(5):
-            centers.append([0.1 + i*0.2, 0.1 + j*0.2])
-            radii.append(0.1)
-    # 1 in gap
-    centers.append([0.2, 0.2])
-    radii.append(0.04)
-    return np.array(centers), np.array(radii)
-
-def get_random_init():
-    """
-    Random initialization.
-    """
-    centers = np.random.rand(26, 2)
-    radii = np.random.rand(26) * 0.05 + 0.01
-    return centers, radii
-
-def run_packing():
-    """
-    Packs 26 circles in a unit square to maximize the sum of radii.
-    """
-    best_sum = 0.0
-    best_centers = None
-    best_radii = None
-    
-    # Initialize with grid and random starts
-    inits = [get_grid_init(), get_random_init(), get_random_init(), get_random_init()]
-    
-    # Bounds for optimization: x, y in [0, 1], r in [0, 0.5]
-    bounds = [(0.0, 1.0)] * (3 * N_CIRCLES)
-    for i in range(0, 3*N_CIRCLES, 3):
-        bounds[i+2] = (0.0, 0.5)
-        
-    for c, r in inits:
-        # Add small noise to escape local minima
-        c += np.random.normal(0, 0.001, c.shape)
-        r += np.random.normal(0, 0.001, r.shape)
-        r = np.maximum(r, 0.001)
-        
-        # Flatten to 1D array for optimizer
-        x0 = []
-        for i in range(N_CIRCLES):
-            x0.extend([c[i, 0], c[i, 1], r[i]])
+            idx = i * 5 + j
+            x0[3*idx] = 0.1 + j * 0.2
+            x0[3*idx+1] = 0.1 + i * 0.2
+            x0[3*idx+2] = 0.1
             
-        # Optimize
-        res = opt.minimize(objective_function_26, x0, method='L-BFGS-B', bounds=bounds, 
-                           options={'maxiter': 5000, 'ftol': 1e-12})
-        
-        f_centers = res.x.reshape(-1, 3)[:, :2]
-        f_radii = res.x.reshape(-1, 3)[:, 2]
-        
-        # Check validity
-        s, p = check_overlap_and_boundary(f_centers, f_radii)
-        if p < 1e-5 and s > best_sum:
-            best_sum = s
-            best_centers = f_centers
-            best_radii = f_radii
-            
-    if best_centers is None:
-        best_centers, best_radii = get_grid_init()
-        best_sum = np.sum(best_radii)
-        
-    return best_centers, best_radii, best_sum
+    # 26th circle in the center
+    x0[3*25] = 0.5
+    x0[3*25+1] = 0.5
+    x0[3*25+2] = 0.04 # Small initial radius
+
+    # Optimization bounds
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+
+    # Solve
+    constraints_list = constraints(x0)
+    result = minimize(
+        objective, 
+        x0, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=constraints_list, 
+        options={'maxiter': 1000, 'ftol': 1e-9}
+    )
+
+    # Extract results
+    best_x = result.x
+    centers = np.array([[best_x[3*i], best_x[3*i+1]] for i in range(n)])
+    radii = np.array([best_x[3*i+2] for i in range(n)])
+    sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii
+
+if __name__ == "__main__":
+    centers, radii, sum_radii = run_packing()
+    print(f"Sum of radii: {sum_radii}")

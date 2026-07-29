@@ -1,0 +1,257 @@
+# sol_000229 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2fe8b400) state=411de605 sum of radii=1.512611 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing():
+    # Number of circles
+    n = 26
+    
+    # 1. Initialize centers with a perturbed hexagonal grid
+    # We try to fit points in a way that respects the aspect ratio
+    # 5 columns seems reasonable for 26 points (5x5=25, plus 1)
+    # Or 6x5 grid subset.
+    # Let's try to distribute them somewhat uniformly first.
+    
+    # Generate a grid of points
+    # sqrt(26) is approx 5.1
+    cols = 5
+    rows = 6
+    
+    centers = []
+    # Simple grid
+    for r in range(rows):
+        for c in range(cols):
+            if len(centers) >= n:
+                break
+            centers.append([c * 0.2, r * 0.2])
+        if len(centers) >= n:
+            break
+            
+    # Convert to numpy array
+    centers = np.array(centers)
+    
+    # Add some random perturbation to break symmetry and avoid grid lock
+    np.random.seed(42)
+    centers += np.random.uniform(-0.02, 0.02, size=centers.shape)
+    
+    # Clip to ensure inside
+    centers = np.clip(centers, 0, 1)
+
+    # 2. Optimization Loop
+    num_iterations = 500
+    learning_rate = 0.05
+    
+    for it in range(num_iterations):
+        # --- Step A: Solve LP to find optimal radii and duals ---
+        
+        # Variables: r_0, r_1, ..., r_25
+        # Objective: Maximize sum(r) => Minimize -sum(r)
+        c_obj = np.ones(n) * -1.0
+        
+        # Constraints:
+        # 1. r_i + r_j <= dist(i, j)  for all i < j
+        # 2. 2*r_i <= dist(i, boundary) for all i
+        
+        # Distances between centers
+        dist_matrix = np.linalg.norm(centers[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+        
+        # Distance to boundaries for each center
+        # dist to x=0 is x, to x=1 is 1-x, same for y
+        b_i = np.zeros(n)
+        for i in range(n):
+            x, y = centers[i]
+            b_i[i] = min(x, 1-x, y, 1-y)
+        
+        # Construct A_ub and b_ub for linprog: A_ub @ r <= b_ub
+        # We have M constraints.
+        # Number of pair constraints: n*(n-1)/2
+        # Number of boundary constraints: n
+        
+        num_pair_constraints = n * (n - 1) // 2
+        num_total_constraints = num_pair_constraints + n
+        
+        A_ub = np.zeros((num_total_constraints, n))
+        b_ub = np.zeros(num_total_constraints)
+        
+        # Pair constraints
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                A_ub[idx, i] = 1.0
+                A_ub[idx, j] = 1.0
+                b_ub[idx] = dist_matrix[i, j]
+                idx += 1
+                
+        # Boundary constraints: 2*r_i <= b_i  => r_i <= b_i / 2
+        # Actually linprog handles 2*r_i <= b_i easily
+        for i in range(n):
+            A_ub[idx, i] = 2.0
+            b_ub[idx] = b_i[i]
+            idx += 1
+            
+        # Bounds for radii: r_i >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        # Solve LP
+        # Use 'highs' method if available (faster), otherwise 'simplex' or 'interior-point'
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        except:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='simplex')
+            
+        if not res.success:
+            # Fallback or break
+            break
+            
+        radii = res.x
+        current_sum_radii = -res.fun # linprog minimizes
+        
+        # --- Step B: Compute Gradient/Forces ---
+        # The dual variables (marginals) tell us the sensitivity of the objective 
+        # to changes in the constraints (distances).
+        # In scipy linprog with highs, marginals are available in res.ineqlin.marginals?
+        # Actually, res.ineqlin.marginals might not be exposed directly in all versions.
+        # However, we can approximate the forces.
+        # If a constraint r_i + r_j = dist_ij is tight, increasing dist_ij allows radii to grow.
+        # The rate of growth is related to the dual variable.
+        # Without explicit duals, we can use a heuristic force based on slack.
+        # But let's try to access duals.
+        
+        # Note: In scipy >= 1.11, marginals are available.
+        # Assuming a reasonably modern environment.
+        # If not, we can estimate forces.
+        
+        # Let's try to get marginals.
+        # res.ineqlin.marginals corresponds to A_ub constraints.
+        try:
+            duals = res.ineqlin.marginals
+        except AttributeError:
+            # Fallback: approximate forces based on proximity
+            duals = np.zeros(num_total_constraints)
+            # If r_i + r_j is close to dist, assign some weight
+            idx = 0
+            for i in range(n):
+                for j in range(i+1, n):
+                    slack = dist_matrix[i, j] - (radii[i] + radii[j])
+                    if slack < 1e-6:
+                        duals[idx] = 1.0 # Heuristic weight
+                    idx += 1
+            # Boundary
+            for i in range(n):
+                slack = 2*radii[i] - b_i[i] # 2r <= b => 2r - b <= 0? No, constraint is 2r <= b.
+                # Slack is b - 2r.
+                if b_i[i] - 2*radii[i] < 1e-6:
+                    duals[idx] = 1.0
+                    idx += 1
+
+        # Compute forces on centers
+        forces = np.zeros((n, 2))
+        
+        # Pairwise forces
+        # Contribution from constraint r_i + r_j <= dist_ij
+        # Gradient of dist_ij w.r.t c_i is (c_i - c_j) / dist_ij
+        # Force direction is along (c_i - c_j)
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                lam = duals[idx]
+                if lam > 1e-9: # Active constraint
+                    d = dist_matrix[i, j]
+                    if d > 1e-9:
+                        # Unit vector from j to i
+                        u = (centers[i] - centers[j]) / d
+                        # Increasing distance helps. Force on i is in direction u.
+                        # Force magnitude proportional to lam.
+                        # Note: lam is d(sum_r)/d(dist). 
+                        # Moving i by delta in direction u increases dist by delta.
+                        # So sum_r increases by lam * delta.
+                        # So force is lam * u.
+                        forces[i] += lam * u
+                        forces[j] -= lam * u # Action-reaction
+                idx += 1
+        
+        # Boundary forces
+        # Constraint 2*r_i <= b_i. b_i is dist to boundary.
+        # Gradient of b_i w.r.t c_i is normal vector pointing inwards.
+        for i in range(n):
+            mu = duals[idx]
+            if mu > 1e-9:
+                x, y = centers[i]
+                # Determine closest boundary
+                dists = [x, 1-x, y, 1-y]
+                min_dist = np.min(dists)
+                argmin = np.argmin(dists)
+                
+                # Normal vector pointing inwards (increasing distance from boundary)
+                # If x is min (left wall), normal is (1, 0)
+                # If 1-x is min (right wall), normal is (-1, 0)
+                # If y is min (bottom), normal is (0, 1)
+                # If 1-y is min (top), normal is (0, -1)
+                
+                normal = np.zeros(2)
+                if argmin == 0: normal[0] = 1.0
+                elif argmin == 1: normal[0] = -1.0
+                elif argmin == 2: normal[1] = 1.0
+                elif argmin == 3: normal[1] = -1.0
+                
+                # Force on i
+                forces[i] += mu * normal
+            idx += 1
+
+        # --- Step C: Update Centers ---
+        # Adaptive learning rate or fixed
+        # Scale forces to reasonable magnitude
+        # Forces can be large if duals are large.
+        # But duals for max sum usually sum to something related to number of constraints?
+        # Let's just use a fixed step.
+        
+        centers += learning_rate * forces
+        
+        # Project back to [0, 1]
+        centers = np.clip(centers, 0, 1)
+        
+        # Reduce learning rate slowly
+        learning_rate *= 0.99
+
+    # Final LP solve to get precise radii
+    dist_matrix = np.linalg.norm(centers[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+    b_i = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        b_i[i] = min(x, 1-x, y, 1-y)
+    
+    num_pair_constraints = n * (n - 1) // 2
+    num_total_constraints = num_pair_constraints + n
+    
+    A_ub = np.zeros((num_total_constraints, n))
+    b_ub = np.zeros(num_total_constraints)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dist_matrix[i, j]
+            idx += 1
+    for i in range(n):
+        A_ub[idx, i] = 2.0
+        b_ub[idx] = b_i[i]
+        idx += 1
+        
+    bounds = [(0, None) for _ in range(n)]
+    c_obj = np.ones(n) * -1.0
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    except:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='simplex')
+        
+    radii = res.x
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

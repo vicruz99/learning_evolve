@@ -1,0 +1,119 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we face a highly non-convex optimization problem. Direct joint optimization of centers and radii often gets trapped in local minima. 
+
+My strategy decouples the problem into two phases for better global exploration:
+1. **Global Position Search (Differential Evolution)**: We treat circle centers as the primary variables. For any fixed set of centers, finding the optimal radii is a Linear Programming problem (maximize $\sum r_i$ subject to $r_i+r_j \le d_{ij}$ and boundary constraints). We use `differential_evolution` to explore the 52-dimensional space of centers. At each evaluation, an exact LP solver (`linprog`) computes the maximum possible sum of radii for those positions. This creates a smooth, well-behaved objective landscape for the global optimizer.
+2. **Local Joint Refinement (SLSQP)**: Once DE finds a highly promising configuration, we switch to a local nonlinear optimizer (`SLSQP`) that jointly adjusts both centers and radii. This fine-tunes the arrangement, allowing circles to shift boundaries and each other to squeeze out additional radius volume.
+3. **Strict Feasibility Enforcement**: A deterministic post-processing step iteratively shrinks radii to guarantee strict compliance with the validator's overlap and boundary tolerances, preventing any floating-point violations.
+
+This hybrid approach combines the robustness of global evolutionary search with the precision of local gradient-based optimization, typically yielding packings that surpass equal-circle lattice limits by exploiting unequal radii to fill residual gaps.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import differential_evolution, linprog, minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def get_optimal_radii(centers):
+    """Solves LP to find radii that maximize sum(r) for fixed centers."""
+    c_obj = -np.ones(N)
+    bounds = [(0, None)] * N
+    
+    n_pairs = len(PAIR_I)
+    n_walls = 4 * N
+    n_con = n_pairs + n_walls
+    
+    A = np.zeros((n_con, N))
+    b = np.zeros(n_con)
+    
+    k = 0
+    # Pairwise non-overlap: r_i + r_j <= d_ij
+    for i, j in zip(PAIR_I, PAIR_J):
+        d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+        A[k, i] = 1.0
+        A[k, j] = 1.0
+        b[k] = d
+        k += 1
+        
+    # Boundary constraints: r_i <= dist_to_wall
+    for i in range(N):
+        b[k] = centers[i, 0]; A[k, i] = 1.0; k += 1
+        b[k] = 1.0 - centers[i, 0]; A[k, i] = 1.0; k += 1
+        b[k] = centers[i, 1]; A[k, i] = 1.0; k += 1
+        b[k] = 1.0 - centers[i, 1]; A[k, i] = 1.0; k += 1
+        
+    res = linprog(c_obj, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+    return res.x if res.success else np.zeros(N)
+
+def de_objective(x):
+    """Objective for DE: maximize sum of optimal radii for given centers."""
+    centers = x.reshape(N, 2)
+    radii = get_optimal_radii(centers)
+    return -np.sum(radii)
+
+def run_packing():
+    # Phase 1: Global search over center positions
+    bounds_de = [(0.0, 1.0)] * (2 * N)
+    res_de = differential_evolution(de_objective, bounds_de, popsize=15, maxiter=500,
+                                    mutation=(0.5, 1.5), recombination=0.9, seed=42,
+                                    polish=False, disp=False)
+    
+    best_centers = res_de.x.reshape(N, 2)
+    best_radii = get_optimal_radii(best_centers)
+    
+    # Phase 2: Local joint refinement with SLSQP
+    def obj_joint(v):
+        return -np.sum(v[2*N:])
+        
+    def cons_joint(v):
+        x = v[:N]
+        y = v[N:2*N]
+        r = v[2*N:]
+        
+        c = np.concatenate([
+            x - r, 1.0 - x - r, y - r, 1.0 - y - r
+        ])
+        
+        dx = x[PAIR_I] - x[PAIR_J]
+        dy = y[PAIR_I] - y[PAIR_J]
+        dist = np.sqrt(dx**2 + dy**2)
+        sum_r = r[PAIR_I] + r[PAIR_J]
+        
+        return np.concatenate([c, dist - sum_r])
+        
+    v0 = np.concatenate([best_centers[:, 0], best_centers[:, 1], best_radii])
+    bounds_joint = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': cons_joint}
+    
+    res_slsqp = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_joint,
+                         constraints=cons_dict, options={'maxiter': 8000, 'ftol': 1e-12, 'disp': False})
+    
+    centers = res_slsqp.x[:2*N].reshape(N, 2)
+    radii = res_slsqp.x[2*N:]
+    
+    # Phase 3: Strict feasibility enforcement for validator compliance
+    # Enforce boundary constraints
+    radii = np.minimum(radii, np.minimum(centers[:, 0], 1.0 - centers[:, 0]))
+    radii = np.minimum(radii, np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    radii = np.maximum(radii, 0.0)
+    
+    # Iteratively resolve any floating-point overlaps
+    for _ in range(10):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if radii[i] + radii[j] > d - 1e-12:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-10
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    return centers, radii, float(np.sum(radii))
+```

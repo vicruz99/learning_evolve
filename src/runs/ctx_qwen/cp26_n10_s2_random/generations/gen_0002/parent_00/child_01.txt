@@ -1,0 +1,158 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.629, we will employ a robust hybrid optimization strategy:
+1. **Vectorized Constraint Handling**: Precompute upper-triangle indices and use fully vectorized numpy operations in the constraint function to speed up gradient evaluations and allow more optimizer iterations.
+2. **Diverse Initializations**: Start from multiple structured lattices (hexagonal, square grid) and random configurations to cover different topological basins.
+3. **Iterative Perturbation & Refinement**: After each successful optimization, perturb the best-found configuration with a decaying noise schedule and re-optimize. This mimics simulated annealing/basin hopping, helping escape shallow local minima.
+4. **High-Precision SLSQP**: Use `SLSQP` with increased `maxiter` and tight tolerances. It handles inequality constraints natively and works well for this problem structure.
+5. **Strict Repair Pass**: A final deterministic shrink-and-validate loop guarantees the solution passes the strict `1e-12` tolerance check without sacrificing meaningful radius sum.
+
+This approach balances global exploration with precise local refinement, typically yielding tighter packings near boundaries and corners where volume is wasted in naive lattices.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+# Precompute upper triangle indices for pairwise constraints (i < j)
+N_CIRCLES = 26
+UPPER_IDXS = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(v):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2 * N_CIRCLES:])
+
+def constraints(v):
+    """Compute all inequality constraints (must be >= 0)."""
+    n = N_CIRCLES
+    c = v[:2 * n].reshape(n, 2)
+    r = v[2 * n:]
+    
+    con = []
+    # Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    
+    # Pairwise non-overlap: dist(i,j) >= r_i + r_j
+    dx = c[:, 0, np.newaxis] - c[:, 0]
+    dy = c[:, 1, np.newaxis] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    con.append(dists[UPPER_IDXS] - r_sum[UPPER_IDXS])
+        
+    return np.concatenate(con)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = N_CIRCLES
+    
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # ---------------------------------------------------------
+    # 1. Generate Diverse Initial Configurations
+    # ---------------------------------------------------------
+    inits = []
+    
+    # Config A: Hexagonal lattice
+    r0 = 0.105
+    dy = r0 * math.sqrt(3)
+    dx = 2 * r0
+    pts = []
+    row = 0
+    while len(pts) < n:
+        y = r0 + row * dy
+        if y + r0 > 1.0:
+            break
+        offset = (dx / 2.0) if row % 2 == 1 else 0.0
+        x = r0 + offset
+        while x + r0 <= 1.0 and len(pts) < n:
+            pts.append([x, y])
+            x += dx
+        row += 1
+    while len(pts) < n:
+        pts.append([np.random.rand(), np.random.rand()])
+    inits.append(np.array(pts[:n]))
+    
+    # Config B: Dense Grid
+    xg = np.linspace(0.1, 0.9, 6)
+    yg = np.linspace(0.1, 0.9, 5)
+    gx, gy = np.meshgrid(xg, yg)
+    inits.append(np.column_stack([gx.flatten(), gy.flatten()])[:n])
+    
+    # Config C: Random Dense
+    inits.append(np.random.rand(n, 2) * 0.75 + 0.125)
+    
+    # ---------------------------------------------------------
+    # 2. Multi-Start Optimization with Decaying Perturbations
+    # ---------------------------------------------------------
+    for trial in range(25):
+        if trial < 3:
+            c0 = inits[trial % 3].copy()
+        else:
+            # Perturb the best solution found so far
+            c0 = best_v[:2 * n].reshape(n, 2).copy()
+            noise_scale = 0.008 * (1.0 - trial / 25.0)
+            c0 += np.random.normal(0, noise_scale, c0.shape)
+            c0 = np.clip(c0, 0.01, 0.99)
+            
+        r0 = np.full(n, 0.088)
+        v0 = np.concatenate([c0.flatten(), r0])
+        
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, 
+                           options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                # Strict feasibility check with tolerance
+                c_vals = constraints(res.x)
+                if np.all(c_vals >= -1e-9):
+                    best_sum = curr_sum
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # ---------------------------------------------------------
+    # 3. Final Extraction & Deterministic Repair
+    # ---------------------------------------------------------
+    centers = best_v[:2 * n].reshape(n, 2)
+    radii = best_v[2 * n:].copy()
+    
+    # Guarantee validity against the strict checker tolerances
+    for _ in range(40):
+        valid = True
+        for i in range(n):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                valid = False
+                break
+        if not valid:
+            break
+            
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = math.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if dist < radii[i] + radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+                
+        if valid:
+            break
+        # Slight uniform shrink to resolve numerical drift
+        radii *= 0.99995
+        
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii
+```

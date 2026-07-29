@@ -1,0 +1,277 @@
+# sol_000329 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 488bfafc) state=996c0c84 sum of radii=0.528892 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Solves the circle packing problem for 26 circles in a unit square.
+    Returns centers, radii, and the sum of radii.
+    """
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    def hex_init(n, seed=0):
+        """
+        Generates a dense hexagonal-like initialization for n circles.
+        """
+        rng = np.random.default_rng(seed)
+        # Heuristic for row distribution to get n circles
+        # Aim for roughly square aspect ratio packing
+        # Try rows of length 5 and 6
+        # 5, 6, 5, 6, 5 -> 27 (close to 26)
+        # 5, 6, 5, 5, 5 -> 26
+        rows = [5, 6, 5, 5, 5]
+        
+        # If sum != n, adjust
+        while sum(rows) > n:
+            # Remove from largest row
+            max_idx = rows.index(max(rows))
+            rows[max_idx] -= 1
+        while sum(rows) < n:
+            # Add to largest row (or just append)
+            max_idx = rows.index(max(rows))
+            rows[max_idx] += 1
+            
+        centers = []
+        # Approximate radii for tight packing to scale coordinates
+        # Assume r ~ 0.1, spacing ~ 0.2
+        spacing_x = 0.22 
+        spacing_y = 0.19  # sqrt(3)/2 * 0.22 approx 0.19
+        
+        y_curr = 0.1
+        
+        for r_idx, count in enumerate(rows):
+            # Center the row horizontally
+            row_width = (count - 1) * spacing_x
+            x_start = 0.5 - row_width / 2.0
+            
+            # Hexagonal offset for odd rows (0-indexed logic: if row index is odd, shift)
+            offset = spacing_x / 2.0 if r_idx % 2 != 0 else 0.0
+            
+            for _ in range(count):
+                x = x_start + offset
+                centers.append([x, y_curr])
+                x_start += spacing_x
+            y_curr += spacing_y
+            
+        centers = np.array(centers)
+        # Scale and shift to [0,1] with some margin
+        min_c = centers.min(axis=0)
+        max_c = centers.max(axis=0)
+        span = max_c - min_c
+        if span.max() == 0:
+            span = 1.0
+            
+        # Scale to fit in [0.1, 0.9] roughly
+        target_scale = 0.8 / span.max()
+        centers = (centers - min_c) * target_scale + 0.1
+        
+        # Add random jitter
+        centers += rng.uniform(-0.02, 0.02, centers.shape)
+        
+        # Clamp
+        centers = np.clip(centers, 0.05, 0.95)
+        
+        return centers, np.ones(n) * 0.05
+
+    def get_constraints(centers, radii):
+        """
+        Prepare constraints for SLSQP.
+        """
+        n = len(radii)
+        cons = []
+        
+        # Variables vector: [x0, y0, ..., xn-1, yn-1, r0, ..., rn-1]
+        # indices: 2*i, 2*i+1 for center i, 2*n + i for radius i
+        
+        # 1. Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+        for i in range(n):
+            idx_x = 2 * i
+            idx_y = 2 * i + 1
+            idx_r = 2 * n + i
+            
+            # x - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[idx_x] - v[idx_r]})
+            # 1 - x - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[idx_x] - v[idx_r]})
+            # y - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[idx_y] - v[idx_r]})
+            # 1 - y - r >= 0
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[idx_y] - v[idx_r]})
+            
+        # 2. Pairwise non-overlap: dist^2 - (r_i + r_j)^2 >= 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                idx_x1, idx_y1 = 2 * i, 2 * i + 1
+                idx_x2, idx_y2 = 2 * j, 2 * j + 1
+                idx_r1, idx_r2 = 2 * n + i, 2 * n + j
+                
+                def cons_dist(v, i=i, j=j):
+                    dx = v[idx_x1] - v[idx_x2]
+                    dy = v[idx_y1] - v[idx_y2]
+                    r_sum = v[idx_r1] + v[idx_r2]
+                    return (dx**2 + dy**2) - (r_sum**2)
+                
+                cons.append({'type': 'ineq', 'fun': cons_dist})
+                
+        return cons
+
+    def objective(v):
+        """Maximize sum of radii -> minimize negative sum."""
+        return -np.sum(v[2*n:])
+
+    # Initial run
+    centers, radii = hex_init(n, seed=42)
+    x0 = np.concatenate([centers.flatten(), radii])
+    constraints = get_constraints(centers, radii)
+    bounds = [(0, 1)] * (2*n) + [(0, 1)] * n
+
+    # Primary Optimization
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+                   options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+    
+    best_sum = -res.fun
+    best_centers = res.x[:2*n].reshape(n, 2)
+    best_radii = res.x[2*n:]
+
+    # Jitter and Re-optimize to escape local optima
+    for trial in range(5):
+        # Perturb best solution
+        jitter_scale = 0.02 * (0.9 ** trial)
+        rng = np.random.default_rng(trial + 100)
+        current_centers = best_centers.copy()
+        current_radii = best_radii.copy()
+        
+        # Random move
+        current_centers += rng.uniform(-jitter_scale, jitter_scale, current_centers.shape)
+        current_centers = np.clip(current_centers, 0.01, 0.99)
+        
+        # Ensure valid start for optimization (shrink radii slightly if needed)
+        # We check validity manually to ensure optimizer doesn't start in invalid state
+        valid = True
+        # Simple overlap check
+        dists_sq = np.sum((current_centers[:, None, :] - current_centers[None, :, :])**2, axis=2)
+        r_sum_sq = (current_radii[:, None] + current_radii[None, :])**2
+        # Upper triangle
+        for i in range(n):
+            for j in range(i+1, n):
+                if dists_sq[i, j] < r_sum_sq[i, j] - 1e-10:
+                    valid = False
+                    break
+            if not valid: break
+        
+        # Boundary check
+        for i in range(n):
+            if (current_centers[i, 0] < current_radii[i] + 1e-10 or 
+                current_centers[i, 0] > 1 - current_radii[i] - 1e-10 or
+                current_centers[i, 1] < current_radii[i] + 1e-10 or 
+                current_centers[i, 1] > 1 - current_radii[i] - 1e-10):
+                valid = False
+                break
+
+        if not valid:
+            # If jitter made it invalid, shrink radii until valid
+            scale = 1.0
+            while scale > 0.5 and not valid:
+                scale *= 0.9
+                current_radii = best_radii * scale
+                # Re-check
+                dists_sq = np.sum((current_centers[:, None, :] - current_centers[None, :, :])**2, axis=2)
+                r_sum_sq = (current_radii[:, None] + current_radii[None, :])**2
+                valid = True
+                for i in range(n):
+                    for j in range(i+1, n):
+                        if dists_sq[i, j] < r_sum_sq[i, j] - 1e-10:
+                            valid = False
+                            break
+                    if not valid: break
+                
+                for i in range(n):
+                    if (current_centers[i, 0] < current_radii[i] + 1e-10 or 
+                        current_centers[i, 0] > 1 - current_radii[i] - 1e-10 or
+                        current_centers[i, 1] < current_radii[i] + 1e-10 or 
+                        current_centers[i, 1] > 1 - current_radii[i] - 1e-10):
+                        valid = False
+                        break
+
+        x0_new = np.concatenate([current_centers.flatten(), current_radii])
+        
+        # Re-optimize from perturbed state
+        # Note: constraints depend on current radii if we treat radii as fixed, 
+        # but here we optimize radii too, so constraints structure is same.
+        res_trial = minimize(objective, x0_new, method='SLSQP', bounds=bounds, constraints=constraints,
+                             options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+        
+        trial_sum = -res_trial.fun
+        if trial_sum > best_sum:
+            best_sum = trial_sum
+            best_centers = res_trial.x[:2*n].reshape(n, 2)
+            best_radii = res_trial.x[2*n:]
+
+    # Final Validation and Correction
+    # Ensure strict validity
+    # 1. Check radii non-negative
+    best_radii = np.maximum(best_radii, 1e-9)
+    
+    # 2. Fix boundary violations by shrinking radii
+    for i in range(n):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        min_dist_wall = min(x, 1-x, y, 1-y)
+        if r > min_dist_wall + 1e-12:
+            best_radii[i] = max(0, min_dist_wall - 1e-12)
+
+    # 3. Fix overlaps by slightly shrinking radii
+    # Use a simple iterative reduction for overlaps
+    changed = True
+    while changed:
+        changed = False
+        dists_sq = np.sum((best_centers[:, None, :] - best_centers[None, :, :])**2, axis=2)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d_sq = dists_sq[i, j]
+                r_sum = best_radii[i] + best_radii[j]
+                if d_sq < (r_sum - 1e-12)**2:
+                    # Shrink the larger radius
+                    if best_radii[i] >= best_radii[j]:
+                        new_r = np.sqrt(d_sq)**0.5 - best_radii[j] + 1e-12 # approx
+                        # Actually just reduce sum to fit distance
+                        # dist = sqrt(d_sq). We need r_i + r_j <= dist
+                        # Reduce r_i
+                        reduction = (best_radii[i] + best_radii[j]) - np.sqrt(d_sq) + 1e-12
+                        if reduction > 0:
+                            best_radii[i] -= reduction / 2
+                            best_radii[j] -= reduction / 2
+                            changed = True
+                    else:
+                         reduction = (best_radii[i] + best_radii[j]) - np.sqrt(d_sq) + 1e-12
+                         if reduction > 0:
+                            best_radii[i] -= reduction / 2
+                            best_radii[j] -= reduction / 2
+                            changed = True
+        # Ensure non-negative
+        best_radii = np.maximum(best_radii, 0)
+
+    final_sum = np.sum(best_radii)
+    
+    # Run the provided validation check (conceptually)
+    # Since we can't call the external function directly if it's not imported,
+    # we rely on our own checks which mirror it.
+    # The problem statement says "We will run the below validation function".
+    # We must ensure our output passes it.
+    
+    return best_centers, best_radii, final_sum
+
+# We need to define validate_packing? 
+# The prompt says "We will run the below validation function (read-only, do not modify this)".
+# It implies the environment has it. But for my code to be self-contained or to test locally,
+# I can include it, but the prompt says "do not modify this".
+# I will not include it in the final output block unless necessary.
+# The return function is what matters.

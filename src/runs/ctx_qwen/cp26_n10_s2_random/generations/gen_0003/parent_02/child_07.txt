@@ -1,0 +1,171 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.623, we need a more robust global optimization strategy that escapes shallow local minima typical of circle packing problems. The proposed approach combines:
+
+1. **Diverse Multi-Start Initialization**: Generate ~20 hexagonal lattice configurations with varying densities and perturbations, plus 15 random starts. This covers both structured and irregular packing topologies.
+2. **Continuation/Growth Method**: After finding the best local optimum, iteratively scale up all radii by a tiny factor (0.05%) and re-optimize positions. This "pushes" the packing against constraints, forcing circles to find tighter, more optimal arrangements that a single static optimization might miss.
+3. **Joint SLSQP Optimization**: Optimize centers and radii simultaneously with explicit inequality constraints. This ensures strict feasibility at each step and directly targets the objective $\sum r_i$.
+4. **Deterministic Post-Processing**: A final safety shrink guarantees the solution strictly satisfies the validator's $10^{-12}$ tolerance without sacrificing meaningful radius sum.
+
+This hybrid approach systematically climbs out of local optima and typically yields packings very close to theoretical bounds for $N=26$.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def compute_constraints(v):
+    """
+    Computes inequality constraints that must be >= 0.
+    Handles boundary containment and non-overlap.
+    """
+    cx = v[0::3]
+    cy = v[1::3]
+    r = v[2::3]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c = np.concatenate([
+        cx - r, 
+        1.0 - cx - r, 
+        cy - r, 
+        1.0 - cy - r
+    ])
+    
+    # Overlap constraints: dist(i,j) >= r_i + r_j
+    diff_cx = cx[:, None] - cx[None, :]
+    diff_cy = cy[:, None] - cy[None, :]
+    dists = np.sqrt(diff_cx**2 + diff_cy**2)
+    np.fill_diagonal(dists, np.inf)
+    
+    iu, ju = np.triu_indices(N_CIRCLES, k=1)
+    c = np.concatenate([c, dists[iu, ju] - (r[iu] + r[ju])])
+    return c
+
+def compute_objective(v):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    return -np.sum(v[2::3])
+
+def get_bounds():
+    """Variable bounds: centers in [0,1], radii in [0, 0.5]."""
+    return [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+
+def generate_hex_init(seed):
+    """Generates a perturbed hexagonal lattice configuration."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    r0 = 0.095
+    y = r0
+    row = 0
+    while len(centers) < N_CIRCLES:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x <= 1.0 - r0 and len(centers) < N_CIRCLES:
+            centers.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+        
+    centers = np.array(centers[:N_CIRCLES])
+    centers += rng.normal(0, 0.005, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    # Compute strictly feasible initial radii
+    r_init = np.full(N_CIRCLES, 0.08)
+    for i in range(N_CIRCLES):
+        mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        for j in range(N_CIRCLES):
+            if i != j:
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d/2 < mx: 
+                    mx = d/2
+        r_init[i] = mx * 0.95
+        
+    v = np.zeros(3 * N_CIRCLES)
+    v[0::3] = centers[:,0]
+    v[1::3] = centers[:,1]
+    v[2::3] = r_init
+    return v
+
+def run_packing():
+    best_v = None
+    best_val = -np.inf
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    # 1. Multi-start optimization from diverse initial configurations
+    starts = [generate_hex_init(i) for i in range(20)]
+    
+    # Add randomized starts to explore non-lattice optima
+    rng = np.random.default_rng(99)
+    for _ in range(15):
+        c = rng.uniform(0.15, 0.85, (N_CIRCLES, 2))
+        r = np.full(N_CIRCLES, 0.07)
+        v = np.zeros(3 * N_CIRCLES)
+        v[0::3] = c[:,0]
+        v[1::3] = c[:,1]
+        v[2::3] = r
+        starts.append(v)
+        
+    for x0 in starts:
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-8):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # 2. Iterative growth continuation to escape local minima
+    # Gradually expand radii and re-optimize positions to find tighter packings
+    if best_v is not None:
+        curr_v = best_v.copy()
+        for step in range(60):
+            curr_v[2::3] *= 1.0005  # Tiny expansion
+            try:
+                res = minimize(compute_objective, curr_v, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 2500, 'ftol': 1e-12})
+                if np.all(compute_constraints(res.x) >= -1e-8) and -res.fun > best_val:
+                    best_val = -res.fun
+                    best_v = res.x.copy()
+                    curr_v = best_v.copy()
+                else:
+                    break  # Cannot expand further without severe violation
+            except Exception:
+                break
+                
+    # 3. Final high-precision polish
+    if best_v is not None:
+        try:
+            res = minimize(compute_objective, best_v, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-13})
+            if np.all(compute_constraints(res.x) >= -1e-9) and -res.fun > best_val:
+                best_v = res.x
+                best_val = -res.fun
+        except Exception:
+            pass
+
+    centers = best_v[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = best_v[2*N_CIRCLES:].copy()
+    
+    # 4. Deterministic safety shrink to guarantee validator tolerance compliance
+    for _ in range(5):
+        for i in range(N_CIRCLES):
+            for j in range(i+1, N_CIRCLES):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i]+radii[j]-1e-12:
+                    sh = (radii[i]+radii[j]-d)/2.0 + 1e-9
+                    radii[i] -= sh
+                    radii[j] -= sh
+        for i in range(N_CIRCLES):
+            mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                
+    return centers, radii, float(np.sum(radii))
+```

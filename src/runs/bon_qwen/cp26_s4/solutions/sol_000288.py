@@ -1,0 +1,272 @@
+# sol_000288 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1e8a963c) state=d0388d84 sum of radii=2.502818 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n_circles = 26
+    square_size = 1.0
+    
+    # 1. Initialization
+    # Start with a grid-like distribution to ensure valid starting positions
+    # We use a 6x5 grid subset to place 26 circles
+    x_coords = np.linspace(0.1, 0.9, 6)
+    y_coords = np.linspace(0.1, 0.9, 5)
+    
+    # Create grid points
+    grid_points = []
+    for y in y_coords:
+        for x in x_coords:
+            grid_points.append([x, y])
+            if len(grid_points) >= n_circles:
+                break
+        if len(grid_points) >= n_circles:
+            break
+            
+    centers = np.array(grid_points[:n_circles])
+    # Start with a safe small radius
+    radii = np.full(n_circles, 0.05)
+    
+    # 2. Force-Directed Growth Layout
+    # We iteratively grow circles and resolve overlaps using repulsive forces
+    
+    num_iterations = 500
+    growth_rate = 0.0005
+    dt = 0.05 # Time step for movement
+    damping = 0.9 # Damping factor for velocities
+    
+    # Initialize velocities
+    velocities = np.zeros_like(centers)
+    
+    # Current radii
+    r = radii.copy()
+    
+    for iteration in range(num_iterations):
+        # Grow radii
+        # We grow them uniformly to try to maximize sum. 
+        # If we hit a limit, the forces will push them apart, possibly increasing sum.
+        # A small growth per step helps explore.
+        growth = growth_rate * (1 - r.mean() / 0.12) # Slow down growth as radii get large
+        if growth < 0: growth = 0.0001 # Ensure we always try to grow slightly
+        r += growth
+        
+        # Calculate forces
+        forces = np.zeros_like(centers)
+        
+        # Repulsion between circles
+        # We only care about overlapping or close circles
+        # Vectorized distance calculation
+        # centers shape (N, 2), diff shape (N, N, 2)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        dist = np.sqrt(np.maximum(dist_sq, 1e-9)) # Avoid division by zero
+        
+        # Radii sum matrix
+        r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+        
+        # Overlap amount: positive if dist < r_i + r_j
+        overlap = r_sum - dist
+        
+        # Identify overlapping pairs
+        # Mask for upper triangle to avoid double counting and self-interaction
+        mask = np.triu(np.ones((n_circles, n_circles), dtype=bool), k=1)
+        overlapping = overlap > 1e-6
+        overlapping = overlapping & mask
+        
+        if np.any(overlapping):
+            # Calculate force directions for overlapping pairs
+            # Force magnitude proportional to overlap
+            # F_ij = overlap * direction_ij
+            # direction_ij = (c_i - c_j) / dist
+            
+            # We can compute this efficiently
+            # Get indices of overlapping pairs
+            i_idx, j_idx = np.where(overlapping)
+            
+            for k in range(len(i_idx)):
+                i = i_idx[k]
+                j = j_idx[k]
+                
+                d_vec = centers[i] - centers[j]
+                d = dist[i, j]
+                if d < 1e-9: d = 1e-9 # Prevent div by zero
+                
+                overlap_val = overlap[i, j]
+                
+                # Repulsive force unit vector
+                force_dir = d_vec / d
+                
+                # Apply force proportional to overlap
+                # Stiffer spring for larger overlap
+                force_mag = overlap_val * 10.0 
+                
+                forces[i] += force_dir * force_mag
+                forces[j] -= force_dir * force_mag
+
+        # Boundary repulsion forces
+        # If circle is too close to wall, push it in
+        for i in range(n_circles):
+            ci = centers[i]
+            ri = r[i]
+            
+            # Left wall
+            if ci[0] - ri < 0:
+                forces[i, 0] += (ci[0] - ri) * 50.0 # Push right (positive force if negative displacement? No)
+                # ci[0] - ri is negative. We want to increase ci[0].
+                # Force should be positive.
+                # Let's use: Force = k * (violation)
+                # Violation = ri - ci[0] (positive amount outside)
+                # Force = + (ri - ci[0]) * k
+                forces[i, 0] += (ri - ci[0]) * 50.0
+                # Clamp position to boundary during force application? 
+                # Or just let force push it. Clamping is safer.
+                centers[i, 0] = max(ci[0], ri)
+            
+            # Right wall
+            if ci[0] + ri > 1.0:
+                forces[i, 0] -= (ci[0] + ri - 1.0) * 50.0
+                centers[i, 0] = min(ci[0], 1.0 - ri)
+            
+            # Bottom wall
+            if ci[1] - ri < 0:
+                forces[i, 1] += (ri - ci[1]) * 50.0
+                centers[i, 1] = max(ci[1], ri)
+            
+            # Top wall
+            if ci[1] + ri > 1.0:
+                forces[i, 1] -= (ci[1] + ri - 1.0) * 50.0
+                centers[i, 1] = min(ci[1], 1.0 - ri)
+
+        # Update velocities and positions
+        velocities += forces * dt
+        velocities *= damping
+        centers += velocities
+        
+        # Strict boundary clamping to ensure validity
+        centers[:, 0] = np.clip(centers[:, 0], r, 1.0 - r)
+        centers[:, 1] = np.clip(centers[:, 1], r, 1.0 - r)
+        
+        # Update global radii variable with current r
+        # (r is updated at start of loop)
+        radii = r.copy()
+
+    # 3. Local Optimization using Scipy
+    # Use the result from force-directed layout as initial guess
+    # We want to maximize sum(radii) subject to constraints.
+    # We can minimize -sum(radii) with penalty constraints.
+    
+    # Flatten parameters: [x1, y1, r1, x2, y2, r2, ...]
+    # Total 3 * 26 = 78 variables
+    
+    def objective(params):
+        # params is 1D array of length 78
+        # reshape to centers (26, 2) and radii (26,)
+        centers_opt = params[0:52].reshape(26, 2)
+        radii_opt = params[52:]
+        
+        # Objective: maximize sum of radii -> minimize negative sum
+        return -np.sum(radii_opt)
+    
+    def constraints_func(params):
+        centers_opt = params[0:52].reshape(26, 2)
+        radii_opt = params[52:]
+        
+        penalties = []
+        
+        # Overlap constraints: dist >= r_i + r_j
+        # dist^2 >= (r_i + r_j)^2
+        # We can use a penalty function or constraint function.
+        # For SLSQP, we need inequalities >= 0.
+        # dist - (r_i + r_j) >= 0
+        
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dist = np.sqrt(np.sum((centers_opt[i] - centers_opt[j])**2))
+                val = dist - (radii_opt[i] + radii_opt[j])
+                penalties.append(val)
+        
+        # Boundary constraints
+        for i in range(n_circles):
+            penalties.append(centers_opt[i, 0] - radii_opt[i]) # x >= r
+            penalties.append(1.0 - radii_opt[i] - centers_opt[i, 0]) # x <= 1-r => 1-r-x >= 0
+            penalties.append(centers_opt[i, 1] - radii_opt[i]) # y >= r
+            penalties.append(1.0 - radii_opt[i] - centers_opt[i, 1]) # y <= 1-r
+            penalties.append(radii_opt[i]) # r >= 0
+            
+        return np.array(penalties)
+
+    # Initial guess from force simulation
+    x0 = np.concatenate([centers.flatten(), radii.flatten()])
+    
+    # Bounds
+    # x, y in [0, 1], r in [0, 0.5] (max radius in unit square is 0.5)
+    bounds = []
+    for _ in range(n_circles):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+
+    # Optimization
+    try:
+        result = opt.minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                              constraints={'type': 'ineq', 'fun': constraints_func},
+                              options={'maxiter': 1000, 'ftol': 1e-9})
+        if result.success or result.fun < -2.5: # If we found something better than 2.5
+            centers_final = result.x[0:52].reshape(26, 2)
+            radii_final = result.x[52:]
+        else:
+            # Fallback to force-directed result
+            centers_final = centers
+            radii_final = radii
+    except Exception:
+        centers_final = centers
+        radii_final = radii
+
+    # Final Validation and Cleanup
+    # Ensure strict constraints are met (fix tiny numerical violations)
+    centers_final = np.clip(centers_final, radii_final[:, np.newaxis], 1.0 - radii_final[:, np.newaxis])
+    # For x and y separately
+    centers_final[:, 0] = np.clip(centers_final[:, 0], radii_final, 1.0 - radii_final)
+    centers_final[:, 1] = np.clip(centers_final[:, 1], radii_final, 1.0 - radii_final)
+    
+    # Check overlaps and shrink if necessary (very small shrink to fix precision)
+    # This is a safety measure.
+    for _ in range(10):
+        valid = True
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dist = np.sqrt(np.sum((centers_final[i] - centers_final[j])**2))
+                min_dist = radii_final[i] + radii_final[j]
+                if dist < min_dist - 1e-12:
+                    # Overlap detected
+                    # Scale down radii slightly or move centers?
+                    # Moving centers is hard here.
+                    # Just reduce radii proportionally to overlap to make it valid.
+                    # This is a last resort.
+                    overlap = min_dist - dist
+                    shrink = overlap / 2.0
+                    radii_final[i] -= shrink
+                    radii_final[j] -= shrink
+                    valid = False
+        
+        if valid:
+            break
+    
+    sum_radii = np.sum(radii_final)
+    
+    return centers_final, radii_final, float(sum_radii)
+
+# Allow running directly
+if __name__ == "__main__":
+    centers, radii, total = run_packing()
+    print(f"Sum of radii: {total}")
+    # print(centers)
+    # print(radii)

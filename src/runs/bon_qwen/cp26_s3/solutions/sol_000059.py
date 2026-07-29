@@ -1,0 +1,102 @@
+# sol_000059 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 05a03f22) state=499e1175 sum of radii=2.438966 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Returns centers, radii, and sum of radii for 26 circles packed in a unit square.
+    Uses a hexagonal packing strategy with 6 rows (5, 4, 5, 4, 5, 4 circles).
+    """
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Geometric constants for hexagonal packing
+    # Vertical distance between rows is diameter * sin(60)
+    # y_step = 2*r * (sqrt(3)/2) = r * sqrt(3)
+    # Total height H = 2*r + 5 * y_step = 2*r + 5*r*sqrt(3) = r * (2 + 5*sqrt(3))
+    # H = 1  =>  r = 1 / (2 + 5*sqrt(3))
+    
+    sqrt_3 = np.sqrt(3.0)
+    r = 1.0 / (2.0 + 5.0 * sqrt_3)
+    
+    # Constants for positioning
+    y_step = r * sqrt_3
+    x_spacing = 2.0 * r
+    
+    # Row definitions: (y_center, number_of_circles, x_offset)
+    # Rows 1, 3, 5: 5 circles, x starts at r
+    # Rows 2, 4, 6: 4 circles, x starts at 2r (shifted by r)
+    
+    row_configs = [
+        (r, 5, r),            # Row 1 (Bottom)
+        (r + y_step, 4, 2*r), # Row 2
+        (r + 2*y_step, 5, r), # Row 3
+        (r + 3*y_step, 4, 2*r), # Row 4
+        (r + 4*y_step, 5, r), # Row 5
+        (r + 5*y_step, 4, 2*r) # Row 6 (Top)
+    ]
+    
+    idx = 0
+    for y, count, x_start in row_configs:
+        for k in range(count):
+            # Stop if we have placed 26 circles
+            if idx >= n:
+                break
+            x = x_start + k * x_spacing
+            centers[idx, 0] = x
+            centers[idx, 1] = y
+            radii[idx] = r
+            idx += 1
+            
+        if idx >= n:
+            break
+
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii
+
+# Execute validation check
+if __name__ == "__main__":
+    import sys
+    try:
+        # Import numpy for validation (assuming it's available in the environment)
+        import numpy as np
+        
+        centers, radii, s_r = run_packing()
+        
+        # Run the validation function provided in the prompt
+        # (Copying the logic here for self-containment in this block if needed, 
+        # but usually we just rely on the external runner)
+        
+        # Quick self-check
+        valid = True
+        n = centers.shape[0]
+        
+        # Check bounds
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x < r - 1e-9 or x > 1 - r + 1e-9 or y < r - 1e-9 or y > 1 - r + 1e-9:
+                print(f"Warning: Circle {i} out of bounds")
+                valid = False
+
+        # Check overlaps
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist < radii[i] + radii[j] - 1e-9:
+                    print(f"Warning: Overlap between {i} and {j}")
+                    valid = False
+        
+        if valid:
+            print(f"Packing Valid. Sum of Radii: {s_r:.5f}")
+        else:
+            print("Packing Invalid.")
+            
+    except Exception as e:
+        print(f"Error during execution: {e}")
+        sys.exit(1)

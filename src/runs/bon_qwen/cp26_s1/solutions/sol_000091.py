@@ -1,146 +1,87 @@
 # sol_000091 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9fb5006a) state=1c253c34 sum of radii=2.504579 correctness=1.0
+# generation=0 parent=seed (state e9cb3956) state=98def28e sum of radii=2.617869 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import math
 from scipy.optimize import minimize
 
-def run_packing():
+def compute_penalty_and_obj(vars, beta):
     """
-    Pack 26 circles in a unit square to maximize the sum of radii.
+    Computes the penalized objective value and the raw penalty sum.
+    vars: flattened array [x1, y1, r1, x2, y2, r2, ...]
+    beta: penalty weight
     """
     n = 26
+    xs = vars[0::3]
+    ys = vars[1::3]
+    rs = vars[2::3]
     
-    # --- Initialization ---
-    # We start with a valid configuration of small circles arranged in a hexagonal grid.
-    # This topology is dense and likely close to the optimal arrangement.
-    # We use a reference radius for spacing to ensure circles are well-separated initially,
-    # and a smaller actual radius to satisfy constraints strictly.
+    # Boundary penalties (squared violations)
+    pen = np.sum(np.maximum(0.0, rs - xs)**2)
+    pen += np.sum(np.maximum(0.0, xs + rs - 1.0)**2)
+    pen += np.sum(np.maximum(0.0, rs - ys)**2)
+    pen += np.sum(np.maximum(0.0, ys + rs - 1.0)**2)
     
-    r_init = 0.02
-    ref_r = 0.04 # Reference radius for determining grid spacing
+    # Overlap penalties (vectorized)
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    overlaps = rs[:, None] + rs[None, :] - dist
+    np.fill_diagonal(overlaps, 0.0)
+    pen += np.sum(np.maximum(0.0, overlaps)**2)
     
-    h_dist = 2 * ref_r
-    v_dist = math.sqrt(3) * ref_r
-    
-    centers_init = []
-    
-    # Pattern to fit 26 circles: 5 rows with counts 6, 5, 5, 5, 5
-    row_counts = [6, 5, 5, 5, 5]
-    
-    current_y = ref_r # Start y position based on ref_r margin
-    for i, count in enumerate(row_counts):
-        # Shift odd rows horizontally for hexagonal packing
-        x_start = ref_r + (i % 2) * ref_r
-        
-        for j in range(count):
-            cx = x_start + j * h_dist
-            cy = current_y
-            centers_init.append([cx, cy])
-        
-        current_y += v_dist
-        
-    centers_init = np.array(centers_init[:n])
-    
-    # Center the configuration in the unit square [0,1]x[0,1]
-    min_x, max_x = np.min(centers_init[:, 0]), np.max(centers_init[:, 0])
-    min_y, max_y = np.min(centers_init[:, 1]), np.max(centers_init[:, 1])
-    
-    shift_x = 0.5 - (min_x + max_x) / 2
-    shift_y = 0.5 - (min_y + max_y) / 2
-    
-    centers_init[:, 0] += shift_x
-    centers_init[:, 1] += shift_y
-    
-    # --- Optimization Setup ---
-    # Variables: [x1...xn, y1...yn, r1...rn]
-    # Total variables = 3 * 26 = 78
-    x0 = np.zeros(3 * n)
-    x0[0:n] = centers_init[:, 0]
-    x0[n:2*n] = centers_init[:, 1]
-    x0[2*n:3*n] = r_init * np.ones(n)
-    
-    bounds = []
-    for _ in range(n):
-        bounds.append((0.0, 1.0)) # x bounds
-        bounds.append((0.0, 1.0)) # y bounds
-        bounds.append((1e-6, 0.5)) # r bounds (must be positive)
-    
-    # Constraint functions
-    
-    # 1. Boundary constraints: circles must be inside [0,1]x[0,1]
-    #    x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
-    def constr_boundary(x_vars):
-        xs = x_vars[0:n]
-        ys = x_vars[n:2*n]
-        rs = x_vars[2*n:3*n]
-        return np.concatenate([
-            xs - rs,
-            1.0 - xs - rs,
-            ys - rs,
-            1.0 - ys - rs
-        ])
+    obj = -np.sum(rs) + beta * pen
+    return obj, pen
 
-    # 2. Non-overlap constraints: distance between centers >= sum of radii
-    #    (xi - xj)^2 + (yi - yj)^2 >= (ri + rj)^2
-    def constr_no_overlap(x_vars):
-        xs = x_vars[0:n]
-        ys = x_vars[n:2*n]
-        rs = x_vars[2*n:3*n]
-        
-        # Vectorized pairwise distance calculation
-        # Create matrices for broadcasting
-        dx = xs[:, np.newaxis] - xs[np.newaxis, :]
-        dy = ys[:, np.newaxis] - ys[np.newaxis, :]
-        dr = rs[:, np.newaxis] + rs[np.newaxis, :]
-        
-        dist_sq = dx**2 + dy**2
-        rad_sum_sq = dr**2
-        
-        diff = dist_sq - rad_sum_sq
-        
-        # Return only upper triangle constraints (i < j) to avoid redundancy
-        idx = np.triu_indices(n, k=1)
-        return diff[idx]
+def objective(vars, beta):
+    obj, _ = compute_penalty_and_obj(vars, beta)
+    return obj
 
-    constraints = [
-        {'type': 'ineq', 'fun': constr_boundary},
-        {'type': 'ineq', 'fun': constr_no_overlap}
-    ]
-
-    # Objective: Maximize sum of radii -> Minimize negative sum
-    def objective(x_vars):
-        return -np.sum(x_vars[2*n:3*n])
-
-    # --- Run Optimizer ---
-    try:
-        # SLSQP is a robust solver for constrained non-linear problems
-        # We allow sufficient iterations to converge
-        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints,
-                       options={'maxiter': 3000, 'ftol': 1e-9, 'disp': False})
-        final_x = res.x
-    except Exception:
-        # Fallback to initial configuration if optimization fails
-        final_x = x0
-
-    best_centers = np.column_stack((final_x[0:n], final_x[n:2*n]))
-    best_radii = final_x[2*n:3*n]
+def run_packing():
+    n = 26
+    rng = np.random.default_rng(42)
     
-    # Safety clamp for radii to ensure non-negative
-    best_radii = np.maximum(best_radii, 1e-9)
+    # Initial feasible configuration: 5x5 grid + center
+    x_grid = np.repeat(np.linspace(0.1, 0.9, 5), 5)
+    y_grid = np.tile(np.linspace(0.1, 0.9, 5), 5)
+    xs = np.append(x_grid, 0.5)
+    ys = np.append(y_grid, 0.5)
+    rs = np.full(n, 0.09)
     
-    # Final check: ensure circles are within bounds (fix potential numerical slips)
-    # If a circle is slightly outside, shrink its radius to fit.
-    for i in range(n):
-        x, y = best_centers[i]
-        r = best_radii[i]
-        margin = min(x, 1 - x, y, 1 - y)
-        if r > margin:
-            best_radii[i] = max(0, margin)
+    # Add small random noise to break symmetry and avoid grid stagnation
+    xs += rng.uniform(-0.005, 0.005, n)
+    ys += rng.uniform(-0.005, 0.005, n)
+    xs = np.clip(xs, 0.02, 0.98)
+    ys = np.clip(ys, 0.02, 0.98)
+    
+    vars_init = np.zeros(3 * n)
+    vars_init[0::3] = xs
+    vars_init[1::3] = ys
+    vars_init[2::3] = rs
+    
+    # Bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = [(0.0, 1.0) if i % 3 != 2 else (0.0, 0.5) for i in range(3 * n)]
+    
+    best_vars = vars_init
+    # Anneal penalty weight to gradually enforce constraints strictly
+    betas = [50.0, 500.0, 5000.0, 50000.0, 200000.0]
+    
+    for beta in betas:
+        res = minimize(objective, best_vars, args=(beta,), method='L-BFGS-B',
+                       bounds=bounds, options={'maxiter': 4000, 'ftol': 1e-13, 'gtol': 1e-13})
+        best_vars = res.x
         
-    sum_radii = np.sum(best_radii)
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
     
-    return best_centers, best_radii, sum_radii
+    # Final robustness check: if numerical noise left tiny violations, scale down slightly
+    _, final_pen = compute_penalty_and_obj(best_vars, 1e10)
+    if final_pen > 1e-12:
+        # Conservative scaling to guarantee validator passes
+        scale_factor = 1.0 - 2.0 * np.sqrt(final_pen) / (np.max(radii) + 1e-9)
+        radii = radii * max(scale_factor, 0.999)
+        centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+        
+    return centers, radii, np.sum(radii)

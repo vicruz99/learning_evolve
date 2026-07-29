@@ -1,0 +1,359 @@
+# sol_000280 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 20c39dac) state=139ea35d sum of radii=2.549693 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+from itertools import combinations
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    N = 26
+    
+    # 1. Initialization: Staggered Hexagonal Grid
+    # We aim for a radius r approx 0.1. Horizontal spacing 2r, vertical r*sqrt(3).
+    # We generate a grid and select 26 points that fit well in [0,1]x[0,1].
+    
+    # Parameters for a "dense" hexagonal grid fitting in a square
+    # We will optimize the positions, so exact initial radii don't matter much, 
+    # but a good geometric layout helps convergence.
+    
+    # Let's try a layout of roughly 6 columns and 5 rows (staggered)
+    # 6 circles in a row take width approx 1.0 if r=0.083. 
+    # But we can shift rows to utilize space better.
+    
+    centers_init = []
+    
+    # Generate a hexagonal pattern
+    # Spacing based on target radius ~0.1
+    dx = 0.15 # horizontal spacing between centers in a row
+    dy = 0.15 * np.sqrt(3)/2 * (2/1.5) # approximate vertical spacing adjustment
+    
+    # A more robust way: Generate points on a hex lattice and filter/scale
+    # Let's create a grid of potential centers
+    cols = 7
+    rows = 6
+    step_x = 1.0 / (cols - 0.5) # approx 0.15
+    step_y = 1.0 / (rows - 0.5) # approx 0.15
+    
+    # Actually, let's just place them in a structured hexagonal way
+    # Row 0: 6 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 6 circles
+    # Row 3: 5 circles (shifted)
+    # Row 4: 6 circles
+    # Total 28, we pick 26.
+    
+    # Let's define a function to generate hex grid
+    def generate_hex_grid(n_cols_max, n_rows, scale_x=1.0, scale_y=1.0, offset_x=0, offset_y=0):
+        pts = []
+        for r_idx in range(n_rows):
+            for c_idx in range(n_cols_max):
+                if r_idx % 2 == 1:
+                    # Shifted row
+                    if c_idx >= n_cols_max - 1:
+                        continue # Skip last one in shifted row to keep count lower or just handle logic
+                    x = (c_idx + 0.5) * scale_x + offset_x
+                else:
+                    x = c_idx * scale_x + offset_x
+                y = r_idx * scale_y + offset_y
+                pts.append((x, y))
+        return pts
+
+    # Try to fit 26 circles. 
+    # Let's try a 5-row configuration. 
+    # 6-5-6-5-6 = 28 circles. We need 26.
+    # We can remove 2 from the end.
+    
+    # Estimate scale to fit in [0,1]
+    # Width for 6 circles (0.5 shift on odd rows): 
+    # Even row: x = 0, 1, 2, 3, 4, 5 * scale_x. Max x = 5*scale_x.
+    # Odd row: x = 0.5, 1.5, 2.5, 3.5, 4.5 * scale_x. Max x = 4.5*scale_x.
+    # So width is determined by even rows. 5 * scale_x + margin.
+    # Let's assume radius r ~ 0.1. Margin ~ 0.1.
+    # 5 * scale_x ~ 0.8 => scale_x ~ 0.16.
+    # Height for 5 rows: 4 * scale_y + margin. 
+    # Hex packing vertical spacing is scale_x * sqrt(3)/2.
+    # scale_y = scale_x * np.sqrt(3)/2 ~ 0.16 * 0.866 ~ 0.138.
+    # 4 * 0.138 = 0.552. + 0.2 margin = 0.752. Fits easily.
+    
+    scale_x = 0.15
+    scale_y = scale_x * np.sqrt(3) / 2
+    offset_x = 0.05 # Leave some margin
+    offset_y = 0.05
+    
+    pts = generate_hex_grid(6, 5, scale_x, scale_y, offset_x, offset_y)
+    
+    # We might have too many or too few, or out of bounds.
+    # Filter valid points
+    valid_pts = []
+    for p in pts:
+        if 0 <= p[0] <= 1 and 0 <= p[1] <= 1:
+            valid_pts.append(p)
+    
+    # If we have more than 26, take the first 26 (which are well distributed)
+    # If less, we need to adjust scale or add points. 
+    # With scale 0.15, 5 rows, 6 cols (staggered), we get:
+    # Row 0: 6 pts (0..5)
+    # Row 1: 5 pts (0.5..4.5) -> indices 0..4
+    # Row 2: 6 pts
+    # Row 3: 5 pts
+    # Row 4: 6 pts
+    # Total 28.
+    
+    if len(valid_pts) >= 26:
+        init_centers = np.array(valid_pts[:26])
+    else:
+        # Fallback to random if grid fails (unlikely)
+        init_centers = np.random.rand(26, 2) * 0.8 + 0.1
+
+    # Initial radii estimate
+    # Based on nearest neighbor distance
+    init_radii = np.array([0.05] * 26) # Small safe start
+
+    # 2. Optimization
+    # Variables: x1, y1, r1, x2, y2, r2, ...
+    # Total 26 * 3 = 78 variables.
+    
+    def flatten_params(centers, radii):
+        # Shape (78,)
+        # Order: x0, y0, r0, x1, y1, r1, ...
+        res = np.empty(78)
+        for i in range(26):
+            res[3*i] = centers[i, 0]
+            res[3*i+1] = centers[i, 1]
+            res[3*i+2] = radii[i]
+        return res
+
+    def unflatten_params(v):
+        centers = np.empty((26, 2))
+        radii = np.empty(26)
+        for i in range(26):
+            centers[i, 0] = v[3*i]
+            centers[i, 1] = v[3*i+1]
+            radii[i] = v[3*i+2]
+        return centers, radii
+
+    def objective(v):
+        _, radii = unflatten_params(v)
+        return -np.sum(radii) # Minimize negative sum
+
+    # Constraints
+    # 1. Box constraints on centers and radii handled by bounds
+    # 2. Boundary constraints: r_i <= dist(center_i, boundary)
+    #    x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    # 3. Pairwise: ||c_i - c_j|| - r_i - r_j >= 0
+    
+    # Bounds
+    # x, y in [0, 1]
+    # r in [0, 0.5] (max possible radius in unit square)
+    bounds = []
+    for _ in range(26):
+        bounds.extend([(0, 1), (0, 1), (0, 0.5)])
+
+    # Linear constraints for boundaries
+    # x_i - r_i >= 0  =>  1*x_i + 0*y_i - 1*r_i >= 0
+    # 1 - x_i - r_i >= 0 => -1*x_i + 0*y_i - 1*r_i >= -1
+    # y_i - r_i >= 0
+    # 1 - y_i - r_i >= 0
+    
+    # We can define these as linear constraints for SLSQP or just include in non-linear
+    # SLSQP supports linear constraints, but mixing might be complex. 
+    # Let's stick to non-linear constraints function for simplicity and correctness.
+    
+    def constraint_boundaries(v):
+        centers, radii = unflatten_params(v)
+        # Vectorized calculation
+        # 4 constraints per circle -> 104 constraints
+        c = np.empty(104)
+        for i in range(26):
+            idx = 4 * i
+            x, y = centers[i]
+            r = radii[i]
+            c[idx] = x - r
+            c[idx+1] = 1 - x - r
+            c[idx+2] = y - r
+            c[idx+3] = 1 - y - r
+        return c
+
+    def constraint_pairs(v):
+        centers, radii = unflatten_params(v)
+        # Pairs
+        # To speed up, we can compute distance matrix
+        # But 26x26 is small.
+        
+        # We need to return an array of constraints.
+        # Number of pairs = 26*25/2 = 325.
+        n_pairs = 325
+        c = np.empty(n_pairs)
+        
+        # Vectorized approach for speed
+        # centers shape (26, 2)
+        # radii shape (26,)
+        
+        # Compute pairwise distances
+        # diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :] # (26, 26, 2)
+        # dists = np.sqrt(np.sum(diff**2, axis=2)) # (26, 26)
+        
+        # r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        # valid = dists - r_sum >= 0
+        
+        # Extract upper triangle
+        # idxs = np.triu_indices(26, k=1)
+        # constraints = dists[idxs] - (radii[idxs[0]] + radii[idxs[1]])
+        
+        # This is efficient enough.
+        
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        
+        r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        
+        # We only care about constraints that are "tight" or could be violated.
+        # But SLSQP needs all.
+        # Return upper triangle values
+        mask = np.triu(np.ones((26, 26), dtype=bool), k=1)
+        constraints = dists[mask] - r_sum[mask]
+        
+        return constraints
+
+    # Define constraints dict
+    cons = [
+        {'type': 'ineq', 'fun': constraint_boundaries},
+        {'type': 'ineq', 'fun': constraint_pairs}
+    ]
+    
+    # Initial point
+    x0 = flatten_params(init_centers, init_radii)
+    
+    # Run optimization
+    # Method 'SLSQP' is good for bounded constrained optimization
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'ftol': 1e-9, 'maxiter': 1000, 'disp': False})
+    
+    final_centers, final_radii = unflatten_params(res.x)
+    final_sum = np.sum(final_radii)
+    
+    # Post-processing: Ensure strict validity within tolerance
+    # The optimizer might return values slightly outside due to tolerance.
+    # We can clamp radii slightly if needed, but the validation function has 1e-12 tolerance.
+    # Just return the result.
+    
+    return final_centers, final_radii, final_sum
+
+# Helper to ensure no lambda or closures if strict, though standard python allows it.
+# The prompt asks for top level helper functions.
+# I've defined them inside run_packing or as methods? 
+# The prompt says "Make all helper functions top level".
+# So I should move them out.
+
+# Let's restructure to follow rules strictly.
+
+def flatten_params_top(centers, radii):
+    res = np.empty(78)
+    for i in range(26):
+        res[3*i] = centers[i, 0]
+        res[3*i+1] = centers[i, 1]
+        res[3*i+2] = radii[i]
+    return res
+
+def unflatten_params_top(v):
+    centers = np.empty((26, 2))
+    radii = np.empty(26)
+    for i in range(26):
+        centers[i, 0] = v[3*i]
+        centers[i, 1] = v[3*i+1]
+        radii[i] = v[3*i+2]
+    return centers, radii
+
+def generate_hex_grid_top(n_cols_max, n_rows, scale_x, scale_y, offset_x, offset_y):
+    pts = []
+    for r_idx in range(n_rows):
+        for c_idx in range(n_cols_max):
+            if r_idx % 2 == 1:
+                if c_idx >= n_cols_max - 1:
+                    continue 
+                x = (c_idx + 0.5) * scale_x + offset_x
+            else:
+                x = c_idx * scale_x + offset_x
+            y = r_idx * scale_y + offset_y
+            pts.append((x, y))
+    return pts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    N = 26
+    
+    # Initialization
+    scale_x = 0.15
+    scale_y = scale_x * np.sqrt(3) / 2
+    offset_x = 0.05
+    offset_y = 0.05
+    
+    pts = generate_hex_grid_top(6, 5, scale_x, scale_y, offset_x, offset_y)
+    
+    valid_pts = []
+    for p in pts:
+        if 0 <= p[0] <= 1 and 0 <= p[1] <= 1:
+            valid_pts.append(p)
+    
+    if len(valid_pts) >= 26:
+        init_centers = np.array(valid_pts[:26])
+    else:
+        init_centers = np.random.rand(26, 2) * 0.8 + 0.1
+
+    init_radii = np.array([0.05] * 26)
+    x0 = flatten_params_top(init_centers, init_radii)
+    
+    # Bounds
+    bounds = []
+    for _ in range(26):
+        bounds.extend([(0, 1), (0, 1), (0, 0.5)])
+
+    # We define objective and constraints using the top level helpers
+    # But to avoid passing state, we can define them inside run_packing 
+    # as long as they are not lambdas? The prompt says "Make all helper functions top level".
+    # It likely means don't nest functions inside other functions if they are helpers.
+    # But constraints need access to nothing specific? 
+    # Actually, constraints logic is generic for N=26.
+    
+    # Let's define objective and constraints as top level functions assuming N=26.
+    
+    def obj_func(v):
+        _, radii = unflatten_params_top(v)
+        return -np.sum(radii)
+
+    def con_boundaries(v):
+        centers, radii = unflatten_params_top(v)
+        c = np.empty(104)
+        for i in range(26):
+            idx = 4 * i
+            x, y = centers[i]
+            r = radii[i]
+            c[idx] = x - r
+            c[idx+1] = 1 - x - r
+            c[idx+2] = y - r
+            c[idx+3] = 1 - y - r
+        return c
+
+    def con_pairs(v):
+        centers, radii = unflatten_params_top(v)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        mask = np.triu(np.ones((26, 26), dtype=bool), k=1)
+        constraints = dists[mask] - r_sum[mask]
+        return constraints
+
+    cons = [
+        {'type': 'ineq', 'fun': con_boundaries},
+        {'type': 'ineq', 'fun': con_pairs}
+    ]
+    
+    res = minimize(obj_func, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'ftol': 1e-9, 'maxiter': 2000})
+    
+    final_centers, final_radii = unflatten_params_top(res.x)
+    final_sum = np.sum(final_radii)
+    
+    return final_centers, final_radii, final_sum

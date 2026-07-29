@@ -1,0 +1,180 @@
+
+
+Looking at the current solution (sum = 2.618068) and the target (2.636), I need to improve by ~0.018. Let me analyze what's limiting performance and design a better approach.
+
+**Key observations:**
+1. The current code only runs one optimization from a single hexagonal start - this easily gets stuck in local minima
+2. Individual constraint functions (closures with lambdas) are inefficient and don't scale well
+3. Using squared distance constraints (dist² ≥ (r₁+r₂)²) is numerically more stable than sqrt-based constraints
+4. Multiple diverse initializations + local refinement is crucial for non-convex optimization
+
+<strategy>
+1. Use vectorized constraint evaluation (reshape and numpy operations) instead of individual closure-based constraints
+2. Try 30 diverse initializations: hexagonal, grid, corner-biased, and random
+3. Add a local refinement phase: perturb the best solution found and re-optimize to escape shallow local minima
+4. Use squared distance constraints for numerical stability
+5. Increase max iterations per optimization run
+6. Implement strict feasibility checking before accepting solutions
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+
+def objective_fn(v):
+    """Minimize negative sum of radii (i.e., maximize sum of radii)."""
+    return -np.sum(v[2::3])
+
+
+def constraint_fn(v):
+    """
+    Compute all inequality constraints that must be >= 0:
+    - Boundary: r <= x <= 1-r, r <= y <= 1-r
+    - Non-overlap: dist^2 >= (r_i + r_j)^2 for all i < j
+    """
+    n = N
+    pts = v.reshape((n, 3))
+    x = pts[:, 0]
+    y = pts[:, 1]
+    r = pts[:, 2]
+
+    cons = list(x - r)
+    cons.extend(list(1.0 - x - r))
+    cons.extend(list(y - r))
+    cons.extend(list(1.0 - y - r))
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            dist_sq = dx * dx + dy * dy
+            r_sum = r[i] + r[j]
+            cons.append(dist_sq - r_sum * r_sum)
+
+    return np.array(cons)
+
+
+def make_init(seed, method):
+    """Generate initial configuration with diverse strategies."""
+    n = N
+    np.random.seed(seed)
+    pts = []
+
+    if method == 0:  # Hexagonal lattice
+        r_est = 0.07 + seed * 0.003
+        y = r_est
+        row = 0
+        while len(pts) < n:
+            x = r_est if row % 2 == 0 else 2 * r_est
+            while x <= 1 - r_est and len(pts) < n:
+                pts.append([x, y])
+                x += 2 * r_est
+            y += r_est * np.sqrt(3)
+            row += 1
+        pts = pts[:n]
+
+    elif method == 1:  # Dense grid
+        for i in range(6):
+            for j in range(5):
+                if len(pts) < n:
+                    pts.append([0.08 + i * 0.16, 0.08 + j * 0.18])
+
+    elif method == 2:  # Corners emphasized
+        corners = [[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.88]]
+        for c in corners:
+            pts.append(list(c))
+        while len(pts) < n:
+            pts.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+
+    else:  # Pure random
+        for _ in range(n):
+            pts.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)])
+
+    pts = np.array(pts[:n])
+    pts += np.random.uniform(-0.015, 0.015, pts.shape)
+    pts = np.clip(pts, 0.02, 0.98)
+
+    v = np.zeros(3 * n)
+    r_init = np.full(n, 0.035)
+    for i in range(n):
+        v[3 * i] = pts[i, 0]
+        v[3 * i + 1] = pts[i, 1]
+        v[3 * i + 2] = r_init[i]
+
+    return v
+
+
+def run_packing():
+    n = N
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+
+    best_sum = -1.0
+    best_v = None
+
+    # Phase 1: Multiple diverse initializations
+    for seed in range(30):
+        method = seed % 4
+        x0 = make_init(seed, method)
+
+        try:
+            res = minimize(
+                objective_fn, x0, method='SLSQP', bounds=bounds,
+                constraints={'type': 'ineq', 'fun': constraint_fn},
+                options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False}
+            )
+
+            if np.isnan(res.x).any():
+                continue
+
+            current_sum = -res.fun
+            con_vals = constraint_fn(res.x)
+
+            if np.all(con_vals >= -1e-7) and current_sum > best_sum:
+                best_sum = current_sum
+                best_v = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Local refinement via perturbation of best solution
+    if best_v is not None:
+        for trial in range(20):
+            np.random.seed(5000 + trial)
+            perturbed = best_v.copy()
+            perturbed[:2 * n] += np.random.uniform(-0.002, 0.002, 2 * n)
+            perturbed[:2 * n] = np.clip(perturbed[:2 * n], 0.01, 0.99)
+
+            try:
+                res = minimize(
+                    objective_fn, perturbed, method='SLSQP', bounds=bounds,
+                    constraints={'type': 'ineq', 'fun': constraint_fn},
+                    options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False}
+                )
+
+                if np.isnan(res.x).any():
+                    continue
+
+                current_sum = -res.fun
+                con_vals = constraint_fn(res.x)
+
+                if np.all(con_vals >= -1e-7) and current_sum > best_sum:
+                    best_sum = current_sum
+                    best_v = res.x.copy()
+            except Exception:
+                continue
+
+    # Fallback if nothing worked
+    if best_v is None:
+        best_v = make_init(0, 0)
+
+    centers = np.column_stack((best_v[::3], best_v[1::3]))
+    radii = best_v[2::3]
+    radii = np.maximum(radii, 0.0)
+
+    # Slight shrink for strict validity margin
+    radii *= 0.9999999
+
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,263 @@
+# sol_000009 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1907b6e7) state=5edeac88 sum of radii=0.003250 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2) with (x, y) coordinates
+        radii: np.array of shape (26) with radius of each circle
+        sum_radii: float, the sum of the radii
+    """
+    n_circles = 26
+    
+    # Constants
+    PENALTY_WEIGHT = 1000.0
+    INITIAL_RADIUS = 0.08
+    
+    def objective(params):
+        """
+        Objective function to minimize.
+        params is a flattened array of [x1, y1, r1, x2, y2, r2, ...]
+        """
+        x = params[0::3]
+        y = params[1::3]
+        r = params[2::3]
+        
+        obj_val = -np.sum(r)
+        
+        # Boundary penalties
+        # Circle i must be inside [0, 1] x [0, 1]
+        # r <= x <= 1-r  =>  x - r >= 0  and  1 - x - r >= 0
+        # Similarly for y
+        
+        # We use a soft penalty: max(0, violation)^2
+        # Violations:
+        # Left: r - x > 0
+        # Right: r - (1-x) > 0 => x + r - 1 > 0
+        # Bottom: r - y > 0
+        # Top: r - (1-y) > 0 => y + r - 1 > 0
+        
+        # Vectorized boundary penalties
+        v_left = np.maximum(0, r - x)
+        v_right = np.maximum(0, x + r - 1.0)
+        v_bottom = np.maximum(0, r - y)
+        v_top = np.maximum(0, y + r - 1.0)
+        
+        penalty_boundary = np.sum(v_left**2 + v_right**2 + v_bottom**2 + v_top**2)
+        
+        # Overlap penalties
+        # Distance between i and j must be >= r_i + r_j
+        # Violation: r_i + r_j - dist_ij > 0
+        # We compute pairwise distances
+        
+        # Using broadcasting for efficiency
+        # x: (n,), compute (x_i - x_j) matrix
+        dx = x[:, np.newaxis] - x[np.newaxis, :]
+        dy = y[:, np.newaxis] - y[np.newaxis, :]
+        dist = np.sqrt(dx**2 + dy**2)
+        
+        # Sum of radii matrix
+        sum_r = r[:, np.newaxis] + r[np.newaxis, :]
+        
+        # Violation matrix (only upper triangle matters, but squaring handles signs)
+        violation = np.maximum(0, sum_r - dist)
+        
+        # Penalty is sum of squared violations. 
+        # Since matrix is symmetric, sum(all) = 2 * sum(upper triangle) + 0 diagonal
+        penalty_overlap = np.sum(violation**2)
+        
+        return obj_val + PENALTY_WEIGHT * (penalty_boundary + penalty_overlap)
+
+    def get_initial_guess():
+        """
+        Generates a hexagonal grid initialization for 26 circles.
+        """
+        # We want to fit 26 circles.
+        # Let's try a pattern of rows.
+        # Rows of 5 and 4 circles alternating fits well in hex packing.
+        # 5, 4, 5, 4, 5, 3 -> Sum = 26.
+        
+        row_counts = [5, 4, 5, 4, 5, 3]
+        centers = []
+        
+        # Hexagonal spacing
+        # If radius is r, horizontal spacing is 2r, vertical is sqrt(3)r.
+        # We don't know r yet, so let's just place points with spacing 1 
+        # and scale/shift later, or just place them with a guessed r.
+        # Let's assume an initial radius and place centers.
+        
+        r_est = 0.1
+        x_step = 2 * r_est
+        y_step = np.sqrt(3) * r_est
+        
+        # To center the packing, we might need to adjust, but let's just start near bottom-left
+        # and let optimizer move them.
+        
+        current_y = r_est
+        for row_idx, count in enumerate(row_counts):
+            # Shift every other row
+            x_offset = 0.0
+            if row_idx % 2 == 1:
+                x_offset = r_est # Shift by radius to nestle
+            
+            # We need to fit 'count' circles in width 1.
+            # Total width required = (count - 1) * x_step + 2 * r_est
+            # If this > 1, we compress x_step.
+            req_width = (count - 1) * x_step + 2 * r_est
+            if req_width > 1.0:
+                # Compress
+                x_step = (1.0 - 2 * r_est) / (count - 1) if count > 1 else 1.0
+            
+            # Calculate x positions centered in the row? 
+            # Or just start at r_est + x_offset?
+            # Let's center the row to maximize symmetry
+            # Total width of circles = count * 2 * r_est? No, distance between centers.
+            # Extent from first center to last center is (count-1)*x_step.
+            # Start x should be such that first circle is at least r_est from left?
+            # Or just place them nicely.
+            
+            # Let's place them symmetrically.
+            # If count is odd, center circle at 0.5.
+            # If count is even, centered around 0.5.
+            
+            # Simple placement:
+            # x coordinates: r_est + x_offset + k * x_step
+            # Check if valid.
+            
+            # Better: Generate x coords such that they are spaced by x_step
+            # and the block is centered in [0, 1].
+            total_span = (count - 1) * x_step
+            start_x = (1.0 - total_span) / 2.0
+            
+            # Apply shift for hex pattern relative to a hypothetical grid
+            # But if we center rows, the shift logic changes.
+            # Let's stick to simple grid placement first, maybe shifted.
+            
+            # Actually, for optimizer, exact hex grid isn't strictly necessary,
+            # just a dense packing.
+            
+            xs = np.linspace(start_x, start_x + total_span, count)
+            
+            for x in xs:
+                centers.append([x, current_y])
+            
+            current_y += y_step
+            
+        return np.array(centers)
+
+    # Generate initial centers
+    centers_init = get_initial_guess()
+    
+    # If we have fewer than 26 points (shouldn't happen with our list), pad with random
+    if len(centers_init) < n_circles:
+        pad = np.random.rand(n_circles - len(centers_init), 2) * 0.8 + 0.1
+        centers_init = np.vstack([centers_init, pad])
+    elif len(centers_init) > n_circles:
+        centers_init = centers_init[:n_circles]
+        
+    # Initialize radii
+    radii_init = np.full(n_circles, INITIAL_RADIUS)
+    
+    # Construct initial parameter vector
+    # [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n_circles)
+    for i in range(n_circles):
+        x0[3*i] = centers_init[i, 0]
+        x0[3*i+1] = centers_init[i, 1]
+        x0[3*i+2] = radii_init[i]
+        
+    # Define bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n_circles):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+        
+    # Run optimization
+    # L-BFGS-B is good for bound-constrained problems
+    res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds, 
+                   options={'maxiter': 2000, 'ftol': 1e-12, 'gtol': 1e-6})
+    
+    # Extract results
+    best_params = res.x
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        centers[i, 0] = best_params[3*i]
+        centers[i, 1] = best_params[3*i+1]
+        radii[i] = best_params[3*i+2]
+        
+    # Clean up small negative radii (due to numerical noise)
+    radii = np.maximum(radii, 0.0)
+    
+    # Clamp coordinates to [0, 1] just in case
+    centers = np.clip(centers, 0.0, 1.0)
+    
+    # Adjust radii if they exceed bounds significantly (shouldn't happen with penalty)
+    # But strictly, r <= x, r <= 1-x, etc.
+    # The penalty handles this, but let's ensure validity for the validator.
+    # We can iteratively reduce radii to satisfy constraints if needed.
+    
+    # Refine radii to be strictly feasible based on final centers
+    # This acts as a projection step
+    radii_feasible = np.zeros(n_circles)
+    
+    # First pass: limit by walls
+    for i in range(n_circles):
+        x, y = centers[i]
+        r_max_wall = min(x, 1.0 - x, y, 1.0 - y)
+        radii_feasible[i] = min(radii[i], r_max_wall)
+        
+    # Second pass: limit by neighbors
+    # This is tricky because reducing r_i helps r_j.
+    # Simple greedy approach: sort by radius desc?
+    # Or just iterate.
+    
+    # A simple way to ensure non-overlap:
+    # Sort circles by radius (largest first), fix their positions, 
+    # and ensure smaller ones don't overlap? No, positions are fixed.
+    # We just need to reduce radii if they overlap.
+    
+    # Since the optimizer should have found a valid config (penalty 0),
+    # we can check and fix.
+    
+    # Check for overlaps and reduce radii slightly if needed
+    # This is a safe post-processing step.
+    
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                required_sum = radii_feasible[i] + radii_feasible[j]
+                if dist < required_sum - 1e-12:
+                    # Overlap. Reduce radii proportionally or just reduce both.
+                    # To preserve sum, reduce larger one? Or both.
+                    # Simple: reduce both by half the overlap.
+                    overlap = required_sum - dist
+                    reduction = overlap / 2.0 + 1e-12
+                    
+                    radii_feasible[i] -= reduction
+                    radii_feasible[j] -= reduction
+                    changed = True
+    
+    # Ensure non-negative
+    radii_feasible = np.maximum(radii_feasible, 0.0)
+    
+    sum_radii = np.sum(radii_feasible)
+    
+    return centers, radii_feasible, sum_radii
+
+# Note: The problem statement requires the function to be defined.
+# The code above defines run_packing.

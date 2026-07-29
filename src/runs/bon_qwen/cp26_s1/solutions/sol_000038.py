@@ -1,5 +1,5 @@
 # sol_000038 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 8e46300b) state=ddafa521 sum of radii=2.547423 correctness=1.0
+# generation=0 parent=seed (state 2740085f) state=a4bf7a4a sum of radii=2.614243 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,77 +7,85 @@
 import numpy as np
 from scipy.optimize import minimize
 
-N = 26
+def objective(params):
+    # Maximize sum of radii => minimize negative sum
+    return -np.sum(params[2::3])
 
-def _objective(vars):
-    return -np.sum(vars[2::3])
+def boundary_con_func(params):
+    n = len(params) // 3
+    vals = np.empty(4 * n)
+    for i in range(n):
+        idx = 3 * i
+        x, y, r = params[idx], params[idx+1], params[idx+2]
+        # Inequality constraints: fun >= 0
+        vals[4*i]   = x - r
+        vals[4*i+1] = 1.0 - x - r
+        vals[4*i+2] = y - r
+        vals[4*i+3] = 1.0 - y - r
+    return vals
 
-def _constraints(vars):
-    xs = vars[0::3]
-    ys = vars[1::3]
-    rs = vars[2::3]
-    c = []
-    # Boundary constraints: circle must stay inside [0,1]x[0,1]
-    c.extend(xs - rs)
-    c.extend(1.0 - xs - rs)
-    c.extend(ys - rs)
-    c.extend(1.0 - ys - rs)
-    
-    # Pairwise non-overlap constraints: dist >= r_i + r_j
-    for i in range(N):
-        for j in range(i + 1, N):
-            dx = xs[i] - xs[j]
-            dy = ys[i] - ys[j]
-            c.append(np.hypot(dx, dy) - rs[i] - rs[j])
-    return np.array(c)
+def overlap_con_func(params):
+    n = len(params) // 3
+    m = n * (n - 1) // 2
+    vals = np.empty(m)
+    k = 0
+    for i in range(n):
+        xi, yi, ri = params[3*i], params[3*i+1], params[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = params[3*j], params[3*j+1], params[3*j+2]
+            dx, dy = xi - xj, yi - yj
+            # dist^2 >= (ri + rj)^2
+            vals[k] = dx*dx + dy*dy - (ri + rj)**2
+            k += 1
+    return vals
 
-def _jac_objective(vars):
-    jac = np.zeros_like(vars)
-    jac[2::3] = -1.0
-    return jac
-
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    np.random.seed(2025)
+def run_packing():
+    n = 26
+    np.random.seed(42)
     
-    # Initialize with a dense hexagonal-like grid
-    x_vals = np.linspace(0.12, 0.88, 6)
-    y_vals = np.linspace(0.12, 0.88, 5)
-    cx, cy = [], []
-    count = 0
-    for i in range(5):
-        for j in range(6):
-            if count < N:
-                shift = 0.06 if i % 2 == 0 else 0.0
-                cx.append(x_vals[j] + shift)
-                cy.append(y_vals[i])
-                count += 1
-        if count >= N:
-            break
-            
-    centers_init = np.array(list(zip(cx, cy)))
-    # Add small random perturbation to break symmetry and avoid degeneracy
-    centers_init += np.random.uniform(-0.03, 0.03, centers_init.shape)
-    centers_init = np.clip(centers_init, 0.05, 0.95)
-    radii_init = np.full(N, 0.06)
+    # Initial guess: perturbed 5x5 grid + 1 center circle
+    init_pts = []
+    xs = np.linspace(0.1, 0.9, 5)
+    ys = np.linspace(0.1, 0.9, 5)
+    for y in ys:
+        for x in xs:
+            init_pts.append([x, y])
+    init_pts.append([0.5, 0.5])
     
-    x0 = np.hstack([centers_init.flatten(), radii_init])
-    bnds = [(0.0, 1.0)] * N + [(0.0, 1.0)] * N + [(0.0, 0.5)] * N
+    # Add small deterministic noise to break symmetry and aid optimization
+    for i in range(n):
+        init_pts[i][0] += np.random.normal(0, 0.005)
+        init_pts[i][1] += np.random.normal(0, 0.005)
+        
+    r_start = 0.07
+    params0 = np.zeros(3 * n)
+    for i in range(n):
+        params0[3*i] = init_pts[i][0]
+        params0[3*i+1] = init_pts[i][1]
+        params0[3*i+2] = r_start
+        
+    # Variable bounds
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
     
-    cons = {'type': 'ineq', 'fun': _constraints}
+    cons = [
+        {'type': 'ineq', 'fun': boundary_con_func},
+        {'type': 'ineq', 'fun': overlap_con_func}
+    ]
     
-    res = minimize(_objective, x0, method='SLSQP', bounds=bnds, constraints=cons,
-                   jac=_jac_objective, options={'maxiter': 8000, 'ftol': 1e-12})
+    # Optimize
+    res = minimize(objective, params0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False})
     
-    xs = res.x[0::3]
-    ys = res.x[1::3]
-    rs = res.x[2::3]
+    params_opt = res.x
     
-    # Enforce non-negativity and clip coordinates to strictly satisfy validator
-    rs = np.maximum(rs, 0.0)
-    xs = np.clip(xs, 0.0, 1.0)
-    ys = np.clip(ys, 0.0, 1.0)
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i] = params_opt[3*i:3*i+2]
+        radii[i] = params_opt[3*i+2]
+        
+    # Apply tiny safety margin to guarantee strict feasibility
+    radii = np.maximum(0.0, radii - 1e-7)
     
-    centers = np.column_stack([xs, ys])
-    sum_r = float(np.sum(rs))
-    
-    return centers, rs, sum_r
+    sum_r = float(np.sum(radii))
+    return centers, radii, sum_r

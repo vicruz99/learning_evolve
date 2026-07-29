@@ -1,0 +1,101 @@
+# sol_000215 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b505a133) state=0a9a25e7 sum of radii=1.737767 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_penalty(centers, radii):
+    n = len(radii)
+    x, y = centers[:, 0], centers[:, 1]
+    p = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.hypot(x[i] - x[j], y[i] - y[j])
+            ov = radii[i] + radii[j] - dist
+            if ov > 0:
+                p += ov ** 2
+        # Boundary penalties
+        p += max(0, radii[i] - x[i]) ** 2
+        p += max(0, x[i] + radii[i] - 1) ** 2
+        p += max(0, radii[i] - y[i]) ** 2
+        p += max(0, y[i] + radii[i] - 1) ** 2
+    return p
+
+def objective(p):
+    n = 26
+    x = p[:n]
+    y = p[n:2 * n]
+    r = p[2 * n:]
+    centers = np.column_stack((x, y))
+    pen = compute_penalty(centers, r)
+    # High penalty weight ensures constraints are respected while maximizing sum(r)
+    return -np.sum(r) + 1e6 * pen
+
+def check_validity(centers, radii):
+    n = len(radii)
+    x, y = centers[:, 0], centers[:, 1]
+    for i in range(n):
+        if radii[i] - x[i] > 1e-10 or x[i] + radii[i] - 1 > 1e-10:
+            return False
+        if radii[i] - y[i] > 1e-10 or y[i] + radii[i] - 1 > 1e-10:
+            return False
+        for j in range(i + 1, n):
+            dist = np.hypot(x[i] - x[j], y[i] - y[j])
+            if dist < radii[i] + radii[j] - 1e-10:
+                return False
+    return True
+
+def run_packing():
+    n = 26
+    # Hexagonal-inspired initialization: 5 rows with counts [6, 5, 6, 5, 4]
+    centers = np.zeros((n, 2))
+    row_counts = [6, 5, 6, 5, 4]
+    idx = 0
+    
+    # Spacing parameters tuned to fit within [0,1]^2 initially
+    dy = 1.0 / 6.0
+    dx = dy * np.sqrt(3.0) / 2.0
+    
+    for row in range(5):
+        count = row_counts[row]
+        y_pos = 0.5 + (row - 2) * dy
+        for col in range(count):
+            x_pos = 0.5 + (col - count / 2 + 0.5) * dx
+            # Shift odd rows horizontally for hexagonal pattern
+            if row % 2 == 1:
+                x_pos += dx / 2.0
+            centers[idx] = [x_pos, y_pos]
+            idx += 1
+            
+    radii = np.full(n, 0.08)
+    
+    # Flatten variables for optimizer: [x1..x26, y1..y26, r1..r26]
+    p0 = np.concatenate([centers[:, 0], centers[:, 1], radii])
+    bounds = [(0.0, 1.0)] * n + [(0.0, 1.0)] * n + [(0.0, 0.5)] * n
+    
+    # Run optimization
+    res = minimize(
+        objective, 
+        p0, 
+        method='L-BFGS-B', 
+        bounds=bounds, 
+        options={'maxiter': 5000, 'ftol': 1e-12, 'gtol': 1e-12}
+    )
+    
+    x_opt, y_opt, r_opt = res.x[:n], res.x[n:2 * n], res.x[2 * n:]
+    centers_opt = np.column_stack((x_opt, y_opt))
+    
+    # Post-processing: ensure strict validity per the validator's tolerance
+    scale = 1.0
+    while not check_validity(centers_opt, r_opt * scale):
+        scale *= 0.995
+        if scale < 0.50:  # Safety break
+            break
+            
+    r_final = r_opt * scale
+    sum_radii = np.sum(r_final)
+    
+    return centers_opt, r_final, sum_radii

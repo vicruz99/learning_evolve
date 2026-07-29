@@ -1,0 +1,159 @@
+# sol_000127 | problem=circle_packing_26 entrypoint=run_packing
+# generation=5 parent=sol_000059 (state 3e3cfdc0) state=a673be88 sum of radii=2.626247 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[0::3])
+
+def constraints(params):
+    """
+    Inequality constraints g(params) >= 0.
+    Automatically satisfies boundary constraints via parameterization.
+    Only enforces pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    """
+    r = params[0::3]
+    u = params[1::3]
+    v = params[2::3]
+    
+    # Recover centers from parameterization
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[I_IDX] - x[J_IDX]
+    dy = y[I_IDX] - y[J_IDX]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[I_IDX] + r[J_IDX]
+    
+    return dist_sq - r_sum**2
+
+def get_params_from_centers(centers):
+    """Converts center coordinates to strictly feasible (r, u, v) parameters."""
+    n = centers.shape[0]
+    r = np.zeros(n)
+    for i in range(n):
+        dw = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        dm = np.min(np.linalg.norm(centers[i] - centers, axis=1))
+        # 0.88 ensures strict interior feasibility for SLSQP start
+        r[i] = 0.88 * min(dw, dm / 2.0)
+        
+    denom = np.clip(1.0 - 2.0 * r, 1e-6, 1.0)
+    u = np.clip((centers[:,0] - r) / denom, 0.0, 1.0)
+    v = np.clip((centers[:,1] - r) / denom, 0.0, 1.0)
+    
+    p = np.empty(3 * n)
+    p[0::3] = r
+    p[1::3] = u
+    p[2::3] = v
+    return p
+
+def hex_init(seed, rot, scale):
+    """Generates a rotated/scaled hexagonal lattice initialization."""
+    np.random.seed(seed)
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        shift = (row % 2) * r_est
+        x = r_est + shift
+        while x <= 1.0 - r_est and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    pts = np.array(pts[:N])
+    
+    # Apply scale and rotation
+    pts = (pts - 0.5) * scale + 0.5
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        R = np.array([[c, -s], [s, c]])
+        pts = (pts - 0.5) @ R + 0.5
+        
+    pts += np.random.uniform(-0.025, 0.025, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    return get_params_from_centers(pts)
+
+def run_packing():
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    best_p = None
+    best_sum = -np.inf
+    rng = np.random.RandomState(42)
+    
+    inits = []
+    # Phase 1: Diverse hexagonal lattice starts
+    for s in range(60):
+        rot = rng.uniform(-0.35, 0.35)
+        scale = rng.uniform(0.85, 1.15)
+        inits.append(hex_init(s, rot, scale))
+        
+    for p0 in inits:
+        try:
+            res = minimize(objective, p0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 6000, 'ftol': 1e-13, 'disp': False})
+            if res.success:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    s_val = -res.fun
+                    if s_val > best_sum:
+                        best_sum = s_val
+                        best_p = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Aggressive perturbation to escape local minima
+    if best_p is not None:
+        for _ in range(80):
+            pp = best_p.copy()
+            pp += rng.normal(0, 0.006, 3 * N)
+            pp[0::3] = np.clip(pp[0::3], 1e-6, 0.5)
+            pp[1::3] = np.clip(pp[1::3], 0.0, 1.0)
+            pp[2::3] = np.clip(pp[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, pp, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+                if res.success:
+                    c_val = constraints(res.x)
+                    if np.min(c_val) >= -1e-7:
+                        s_val = -res.fun
+                        if s_val > best_sum:
+                            best_sum = s_val
+                            best_p = res.x.copy()
+            except Exception:
+                pass
+                
+        # Phase 3: High-precision numerical polish
+        try:
+            res = minimize(objective, best_p, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            if res.success and np.min(constraints(res.x)) >= -1e-8:
+                best_p = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+            
+    # Fallback (should rarely trigger given robust initialization)
+    if best_p is None:
+        best_p = hex_init(0, 0.0, 1.0)
+        best_sum = np.sum(best_p[0::3])
+        
+    # Reconstruct physical coordinates
+    r_opt = best_p[0::3]
+    u_opt = best_p[1::3]
+    v_opt = best_p[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    
+    return centers, r_opt, float(best_sum)

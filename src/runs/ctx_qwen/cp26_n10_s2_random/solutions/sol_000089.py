@@ -1,0 +1,178 @@
+# sol_000089 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000068 (state 22e68fa8) state=549629d6 sum of radii=2.627092 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_constraints(v):
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = []
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Pairwise non-overlap: dist(i,j) >= r_i + r_j
+    # Using linear distance gives better gradient direction at contact
+    X = x[:, None] - x[None, :]
+    Y = y[:, None] - y[None, :]
+    R = r[:, None] + r[None, :]
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    dists = np.sqrt(X**2 + Y**2 + 1e-12)
+    c.append(dists[mask] - R[mask])
+    return np.concatenate(c)
+
+def objective(v):
+    return -np.sum(v[2::3])
+
+def get_bounds():
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)])
+    return b
+
+def init_hex(seed, scale=1.0):
+    rng = np.random.default_rng(seed)
+    centers = []
+    r0 = 0.10 * scale
+    y = r0
+    row = 0
+    while len(centers) < N:
+        x_start = r0 if row % 2 == 0 else 2 * r0
+        x = x_start
+        while x + r0 <= 1.0 + 1e-9 and len(centers) < N:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < N:
+        centers.append([rng.uniform(0.1, 0.9), rng.uniform(0.1, 0.9)])
+        
+    centers = np.array(centers[:N])
+    centers += rng.normal(0, 0.003, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    rs = np.full(N, 0.05)
+    for i in range(N):
+        d_b = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        mask = np.ones(N, dtype=bool)
+        mask[i] = False
+        d_n = np.min(np.hypot(centers[i,0]-centers[mask,0], centers[i,1]-centers[mask,1]))
+        rs[i] = min(d_b, d_n/2.0) * 0.90
+        
+    v = np.zeros(3 * N)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = rs
+    return v
+
+def init_grid(seed):
+    rng = np.random.default_rng(seed)
+    x = np.linspace(0.12, 0.88, 5)
+    y = np.linspace(0.12, 0.88, 5)
+    cx, cy = np.meshgrid(x, y)
+    centers = np.column_stack((cx.flatten(), cy.flatten()))
+    centers = np.vstack([centers, [0.5, 0.5]])
+    centers += rng.normal(0, 0.015, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    rs = np.full(N, 0.06)
+    for i in range(N):
+        d_b = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        mask = np.ones(N, dtype=bool)
+        mask[i] = False
+        d_n = np.min(np.hypot(centers[i,0]-centers[mask,0], centers[i,1]-centers[mask,1]))
+        rs[i] = min(d_b, d_n/2.0) * 0.90
+        
+    v = np.zeros(3 * N)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = rs
+    return v
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_v = None
+    best_sum = -np.inf
+    
+    # Phase 1: Diverse initializations
+    inits = []
+    for s in range(12):
+        for sc in [0.90, 0.95, 1.0, 1.05, 1.1]:
+            inits.append(init_hex(s, scale=sc))
+        inits.append(init_grid(s))
+        
+    # Phase 2: Multi-start optimization
+    for v0 in inits:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            s_val = -res.fun
+            c_vals = compute_constraints(res.x)
+            if np.min(c_vals) >= -1e-6:
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 3: Iterative perturbation refinement to escape local minima
+    if best_v is not None:
+        for step in range(50):
+            noise_scale = 0.008 * (1.0 - step / 50.0)
+            v_trial = best_v.copy()
+            v_trial[0::3] += np.random.normal(0, noise_scale, N)
+            v_trial[1::3] += np.random.normal(0, noise_scale, N)
+            v_trial[0::3] = np.clip(v_trial[0::3], 0.02, 0.98)
+            v_trial[1::3] = np.clip(v_trial[1::3], 0.02, 0.98)
+            v_trial[2::3] = np.clip(v_trial[2::3], 0.01, 0.45)
+            
+            try:
+                res = minimize(objective, v_trial, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+                if -res.fun > best_sum:
+                    c_vals = compute_constraints(res.x)
+                    if np.min(c_vals) >= -1e-6:
+                        best_sum = -res.fun
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    if best_v is None:
+        best_v = init_hex(0)
+        
+    centers = np.column_stack((best_v[0::3], best_v[1::3]))
+    radii = best_v[2::3].copy()
+    
+    # Phase 4: Deterministic repair for strict validator compliance
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-9:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))

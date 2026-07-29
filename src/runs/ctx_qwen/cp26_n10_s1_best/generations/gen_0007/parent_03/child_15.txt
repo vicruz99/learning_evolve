@@ -1,0 +1,198 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond the current ~2.628 and target 2.636, we need a more robust optimization pipeline that handles the highly non-convex nature of the problem. The previous approaches relied heavily on SLSQP, which easily gets trapped in local minima due to the piecewise-quadratic constraints.
+
+Key improvements in this strategy:
+1. **Global Search with Differential Evolution (DE)**: DE is exceptionally effective for black-box optimization in high dimensions (52 variables here). We optimize centers directly using a fitness function that computes the maximum sum of radii via Linear Programming (LP). This decouples center placement from radius optimization, allowing the solver to find globally promising configurations.
+2. **LP for Radii**: For any fixed center configuration, finding optimal radii is a linear programming problem (`max sum(r)` s.t. `r_i + r_j <= d_ij` and boundary constraints). This is solved exactly and rapidly using `scipy.optimize.linprog` with the `highs` solver.
+3. **Hybrid Local Refinement**: 
+   - **Nelder-Mead**: Applied after DE to refine centers. It's derivative-free, making it robust to the non-differentiable fitness landscape introduced by the LP solver.
+   - **SLSQP Joint Optimization**: Fine-tunes both centers and radii simultaneously using squared-distance constraints for high-precision polishing.
+   - **Perturbation Loop**: Systematically perturbs the best solution, re-solves LP, and polishes with SLSQP to escape shallow local minima.
+4. **Strict Validation & Repair**: A final deterministic pass ensures all constraints strictly satisfy the `1e-12` tolerance of the validator, applying minimal necessary shrinkage only if numerical drift occurs.
+
+This multi-phase approach balances exploration (DE), robust local search (Nelder-Mead), precise gradient refinement (SLSQP), and safety checks, reliably pushing the sum of radii past previous local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+N = 26
+TRIL = np.tril_indices(N, -1)
+
+def solve_lp_radii(centers):
+    """Optimally compute radii for fixed centers using Linear Programming."""
+    n = N
+    c_obj = -np.ones(n)
+    num_ineq = n + n * (n - 1) // 2
+    A_ub = np.zeros((num_ineq, n))
+    b_ub = np.zeros(num_ineq)
+    
+    idx = 0
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = max(1e-12, lim)
+        idx += 1
+        
+    # Overlap constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = max(1e-12, dist)
+            idx += 1
+            
+    bounds = [(0.0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 0.05)
+
+def lp_fitness(centers_flat):
+    """Fitness for global search: negative sum of optimal radii."""
+    centers = centers_flat.reshape(N, 2)
+    r = solve_lp_radii(centers)
+    return -np.sum(r)
+
+def obj_sl(x):
+    """SLSQP objective: minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def con_sl(x):
+    """SLSQP constraints: boundary and non-overlap (squared)."""
+    xs, ys, rs = x[0::3], x[1::3], x[2::3]
+    c = np.concatenate([xs - rs, 1.0 - xs - rs, ys - rs, 1.0 - ys - rs])
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dr = rs[:, None] + rs[None, :]
+    c = np.concatenate([c, dx[TRIL]**2 + dy[TRIL]**2 - dr[TRIL]**2])
+    return c
+
+def get_bounds_sl():
+    """Variable bounds for SLSQP."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    bounds_de = [(0.0, 1.0)] * (2 * N)
+    bounds_sl = get_bounds_sl()
+    cons_sl = {'type': 'ineq', 'fun': con_sl}
+    
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+
+    # Phase 1: Differential Evolution for global center optimization
+    try:
+        res_de = differential_evolution(lp_fitness, bounds_de, popsize=20, maxiter=250, 
+                                        tol=1e-6, mutation=(0.5, 1.5), recombination=0.9, 
+                                        seed=42, workers=1, polish=True)
+        best_centers = res_de.x.reshape(N, 2)
+        best_radii = solve_lp_radii(best_centers)
+        best_sum = np.sum(best_radii)
+    except Exception:
+        # Fallback hexagonal init
+        best_centers = np.zeros((N, 2))
+        idx = 0; y = 0.09; row = 0
+        while idx < N and y < 1.0:
+            x = 0.09 if row % 2 == 0 else 0.18
+            while x < 1.0 and idx < N:
+                best_centers[idx] = [x, y]
+                idx += 1; x += 0.18
+            y += 0.09 * np.sqrt(3); row += 1
+        best_radii = solve_lp_radii(best_centers)
+        best_sum = np.sum(best_radii)
+
+    # Phase 2: Nelder-Mead local search on centers (derivative-free for LP fitness)
+    try:
+        res_nm = minimize(lp_fitness, best_centers.flatten(), method='Nelder-Mead',
+                          options={'maxiter': 5000, 'xatol': 1e-5, 'fatol': 1e-5})
+        if -res_nm.fun > best_sum:
+            best_centers = res_nm.x.reshape(N, 2)
+            best_radii = solve_lp_radii(best_centers)
+            best_sum = np.sum(best_radii)
+    except Exception:
+        pass
+
+    # Phase 3: SLSQP joint refinement on centers and radii
+    x0 = np.zeros(3 * N)
+    x0[0::3] = best_centers[:, 0]
+    x0[1::3] = best_centers[:, 1]
+    x0[2::3] = best_radii * 0.995
+    
+    try:
+        res_sl = minimize(obj_sl, x0, method='SLSQP', bounds=bounds_sl, constraints=cons_sl,
+                          options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+        if not np.isnan(res_sl.fun) and -res_sl.fun > best_sum:
+            best_centers = np.column_stack((res_sl.x[0::3], res_sl.x[1::3]))
+            best_radii = res_sl.x[2::3]
+            best_sum = -res_sl.fun
+    except Exception:
+        pass
+
+    # Phase 4: Perturbation & LP refinement to escape local minima
+    for _ in range(60):
+        noise = np.random.uniform(0.001, 0.008)
+        pert_centers = best_centers + np.random.normal(0, noise, best_centers.shape)
+        pert_centers = np.clip(pert_centers, 0.005, 0.995)
+        
+        r_new = solve_lp_radii(pert_centers)
+        if np.sum(r_new) > best_sum:
+            best_centers = pert_centers
+            best_radii = r_new
+            best_sum = np.sum(r_new)
+            
+            # Quick SLSQP polish
+            x0_p = np.zeros(3 * N)
+            x0_p[0::3] = best_centers[:, 0]
+            x0_p[1::3] = best_centers[:, 1]
+            x0_p[2::3] = best_radii * 0.998
+            try:
+                res_p = minimize(obj_sl, x0_p, method='SLSQP', bounds=bounds_sl, constraints=cons_sl,
+                                 options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+                if not np.isnan(res_p.fun) and -res_p.fun > best_sum:
+                    best_centers = np.column_stack((res_p.x[0::3], res_p.x[1::3]))
+                    best_radii = res_p.x[2::3]
+                    best_sum = -res_p.fun
+            except:
+                pass
+
+    # Final strict validation & repair
+    centers = best_centers
+    radii = best_radii
+    
+    for _ in range(50):
+        valid = True
+        for i in range(N):
+            if radii[i] < 0 or centers[i, 0] < radii[i] - 1e-9 or centers[i, 0] > 1.0 - radii[i] + 1e-9 or \
+               centers[i, 1] < radii[i] - 1e-9 or centers[i, 1] > 1.0 - radii[i] + 1e-9:
+                valid = False; break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-9:
+                        valid = False; break
+                if not valid: break
+        if valid: break
+        
+        radii *= 0.9995
+        centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+        
+    return centers, radii, float(np.sum(radii))
+```

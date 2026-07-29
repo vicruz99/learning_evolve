@@ -1,0 +1,194 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a multi-phase optimization strategy that balances global exploration, local exploitation, and numerical precision:
+
+1. **Diverse Initialization**: Generate multiple starting configurations including hexagonal lattices (optimal for density), random distributions, uniform grids, and corner-focused layouts. This ensures coverage of different topological basins.
+2. **LP-Evaluated Center Optimization**: For fixed centers, the maximum sum of radii is a Linear Programming problem. We use `scipy.optimize.linprog` to exactly compute the optimal radii and their sum for any center configuration. This exact evaluation serves as the objective function for a derivative-free `Powell` optimizer, which efficiently navigates the non-smooth landscape of packing problems.
+3. **Simulated Annealing**: After local optimization, we apply Simulated Annealing on the centers. This stochastic phase allows escaping shallow local minima by occasionally accepting worse configurations, with a decaying temperature schedule.
+4. **Joint Smooth Refinement**: We fine-tune both centers and radii simultaneously using `SLSQP`. By using squared-distance constraints `(dx^2 + dy^2) >= (r_i + r_j)^2`, we provide a smooth, differentiable constraint surface that helps the gradient-based optimizer make precise micro-adjustments.
+5. **Deterministic Repair**: A final iterative repair pass guarantees that all boundary and non-overlap constraints are strictly satisfied within the validator's `1e-12` tolerance, shrinking radii minimally only where necessary.
+
+This pipeline leverages the exactness of LP for radius calculation, the robustness of derivative-free methods for center placement, and the precision of gradient-based methods for final polishing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import math
+
+N = 26
+_I_IDX, _J_IDX = np.triu_indices(N, 1)
+_M_PAIR = len(_I_IDX)
+
+# Precompute sparse-like constraint matrix for LP pairwise bounds
+_A_PAIR = np.zeros((_M_PAIR, N))
+_A_PAIR[np.arange(_M_PAIR), _I_IDX] = 1.0
+_A_PAIR[np.arange(_M_PAIR), _J_IDX] = 1.0
+_A_BOUND = np.eye(N)
+
+def get_lp_radii_and_sum(centers):
+    """Solves LP to maximize sum of radii for fixed centers."""
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 10.0)
+
+    b_pair = dists[_I_IDX, _J_IDX]
+    A = np.vstack([_A_PAIR, _A_BOUND])
+    b = np.concatenate([b_pair, ub])
+
+    try:
+        res = linprog(-np.ones(N), A_ub=A, b_ub=b, bounds=[(0, None)]*N, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback heuristic if LP fails
+    r = ub * 0.5
+    r = np.minimum(r, 0.5 * np.min(dists, axis=1))
+    return np.maximum(r, 0.0), np.sum(r)
+
+def objective_centers(centers_flat):
+    """Objective for center optimization: maximize LP-computed sum of radii."""
+    centers = centers_flat.reshape(N, 2)
+    centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    _, s = get_lp_radii_and_sum(centers)
+    return -s
+
+def _sq_constraints(p):
+    """Smooth squared-distance constraints for joint optimization."""
+    x, y, r = p[0::3], p[1::3], p[2::3]
+    c = np.empty(4*N + _M_PAIR)
+    idx = 0
+    c[idx:idx+N] = x - r; idx += N
+    c[idx:idx+N] = 1.0 - x - r; idx += N
+    c[idx:idx+N] = y - r; idx += N
+    c[idx:idx+N] = 1.0 - y - r; idx += N
+    dx = x[_I_IDX] - x[_J_IDX]
+    dy = y[_I_IDX] - y[_J_IDX]
+    dr = r[_I_IDX] + r[_J_IDX]
+    c[idx:] = dx*dx + dy*dy - dr*dr
+    return c
+
+def _obj_joint(p):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(p[2*N:])
+
+def repair_radii(centers, radii):
+    """Deterministic repair to guarantee strict validity."""
+    radii = radii.copy()
+    for _ in range(30):
+        changed = False
+        for i in range(N):
+            mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mx + 1e-10:
+                radii[i] = mx
+                changed = True
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+
+    inits = []
+    # 1. Hexagonal lattice
+    r_est = 0.095
+    dy = r_est * np.sqrt(3)
+    dx = 2 * r_est
+    pts = []
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        x = r_est if row % 2 == 0 else 2 * r_est
+        while x + r_est <= 1.0 and len(pts) < N:
+            pts.append([x, y])
+            x += dx
+        y += dy
+        row += 1
+    inits.append(np.array(pts))
+    
+    # 2. Random & Grid & Corner-focused
+    for _ in range(8):
+        inits.append(np.random.rand(N, 2) * 0.8 + 0.1)
+    for s in [5, 6, 7]:
+        g = np.linspace(0.1, 0.9, s)
+        gx, gy = np.meshgrid(g, g)
+        inits.append(np.column_stack((gx.flatten(), gy.flatten()))[:N])
+    corners = [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92]]
+    for _ in range(4):
+        p = np.random.rand(N, 2) * 0.6 + 0.2
+        p[:4] = corners
+        inits.append(p)
+
+    bounds_c = [(1e-5, 0.9999)] * (2*N)
+
+    # Phase 1: Local optimization of centers using LP objective
+    for init in inits:
+        c0 = init.copy() + np.random.normal(0, 0.003, init.shape)
+        c0 = np.clip(c0, 1e-5, 0.9999)
+        try:
+            res = minimize(objective_centers, c0.flatten(), method='Powell',
+                           bounds=bounds_c, options={'maxiter': 600, 'ftol': 1e-12})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = res.x.reshape(N, 2)
+                best_radii = get_lp_radii_and_sum(best_centers)[0]
+        except Exception:
+            pass
+
+    # Phase 2: Simulated Annealing to escape local minima
+    curr_c = best_centers.copy()
+    curr_r = best_radii.copy()
+    temp = 0.015
+    for i in range(800):
+        temp *= 0.996
+        idx = np.random.randint(N)
+        pert = curr_c.copy()
+        pert[idx] += np.random.normal(0, temp, 2)
+        pert[idx] = np.clip(pert[idx], 1e-5, 0.9999)
+        new_r, new_s = get_lp_radii_and_sum(pert)
+        if new_s > best_sum or np.random.rand() < math.exp((new_s - best_sum)/max(temp, 1e-6)):
+            curr_c = pert
+            curr_r = new_r
+            if new_s > best_sum:
+                best_sum = new_s
+                best_centers = curr_c.copy()
+                best_radii = curr_r.copy()
+
+    # Phase 3: Joint smooth refinement
+    p0 = np.concatenate([best_centers.flatten(), best_radii])
+    bounds_pr = [(0.0, 1.0)] * (2*N) + [(1e-8, 0.5)] * N
+    try:
+        res = minimize(_obj_joint, p0, method='SLSQP', bounds=bounds_pr,
+                       constraints={'type': 'ineq', 'fun': _sq_constraints},
+                       options={'maxiter': 6000, 'ftol': 1e-14})
+        if -res.fun > best_sum:
+            best_centers = res.x[:2*N].reshape(N, 2)
+            best_radii = res.x[2*N:]
+            best_sum = -res.fun
+    except Exception:
+        pass
+
+    # Phase 4: Strict numerical repair
+    best_radii = repair_radii(best_centers, best_radii)
+    best_sum = float(np.sum(best_radii))
+    return best_centers, best_radii, best_sum
+```

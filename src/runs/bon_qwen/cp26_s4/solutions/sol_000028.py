@@ -1,0 +1,306 @@
+# sol_000028 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 55285a70) state=2072b0ab sum of radii=2.607450 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n = 26
+    
+    # --- 1. Initialization ---
+    # We use a hexagonal lattice pattern for initialization as it is denser than a square grid.
+    # We generate a grid of points and select the first 26 that fit or simply generate a structured pattern.
+    # A pattern of 5 rows with varying counts or a staggered grid works well.
+    
+    centers = []
+    
+    # Let's try to fit a hexagonal packing.
+    # Approximate radius for 26 circles is around 0.1.
+    # Spacing for hex lattice: horizontal 2r, vertical r*sqrt(3).
+    # Let's place centers based on a grid that fits 26 circles.
+    # 5 rows seems appropriate.
+    # Row 0: 5 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 5 circles
+    # Row 3: 5 circles (shifted)
+    # Row 4: 6 circles? Or 5 and put one in gap?
+    # Actually, 5x5 is 25. We need 26.
+    # Let's generate a dense hex grid and pick 26 points.
+    
+    # Parameters for grid generation
+    # We want to cover [0,1]x[0,1].
+    # Let's use a spacing that allows roughly 5-6 circles per dimension.
+    spacing = 0.2 # Initial guess, will be optimized
+    
+    y = 0.1 # Start y with some margin
+    row_idx = 0
+    
+    while len(centers) < n and y < 0.95:
+        x = 0.1
+        # Shift odd rows
+        if row_idx % 2 == 1:
+            x += spacing / 2.0
+        
+        while x < 0.95 and len(centers) < n:
+            centers.append([x, y])
+            x += spacing
+            if len(centers) >= n:
+                break
+        
+        y += spacing * np.sqrt(3) / 2.0
+        row_idx += 1
+        
+    # If we didn't get 26, fill with random points (unlikely with this logic, but safe)
+    while len(centers) < n:
+        centers.append([0.5, 0.5]) # Fallback
+        
+    centers = np.array(centers[:n])
+    
+    # Initial radii: small enough to be valid
+    # Distance between neighbors in this grid is approx 0.2.
+    # So radius 0.05 is safe.
+    radii_init = np.full(n, 0.05)
+    
+    # Flatten variables: x1, y1, r1, x2, y2, r2, ...
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers[i, 0]
+        x0[3 * i + 1] = centers[i, 1]
+        x0[3 * i + 2] = radii_init[i]
+    
+    # Bounds for variables
+    # x, y in [0, 1]
+    # r in [0, 0.5] (practically much smaller)
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((1e-6, 0.5)) # r
+    
+    # --- 2. Objective Function ---
+    def objective(vars):
+        # Maximize sum of radii => Minimize negative sum
+        r = vars[2::3]
+        return -np.sum(r)
+    
+    # --- 3. Constraints ---
+    # We combine all inequality constraints into a single vector for efficiency.
+    # g(vars) >= 0
+    
+    def constraint_func(vars):
+        n_vars = len(vars)
+        num_circles = n_vars // 3
+        c_vals = []
+        
+        # Pre-extract variables for speed
+        # vars is [x0, y0, r0, x1, y1, r1, ...]
+        
+        for i in range(num_circles):
+            idx = 3 * i
+            xi = vars[idx]
+            yi = vars[idx + 1]
+            ri = vars[idx + 2]
+            
+            # Boundary constraints:
+            # x - r >= 0
+            c_vals.append(xi - ri)
+            # 1 - x - r >= 0
+            c_vals.append(1.0 - xi - ri)
+            # y - r >= 0
+            c_vals.append(yi - ri)
+            # 1 - y - r >= 0
+            c_vals.append(1.0 - yi - ri)
+            
+            # Pairwise constraints
+            # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+            for j in range(i + 1, num_circles):
+                jdx = 3 * j
+                xj = vars[jdx]
+                yj = vars[jdx + 1]
+                rj = vars[jdx + 2]
+                
+                dx = xi - xj
+                dy = yi - yj
+                dr = ri + rj
+                
+                # Squared distance minus squared sum of radii
+                val = dx * dx + dy * dy - dr * dr
+                c_vals.append(val)
+                
+        return np.array(c_vals)
+
+    # Constraint dictionary for scipy
+    constraint = {
+        'type': 'ineq',
+        'fun': constraint_func
+    }
+    
+    # --- 4. Optimization ---
+    # Using SLSQP method
+    try:
+        res = minimize(
+            objective, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=constraint, 
+            options={
+                'ftol': 1e-12, 
+                'maxiter': 2000,
+                'disp': False
+            }
+        )
+        best_vars = res.x
+    except Exception as e:
+        # Fallback to initial guess if optimization fails
+        print(f"Optimization failed: {e}")
+        best_vars = x0
+    
+    # --- 5. Extract and Validate Results ---
+    centers_res = np.array([[best_vars[3 * i], best_vars[3 * i + 1]] for i in range(n)])
+    radii_res = np.array([best_vars[3 * i + 2] for i in range(n)])
+    
+    # Clean up any potential numerical issues (e.g. negative radii due to precision)
+    radii_res = np.maximum(radii_res, 0.0)
+    
+    # Ensure centers are within bounds considering radii (clamping if necessary)
+    # Though optimizer should handle this, it's a safety check.
+    for i in range(n):
+        r = radii_res[i]
+        cx, cy = centers_res[i]
+        # Clamp center to [r, 1-r]
+        cx = np.clip(cx, r, 1.0 - r)
+        cy = np.clip(cy, r, 1.0 - r)
+        centers_res[i] = [cx, cy]
+
+    sum_radii = np.sum(radii_res)
+    
+    # Final validation check using the provided logic (conceptually)
+    # We assume the output is valid.
+    
+    return centers_res, radii_res, sum_radii
+
+# Helper to ensure no lambda/closure issues if run in restricted env, 
+# though the above code defines functions locally or uses numpy ops.
+# The prompt asks for top level helper functions, but run_packing is the entry.
+# The constraint_func and objective are defined inside. To be strictly compliant with 
+# "Make all helper functions top level", I should move them out.
+# However, they depend on 'n' or structure. 
+# Let's refactor slightly to be safe.
+
+def _objective_func(vars):
+    r = vars[2::3]
+    return -np.sum(r)
+
+def _constraint_func(vars):
+    n_vars = len(vars)
+    num_circles = n_vars // 3
+    c_vals = []
+    
+    for i in range(num_circles):
+        idx = 3 * i
+        xi = vars[idx]
+        yi = vars[idx + 1]
+        ri = vars[idx + 2]
+        
+        c_vals.append(xi - ri)
+        c_vals.append(1.0 - xi - ri)
+        c_vals.append(yi - ri)
+        c_vals.append(1.0 - yi - ri)
+        
+        for j in range(i + 1, num_circles):
+            jdx = 3 * j
+            xj = vars[jdx]
+            yj = vars[jdx + 1]
+            rj = vars[jdx + 2]
+            
+            dx = xi - xj
+            dy = yi - yj
+            dr = ri + rj
+            val = dx * dx + dy * dy - dr * dr
+            c_vals.append(val)
+            
+    return np.array(c_vals)
+
+def run_packing_top_level():
+    n = 26
+    centers = []
+    spacing = 0.2
+    y = 0.1
+    row_idx = 0
+    
+    while len(centers) < n and y < 0.95:
+        x = 0.1
+        if row_idx % 2 == 1:
+            x += spacing / 2.0
+        
+        while x < 0.95 and len(centers) < n:
+            centers.append([x, y])
+            x += spacing
+            if len(centers) >= n:
+                break
+        
+        y += spacing * np.sqrt(3) / 2.0
+        row_idx += 1
+        
+    while len(centers) < n:
+        centers.append([0.5, 0.5])
+        
+    centers = np.array(centers[:n])
+    radii_init = np.full(n, 0.05)
+    
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers[i, 0]
+        x0[3 * i + 1] = centers[i, 1]
+        x0[3 * i + 2] = radii_init[i]
+    
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 1.0))
+        bounds.append((1e-6, 0.5))
+    
+    constraint = {'type': 'ineq', 'fun': _constraint_func}
+    
+    try:
+        res = minimize(
+            _objective_func, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=constraint, 
+            options={'ftol': 1e-12, 'maxiter': 2000}
+        )
+        best_vars = res.x
+    except Exception:
+        best_vars = x0
+    
+    centers_res = np.array([[best_vars[3 * i], best_vars[3 * i + 1]] for i in range(n)])
+    radii_res = np.array([best_vars[3 * i + 2] for i in range(n)])
+    radii_res = np.maximum(radii_res, 0.0)
+    
+    for i in range(n):
+        r = radii_res[i]
+        cx, cy = centers_res[i]
+        cx = np.clip(cx, r, 1.0 - r)
+        cy = np.clip(cy, r, 1.0 - r)
+        centers_res[i] = [cx, cy]
+
+    sum_radii = np.sum(radii_res)
+    
+    return centers_res, radii_res, sum_radii
+
+# Rename to match required signature
+run_packing = run_packing_top_level

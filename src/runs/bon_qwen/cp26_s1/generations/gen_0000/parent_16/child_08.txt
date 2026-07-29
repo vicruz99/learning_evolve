@@ -1,95 +1,270 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we recognize that this is equivalent to maximizing the radius $r$ when all circles are equal (a standard result for dense packings in a square). The optimal configuration approximates a hexagonal lattice.
+To maximize the sum of radii for 26 circles in a unit square, I will implement a hybrid optimization strategy combining a physics-based force-directed relaxation with a numerical optimizer.
 
-Strategy:
-1. **Initialization**: Place 26 circles in a hexagonal lattice pattern with a small initial radius ($r_0 = 0.08$) to ensure feasibility. The hexagonal arrangement naturally maximizes packing density.
-2. **Optimization Formulation**: 
-   - Variables: $(x_i, y_i)$ for each circle center and a shared radius $r$.
-   - Objective: Maximize $r$ (minimize $-r$).
-   - Constraints: 
-     - Boundary: $r \le x_i \le 1-r$, $r \le y_i \le 1-r$
-     - Non-overlap: $\|c_i - c_j\|^2 \ge 4r^2$ for all $i < j$
-3. **Solver**: Use `scipy.optimize.minimize` with the `SLSQP` method, which handles nonlinear inequality constraints efficiently. Vectorized constraint evaluation ensures fast iteration.
-4. **Robustness**: Tight tolerance (`ftol=1e-12`) and high iteration limit ensure convergence to the theoretical optimum ($r \approx 0.10138$, sum $\approx 2.6359$), matching the target.
-5. **Compliance**: All helper functions are top-level, no closures or lambdas are used, and the output format matches specifications.
+1.  **Initialization**: I will start by placing the 26 circles in a perturbed hexagonal lattice pattern. This provides a high-density starting configuration.
+2.  **Force-Directed Relaxation**: I will simulate a "pressure" system where circles repel each other to resolve overlaps and repel from boundaries to maintain validity. During this phase, I will iteratively increase the radii of the circles as long as a valid configuration can be maintained.
+3.  **Numerical Optimization**: To escape local optima and fine-tune the solution, I will use `scipy.optimize.minimize` (specifically the 'Nelder-Mead' method, which is derivative-free and robust). I will minimize a penalty function that penalizes overlaps and boundary violations while encouraging large radii.
+4.  **Iterative Refinement**: I will run the optimization multiple times from different random seeds and initial configurations (both hexagonal and random) to find the global maximum.
+
+The validation function provided will be used implicitly to ensure constraints are met, but the core logic will rely on minimizing a smooth penalty function to allow gradient-free optimization to work effectively.
 </strategy>
 
 ```python
 import numpy as np
 from scipy.optimize import minimize
+import math
 
-N_CIRCLES = 26
+def get_distance_matrix(centers):
+    """Compute pairwise distance matrix."""
+    # centers shape (n, 2)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    return dists
 
-def objective(vars):
-    """Objective function: maximize radius r (minimize -r)"""
-    return -vars[-1]
-
-def constraint_func(vars):
+def compute_penalty(centers, radii, alpha):
     """
-    Returns inequality constraints g(vars) >= 0:
-    1. Boundary constraints: circles inside [0,1]^2
-    2. Distance constraints: no overlaps
+    Compute penalty for overlaps and boundary violations.
+    Returns a scalar penalty value.
     """
-    r = vars[-1]
-    c = vars[:-1].reshape(N_CIRCLES, 2)
+    n = len(radii)
+    penalty = 0.0
     
-    # Boundary constraints
-    con_b = np.concatenate([
-        c[:, 0] - r,
-        1.0 - c[:, 0] - r,
-        c[:, 1] - r,
-        1.0 - c[:, 1] - r
-    ])
+    # Boundary violations
+    # Circle i must be inside [0,1]x[0,1]
+    # x - r >= 0 => r - x <= 0
+    # x + r <= 1 => x + r - 1 <= 0
+    # Same for y
     
-    # Distance constraints: ||c_i - c_j||^2 >= 4r^2
-    cx = c[:, 0]
-    cy = c[:, 1]
-    dx = cx[:, np.newaxis] - cx
-    dy = cy[:, np.newaxis] - cy
-    d2 = dx**2 + dy**2
+    # Vectorized boundary check
+    # Left: r - x
+    # Right: x + r - 1
+    # Bottom: r - y
+    # Top: y + r - 1
     
-    idx = np.triu_indices(N_CIRCLES, k=1)
-    con_d = d2[idx] - 4.0 * r * r
+    left_viol = np.maximum(0, radii - centers[:, 0])
+    right_viol = np.maximum(0, centers[:, 0] + radii - 1)
+    bottom_viol = np.maximum(0, radii - centers[:, 1])
+    top_viol = np.maximum(0, centers[:, 1] + radii - 1)
     
-    return np.concatenate([con_b, con_d])
+    boundary_violations = left_viol**2 + right_viol**2 + bottom_viol**2 + top_viol**2
+    penalty += np.sum(boundary_violations)
+    
+    # Overlap violations
+    # dist(i,j) >= r_i + r_j
+    # violation = max(0, r_i + r_j - dist(i,j))
+    
+    # Vectorized overlap check
+    # radii shape (n,), centers (n, 2)
+    # dists (n, n)
+    dists = get_distance_matrix(centers)
+    np.fill_diagonal(dists, np.inf) # No self-overlap
+    
+    sum_radii_matrix = radii[:, np.newaxis] + radii[np.newaxis, :]
+    overlap = np.maximum(0, sum_radii_matrix - dists)
+    
+    # Sum of squared overlaps (upper triangle to avoid double counting)
+    penalty += np.sum(np.triu(overlap**2))
+    
+    return alpha * penalty
+
+def objective_function(params, n, alpha):
+    """
+    Objective function to minimize.
+    We want to maximize sum(radii), so we minimize -sum(radii).
+    We add a penalty term for constraint violations.
+    """
+    centers = params[:2*n].reshape(n, 2)
+    radii = params[2*n:]
+    
+    # Ensure radii are non-negative (soft constraint)
+    radii = np.maximum(radii, 0.0)
+    
+    penalty = compute_penalty(centers, radii, alpha)
+    obj = -np.sum(radii) + penalty
+    
+    return obj
+
+def run_force_based_initialization(n, iterations=500, dt=0.01, growth_rate=1e-4):
+    """
+    Run a simple force-based simulation to pack circles and grow radii.
+    """
+    # Initialize centers in a hexagonal pattern perturbed slightly
+    centers = np.zeros((n, 2))
+    r = 0.05 # Initial small radius
+    
+    # Hexagonal packing generation
+    row = 0
+    col = 0
+    spacing_x = 0.15
+    spacing_y = spacing_x * math.sqrt(3) / 2
+    
+    for i in range(n):
+        centers[i, 0] = 0.1 + col * spacing_x + (row % 2) * (spacing_x / 2)
+        centers[i, 1] = 0.1 + row * spacing_y
+        if centers[i, 0] > 0.9:
+            row += 1
+            col = 0
+        else:
+            col += 1
+            
+    # Randomize slightly to break symmetry
+    centers += np.random.uniform(-0.02, 0.02, (n, 2))
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    radii = np.full(n, r)
+    
+    # Velocities
+    velocities = np.random.uniform(-0.01, 0.01, (n, 2))
+    
+    for _ in range(iterations):
+        # Calculate forces
+        forces = np.zeros((n, 2))
+        
+        # Pairwise repulsion
+        dists = get_distance_matrix(centers)
+        np.fill_diagonal(dists, 1e9)
+        sum_radii = radii[:, np.newaxis] + radii[np.newaxis, :]
+        
+        overlap = sum_radii - dists
+        
+        # Only apply force if overlapping
+        mask = overlap > 0
+        # Distance vector
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        
+        # Force magnitude proportional to overlap
+        # Avoid division by zero
+        safe_dist = np.where(dists < 1e-9, 1e-9, dists)
+        force_magnitude = np.where(mask, overlap, 0.0)
+        force_direction = np.where(mask, diff / safe_dist[..., np.newaxis], 0.0)
+        
+        # Accumulate forces
+        # We need to sum over the other axis. 
+        # forces[i] += sum over j (force_ij)
+        # Note: force_ij = -force_ji. 
+        # Vector form: f = k * overlap * (p_i - p_j) / dist
+        f_vec = force_magnitude[..., np.newaxis] * force_direction
+        forces = np.sum(f_vec, axis=1)
+        
+        # Boundary repulsion
+        margin = 0.01
+        # If center is too close to wall relative to radius
+        # Actually, we want to keep inside.
+        # If x < r, push right.
+        left_v = np.maximum(0, radii - centers[:, 0])
+        right_v = np.maximum(0, centers[:, 0] + radii - 1)
+        bottom_v = np.maximum(0, radii - centers[:, 1])
+        top_v = np.maximum(0, centers[:, 1] + radii - 1)
+        
+        forces[:, 0] += left_v - right_v
+        forces[:, 1] += bottom_v - top_v
+        
+        # Update velocities and positions (simple integration)
+        # Damping
+        velocities = 0.9 * velocities + dt * forces
+        centers += dt * velocities
+        
+        # Clip centers to valid range (soft clip to prevent explosion)
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Try to grow radii
+        # Check if valid (minimal overlap)
+        current_overlap = np.sum(np.triu(np.maximum(0, sum_radii - dists)**2))
+        boundary_pen = np.sum(np.maximum(0, radii - centers[:, 0])**2 + 
+                              np.maximum(0, centers[:, 0] + radii - 1)**2 +
+                              np.maximum(0, radii - centers[:, 1])**2 + 
+                              np.maximum(0, centers[:, 1] + radii - 1)**2)
+        
+        if current_overlap < 1e-6 and boundary_pen < 1e-6:
+            radii += growth_rate
+            # Increase growth rate slowly?
+            # growth_rate *= 1.001 
+            
+    return centers, radii
 
 def run_packing():
-    # 1. Initialize centers on a hexagonal lattice
-    r0 = 0.08
-    centers = []
-    y = r0
-    row = 0
-    while len(centers) < N_CIRCLES:
-        x = r0 if row % 2 == 0 else 2.0 * r0
-        while x + r0 <= 1.0 and len(centers) < N_CIRCLES:
-            centers.append([x, y])
-            x += 2.0 * r0
-        y += np.sqrt(3.0) * r0
-        row += 1
+    n = 26
+    
+    # Strategy: Run force-based initialization, then refine with scipy
+    best_centers = None
+    best_radii = None
+    best_score = -np.inf
+    
+    # Run multiple attempts to avoid local minima
+    attempts = 10
+    
+    for attempt in range(attempts):
+        np.random.seed(attempt * 42) # Different seed for each attempt
         
-    centers = np.array(centers[:N_CIRCLES])
-    x0 = np.concatenate([centers.flatten(), [r0]])
+        # 1. Force-based initialization to get a decent packing
+        # We can vary the parameters
+        init_centers, init_radii = run_force_based_initialization(n, iterations=1000, dt=0.05, growth_rate=5e-5)
+        
+        # 2. Construct initial params for scipy
+        # Flatten centers and radii
+        x0 = np.hstack([init_centers.flatten(), init_radii])
+        
+        # We want to maximize sum(radii).
+        # Objective: -sum(radii) + penalty
+        # We need a high alpha to enforce constraints strictly.
+        alpha = 1000.0
+        
+        # Optimization
+        # Using Nelder-Mead as it doesn't require gradients
+        res = minimize(objective_function, x0, args=(n, alpha), method='Nelder-Mead', 
+                       options={'maxiter': 5000, 'xatol': 1e-6, 'fatol': 1e-8})
+        
+        # Extract results
+        opt_centers = res.x[:2*n].reshape(n, 2)
+        opt_radii = res.x[2*n:]
+        
+        # Ensure non-negative radii
+        opt_radii = np.maximum(opt_radii, 0.0)
+        
+        # Validate and calculate score
+        # Check validity manually to be sure
+        valid = True
+        dists = get_distance_matrix(opt_centers)
+        np.fill_diagonal(dists, np.inf)
+        overlaps = np.maximum(0, (opt_radii[:, np.newaxis] + opt_radii[np.newaxis, :]) - dists)
+        if np.sum(overlaps) > 1e-4:
+            valid = False # Overlaps exist
+            
+        # Boundary check
+        if np.any(opt_radii - opt_centers[:, 0] > 1e-4) or \
+           np.any(opt_centers[:, 0] + opt_radii - 1 > 1e-4) or \
+           np.any(opt_radii - opt_centers[:, 1] > 1e-4) or \
+           np.any(opt_centers[:, 1] + opt_radii - 1 > 1e-4):
+            valid = False
+            
+        if valid:
+            score = np.sum(opt_radii)
+            if score > best_score:
+                best_score = score
+                best_centers = opt_centers.copy()
+                best_radii = opt_radii.copy()
     
-    # 2. Setup optimization problem
-    cons = {'type': 'ineq', 'fun': constraint_func}
-    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)]
+    # Fallback if all attempts failed (unlikely with force init)
+    if best_centers is None:
+        # Return a valid small packing
+        best_centers = np.tile([0.5, 0.5], (n, 1))
+        # Place them in a grid
+        for i in range(n):
+            row = i // 6
+            col = i % 6
+            best_centers[i, 0] = 0.1 + col * 0.15
+            best_centers[i, 1] = 0.1 + row * 0.15
+        best_radii = np.full(n, 0.01)
+        best_score = np.sum(best_radii)
+        
+    # Final validation using the provided logic (simulated)
+    # The problem statement says we MUST return (centers, radii, sum_radii)
+    # and they must satisfy constraints.
     
-    # 3. Run SLSQP optimizer
-    res = minimize(
-        objective, 
-        x0, 
-        method='SLSQP', 
-        bounds=bounds, 
-        constraints=cons,
-        options={'ftol': 1e-12, 'maxiter': 5000, 'disp': False}
-    )
+    # Just in case, clean up any tiny negative radii or NaNs
+    best_radii = np.maximum(best_radii, 0.0)
     
-    # 4. Extract results
-    opt_r = max(res.x[-1], 0.0)
-    opt_centers = res.x[:-1].reshape(N_CIRCLES, 2)
-    
-    radii = np.full(N_CIRCLES, opt_r)
-    return opt_centers, radii, np.sum(radii)
+    return best_centers, best_radii, best_score
 ```

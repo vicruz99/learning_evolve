@@ -1,0 +1,200 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust multi-strategy optimization approach. The problem is non-convex with many local optima. Known optimal packings for N=26 typically achieve a sum of radii around 2.641 (near-equal radii configuration). Our current best is 2.629.
+
+Strategy:
+1. **Differential Evolution (Global Search)**: Use DE to search the space of circle centers directly. The objective is the negative sum of maximum feasible radii for those centers. DE handles the non-smooth nature of the `min` function in radius computation well.
+2. **Force-Directed Relaxation (Physical Simulation)**: Initialize with a hexagonal lattice and run a simulation where circles repel each other and boundaries. Gently grow radii when the system reaches equilibrium. This mimics physical packing and often finds very dense configurations.
+3. **Explicit Equal-Radius Optimization**: Since the global optimum for sum of radii is often near-equal, explicitly optimize a single radius `r` subject to non-overlap (`d_ij >= 2r`) and boundary constraints using SLSQP. This targets the known dense lattice structures directly.
+4. **Local Refinement**: Apply gradient-free local optimizers (Powell, Nelder-Mead) to the best results from the above methods to squeeze out marginal gains.
+5. **Strict Feasibility Repair**: Before returning, verify all constraints and apply a minimal shrink (`1e-13`) to guarantee the validation function passes within its `1e-12` tolerance.
+
+This combination ensures we explore the global landscape, exploit physical packing intuition, target theoretical optima, and polish the result to high precision.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+import math
+
+def get_max_radii(centers):
+    """Compute maximum feasible radii for fixed centers respecting boundaries and non-overlap."""
+    n = centers.shape[0]
+    # Distance to boundaries
+    rb = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    # Pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    # Radius limited by half the distance to nearest neighbor
+    rp = 0.5 * np.min(dists, axis=1)
+    return np.minimum(rb, rp)
+
+def obj_func(x):
+    """Objective for optimization: minimize negative sum of radii."""
+    n = 26
+    centers = x.reshape(-1, 2)
+    radii = get_max_radii(centers)
+    return -np.sum(radii)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_centers = [(0.0, 1.0)] * (2 * n)
+    
+    # ---------------------------------------------------------
+    # 1. Differential Evolution (Global Search on Centers)
+    # ---------------------------------------------------------
+    np.random.seed(42)
+    try:
+        res_de = differential_evolution(
+            obj_func, bounds_centers, seed=42, popsize=25, maxiter=300, 
+            tol=1e-7, mutation=(0.5, 1.5), recombination=0.9, disp=False
+        )
+        c_de = res_de.x.reshape(n, 2)
+        r_de = get_max_radii(c_de)
+        if np.sum(r_de) > best_sum:
+            best_sum = np.sum(r_de)
+            best_centers = c_de
+            best_radii = r_de
+    except Exception:
+        pass
+        
+    # ---------------------------------------------------------
+    # 2. Force-Directed Relaxation (Hexagonal Initialization)
+    # ---------------------------------------------------------
+    hex_centers = []
+    r_est = 0.102
+    dy = r_est * math.sqrt(3)
+    dx = 2 * r_est
+    row = 0
+    while len(hex_centers) < n:
+        y = r_est + row * dy
+        if y + r_est > 1.0:
+            break
+        offset = (dx / 2.0) if row % 2 == 1 else 0.0
+        x = r_est + offset
+        while x + r_est <= 1.0 and len(hex_centers) < n:
+            hex_centers.append([x, y])
+            x += dx
+        row += 1
+    while len(hex_centers) < n:
+        hex_centers.append([np.random.rand() * 0.6 + 0.2, np.random.rand() * 0.6 + 0.2])
+    centers_f = np.array(hex_centers[:n])
+    radii_f = np.full(n, 0.04)
+    
+    alpha = 0.02
+    grow_rate = 0.0004
+    for step in range(6000):
+        forces = np.zeros_like(centers_f)
+        max_ov = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers_f[i, 0] - centers_f[j, 0]
+                dy = centers_f[i, 1] - centers_f[j, 1]
+                d = math.hypot(dx, dy)
+                md = radii_f[i] + radii_f[j]
+                if d < md and d > 1e-9:
+                    ov = md - d
+                    f = ov / d
+                    fx, fy = dx * f, dy * f
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+                    max_ov = max(max_ov, ov)
+            r = radii_f[i]
+            cx, cy = centers_f[i]
+            if cx < r: forces[i, 0] += (r - cx) * 10.0; max_ov = max(max_ov, r - cx)
+            if cx > 1 - r: forces[i, 0] -= (cx - (1 - r)) * 10.0; max_ov = max(max_ov, cx - (1 - r))
+            if cy < r: forces[i, 1] += (r - cy) * 10.0; max_ov = max(max_ov, r - cy)
+            if cy > 1 - r: forces[i, 1] -= (cy - (1 - r)) * 10.0; max_ov = max(max_ov, cy - (1 - r))
+            
+        centers_f += alpha * forces
+        centers_f = np.clip(centers_f, 0.0, 1.0)
+        
+        if max_ov < 1e-7:
+            radii_f += grow_rate
+            for i in range(n):
+                mx = min(centers_f[i, 0], 1.0 - centers_f[i, 0], centers_f[i, 1], 1.0 - centers_f[i, 1])
+                radii_f[i] = min(radii_f[i], mx)
+                
+    radii_f = get_max_radii(centers_f)
+    if np.sum(radii_f) > best_sum:
+        best_sum = np.sum(radii_f)
+        best_centers = centers_f
+        best_radii = radii_f
+
+    # ---------------------------------------------------------
+    # 3. Explicit Equal-Radius Optimization (SLSQP)
+    # ---------------------------------------------------------
+    def obj_equal(vars_flat):
+        return -vars_flat[-1]
+        
+    def cons_equal(vars_flat):
+        centers = vars_flat[:2*n].reshape(n, 2)
+        r = vars_flat[-1]
+        c = []
+        c.append(centers[:, 0] - r)
+        c.append(1.0 - centers[:, 0] - r)
+        c.append(centers[:, 1] - r)
+        c.append(1.0 - centers[:, 1] - r)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        c.append(dists[mask] - 2.0 * r)
+        return np.concatenate([arr.flatten() for arr in c])
+
+    bounds_eq = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)]
+    cons_eq = {'type': 'ineq', 'fun': cons_equal}
+    
+    # Try from force result and random perturbations
+    for seed in range(5):
+        np.random.seed(seed)
+        x0 = best_centers.flatten().copy()
+        x0 += np.random.normal(0, 0.005, 2 * n)
+        x0 = np.concatenate([np.clip(x0, 0.05, 0.95), [0.095]])
+        try:
+            res_eq = minimize(obj_equal, x0, method='SLSQP', bounds=bounds_eq, 
+                              constraints=cons_eq, options={'maxiter': 2000, 'ftol': 1e-12})
+            if res_eq.success and res_eq.x[-1] > 0:
+                r_eq = res_eq.x[-1]
+                c_eq = res_eq.x[:2*n].reshape(n, 2)
+                if 26 * r_eq > best_sum:
+                    best_sum = 26 * r_eq
+                    best_centers = c_eq
+                    best_radii = np.full(n, r_eq)
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # 4. Local Refinement (Powell on best found)
+    # ---------------------------------------------------------
+    try:
+        res_powell = minimize(obj_func, best_centers.flatten(), method='Powell', 
+                              options={'maxiter': 8000, 'xatol': 1e-9, 'fatol': 1e-11})
+        c_pw = res_powell.x.reshape(n, 2)
+        r_pw = get_max_radii(c_pw)
+        if np.sum(r_pw) > best_sum:
+            best_sum = np.sum(r_pw)
+            best_centers = c_pw
+            best_radii = r_pw
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------
+    # 5. Final Safety & Validation Preparation
+    # ---------------------------------------------------------
+    # Ensure strict feasibility within validator tolerance
+    best_radii = get_max_radii(best_centers)
+    # Shrink minimally to guarantee dist >= r1+r2 - 1e-12 passes strictly
+    best_radii = np.maximum(best_radii - 1e-13, 0.0)
+    
+    final_sum = float(np.sum(best_radii))
+    return best_centers, best_radii, final_sum
+```

@@ -1,0 +1,141 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we shift from a constrained optimization over $(x, y, r)$ to an unconstrained optimization over centers $(x, y)$ only. The radius of each circle is analytically determined as the minimum distance to any boundary or half the distance to the nearest neighbor center. This transforms the problem into a smooth(ish) black-box optimization that avoids constraint handling overhead and local minima trapping associated with hard constraints.
+
+Strategy:
+1. **Center-Only Formulation**: Define a function `compute_radii(centers)` that efficiently calculates the maximum valid radius for each circle given a set of centers. This embeds boundary and non-overlap constraints directly into the radius calculation.
+2. **Global Exploration**: Use `scipy.optimize.differential_evolution` to explore the 52-dimensional center space. DE is robust to the non-smooth kinks introduced by the `min` operation in radius calculation.
+3. **Structured Priors**: Add known efficient layouts (hexagonal lattice, uniform grid) as additional starting points for local search. Hexagonal packing is theoretically densest, and grid layouts provide symmetry to escape random local minima.
+4. **Local Polishing**: Apply `L-BFGS-B` from multiple perturbations of the DE result and structured starts. This gradient-based method rapidly converges to high-precision local optima.
+5. **Safety Shrink**: Apply a negligible multiplicative factor to radii to guarantee strict satisfaction of the validation function's $10^{-12}$ numerical tolerance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+import math
+
+def compute_radii(centers):
+    """
+    Computes the maximum valid radius for each circle given fixed centers.
+    Radius is limited by distance to boundaries and half the distance to nearest neighbor.
+    """
+    n = centers.shape[0]
+    # Distance to vertical and horizontal boundaries
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Ignore self-distances
+    np.fill_diagonal(dists, np.inf)
+    
+    # Radius limited by half the distance to the closest circle
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    # Final radius is the tighter of the two constraints
+    return np.minimum(r_bound, r_pair)
+
+def objective_centers(x):
+    """Objective: minimize negative sum of radii (equivalent to maximizing sum)."""
+    centers = x.reshape(-1, 2)
+    radii = compute_radii(centers)
+    return -np.sum(radii)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    bounds = [(0.0, 1.0)] * (2 * n)
+    np.random.seed(42)
+    
+    # ---------------------------------------------------------
+    # 1. Global Search with Differential Evolution
+    # ---------------------------------------------------------
+    de_res = differential_evolution(
+        objective_centers, 
+        bounds, 
+        seed=42, 
+        maxiter=180, 
+        popsize=20, 
+        mutation=(0.5, 1.5), 
+        recombination=0.9, 
+        tol=1e-7, 
+        polish=False
+    )
+    best_x = de_res.x
+    best_val = de_res.fun
+    
+    # ---------------------------------------------------------
+    # 2. Generate Structured Initial Configurations
+    # ---------------------------------------------------------
+    structured_starts = []
+    
+    # Hexagonal lattice pattern
+    r_est = 0.105
+    dy = r_est * math.sqrt(3)
+    dx = 2 * r_est
+    hex_centers = []
+    row = 0
+    while len(hex_centers) < n:
+        y = r_est + row * dy
+        if y + r_est > 1.0: 
+            break
+        offset = (dx / 2.0) if row % 2 == 1 else 0.0
+        x = r_est + offset
+        while x + r_est <= 1.0 and len(hex_centers) < n:
+            hex_centers.append([x, y])
+            x += dx
+        row += 1
+    while len(hex_centers) < n:
+        hex_centers.append([np.random.rand(), np.random.rand()])
+    structured_starts.append(np.array(hex_centers[:n]).flatten())
+    
+    # Uniform grid pattern
+    x_g = np.linspace(0.12, 0.88, 5)
+    y_g = np.linspace(0.12, 0.88, 5)
+    cx, cy = np.meshgrid(x_g, y_g)
+    grid = np.column_stack((cx.flatten(), cy.flatten()))
+    grid = np.vstack([grid, [0.5, 0.5]])
+    structured_starts.append(grid[:n].flatten())
+    
+    # ---------------------------------------------------------
+    # 3. Local Refinement with L-BFGS-B
+    # ---------------------------------------------------------
+    candidates = [best_x] + structured_starts
+    
+    for x_init in candidates:
+        for _ in range(3):
+            # Perturb to escape symmetric/degenerate basins
+            x_pert = x_init.copy()
+            x_pert += np.random.normal(0, 0.004, x_pert.shape)
+            x_pert = np.clip(x_pert, 0.0, 1.0)
+            
+            try:
+                res = minimize(
+                    objective_centers, 
+                    x_pert, 
+                    method='L-BFGS-B', 
+                    bounds=bounds, 
+                    options={'maxiter': 2500, 'ftol': 1e-13}
+                )
+                if res.fun < best_val:
+                    best_x = res.x
+                    best_val = res.fun
+            except Exception:
+                continue
+                
+    # ---------------------------------------------------------
+    # 4. Final Extraction & Safety Validation
+    # ---------------------------------------------------------
+    centers = best_x.reshape(n, 2)
+    radii = compute_radii(centers)
+    
+    # Shrink slightly to guarantee strict inequality for numerical tolerance checks
+    radii *= 0.99999999
+    radii = np.maximum(radii, 1e-9)
+    
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,150 @@
+
+
+<strategy>
+To improve the circle packing sum of radii from ~2.626 to the target 2.636, we need a more robust optimization strategy that avoids local minima and tightly handles the non-linear constraints.
+
+Key improvements:
+1. **Multiple Diverse Initializations**: Generate candidates from both hexagonal lattices (optimal for dense packing) and uniform grids, with varied spacing and controlled jitter. This covers different topological basins of attraction.
+2. **Vectorized Constraint Formulation**: Compute boundary and pairwise overlap constraints efficiently using NumPy broadcasting and precomputed upper-triangular indices. This speeds up gradient evaluations significantly.
+3. **Two-Phase Optimization**: 
+   - Phase 1: Run SLSQP from all diverse initial candidates with high iteration limits and tight tolerance (`ftol=1e-13`).
+   - Phase 2: Local refinement around the best found solution by adding small Gaussian noise and re-optimizing. This helps escape shallow local minima common in constrained packing problems.
+4. **Strict Post-Processing Validation**: After optimization, iteratively enforce boundary and non-overlap constraints by shrinking radii only when necessary. A final negligible global shrink (`1e-9`) guarantees compliance with the validator's `1e-12` tolerance without meaningfully impacting the objective score.
+5. **No Closures/Lambdas**: All helper functions are defined at the top level as requested, ensuring clean execution and compatibility with the validation framework.
+
+This approach systematically explores the configuration space while maintaining mathematical rigor in constraint handling, pushing the solution closer to the theoretical packing density limit.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+INDICES = np.triu_indices(N, k=1)
+
+def obj(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def cons(v):
+    """Inequality constraints: boundaries and non-overlap."""
+    cx = v[:N]
+    cy = v[N:2*N]
+    r = v[2*N:]
+    
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c = np.concatenate([
+        cx - r,
+        1.0 - cx - r,
+        cy - r,
+        1.0 - cy - r
+    ])
+    
+    # Pairwise non-overlap: dist >= r_i + r_j
+    i, j = INDICES
+    dx = cx[i] - cx[j]
+    dy = cy[i] - cy[j]
+    dist = np.sqrt(dx*dx + dy*dy)
+    c = np.concatenate([c, dist - (r[i] + r[j])])
+    
+    return c
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': cons}
+    
+    best_sum = 0.0
+    best_v = None
+    candidates = []
+    
+    # 1. Generate Hexagonal Lattice Candidates
+    for seed in range(8):
+        np.random.seed(seed)
+        pts = []
+        r0 = 0.085 + seed * 0.001
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x = r0 + (row % 2) * r0
+            while x <= 1 - r0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r0
+            y += r0 * np.sqrt(3)
+            row += 1
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.012, 0.012, pts.shape)
+        pts = np.clip(pts, 0.01, 0.99)
+        candidates.append(np.concatenate([pts.ravel(), np.full(N, 0.04)]))
+        
+    # 2. Generate Grid Candidates
+    for seed in range(4):
+        np.random.seed(seed + 100)
+        xs = np.linspace(0.1, 0.9, 6)
+        ys = np.linspace(0.1, 0.9, 5)
+        pts = []
+        for y in ys:
+            for x in xs:
+                if len(pts) < N:
+                    pts.append([x, y])
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.01, 0.01, pts.shape)
+        pts = np.clip(pts, 0.01, 0.99)
+        candidates.append(np.concatenate([pts.ravel(), np.full(N, 0.04)]))
+        
+    # 3. Primary Optimization
+    for v0 in candidates:
+        res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons_dict,
+                       options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+        if -res.fun > best_sum:
+            best_sum = -res.fun
+            best_v = res.x.copy()
+            
+    # 4. Local Refinement around best solution
+    if best_v is not None:
+        for _ in range(8):
+            noise = np.random.normal(0, 0.0015, len(best_v))
+            v_refine = best_v + noise
+            v_refine[:2*N] = np.clip(v_refine[:2*N], 0.001, 0.999)
+            v_refine[2*N:] = np.clip(v_refine[2*N:], 0.001, 0.49)
+            
+            res = minimize(obj, v_refine, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict,
+                           options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_v = res.x.copy()
+                
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:]
+    
+    # 5. Strict Post-Processing Validation
+    radii = np.maximum(radii, 0.0)
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        x, y = centers[i]
+        radii[i] = min(radii[i], x, 1.0 - x, y, 1.0 - y)
+        
+    # Enforce non-overlap constraints iteratively
+    for _ in range(40):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                s = radii[i] + radii[j]
+                if d < s - 1e-9:
+                    shrink = (s - d + 1e-9) / 2.0
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    # Final negligible shrink to guarantee validator tolerance
+    radii *= (1.0 - 1e-9)
+    
+    return centers, radii, np.sum(radii)
+```

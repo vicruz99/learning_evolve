@@ -1,0 +1,341 @@
+# sol_000008 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b5cb09ab) state=b416fe68 sum of radii=2.467727 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize
+
+def generate_hex_centers(n, r_init):
+    """
+    Generates n center coordinates in a hexagonal packing pattern 
+    starting with a small radius r_init to ensure validity.
+    """
+    centers = []
+    # Approximate number of rows needed
+    # Area ~ 1, circle area ~ pi*r^2. Density ~ 0.9.
+    # n * pi * r^2 * 0.9 ~ 1 => r ~ 0.1.
+    # Let's use a slightly smaller r to fit easily, say 0.08.
+    r = r_init
+    
+    # Vertical spacing
+    dy = r * np.sqrt(3)
+    # Horizontal spacing
+    dx = 2 * r
+    
+    y = r
+    row_idx = 0
+    
+    while len(centers) < n:
+        x_start = r + (row_idx % 2) * r  # Shift odd rows by r (half spacing)
+        
+        # Check how many circles fit in this row
+        # Max x is 1 - r
+        num_in_row = int((1 - 2*r) / dx) + 1
+        if num_in_row < 1:
+            num_in_row = 1 # Should not happen with small r
+            
+        # Fill row
+        for i in range(num_in_row):
+            if len(centers) >= n:
+                break
+            x = x_start + i * dx
+            # Ensure within bounds strictly
+            if r <= x <= 1 - r and r <= y <= 1 - r:
+                centers.append([x, y])
+        
+        y += dy
+        row_idx += 1
+        
+    return np.array(centers[:n])
+
+def get_constraints(centers, radii, r_val):
+    """
+    Helper to check constraints, mainly for debugging or custom logic.
+    """
+    n = centers.shape[0]
+    # Boundary
+    if np.any(centers - radii < -1e-12) or np.any(1 - centers - radii < -1e-12):
+        return False
+    # Overlap
+    dists = np.linalg.norm(centers[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+    # Set diagonal to infinity
+    np.fill_diagonal(dists, np.inf)
+    min_dist = np.min(dists)
+    return min_dist >= 2 * r_val - 1e-12
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # 1. Initialization
+    # We start with a hexagonal packing with a radius slightly smaller than target.
+    # Target sum 2.636 => avg r ~ 0.101.
+    # Start with r=0.08 to be safe.
+    r_start = 0.08
+    centers_init = generate_hex_centers(n, r_start)
+    
+    # Variable vector: [x1, y1, x2, y2, ..., x26, y26, r]
+    # Total 53 variables
+    x0 = np.concatenate([centers_init.flatten(), [r_start]])
+    
+    # 2. Define Objective: Maximize r => Minimize -r
+    # The last variable is r
+    def objective(vars):
+        return -vars[-1]
+
+    # 3. Define Constraints
+    constraints = []
+    
+    # Variables unpacking helper inside constraints
+    # vars[:52] are centers (26x2), vars[52] is r
+    
+    # Boundary constraints: r <= x <= 1-r => x - r >= 0 and 1 - x - r >= 0
+    # y - r >= 0 and 1 - y - r >= 0
+    
+    # We can add these as linear constraints or inequality functions.
+    # Using inequality functions is easier to manage with variable 'r'.
+    
+    def boundary_constraint_x(vars):
+        # Returns array of values >= 0
+        centers = vars[:52].reshape(26, 2)
+        r = vars[52]
+        # x_i - r >= 0
+        c1 = centers[:, 0] - r
+        # 1 - x_i - r >= 0
+        c2 = 1 - centers[:, 0] - r
+        return np.concatenate([c1, c2])
+
+    def boundary_constraint_y(vars):
+        centers = vars[:52].reshape(26, 2)
+        r = vars[52]
+        # y_i - r >= 0
+        c1 = centers[:, 1] - r
+        # 1 - y_i - r >= 0
+        c2 = 1 - centers[:, 1] - r
+        return np.concatenate([c1, c2])
+
+    def non_overlap_constraints(vars):
+        centers = vars[:52].reshape(26, 2)
+        r = vars[52]
+        constraints_vals = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist_sq = np.sum((centers[i] - centers[j])**2)
+                # dist >= 2r => dist^2 >= 4r^2 => dist^2 - 4r^2 >= 0
+                val = dist_sq - 4 * (r**2)
+                constraints_vals.append(val)
+        return np.array(constraints_vals)
+
+    # Add constraints to list
+    # scipy expects constraints as dict or NonlinearConstraint
+    # For SLSQP, we can pass a list of dicts {'type': 'ineq', 'fun': ...}
+    
+    cons = [
+        {'type': 'ineq', 'fun': boundary_constraint_x},
+        {'type': 'ineq', 'fun': boundary_constraint_y},
+        {'type': 'ineq', 'fun': non_overlap_constraints}
+    ]
+    
+    # 4. Bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    # Actually x, y bounds can be tighter but [0,1] is safe.
+    bounds = [(0, 1)] * 52 + [(0, 0.5)]
+    
+    # 5. Optimization
+    # SLSQP is good for this
+    try:
+        res = scipy.optimize.minimize(
+            objective, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=cons,
+            options={'maxiter': 1000, 'ftol': 1e-9, 'disp': False}
+        )
+        
+        if res.success or res.fun < -0.1: # Check if we found something reasonable
+            final_centers = res.x[:52].reshape(26, 2)
+            final_r = res.x[52]
+            final_radii = np.full(26, final_r)
+            
+            # Verify validity manually just in case
+            if validate_packing(final_centers, final_radii):
+                sum_r = np.sum(final_radii)
+                return final_centers, final_radii, sum_r
+            
+            # If validation fails due to numerical issues, clamp and retry?
+            # Or just return the result, the validator might pass with tolerance.
+            # But let's ensure validity.
+            
+    except Exception as e:
+        pass
+
+    # Fallback: If optimization fails or is too slow, return the initial hex packing scaled?
+    # But SLSQP should work for 53 vars.
+    # Let's try a fallback random local search if needed, but SLSQP is robust.
+    
+    # If we reached here, something went wrong or we didn't return.
+    # Let's return the best valid configuration we have.
+    # In case of failure, return a valid small packing.
+    # But the prompt implies we should get close to 2.636.
+    
+    # Let's refine the optimization loop with multiple restarts if needed?
+    # Single run might be enough with good init.
+    
+    # Let's double check the result from res
+    if 'res' in locals():
+        final_centers = res.x[:52].reshape(26, 2)
+        final_r = res.x[52]
+        final_radii = np.full(26, final_r)
+        # Enforce strict bounds
+        final_centers = np.clip(final_centers, final_r, 1 - final_r)
+        
+        # Re-check validation
+        if validate_packing(final_centers, final_radii):
+            return final_centers, final_radii, np.sum(final_radii)
+
+    # Final Fallback: Grid packing
+    # 5x5 grid is 25 circles. We need 26.
+    # This fallback is unlikely to be reached if code is correct.
+    # Construct a valid 26 circle packing manually?
+    # 6x5 grid (30 circles) radius 0.08. Remove 4.
+    centers_fb = []
+    radii_fb = []
+    r_fb = 0.08
+    # Generate 6x5 grid points
+    # Rows 0..5, Cols 0..4
+    for r_idx in range(6):
+        for c_idx in range(5):
+            if len(centers_fb) >= 26:
+                break
+            x = 0.1 + c_idx * 0.2
+            y = 0.1 + r_idx * 0.2 # Square grid spacing 0.2
+            # Check overlap with existing?
+            # Grid points are spaced 0.2, diameter 0.16. No overlap.
+            centers_fb.append([x, y])
+            radii_fb.append(r_fb)
+        if len(centers_fb) >= 26:
+            break
+            
+    if len(centers_fb) < 26:
+        # Fill remaining if any
+        while len(centers_fb) < 26:
+             centers_fb.append([0.05, 0.05]) # dummy, should not happen
+             radii_fb.append(0.0)
+             
+    return np.array(centers_fb), np.array(radii_fb), np.sum(radii_fb)
+
+# We need to include the validate_packing function or assume it exists?
+# The prompt says "We will run the below validation function". 
+# It is not available inside run_packing scope unless defined or imported.
+# But we can just use the logic or assume it works. 
+# To be safe, I will not call validate_packing inside run_packing if it's not defined,
+# or I can copy-paste it? No, "read-only, do not modify this".
+# I can import it? No, it's not in a module.
+# I will assume the validator is called externally.
+# However, to be robust, I'll implement a simple check or just trust the optimizer.
+# Actually, I can define a local validation check.
+
+def check_validity(centers, radii):
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    if np.any(radii < 0):
+        return False
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+# Redefine run_packing to use local check
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    r_start = 0.09 # Start closer to target
+    
+    # Generate initial centers
+    centers_init = generate_hex_centers(n, r_start)
+    x0 = np.concatenate([centers_init.flatten(), [r_start]])
+    
+    def objective(vars):
+        return -vars[-1]
+
+    def boundary_constraint_x(vars):
+        centers = vars[:52].reshape(26, 2)
+        r = vars[52]
+        return np.concatenate([centers[:, 0] - r, 1 - centers[:, 0] - r])
+
+    def boundary_constraint_y(vars):
+        centers = vars[:52].reshape(26, 2)
+        r = vars[52]
+        return np.concatenate([centers[:, 1] - r, 1 - centers[:, 1] - r])
+
+    def non_overlap_constraints(vars):
+        centers = vars[:52].reshape(26, 2)
+        r = vars[52]
+        vals = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist_sq = np.sum((centers[i] - centers[j])**2)
+                vals.append(dist_sq - 4 * (r**2))
+        return np.array(vals)
+
+    cons = [
+        {'type': 'ineq', 'fun': boundary_constraint_x},
+        {'type': 'ineq', 'fun': boundary_constraint_y},
+        {'type': 'ineq', 'fun': non_overlap_constraints}
+    ]
+    
+    bounds = [(0, 1)] * 52 + [(0, 0.5)]
+    
+    # Try optimization
+    try:
+        res = scipy.optimize.minimize(
+            objective, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=cons,
+            options={'maxiter': 2000, 'ftol': 1e-10}
+        )
+        
+        if res.success:
+            final_centers = res.x[:52].reshape(26, 2)
+            final_r = res.x[52]
+            final_radii = np.full(26, final_r)
+            
+            # Clip centers to strictly satisfy boundary with tolerance
+            # Ensure x >= r and x <= 1-r
+            final_centers[:, 0] = np.clip(final_centers[:, 0], final_r, 1 - final_r)
+            final_centers[:, 1] = np.clip(final_centers[:, 1], final_r, 1 - final_r)
+            
+            if check_validity(final_centers, final_radii):
+                return final_centers, final_radii, np.sum(final_radii)
+                
+            # If clipping broke overlap, reduce r slightly
+            while not check_validity(final_centers, final_radii) and final_r > 0.01:
+                final_r -= 0.0001
+                final_radii = np.full(26, final_r)
+                # Adjust centers? No, just reducing r helps overlap.
+                # But boundary clipping might be needed again.
+                final_centers[:, 0] = np.clip(final_centers[:, 0], final_r, 1 - final_r)
+                final_centers[:, 1] = np.clip(final_centers[:, 1], final_r, 1 - final_r)
+            
+            if check_validity(final_centers, final_radii):
+                return final_centers, final_radii, np.sum(final_radii)
+                
+    except Exception:
+        pass
+
+    # Fallback
+    # 26 circles radius 0.05
+    centers_fb = np.random.rand(26, 2) * 0.9 + 0.05
+    radii_fb = np.full(26, 0.04)
+    return centers_fb, radii_fb, np.sum(radii_fb)

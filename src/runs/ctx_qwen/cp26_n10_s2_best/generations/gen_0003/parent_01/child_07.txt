@@ -1,0 +1,169 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.631 and approach the 2.636 target, we need a more robust search strategy that escapes shallow local minima where standard gradient-based optimizers often stall.
+
+1. **Force-Directed Relaxation Pre-optimizer**: Before calling SLSQP, we will run a custom iterative relaxation routine. This routine applies repulsive forces between overlapping circles, pushes circles away from boundaries, and gradually expands all radii when no overlaps exist. This "expansion" phase mimics physical packing processes and reliably converges to tightly packed local configurations that are excellent starting points for mathematical optimization.
+
+2. **Diverse Topological Initializations**: We will generate initial configurations using multiple known dense patterns for N=26:
+   - Hexagonal lattices with varying base radii
+   - Staggered row counts (e.g., 6-5-6-5-4, 5-6-5-6-4) which match known optimal topologies for this N
+   - Uniform random scatter for basin diversity
+   Each pattern is perturbed slightly to break symmetry.
+
+3. **Multi-Start SLSQP Refinement**: Each relaxed configuration is fed into `scipy.optimize.minimize` (SLSQP) with high iteration limits and tight tolerances. SLSQP precisely adjusts centers and radii to maximize the sum while strictly satisfying non-overlap and boundary constraints.
+
+4. **Strict Post-Processing**: After optimization, we apply a deterministic shrinkage loop that guarantees the final output satisfies the validator's `1e-12` tolerance margin without unnecessarily sacrificing radii sum.
+
+This combination of physics-inspired relaxation and rigorous nonlinear programming has consistently pushed equal/unequal circle packing results past standard multi-start baselines.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and non-overlap (squared distances)."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r,
+        (x[PAIR_I] - x[PAIR_J])**2 + (y[PAIR_I] - y[PAIR_J])**2 - (r[PAIR_I] + r[PAIR_J])**2
+    ])
+    return c
+
+def relax(centers, radii, steps=600):
+    """Force-directed relaxation and radius expansion."""
+    for _ in range(steps):
+        dx = centers[PAIR_I, 0] - centers[PAIR_J, 0]
+        dy = centers[PAIR_I, 1] - centers[PAIR_J, 1]
+        d = np.sqrt(dx**2 + dy**2)
+        sr = radii[PAIR_I] + radii[PAIR_J]
+        
+        overlap = np.maximum(0, sr - d)
+        if np.sum(overlap) > 1e-10:
+            f = overlap / np.maximum(d, 1e-9)
+            forces = np.zeros((N, 2))
+            for k in range(len(PAIR_I)):
+                i, j = PAIR_I[k], PAIR_J[k]
+                fx, fy = f[k] * dx[k], f[k] * dy[k]
+                forces[i] += [fx, fy]
+                forces[j] -= [fx, fy]
+            centers += forces * 0.02
+            
+        # Boundary correction
+        r_max = np.minimum(np.minimum(centers[:,0], 1.0 - centers[:,0]), 
+                           np.minimum(centers[:,1], 1.0 - centers[:,1]))
+        radii = np.minimum(radii, r_max)
+        centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+        
+        # Expand if stable
+        if np.all(overlap <= 1e-9):
+            radii *= 1.001
+    return centers, radii
+
+def generate_inits():
+    """Generate diverse initial configurations."""
+    inits = []
+    # Hexagonal lattices
+    for r0 in [0.08, 0.09, 0.10, 0.105]:
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N + 5:
+            x = r0 if row % 2 == 0 else 2*r0
+            while x <= 1.0 - r0 and len(pts) < N + 5:
+                pts.append([x, y])
+                x += 2*r0
+            y += np.sqrt(3)*r0
+            row += 1
+        inits.append(np.array(pts[:N]))
+        
+    # Staggered row topologies known to be efficient for N=26
+    rows = [[6,5,6,5,4], [5,6,5,6,4], [6,6,5,5,4]]
+    for pat in rows:
+        pts = []
+        y = 0.10
+        for r_idx, cnt in enumerate(pat):
+            x_start = 0.10 if r_idx % 2 == 0 else 0.18
+            for _ in range(cnt):
+                pts.append([x_start, y])
+                x_start += 0.16
+            y += 0.14 * np.sqrt(3)
+        inits.append(np.array(pts[:N]))
+        
+    # Random uniform
+    for seed in range(5):
+        np.random.seed(seed)
+        inits.append(np.random.uniform(0.15, 0.85, (N, 2)))
+    return inits
+
+def run_packing():
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)]*(2*N) + [(0.0, 0.5)]*N
+    best_sum = -1.0
+    best_v = None
+    
+    inits = generate_inits()
+    
+    for base_c in inits:
+        for p_seed in range(4):
+            np.random.seed(p_seed + 10)
+            c = base_c + np.random.uniform(-0.01, 0.01, base_c.shape)
+            c = np.clip(c, 0.02, 0.98)
+            r = np.full(N, 0.05)
+            
+            # Pre-optimize with force relaxation
+            c_rel, r_rel = relax(c, r, steps=600)
+            v0 = np.concatenate([c_rel[:,0], c_rel[:,1], r_rel])
+            
+            try:
+                res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                               constraints={'type':'ineq', 'fun':constraints},
+                               options={'maxiter':6000, 'ftol':1e-13, 'disp':False})
+                s = -res.fun
+                if s > best_sum:
+                    cons_val = constraints(res.x)
+                    if np.min(cons_val) >= -1e-7:
+                        best_sum = s
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    # Extract best configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Strict post-processing to guarantee validator compliance
+    cr = np.minimum(cr, np.minimum(centers[:,0], 1.0 - centers[:,0]))
+    cr = np.minimum(cr, np.minimum(centers[:,1], 1.0 - centers[:,1]))
+    cr = np.maximum(cr, 0.0)
+    
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < cr[i] + cr[j] - 1e-11:
+                    shr = (cr[i] + cr[j] - d)/2.0 + 1e-11
+                    cr[i] = max(0.0, cr[i] - shr)
+                    cr[j] = max(0.0, cr[j] - shr)
+                    changed = True
+        if not changed: break
+        
+    return centers, cr, float(np.sum(cr))
+```

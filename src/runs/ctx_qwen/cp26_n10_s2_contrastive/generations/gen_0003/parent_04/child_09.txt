@@ -1,0 +1,271 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we will employ a hybrid optimization strategy that combines structured initializations, joint nonlinear optimization (SLSQP), exact linear programming (LP) refinement, and gradient-guided local search on the center coordinates.
+
+Key improvements over previous attempts:
+1. **LP-based Objective Evaluation**: For any fixed set of centers, the optimal radii can be found exactly and rapidly via a small LP problem. This separates the difficult non-convex geometry from the radius sizing.
+2. **Gradient Ascent on Centers**: By leveraging the dual variables (shadow prices) from the LP solution, we can compute an analytical gradient of the total radius sum with respect to center positions. This allows us to push circles apart along active contact constraints much more efficiently than blind random perturbations.
+3. **Multi-Phase Pipeline**: 
+   - Phase 1: Diverse structured initializations (hexagonal, grid, random) followed by joint SLSQP optimization to find a strong local optimum.
+   - Phase 2: LP refinement to extract exact maximum radii for the optimized centers.
+   - Phase 3: Gradient ascent on centers using LP duals to climb the objective landscape precisely.
+   - Phase 4: Stochastic hill-climbing with small perturbations to escape micro-local optima.
+4. **Robustness**: Strict boundary and overlap projection at the end guarantees validity within numerical tolerance. The code avoids closures and lambdas as requested.
+
+This approach systematically explores the configuration space while using mathematical insights (LP duality) to direct search effort towards packing denser arrangements.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+N_PAIRS = len(I_IDX)
+
+def solve_lp_radii(centers):
+    """Solve LP to maximize sum of radii for fixed centers."""
+    n = centers.shape[0]
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    d_pair = dists[I_IDX, J_IDX]
+    
+    d_bound = np.minimum(
+        np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    )
+    
+    A = np.zeros((N_PAIRS, n))
+    A[np.arange(N_PAIRS), I_IDX] = 1.0
+    A[np.arange(N_PAIRS), J_IDX] = 1.0
+    
+    bounds = [(0.0, max(0.0, d)) for d in d_bound]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A, b_ub=d_pair, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun, res
+    except Exception:
+        pass
+    return np.zeros(n), 0.0, None
+
+def compute_center_gradient(centers, res):
+    """Compute gradient of LP objective w.r.t centers using dual variables."""
+    if res is None:
+        return np.zeros_like(centers)
+    
+    n = centers.shape[0]
+    grad = np.zeros((n, 2))
+    
+    # Pair constraints duals
+    try:
+        lambdas = np.abs(res.ineqlin.marginals)
+    except (AttributeError, TypeError):
+        lambdas = np.zeros(N_PAIRS)
+        
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    d_pair = dists[I_IDX, J_IDX]
+    
+    for k in range(N_PAIRS):
+        lam = lambdas[k]
+        if lam > 1e-8:
+            i, j = I_IDX[k], J_IDX[k]
+            d = d_pair[k]
+            if d > 1e-9:
+                vec = centers[i] - centers[j]
+                grad[i] += lam * vec / d
+                grad[j] -= lam * vec / d
+                
+    # Boundary constraints duals
+    try:
+        ub_duals = np.abs(res.upper.marginals)
+    except (AttributeError, TypeError):
+        ub_duals = np.zeros(n)
+        
+    for i in range(n):
+        if ub_duals[i] > 1e-8:
+            x, y = centers[i]
+            vals = np.array([x, 1.0-x, y, 1.0-y])
+            active = np.argmin(vals)
+            if active == 0: grad[i] += ub_duals[i] * np.array([1.0, 0.0])
+            elif active == 1: grad[i] += ub_duals[i] * np.array([-1.0, 0.0])
+            elif active == 2: grad[i] += ub_duals[i] * np.array([0.0, 1.0])
+            else: grad[i] += ub_duals[i] * np.array([0.0, -1.0])
+            
+    return grad
+
+def local_search_gradient(centers, n_steps=400):
+    """Improve centers via gradient ascent on LP objective."""
+    best_centers = centers.copy()
+    best_sum = 0.0
+    step_size = 3e-4
+    
+    for _ in range(n_steps):
+        r, s, res = solve_lp_radii(centers)
+        if s > best_sum:
+            best_sum = s
+            best_centers = centers.copy()
+            
+        grad = compute_center_gradient(centers, res)
+        g_norm = np.linalg.norm(grad)
+        if g_norm > 1e-9:
+            centers += (step_size / g_norm) * grad
+            
+        centers = np.clip(centers, 0.001, 0.999)
+        step_size *= 0.998
+        
+    return best_centers, best_sum
+
+def obj_func(x):
+    return -np.sum(x[2*N:])
+
+def constr_func(x):
+    c = x[:2*N].reshape(N, 2)
+    r = x[2*N:]
+    
+    con = np.concatenate([
+        c[:, 0] - r, 1.0 - c[:, 0] - r,
+        c[:, 1] - r, 1.0 - c[:, 1] - r
+    ])
+    
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    con = np.concatenate([con, dists[I_IDX, J_IDX] - r[I_IDX] - r[J_IDX]])
+    return con
+
+def init_hex(seed):
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    idx = 0
+    row_counts = [6, 5, 6, 5, 4]
+    y_step = 1.0 / (len(row_counts) + 1)
+    
+    for r_idx, cnt in enumerate(row_counts):
+        y = (r_idx + 1) * y_step
+        x_step = 1.0 / (cnt + 1)
+        shift = 0.5 * x_step if r_idx % 2 == 1 else 0.0
+        for c_idx in range(cnt):
+            x = (c_idx + 1) * x_step + shift
+            centers[idx] = [x, y]
+            idx += 1
+            
+    centers += rng.uniform(-0.03, 0.03, centers.shape)
+    return np.clip(centers, 0.05, 0.95)
+
+def generate_inits():
+    inits = []
+    for seed in range(10):
+        inits.append(init_hex(seed))
+        
+    for seed in range(5):
+        rng = np.random.RandomState(seed+100)
+        c = np.zeros((N, 2))
+        idx = 0
+        step = 0.18
+        for i in range(7):
+            for j in range(7):
+                if idx < N:
+                    c[idx] = [0.05 + j*step, 0.05 + i*step]
+                    idx += 1
+        c += rng.uniform(-0.02, 0.02, c.shape)
+        inits.append(np.clip(c, 0.02, 0.98))
+        
+    for seed in range(5):
+        rng = np.random.RandomState(seed+200)
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    return inits
+
+def run_packing():
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    bounds_opt = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constr_func}
+    
+    inits = generate_inits()
+    
+    # Phase 1: Multi-start SLSQP
+    for c0 in inits:
+        r0, _, _ = solve_lp_radii(c0)
+        r0 = np.maximum(r0 * 0.9, 0.01)
+        x0 = np.concatenate([c0.flatten(), r0])
+        
+        try:
+            res = minimize(obj_func, x0, method='SLSQP', bounds=bounds_opt,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14})
+            c_opt = res.x[:2*N].reshape(N, 2)
+            r_opt = solve_lp_radii(c_opt)[0]
+            s_opt = np.sum(r_opt)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Gradient ascent on centers
+    if best_c is not None:
+        c_opt, s_opt = local_search_gradient(best_c, n_steps=500)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt
+            best_r = solve_lp_radii(best_c)[0]
+            
+        for trial in range(4):
+            rng = np.random.RandomState(trial*7+1)
+            c_pert = best_c + rng.normal(0, 0.004, best_c.shape)
+            c_pert = np.clip(c_pert, 0.01, 0.99)
+            c_opt, s_opt = local_search_gradient(c_pert, n_steps=300)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt
+                best_r = solve_lp_radii(best_c)[0]
+                
+    # Phase 3: Random perturbation hill-climbing
+    if best_c is not None:
+        rng = np.random.RandomState(42)
+        current_c = best_c.copy()
+        current_s = best_sum
+        for _ in range(200):
+            pert = rng.normal(0, 0.002, current_c.shape)
+            new_c = np.clip(current_c + pert, 0.005, 0.995)
+            r_new, s_new, _ = solve_lp_radii(new_c)
+            if s_new > current_s:
+                current_c = new_c
+                current_s = s_new
+                best_c = current_c.copy()
+                best_r = r_new.copy()
+                best_sum = current_s
+                
+    if best_c is None:
+        best_c = init_hex(0)
+        best_r, best_sum, _ = solve_lp_radii(best_c)
+        
+    # Strict validation and fixing
+    for i in range(N):
+        mx = min(best_c[i,0], 1-best_c[i,0], best_c[i,1], 1-best_c[i,1])
+        if best_r[i] > mx:
+            best_r[i] = max(0.0, mx - 1e-9)
+            
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+                if d < best_r[i] + best_r[j] - 1e-10:
+                    exc = best_r[i] + best_r[j] - d
+                    best_r[i] -= exc/2
+                    best_r[j] -= exc/2
+                    changed = True
+        if not changed:
+            break
+            
+    best_r = np.maximum(best_r, 0.0)
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

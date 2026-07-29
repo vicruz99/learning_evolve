@@ -1,0 +1,170 @@
+# sol_000336 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 29661f66) state=fdce7594 sum of radii=2.277874 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a physics-based repulsion/attraction simulation.
+    """
+    n = 26
+    np.random.seed(42)
+    
+    # Initialize centers in a hexagonal grid pattern
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.05  # Start with small radii
+    
+    idx = 0
+    row = 0
+    col = 0
+    # Approximate spacing for 26 circles
+    # 5 rows of 5-6 circles
+    while idx < n:
+        x = 0.1 + col * 0.18 * (1 if row % 2 == 0 else 1.0)
+        y = 0.1 + row * 0.15
+        
+        # Adjust for hexagonal offset
+        if row % 2 != 0:
+            x += 0.09
+        
+        if x < 0.9 and y < 0.9:
+            centers[idx] = [x, y]
+            idx += 1
+            col += 1
+        else:
+            col = 0
+            row += 1
+            if row % 2 != 0:
+                 x = 0.1 + col * 0.18 + 0.09 # Start shifted row correctly
+            else:
+                 x = 0.1 + col * 0.18
+    
+    # Reset radii to a reasonable initial value based on grid
+    radii = np.full(n, 0.08)
+    
+    # Simulation parameters
+    dt = 0.05
+    damping = 0.95
+    force_factor = 1.0
+    radius_growth_rate = 0.001
+    
+    # Run simulation
+    for step in range(2000):
+        forces = np.zeros_like(centers)
+        
+        # Calculate repulsion forces between circles
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist_vec = centers[i] - centers[j]
+                dist = np.linalg.norm(dist_vec)
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist and dist > 1e-6:
+                    # Overlap penalty: push apart
+                    overlap = min_dist - dist
+                    force_mag = overlap * force_factor / dist
+                    force_vec = dist_vec * force_mag
+                    forces[i] += force_vec
+                    forces[j] -= force_vec
+        
+        # Boundary repulsion: keep circles inside [0,1]x[0,1]
+        # If circle is too close to boundary, push inward and limit radius
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left wall
+            if x - r < 0:
+                forces[i, 0] += (r - x) * 10.0
+                radii[i] = x # Clamp radius to fit
+            # Right wall
+            if x + r > 1:
+                forces[i, 0] -= (x + r - 1) * 10.0
+                radii[i] = 1 - x
+            # Bottom wall
+            if y - r < 0:
+                forces[i, 1] += (r - y) * 10.0
+                radii[i] = y
+            # Top wall
+            if y + r > 1:
+                forces[i, 1] -= (y + r - 1) * 10.0
+                radii[i] = 1 - y
+            
+            # Ensure radius is positive
+            if radii[i] < 1e-6:
+                radii[i] = 1e-6
+                # Push away from boundaries if radius is tiny
+                if x < 0.5: forces[i, 0] += 0.1
+                else: forces[i, 0] -= 0.1
+                if y < 0.5: forces[i, 1] += 0.1
+                else: forces[i, 1] -= 0.1
+
+        # Update centers
+        centers += forces * dt
+        centers = np.clip(centers, 1e-6, 1 - 1e-6) # Keep centers strictly inside
+        
+        # Try to grow radii slightly if not overlapping
+        # A simple heuristic: if force is low, grow radius
+        current_overlap = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                if dist < radii[i] + radii[j]:
+                    current_overlap += (radii[i] + radii[j] - dist)**2
+        
+        if current_overlap < 1e-5:
+            # Gently increase radii
+            radii += radius_growth_rate
+        else:
+            # Reduce growth or shrink slightly to escape local min
+            radii *= 0.999
+            
+        # Decay damping
+        dt *= damping
+        
+    # Final cleanup: ensure strict validity
+    # Solve for max radii given fixed centers using a simple iterative method
+    # This projects the problem onto the feasible set of radii for fixed centers
+    for _ in range(100):
+        changed = False
+        # Update radii based on boundaries
+        for i in range(n):
+            r_bound = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            if radii[i] > r_bound:
+                radii[i] = r_bound
+                changed = True
+        
+        # Update radii based on neighbors (bipartite update style or random order)
+        # We use a relaxation method: r_i = min(r_i, dist_ij - r_j)
+        # To avoid oscillation, we can just clamp.
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                # Constraint: r_i + r_j <= dist
+                # If violated, reduce the larger radius or split reduction
+                if radii[i] + radii[j] > dist:
+                    excess = (radii[i] + radii[j] - dist)
+                    # Reduce proportional to radius or just split
+                    # Simple split:
+                    reduction = excess / 2.0
+                    radii[i] -= reduction
+                    radii[j] -= reduction
+                    changed = True
+                    if radii[i] < 1e-9: radii[i] = 1e-9
+                    if radii[j] < 1e-9: radii[j] = 1e-9
+        
+        if not changed:
+            break
+            
+    # Ensure non-negative
+    radii = np.maximum(radii, 0.0)
+    
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii
+
+# Helper for validation if needed, but the function returns the tuple
+# The validation function is provided in the prompt, we just need to run_packing

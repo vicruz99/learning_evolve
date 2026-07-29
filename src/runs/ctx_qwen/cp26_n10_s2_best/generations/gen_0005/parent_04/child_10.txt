@@ -1,0 +1,231 @@
+
+
+<strategy>
+To improve the packing sum of radii from ~2.630 to >2.636, I will employ a multi-phase optimization strategy that leverages known properties of dense circle packings:
+1. **Equal-Radius Pre-optimization**: Optimal packings for fixed N are often nearly equal in radius. I will first optimize a configuration assuming all radii are equal (`R`). This drastically reduces the search space (2N+1 variables) and quickly converges to a highly symmetric, dense layout.
+2. **Diverse Initial Configurations**: I will generate starting points using multiple hexagonal row distributions (e.g., [6,5,6,5,4], [7,5,6,5,3]) and force-directed relaxations from random seeds. This ensures coverage of different topological arrangements.
+3. **Full Optimization & Refinement**: The best equal-radius configurations will serve as initial guesses for the full variable-radius optimization. I will then run an iterative refinement phase that perturbs centers, shrinks radii to create slack, and re-optimizes. Occasional coordinate swaps will break symmetries that trap gradient-based solvers.
+4. **Strict Constraint Handling & Post-processing**: Squared distance constraints will be used for smooth gradients during optimization. A rigorous post-processing step will enforce boundary and non-overlap constraints to guarantee validator compliance.
+This structured approach systematically explores the configuration space, exploits geometric priors, and refines solutions to push past local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and squared non-overlap."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c = np.empty(4*N + N*(N-1)//2)
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    return c
+
+def objective_eq(v):
+    """Objective for equal-radius phase: minimize negative total radius."""
+    return -N * v[-1]
+
+def constraints_eq(v):
+    """Constraints for equal-radius phase."""
+    x = v[:N]
+    y = v[N:2*N]
+    R = v[-1]
+    c = np.empty(4*N + N*(N-1)//2)
+    c[:N] = x - R
+    c[N:2*N] = 1.0 - x - R
+    c[2*N:3*N] = y - R
+    c[3*N:4*N] = 1.0 - y - R
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - 4.0*R**2
+    return c
+
+def make_feasible_radii(centers):
+    """Compute strictly feasible radii for given centers with safety margin."""
+    r = np.full(N, 0.5)
+    for i in range(N):
+        mr = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        for j in range(N):
+            if i != j:
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                val = d / 2.0
+                if val < mr:
+                    mr = val
+        r[i] = mr
+    return r * 0.75
+
+def generate_hex_starts():
+    """Generate hexagonal lattice configurations with various row distributions."""
+    starts = []
+    row_counts_list = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [7, 5, 6, 5, 3],
+        [4, 6, 6, 6, 4], [5, 5, 5, 5, 6], [6, 6, 5, 5, 4],
+        [8, 6, 6, 6], [7, 7, 6, 6], [6, 7, 7, 6], [5, 7, 6, 5, 3]
+    ]
+    
+    for counts in row_counts_list:
+        for rot in [0.0, 0.08, -0.08, 0.15, -0.15]:
+            pts = []
+            y = 0.04
+            row_idx = 0
+            for cnt in counts:
+                x_start = 0.04 + (0.5 if row_idx % 2 == 1 else 0.0) * 0.11
+                for c in range(cnt):
+                    pts.append([x_start + c * 0.11, y])
+                y += 0.095
+                row_idx += 1
+            pts = np.array(pts[:N])
+            
+            # Rotate and center
+            pts -= 0.5
+            cos_a, sin_a = np.cos(rot), np.sin(rot)
+            pts = pts @ np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            pts += 0.5
+            pts = np.clip(pts, 0.02, 0.98)
+            
+            r = make_feasible_radii(pts)
+            starts.append(np.concatenate([pts[:, 0], pts[:, 1], r]))
+    return starts
+
+def generate_force_starts():
+    """Generate force-relaxed random configurations."""
+    starts = []
+    for seed in range(20):
+        np.random.seed(seed + 1000)
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        for _ in range(250):
+            forces = np.zeros_like(pts)
+            diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+            dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+            mask = dists < 0.22
+            f_mag = np.zeros_like(dists)
+            f_mag[mask] = (0.22 - dists[mask]) / dists[mask]
+            f_vec = diff * f_mag[:, :, np.newaxis]
+            forces = np.sum(f_vec, axis=1)
+            pts += forces * 0.04
+            pts = np.clip(pts, 0.03, 0.97)
+        r = make_feasible_radii(pts)
+        starts.append(np.concatenate([pts[:, 0], pts[:, 1], r]))
+    return starts
+
+def optimize_equal_radius(centers_init):
+    """Optimize configuration assuming all circles have the same radius R."""
+    x0 = np.concatenate([centers_init[:, 0], centers_init[:, 1], [0.05]])
+    bounds_eq = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)]
+    
+    try:
+        res = minimize(objective_eq, x0, method='SLSQP', bounds=bounds_eq, 
+                       constraints={'type': 'ineq', 'fun': constraints_eq},
+                       options={'maxiter': 2500, 'ftol': 1e-12, 'disp': False})
+        return res.x
+    except Exception:
+        return x0
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    # Phase 1: Generate diverse initial configurations
+    all_starts = generate_hex_starts() + generate_force_starts()
+    
+    # Phase 2: Equal-radius pre-optimization to find dense symmetric layouts
+    equal_starts = []
+    for v0 in all_starts:
+        centers = np.column_stack([v0[:N], v0[N:2*N]])
+        res_eq = optimize_equal_radius(centers)
+        # Convert equal-radius solution to full variable format
+        v_eq = np.concatenate([res_eq[:2*N], np.full(N, res_eq[-1])])
+        equal_starts.append(v_eq)
+        
+    # Phase 3: Full optimization from pre-optimized starts
+    for v0 in equal_starts:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 4000, 'ftol': 1e-12, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-6:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        best_v = equal_starts[0]
+        
+    # Phase 4: Iterative refinement to escape local minima and symmetries
+    current_v = best_v.copy()
+    for step in range(40):
+        pert = current_v.copy()
+        noise_scale = 0.004 * (1.0 - step / 40.0)
+        
+        # Perturb centers slightly
+        pert[:2*N] += np.random.uniform(-noise_scale, noise_scale, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        
+        # Occasional coordinate swap to break grid symmetries
+        if step % 5 == 0:
+            idx1, idx2 = np.random.choice(N, 2, replace=False)
+            pert[idx1], pert[idx2] = pert[idx2], pert[idx1]
+            pert[N+idx1], pert[N+idx2] = pert[N+idx2], pert[N+idx1]
+            
+        # Shrink radii and recompute feasible bounds to guarantee valid restart
+        centers_pert = np.column_stack([pert[:N], pert[N:2*N]])
+        pert[2*N:] = make_feasible_radii(centers_pert) * 0.88
+        
+        try:
+            res = minimize(objective, pert, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-6:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    current_v = best_v.copy()
+        except Exception:
+            pass
+            
+    # Extract final configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    
+    # Strict post-processing to guarantee validator compliance
+    for _ in range(5):
+        for i in range(N):
+            cr[i] = min(cr[i], cx[i], 1.0 - cx[i], cy[i], 1.0 - cy[i])
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                if cr[i] + cr[j] > d - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    
+    centers = np.column_stack([cx, cy])
+    return centers, cr, float(np.sum(cr))
+```

@@ -1,0 +1,130 @@
+# sol_000059 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 9227c4d6) state=69caf99e sum of radii=2.393654 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def generate_hex_grid(n, seed_val):
+    """Generates an initial hexagonal packing configuration."""
+    np.random.seed(seed_val)
+    # Estimate radius based on area and packing efficiency
+    r_init = 0.095
+    rows = []
+    count = 0
+    
+    # Fill rows in a hexagonal pattern
+    y = r_init
+    row_idx = 0
+    while count < n:
+        # Alternating rows are shifted
+        x_start = r_init + (r_init * (row_idx % 2))
+        row_circles = []
+        x = x_start
+        while x + r_init <= 1.0 + 1e-9:
+            if count < n:
+                row_circles.append([x, y, r_init])
+                count += 1
+            x += 2 * r_init
+        rows.append(row_circles)
+        y += r_init * np.sqrt(3)
+        row_idx += 1
+        
+    centers = []
+    radii = []
+    for row in rows:
+        for c in row:
+            centers.append(c[:2])
+            radii.append(c[2])
+            
+    return np.array(centers), np.array(radii)
+
+def evaluate_cost(x, n):
+    """Cost function: overlap penalty + boundary penalty."""
+    cost = 0.0
+    centers = x[:2*n].reshape((n, 2))
+    radii = x[2*n:]
+    
+    # Boundary constraints: x, y must be within [r, 1-r]
+    for i in range(n):
+        r = radii[i]
+        if r < 0: r = 0
+        # Penalty for being too close to boundary
+        cost += max(0, r - centers[i, 0])**2 + max(0, centers[i, 0] - (1.0 - r))**2
+        cost += max(0, r - centers[i, 1])**2 + max(0, centers[i, 1] - (1.0 - r))**2
+
+    # Overlap constraints
+    for i in range(n):
+        r_i = radii[i]
+        if r_i < 0: r_i = 0
+        for j in range(i + 1, n):
+            r_j = radii[j]
+            if r_j < 0: r_j = 0
+            
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            req_dist = r_i + r_j
+            if dist < req_dist:
+                cost += (req_dist - dist)**2
+                
+    return cost
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_centers = None
+    best_radii = None
+    min_cost = float('inf')
+    
+    # Run multiple times with different random seeds for robustness
+    for seed in range(5):
+        try:
+            # 1. Generate initial hexagonal grid
+            init_centers, init_radii = generate_hex_grid(n, seed)
+            
+            # 2. Flatten variables for optimizer
+            x0 = np.concatenate([init_centers.flatten(), init_radii])
+            
+            # 3. Define bounds (Center in [0,1], Radius in [0, 0.5])
+            bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+            
+            # 4. Optimize: Minimize cost (which corresponds to maximizing radii)
+            res = opt.minimize(evaluate_cost, x0, args=(n,), method='L-BFGS-B', 
+                               bounds=bounds, options={'ftol': 1e-15, 'maxiter': 2000})
+            
+            if res.fun < min_cost:
+                min_cost = res.fun
+                best_centers = res.x[:2*n].reshape((n, 2))
+                best_radii = res.x[2*n:]
+        except Exception:
+            continue
+
+    # Final validation check
+    if best_centers is not None:
+        if validate_packing(best_centers, best_radii):
+            return best_centers, best_radii, np.sum(best_radii)
+    
+    # Fallback (should not happen with the logic above)
+    return np.zeros((26, 2)), np.zeros(26), 0.0
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    import numpy as np
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True

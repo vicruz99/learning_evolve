@@ -1,0 +1,206 @@
+
+
+<strategy>
+I need to pack 26 circles in a unit square to maximize the sum of radii. Here's my strategy:
+
+1. **Problem Structure**: This is a non-convex optimization problem. The key insight is that with unequal circles, we can achieve higher sum of radii than equal circles by placing larger circles in the interior and smaller ones near boundaries.
+
+2. **Two-Level Optimization Approach**:
+   - **Lower level**: Given fixed centers, the optimal radii can be found exactly via Linear Programming (LP). This gives us the maximum sum of radii for any center configuration.
+   - **Upper level**: Optimize centers to maximize the LP solution.
+
+3. **Initialization**: Use a hexagonal lattice pattern, which is known to be near-optimal for circle packing. For 26 circles, I'll use ~6 rows with alternating 4-5 circles per row.
+
+4. **Optimization Strategy**:
+   - Use differential evolution for global search over center positions (robust to local optima)
+   - After DE, refine with SLSQP (gradient-based, faster convergence)
+   - Use the LP solver (cvxpy/ECOS) to compute optimal radii at each evaluation
+   - Multiple restarts with different initial configurations
+
+5. **Constraints Handling**: 
+   - Boundary: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+   - Non-overlap: ||c_i - c_j|| >= r_i + r_j
+
+6. **Post-processing**: After optimization, re-solve the LP to ensure radii are optimal for the final centers.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution, basinhopping
+import cvxpy as cp
+
+
+def solve_radii_lp(centers):
+    """Given fixed centers, find optimal radii via LP."""
+    n = centers.shape[0]
+    r = cp.Variable(n)
+    constraints = []
+
+    for i in range(n):
+        x, y = centers[i]
+        constraints.append(r[i] <= x)
+        constraints.append(r[i] <= 1.0 - x)
+        constraints.append(r[i] <= y)
+        constraints.append(r[i] <= 1.0 - y)
+        constraints.append(r[i] >= 0)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            constraints.append(r[i] + r[j] <= d)
+
+    prob = cp.Problem(cp.Maximize(cp.sum(r)), constraints)
+    prob.solve(solver=cp.ECOS, verbose=False)
+
+    if r.value is None:
+        return np.zeros(n)
+    return np.array(r.value)
+
+
+def neg_sum_radii_for_de(center_flat):
+    """Objective for differential evolution: minimize negative sum of radii."""
+    centers = center_flat.reshape(N_CIRCLES, 2)
+    radii = solve_radii_lp(centers)
+    return -np.sum(radii)
+
+
+def make_hex_init(n, row_shift=0.0, col_shift=0.0):
+    """Create hexagonal initial configuration."""
+    centers = np.zeros((n, 2))
+    idx = 0
+    n_rows = 6
+    for row in range(n_rows):
+        ncols = 5 if row % 2 == 0 else 4
+        for col in range(ncols):
+            if idx < n:
+                x = (col + 0.5 + (row % 2) * 0.5 + col_shift) / 5.0
+                y = (row + 0.5 + row_shift) / n_rows
+                x = np.clip(x, 0.05, 0.95)
+                y = np.clip(y, 0.05, 0.95)
+                centers[idx] = [x, y]
+                idx += 1
+            if idx >= n:
+                break
+        if idx >= n:
+            break
+    return centers
+
+
+def constraint_array(params):
+    """Combined constraint function for SLSQP."""
+    n = N_CIRCLES
+    vals = []
+    for i in range(n):
+        x = params[2 * i]
+        y = params[2 * i + 1]
+        r = params[2 * n + i]
+        vals.extend([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = params[2 * i] - params[2 * j]
+            dy = params[2 * i + 1] - params[2 * j + 1]
+            d = np.sqrt(dx * dx + dy * dy)
+            vals.append(d - params[2 * n + i] - params[2 * n + j])
+    return np.array(vals)
+
+
+def neg_sum_radii(params):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(params[2 * N_CIRCLES:])
+
+
+def refine_with_slscp(centers, radii):
+    """Refine using SLSQP joint optimization."""
+    n = N_CIRCLES
+    params0 = np.concatenate([centers.flatten(), radii])
+
+    cons = [{'type': 'ineq', 'fun': constraint_array}]
+    bounds = [(0.005, 0.995)] * (2 * n) + [(0, 0.4)] * n
+
+    try:
+        result = minimize(neg_sum_radii, params0, method='SLSQP',
+                         constraints=cons, bounds=bounds,
+                         options={'maxiter': 3000, 'ftol': 1e-15})
+
+        c_opt = result.x[:2 * n].reshape(n, 2)
+        r_opt = np.maximum(result.x[2 * n:], 1e-10)
+        return c_opt, r_opt
+    except Exception:
+        return centers, radii
+
+
+def run_packing():
+    global N_CIRCLES
+    N_CIRCLES = 26
+
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+
+    # Strategy 1: Differential evolution for global search
+    bounds_de = [(0.01, 0.99)] * (2 * N_CIRCLES)
+
+    for seed in range(3):
+        try:
+            result_de = differential_evolution(
+                neg_sum_radii_for_de, bounds_de,
+                seed=seed, maxiter=300, popsize=15,
+                tol=1e-7, mutation=(0.5, 1.5), recombination=0.7,
+                polish=False
+            )
+
+            c_de = result_de.x.reshape(N_CIRCLES, 2)
+            r_de = solve_radii_lp(c_de)
+
+            # Refine with SLSQP
+            c_ref, r_ref = refine_with_slscp(c_de, r_de)
+
+            # Final LP pass
+            r_final = solve_radii_lp(c_ref)
+            s = np.sum(r_final)
+
+            if s > best_sum:
+                best_sum = s
+                best_c = c_ref.copy()
+                best_r = r_final.copy()
+        except Exception:
+            pass
+
+    # Strategy 2: Multiple hexagonal restarts with SLSQP refinement
+    for row_shift in np.linspace(-0.2, 0.2, 5):
+        for col_shift in np.linspace(-0.1, 0.1, 3):
+            centers = make_hex_init(N_CIRCLES, row_shift, col_shift)
+            radii = solve_radii_lp(centers)
+
+            c_ref, r_ref = refine_with_slscp(centers, radii)
+            r_final = solve_radii_lp(c_ref)
+            s = np.sum(r_final)
+
+            if s > best_sum:
+                best_sum = s
+                best_c = c_ref.copy()
+                best_r = r_final.copy()
+
+    # Strategy 3: Perturb best solution and refine
+    if best_c is not None:
+        for pert_seed in range(5):
+            np.random.seed(pert_seed + 100)
+            c_pert = best_c + np.random.randn(N_CIRCLES, 2) * 0.02
+            c_pert = np.clip(c_pert, 0.05, 0.95)
+
+            r_pert = solve_radii_lp(c_pert)
+            c_ref, r_ref = refine_with_slscp(c_pert, r_pert)
+            r_final = solve_radii_lp(c_ref)
+            s = np.sum(r_final)
+
+            if s > best_sum:
+                best_sum = s
+                best_c = c_ref.copy()
+                best_r = r_final.copy()
+
+    # Final LP pass to ensure optimality
+    best_r = solve_radii_lp(best_c)
+    final_sum = float(np.sum(best_r))
+
+    return best_c, best_r, final_sum
+```

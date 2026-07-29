@@ -1,0 +1,211 @@
+# sol_000088 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000070 (state 16cb787f) state=0645ca5b sum of radii=2.622383 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def objective_func(x):
+    return -np.sum(x[2::3])
+
+def constraint_func(x):
+    cx = x[0::3]
+    cy = x[1::3]
+    cr = x[2::3]
+    c = np.concatenate([cx - cr, 1.0 - cx - cr, cy - cr, 1.0 - cy - cr])
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dr = cr[:, None] + cr[None, :]
+    idx = np.tril_indices(N, -1)
+    c = np.concatenate([c, dx[idx]**2 + dy[idx]**2 - dr[idx]**2])
+    return c
+
+def get_bounds():
+    return [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+
+def solve_lp_radii(centers):
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    num_ineq = n + n * (n - 1) // 2
+    A = np.zeros((num_ineq, n))
+    b = np.zeros(num_ineq)
+    idx = 0
+    for i in range(n):
+        lim = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        A[idx, i] = 1.0
+        b[idx] = max(0.0, lim)
+        idx += 1
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = max(0.0, dist)
+            idx += 1
+    try:
+        res = linprog(c_obj, A_ub=A, b_ub=b, bounds=[(0, None)]*n, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return None
+
+def generate_hex_init(seed, angle=0.0):
+    np.random.seed(seed)
+    pts = []
+    r0 = 0.095
+    y = r0
+    row = 0
+    while len(pts) < N + 10:
+        x = r0 if row % 2 == 0 else 2.0 * r0
+        while x <= 1.0 - r0:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+    pts = np.array(pts[:N+10])
+    if angle != 0.0:
+        cx, cy = 0.5, 0.5
+        ca, sa = np.cos(angle), np.sin(angle)
+        dx = pts[:, 0] - cx
+        dy = pts[:, 1] - cy
+        pts[:, 0] = dx * ca - dy * sa + cx
+        pts[:, 1] = dx * sa + dy * ca + cy
+    mask = (pts[:,0]>=0.05) & (pts[:,0]<=0.95) & (pts[:,1]>=0.05) & (pts[:,1]<=0.95)
+    pts = pts[mask]
+    if len(pts) < N:
+        pad = N - len(pts)
+        pts = np.vstack([pts, np.random.uniform(0.2, 0.8, (pad, 2))])
+    return pts[:N]
+
+def force_directed_init(seed, steps=400):
+    np.random.seed(seed)
+    pts = np.random.uniform(0.1, 0.9, (N, 2))
+    for _ in range(steps):
+        f = np.zeros_like(pts)
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(pts[i,0]-pts[j,0], pts[i,1]-pts[j,1])
+                if d < 0.22 and d > 1e-5:
+                    k = 0.015 / (d**2 + 0.001)
+                    f[i,0] += k * (pts[i,0]-pts[j,0])
+                    f[i,1] += k * (pts[i,1]-pts[j,1])
+            for dim in range(2):
+                if pts[i, dim] < 0.05: f[i, dim] += 0.04
+                elif pts[i, dim] > 0.95: f[i, dim] -= 0.04
+        pts += f * 0.04
+        pts = np.clip(pts, 0.02, 0.98)
+    return pts
+
+def project_to_bounds(x):
+    out = x.copy()
+    for i in range(N):
+        r = max(0.001, out[3*i+2])
+        out[3*i] = np.clip(out[3*i], r, 1.0-r)
+        out[3*i+1] = np.clip(out[3*i+1], r, 1.0-r)
+        out[3*i+2] = r
+    return out
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    inits = []
+    for s in range(10):
+        inits.append(generate_hex_init(s, angle=0.0))
+    for s in range(8):
+        inits.append(generate_hex_init(s, angle=0.2))
+    for s in range(8):
+        inits.append(generate_hex_init(s, angle=-0.2))
+    for s in range(6):
+        inits.append(force_directed_init(s))
+    for s in range(5):
+        np.random.seed(s)
+        inits.append(np.random.uniform(0.15, 0.85, (N, 2)))
+        
+    for pts in inits:
+        r_lp = solve_lp_radii(pts)
+        if r_lp is None:
+            r_lp = np.full(N, 0.06)
+            
+        x0 = np.zeros(3*N)
+        x0[0::3] = pts[:,0]
+        x0[1::3] = pts[:,1]
+        x0[2::3] = r_lp
+        x0 = project_to_bounds(x0)
+        
+        try:
+            res = minimize(objective_func, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 25000, 'ftol': 1e-14, 'disp': False})
+            if not np.isnan(res.fun):
+                c_vals = constraint_func(res.x)
+                if np.min(c_vals) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_x is not None:
+        for step in range(12):
+            x0 = best_x.copy()
+            x0[2::3] *= 0.982
+            noise = 0.0025 / (step + 1)
+            x0[0::3] += np.random.normal(0, noise, N)
+            x0[1::3] += np.random.normal(0, noise, N)
+            x0 = project_to_bounds(x0)
+            
+            try:
+                res = minimize(objective_func, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 30000, 'ftol': 1e-14, 'disp': False})
+                if not np.isnan(res.fun):
+                    c_vals = constraint_func(res.x)
+                    if np.min(c_vals) >= -1e-7:
+                        curr_sum = -res.fun
+                        if curr_sum > best_sum:
+                            best_sum = curr_sum
+                            best_x = res.x.copy()
+            except Exception:
+                pass
+                
+            if best_x is not None:
+                c_temp = np.column_stack((best_x[0::3], best_x[1::3]))
+                r_lp = solve_lp_radii(c_temp)
+                if r_lp is not None and np.sum(r_lp) > best_sum - 1e-7:
+                    best_x[2::3] = r_lp
+                    best_sum = np.sum(r_lp)
+
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3].copy()
+    
+    for _ in range(100):
+        valid = True
+        for i in range(N):
+            if radii[i] < 0 or centers[i,0] < radii[i]-1e-9 or centers[i,0] > 1.0-radii[i]+1e-9 or \
+               centers[i,1] < radii[i]-1e-9 or centers[i,1] > 1.0-radii[i]+1e-9:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i+1, N):
+                    d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                    if d < radii[i]+radii[j]-1e-9:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+        radii *= 0.9995
+        centers[:,0] = np.clip(centers[:,0], radii, 1.0-radii)
+        centers[:,1] = np.clip(centers[:,1], radii, 1.0-radii)
+        
+    return centers, radii, float(np.sum(radii))

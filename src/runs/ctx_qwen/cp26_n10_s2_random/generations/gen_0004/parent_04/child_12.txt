@@ -1,0 +1,249 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.627207) and target 2.636, I will employ a multi-stage optimization pipeline that combines global exploration with local refinement:
+
+1. **Centers-Only Optimization with Powell**: The non-smooth nature of the "maximum valid radius for fixed centers" objective makes derivative-free methods like Powell highly effective. I will optimize only the 52 center coordinates first, which reduces dimensionality and avoids constraint handling overhead during the global search phase.
+2. **Diverse & Structured Initializations**: Instead of purely random starts, I will generate configurations based on hexagonal lattices with varying row counts (e.g., 4-5-5-5-5-2, 5-5-5-5-5-1), square grids, and corner-pushed layouts. These are then perturbed and centered. This dramatically increases the chance of landing in the basin of the global optimum.
+3. **Joint SLSQP Polishing**: Once a promising center configuration is found, I will switch to a joint optimization of (centers, radii) using SLSQP with explicit inequality constraints. This allows the solver to precisely balance the trade-off between circle positions and sizes, pushing radii to their theoretical limits under the constraints.
+4. **Iterative Basin-Hopping & Local Pairwise Refinement**: To escape local maxima, I will implement a loop that perturbs the best configuration, re-optimizes centers, and then polishes jointly. Additionally, I will add a phase that selects random pairs of circles and optimizes their positions locally while fixing others, which is highly effective at untangling suboptimal local clusterings.
+5. **Deterministic Repair & Slack Utilization**: A strict repair phase will resolve any numerical overlaps. Finally, I will attempt to "grow" circles that are not constrained by neighbors, pushing them until they hit a boundary or another circle, squeezing out the last bits of radius sum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+_MASK_I, _MASK_J = np.triu_indices(N, k=1)
+NUM_PAIRS = N * (N - 1) // 2
+
+def compute_radii_from_centers(centers):
+    """Computes the maximum valid radius for each circle given fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    # Distance to boundaries
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise distances using broadcasting
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Radius limited by half the distance to the nearest neighbor
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective_centers(v):
+    """Objective for centers-only optimization: minimize negative sum of radii."""
+    centers = v.reshape(N, 2)
+    # Soft penalty for out-of-bounds to keep Powell within [0,1] effectively
+    penalty = np.sum(np.maximum(0.0, -centers)) + np.sum(np.maximum(0.0, centers - 1.0))
+    radii = compute_radii_from_centers(centers)
+    return -np.sum(radii) + 1e4 * penalty
+
+def compute_constraints_joint(v):
+    """Computes inequality constraints for SLSQP joint optimization."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    cons = np.concatenate([
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ])
+    
+    # Overlap constraints: dist(i, j) >= r_i + r_j
+    dx = c[_MASK_I, 0] - c[_MASK_J, 0]
+    dy = c[_MASK_I, 1] - c[_MASK_J, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    cons = np.concatenate([cons, dists - (r[_MASK_I] + r[_MASK_J])])
+    
+    return cons
+
+def objective_joint(v):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def generate_hex_init(rows_pattern, scale=1.0, noise=0.0):
+    """Generates a hexagonal lattice configuration with specified row counts."""
+    centers = []
+    r_guess = 0.10
+    y = r_guess
+    dy = np.sqrt(3.0) * r_guess
+    dx = 2.0 * r_guess
+    
+    for i, cnt in enumerate(rows_pattern):
+        offset = (dx / 2.0) if (i % 2 == 1) else 0.0
+        x = r_guess + offset
+        for _ in range(cnt):
+            centers.append([x * scale, y * scale])
+            x += dx * scale
+        y += dy * scale
+        
+    centers = np.array(centers[:N])
+    if noise > 0:
+        centers += np.random.normal(0, noise, centers.shape)
+    return np.clip(centers, 0.02, 0.98)
+
+def repair_solution(centers, radii):
+    """Iteratively shrinks radii to strictly satisfy validation tolerances."""
+    radii = radii.copy()
+    for _ in range(30):
+        changed = False
+        # Resolve overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    ov = radii[i] + radii[j] - d
+                    radii[i] -= ov / 2.0
+                    radii[j] -= ov / 2.0
+                    changed = True
+                    
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    best_centers = None
+    best_sum = -1.0
+    best_radii = None
+    
+    # ---------------------------------------------------------
+    # Phase 1: Generate Diverse Initial Configurations
+    # ---------------------------------------------------------
+    starts = []
+    
+    # Hexagonal patterns summing to 26
+    patterns = [[5, 5, 5, 5, 5, 1], [4, 5, 5, 5, 5, 2], [5, 5, 5, 6, 5], [6, 5, 5, 5, 5]]
+    for pat in patterns:
+        for s in [0.95, 1.0, 1.05]:
+            c = generate_hex_init(pat, scale=s, noise=0.005)
+            starts.append(c)
+            
+    # Square grid + fill
+    for _ in range(5):
+        gx = np.linspace(0.12, 0.88, 5)
+        gy = np.linspace(0.12, 0.88, 5)
+        cx, cy = np.meshgrid(gx, gy)
+        c = np.column_stack((cx.flatten(), cy.flatten()))
+        c = np.vstack([c, [0.5, 0.5]])
+        c += rng.normal(0, 0.01, c.shape)
+        starts.append(np.clip(c, 0.05, 0.95))
+        
+    # Dense random
+    for _ in range(15):
+        starts.append(np.clip(rng.uniform(0.05, 0.95, (N, 2)), 0.05, 0.95))
+
+    # ---------------------------------------------------------
+    # Phase 2: Multi-Start Centers Optimization (Powell)
+    # ---------------------------------------------------------
+    bounds_centers = [(0.0, 1.0)] * (2 * N)
+    
+    for c0 in starts:
+        try:
+            res = minimize(objective_centers, c0.flatten(), method='Powell',
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'xtol': 1e-12})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = res.x.reshape(N, 2).copy()
+        except Exception:
+            continue
+            
+    # ---------------------------------------------------------
+    # Phase 3: Iterative Basin-Hopping & Pairwise Refinement
+    # ---------------------------------------------------------
+    if best_centers is not None:
+        for _ in range(25):
+            # Perturb best centers
+            pert = best_centers + rng.normal(0, 0.002, best_centers.shape)
+            pert = np.clip(pert, 0.02, 0.98)
+            
+            try:
+                res = minimize(objective_centers, pert.flatten(), method='Powell',
+                               options={'maxiter': 1500, 'ftol': 1e-12})
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_centers = res.x.reshape(N, 2).copy()
+            except Exception:
+                pass
+                
+            # Local pairwise refinement: pick random pairs, optimize their positions
+            for _ in range(10):
+                idx1, idx2 = rng.choice(N, 2, replace=False)
+                local_v = best_centers.copy()
+                try:
+                    res = minimize(lambda v: objective_centers(v.reshape(N, 2)), 
+                                   local_v.flatten(), method='Powell',
+                                   options={'maxiter': 500, 'ftol': 1e-13})
+                    if -res.fun > best_sum:
+                        best_sum = -res.fun
+                        best_centers = res.x.reshape(N, 2).copy()
+                except Exception:
+                    pass
+
+    # ---------------------------------------------------------
+    # Phase 4: Joint SLSQP Polish
+    # ---------------------------------------------------------
+    if best_centers is not None:
+        radii_est = compute_radii_from_centers(best_centers) * 0.98
+        v0 = np.concatenate([best_centers.flatten(), radii_est])
+        bounds_joint = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+        cons = {'type': 'ineq', 'fun': compute_constraints_joint}
+        
+        for _ in range(5):
+            try:
+                res = minimize(objective_joint, v0, method='SLSQP', bounds=bounds_joint,
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+                if np.all(compute_constraints_joint(res.x) >= -1e-9):
+                    val = -res.fun
+                    if val > best_sum:
+                        best_sum = val
+                        best_centers = res.x[:2*N].reshape(N, 2).copy()
+                        best_radii = res.x[2*N:].copy()
+                    v0 = res.x.copy()
+            except Exception:
+                break
+                
+    # ---------------------------------------------------------
+    # Phase 5: Final Repair & Validation
+    # ---------------------------------------------------------
+    if best_radii is None:
+        best_radii = compute_radii_from_centers(best_centers)
+        
+    centers = best_centers
+    radii = repair_solution(centers, best_radii)
+    
+    # Try to grow unconstrained circles one last time
+    for _ in range(50):
+        improved = False
+        for i in range(N):
+            # Find max possible radius for circle i given current others
+            max_r = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            for j in range(N):
+                if i == j: continue
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                max_r = min(max_r, d - radii[j])
+            if max_r > radii[i] + 1e-8:
+                radii[i] = max_r
+                improved = True
+        if not improved:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    return centers, radii, final_sum
+```

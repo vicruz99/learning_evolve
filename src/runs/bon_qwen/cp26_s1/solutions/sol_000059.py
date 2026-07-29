@@ -1,204 +1,110 @@
 # sol_000059 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state fcf75c21) state=3645fcd9 sum of radii=2.568067 correctness=1.0
+# generation=0 parent=seed (state 608ae89b) state=31ee7bab sum of radii=2.598500 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize
+from scipy.optimize import minimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+N_CIRCLES = 26
+
+def objective(params):
+    """Minimize negative sum of radii to maximize total radius."""
+    return -np.sum(params[2 * N_CIRCLES:])
+
+def get_constraints(params):
+    """Compute all inequality constraints for SLSQP (must be >= 0)."""
+    c = params[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    r = params[2 * N_CIRCLES:]
+    cons = []
     
-    Returns:
-        centers: np.array of shape (26, 2)
-        radii: np.array of shape (26,)
-        sum_radii: float
-    """
-    n = 26
-    
-    # --- 1. Initialization (Hexagonal Packing) ---
-    # We use a staggered grid to approximate a dense packing.
-    # Rows: 5, 4, 5, 4, 5, 3 circles.
-    rows_config = [5, 4, 5, 4, 5, 3]
-    
-    centers_init = []
-    # Estimate an initial radius to ensure valid starting positions
-    r_init = 0.08 
-    
-    y_curr = r_init
-    for i, count in enumerate(rows_config):
-        # Stagger odd rows (index 0, 2, 4) by shifting x
-        shift = r_init if (i % 2 == 0) else 0.0
+    # Boundary constraints: 0 <= c - r  and  c + r <= 1
+    for i in range(N_CIRCLES):
+        cons.append(c[i, 0] - r[i])
+        cons.append(c[i, 1] - r[i])
+        cons.append(1.0 - c[i, 0] - r[i])
+        cons.append(1.0 - c[i, 1] - r[i])
         
-        # Calculate starting x to center the row
-        # Total width of 'count' circles is (count-1)*2r + 2r = count*2r
-        # Start at 0.5 - (count-1)*r
-        x_start = 0.5 - (count - 1) * r_init + shift
-        
-        for j in range(count):
-            x = x_start + j * 2 * r_init
-            centers_init.append([x, y_curr])
-        
-        # Move to next row (hexagonal vertical spacing)
-        y_curr += r_init * np.sqrt(3)
-
-    centers_init = np.array(centers_init)
-    # Ensure we have exactly 26
-    assert len(centers_init) == n, f"Expected 26 circles, got {len(centers_init)}"
-
-    # --- 2. Optimization Setup ---
-    
-    def objective(vars):
-        # vars contains [x_0, y_0, r_0, x_1, y_1, r_1, ...]
-        # We want to maximize sum(r), so minimize -sum(r)
-        radii = vars[2::3]
-        return -np.sum(radii)
-
-    def boundary_constraints(vars):
-        cons = []
-        for i in range(n):
-            x = vars[3*i]
-            y = vars[3*i + 1]
-            r = vars[3*i + 2]
+    # Non-overlap constraints: ||c_i - c_j||^2 >= (r_i + r_j)^2
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            d2 = np.sum((c[i] - c[j]) ** 2)
+            rs = r[i] + r[j]
+            cons.append(d2 - rs * rs)
             
-            # x - r >= 0
-            cons.append(x - r)
-            # 1 - (x + r) >= 0  => x + r <= 1
-            cons.append(1 - (x + r))
-            # y - r >= 0
-            cons.append(y - r)
-            # 1 - (y + r) >= 0 => y + r <= 1
-            cons.append(1 - (y + r))
-        return cons
+    return np.array(cons)
 
-    def non_overlap_constraints(vars):
-        cons = []
-        for i in range(n):
-            xi, yi, ri = vars[3*i], vars[3*i+1], vars[3*i+2]
-            for j in range(i + 1, n):
-                xj, yj, rj = vars[3*j], vars[3*j+1], vars[3*j+2]
+def initial_guess(seed):
+    """Generate a feasible initial configuration using a hexagonal lattice."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    s = 0.15
+    # Hexagonal/triangular grid covers the square efficiently
+    for i in range(15):
+        for j in range(15):
+            x = i * s + (j % 2) * s / 2
+            y = j * s * np.sqrt(3) / 2
+            if 0.05 <= x <= 0.95 and 0.05 <= y <= 0.95:
+                pts.append([x, y])
                 
-                dist_sq = (xi - xj)**2 + (yi - yj)**2
-                sum_r = ri + rj
-                
-                # dist >= sum_r => dist^2 >= sum_r^2
-                # To avoid sqrt, we can check dist_sq - sum_r^2 >= 0
-                # However, for differentiability and optimization stability,
-                # sometimes dist - sum_r >= 0 is better, but let's use squared.
-                # Note: This is non-convex but works with local solvers.
-                cons.append(dist_sq - sum_r**2)
-        return cons
-
-    # --- 3. Run Optimization ---
-    
-    # Initial vector
-    x0 = np.zeros(n * 3)
-    for i in range(n):
-        x0[3*i] = centers_init[i, 0]
-        x0[3*i+1] = centers_init[i, 1]
-        x0[3*i+2] = r_init
-
-    # Bounds: 0 <= x, y <= 1; 0 <= r <= 0.5
-    bounds = []
-    for i in range(n):
-        bounds.extend([(0, 1), (0, 1), (0, 0.5)])
-
-    constraints_list = []
-    
-    # Add boundary constraints
-    # Note: scipy.optimize expects constraints to be returned as a list of dicts or a single dict.
-    # For multiple inequalities, we can pass a list of dicts or one dict with a vector function.
-    # We will use a list of dicts for clarity, though it's slower.
-    # Better: Vectorized constraint function.
-    
-    def vec_boundary(vars):
-        out = np.zeros(4 * n)
-        for i in range(n):
-            idx = 4 * i
-            x = vars[3*i]
-            y = vars[3*i + 1]
-            r = vars[3*i + 2]
-            out[idx] = x - r
-            out[idx+1] = 1 - (x + r)
-            out[idx+2] = y - r
-            out[idx+3] = 1 - (y + r)
-        return out
-
-    def vec_overlap(vars):
-        m = n * (n - 1) // 2
-        out = np.zeros(m)
-        k = 0
-        for i in range(n):
-            xi, yi, ri = vars[3*i], vars[3*i+1], vars[3*i+2]
-            for j in range(i + 1, n):
-                xj, yj, rj = vars[3*j], vars[3*j+1], vars[3*j+2]
-                out[k] = (xi - xj)**2 + (yi - yj)**2 - (ri + rj)**2
-                k += 1
-        return out
-
-    constr_bound = {'type': 'ineq', 'fun': vec_boundary}
-    constr_overlap = {'type': 'ineq', 'fun': vec_overlap}
-    
-    # Optimization
-    # Using SLSQP which handles bounds and constraints
-    try:
-        res = scipy.optimize.minimize(
-            objective,
-            x0,
-            method='SLSQP',
-            bounds=bounds,
-            constraints=[constr_bound, constr_overlap],
-            options={'maxiter': 500, 'ftol': 1e-9, 'disp': False}
-        )
+    if len(pts) < N_CIRCLES:
+        pts = rng.rand(N_CIRCLES, 2) * 0.8 + 0.1
+    else:
+        idx = rng.choice(len(pts), N_CIRCLES, replace=False)
+        pts = np.array(pts)[idx]
         
-        best_vars = res.x
-    except Exception as e:
-        print(f"Optimization failed: {e}")
-        # Fallback to initial if optimization fails
-        best_vars = x0
+    r = np.ones(N_CIRCLES) * 0.04
+    return np.concatenate([pts.flatten(), r])
 
-    # --- 4. Extract Results ---
-    final_centers = np.zeros((n, 2))
-    final_radii = np.zeros(n)
+def run_packing():
+    bounds = [(0, 1)] * (2 * N_CIRCLES) + [(0, 0.5)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': get_constraints}
     
-    for i in range(n):
-        final_centers[i, 0] = best_vars[3*i]
-        final_centers[i, 1] = best_vars[3*i+1]
-        final_radii[i] = best_vars[3*i+2]
+    best_x = None
+    best_sum = -1.0
+    
+    # Multi-restart to escape local optima
+    for s in range(5):
+        x0 = initial_guess(s)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                          constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+            
+            # Verify feasibility with tolerance
+            if np.all(get_constraints(res.x) >= -1e-6):
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_x = res.x
+        except Exception:
+            continue
+            
+    if best_x is None:
+        best_x = initial_guess(42)
         
-        # Ensure radii are non-negative (numerical safety)
-        if final_radii[i] < 0:
-            final_radii[i] = 0.0
-            # If radius is 0, position doesn't matter much, but keep it valid
-            final_centers[i, 0] = 0.5
-            final_centers[i, 1] = 0.5
-
-    total_sum = np.sum(final_radii)
+    c = best_x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    r = best_x[2 * N_CIRCLES:]
     
-    return final_centers, final_radii, total_sum
-
-# Validation check (optional, for local testing)
-if __name__ == "__main__":
-    import numpy as np
-    centers, radii, s = run_packing()
-    
-    # Run the provided validation function
-    def validate_packing(centers, radii):
-        n = centers.shape[0]
-        if np.isnan(centers).any(): return False
-        if np.isnan(radii).any(): return False
-        for i in range(n):
-            if radii[i] < 0: return False
-            x, y = centers[i]
-            r = radii[i]
-            if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12: return False
-        for i in range(n):
-            for j in range(i + 1, n):
-                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-                if dist < radii[i] + radii[j] - 1e-12: return False
-        return True
-
-    is_valid = validate_packing(centers, radii)
-    print(f"Valid: {is_valid}, Sum of Radii: {s:.5f}")
+    # Strict validation and safe shrinking if numerical errors occur
+    while True:
+        valid = True
+        for i in range(N_CIRCLES):
+            if (r[i] > c[i, 0] + 1e-9 or r[i] > c[i, 1] + 1e-9 or 
+                r[i] > 1 - c[i, 0] + 1e-9 or r[i] > 1 - c[i, 1] + 1e-9):
+                valid = False
+                break
+        if valid:
+            for i in range(N_CIRCLES):
+                for j in range(i + 1, N_CIRCLES):
+                    d = np.sqrt(np.sum((c[i] - c[j]) ** 2))
+                    if d < r[i] + r[j] - 1e-9:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+        r *= 0.995 # Gradually shrink until strictly valid
+        
+    return c, r, np.sum(r)

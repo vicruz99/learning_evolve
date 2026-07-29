@@ -1,0 +1,174 @@
+
+
+<strategy>
+To improve upon the current packing, I will adopt a hybrid optimization strategy that separates the geometric placement of centers from the radius maximization. Pure constrained optimization (like SLSQP on both centers and radii) often struggles with the highly non-convex feasible region of circle packing problems. 
+
+The strategy involves three phases:
+1. **Radius Resolution for Fixed Centers**: Define a fast, iterative solver that computes the maximum possible radii for any given set of centers by resolving overlaps and boundary constraints. This transforms the problem into maximizing a scalar function of the centers alone.
+2. **Global Search on Centers**: Use `scipy.optimize.differential_evolution` to globally search for center coordinates that maximize the sum of radii (as computed by the resolver). This handles the rugged landscape better than gradient-based methods alone.
+3. **Local Refinement**: Take the best centers found, compute their optimal radii, and pass both to a high-precision SLSQP solver for final polishing. This jointly optimizes positions and sizes to squeeze out the last fraction of radius sum.
+4. **Strict Validation**: Apply a deterministic post-processing step to guarantee the validator's tolerance thresholds are met, shrinking radii minimally if needed.
+
+This approach leverages the strength of derivative-free global optimization for topology discovery and gradient-based local optimization for metric refinement, typically yielding higher-quality packings than multi-start SLSQP alone.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def resolve_radii(centers):
+    """
+    Computes the maximum feasible radii for a fixed set of centers.
+    Iteratively resolves overlaps and boundary constraints.
+    """
+    r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Fixed-point iteration: r_i <= min_j (d_ij - r_j)
+    for _ in range(25):
+        r = np.minimum(r, np.min(dists - r[np.newaxis, :], axis=1))
+        
+    return np.maximum(r, 1e-9)
+
+def neg_sum_radii_for_de(x_flat):
+    """Objective for differential evolution: minimize negative sum of radii."""
+    centers = x_flat.reshape((N, 2))
+    # Keep centers strictly inside bounds to avoid degenerate radii
+    centers = np.clip(centers, 0.02, 0.98)
+    r = resolve_radii(centers)
+    return -np.sum(r)
+
+def objective(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and squared non-overlap."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    return c
+
+def strict_post_process(centers, radii):
+    """Guarantee validator compliance with minimal shrinkage."""
+    r = radii.copy()
+    
+    # Enforce boundaries strictly
+    r = np.minimum(r, centers[:, 0])
+    r = np.minimum(r, 1.0 - centers[:, 0])
+    r = np.minimum(r, centers[:, 1])
+    r = np.minimum(r, 1.0 - centers[:, 1])
+    
+    # Enforce non-overlap iteratively
+    for _ in range(30):
+        changed = False
+        dx = centers[PAIR_I, 0] - centers[PAIR_J, 0]
+        dy = centers[PAIR_I, 1] - centers[PAIR_J, 1]
+        dist = np.hypot(dx, dy)
+        overlap = (r[PAIR_I] + r[PAIR_J]) - dist
+        
+        idxs = overlap > 1e-10
+        if not np.any(idxs):
+            break
+            
+        shrink = overlap[idxs] / 2.0 + 1e-9
+        r[PAIR_I[idxs]] = np.maximum(0.0, r[PAIR_I[idxs]] - shrink)
+        r[PAIR_J[idxs]] = np.maximum(0.0, r[PAIR_J[idxs]] - shrink)
+        changed = True
+        if not changed:
+            break
+            
+    return r
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    bounds_centers = [(0.05, 0.95)] * (2 * N)
+    
+    # Phase 1: Global search on centers using Differential Evolution
+    best_de = differential_evolution(neg_sum_radii_for_de, bounds_centers,
+                                     maxiter=150, popsize=20, mutation=(0.5, 1.5),
+                                     recombination=0.9, seed=42, polish=True)
+    
+    best_centers = best_de.x.reshape((N, 2))
+    best_radii = resolve_radii(best_centers)
+    
+    # Phase 2: Local refinement with SLSQP on both centers and radii
+    v0 = np.concatenate([best_centers[:, 0], best_centers[:, 1], best_radii])
+    bounds_full = [(0.0, 1.0)] * (2 * N) + [(1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = v0.copy()
+    best_sum = np.sum(best_radii)
+    
+    # Run SLSQP from the DE result
+    try:
+        res = minimize(objective, v0, method='SLSQP', bounds=bounds_full,
+                       constraints=cons, options={'maxiter': 15000, 'ftol': 1e-14, 'disp': False})
+        if -res.fun > best_sum:
+            c_val = constraints(res.x)
+            if np.min(c_val) >= -1e-7:
+                best_sum = -res.fun
+                best_v = res.x.copy()
+    except Exception:
+        pass
+        
+    # Phase 3: Perturbation & Escape from Local Minima
+    current_v = best_v.copy()
+    for step in range(15):
+        np.random.seed(step + 500)
+        v_pert = current_v.copy()
+        
+        # Perturb centers
+        noise = np.random.uniform(-0.003, 0.003, 2*N)
+        v_pert[:2*N] += noise
+        v_pert[:2*N] = np.clip(v_pert[:2*N], 0.02, 0.98)
+        
+        # Shrink radii to guarantee feasibility after perturbation
+        c_pert = v_pert[:2*N].reshape(N, 2)
+        r_pert = resolve_radii(c_pert) * 0.90
+        v_pert[2*N:] = r_pert
+        
+        try:
+            res = minimize(objective, v_pert, method='SLSQP', bounds=bounds_full,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    current_v = best_v.copy()
+        except Exception:
+            pass
+            
+    # Extract final configuration
+    centers = np.column_stack((best_v[:N], best_v[N:2*N]))
+    radii = best_v[2*N:].copy()
+    
+    # Phase 4: Strict Post-Processing for Validator Compliance
+    radii = strict_post_process(centers, radii)
+    centers = np.clip(centers, 0.0, 1.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

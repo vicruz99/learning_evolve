@@ -1,0 +1,346 @@
+
+
+<strategy>
+I'll use a hybrid approach combining LP-based radius computation with position optimization:
+
+1. **LP for radii**: Given fixed positions, compute maximum radii using Linear Programming (the constraints are linear in radii: r_i ≤ boundary distances and r_i + r_j ≤ ||c_i - c_j||).
+
+2. **Position optimization**: Optimize circle positions using Nelder-Mead (derivative-free, handles non-smooth objectives well) to maximize the sum of radii.
+
+3. **Multiple restarts**: Try many different initial configurations (hexagonal grids, random perturbations) to escape local optima.
+
+4. **Two-phase optimization**: First optimize with larger perturbations, then fine-tune.
+
+5. **Refinement**: After finding good positions, use the LP to get exact maximum radii.
+
+The LP approach is elegant because for fixed positions, the radius optimization problem is linear:
+- Maximize Σ r_i
+- Subject to: r_i ≤ x_i, r_i ≤ 1-x_i, r_i ≤ y_i, r_i ≤ 1-y_i (boundary)
+- And: r_i + r_j ≤ ||c_i - c_j|| for all i<j (non-overlap)
+
+This gives exact optimal radii for any positions, and we just need to optimize the positions.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+
+def compute_max_radii_lp(centers):
+    """
+    Given circle positions, compute maximum feasible radii using LP.
+    
+    Maximizes sum of radii subject to:
+    - r_i <= distance to each boundary
+    - r_i + r_j <= distance between circles i and j
+    """
+    n = centers.shape[0]
+    
+    # Objective: maximize sum(r_i) => minimize -sum(r_i)
+    c_obj = -np.ones(n)
+    
+    # Build constraints: A_ub @ r <= b_ub
+    A_rows = []
+    b_rows = []
+    
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    for i in range(n):
+        x, y = centers[i]
+        for bound_val in [x, 1 - x, y, 1 - y]:
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_rows.append(row)
+            b_rows.append(max(bound_val, 1e-12))  # Ensure positive
+    
+    # Pairwise constraints: r_i + r_j <= dist(i,j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_rows.append(row)
+            b_rows.append(dist)
+    
+    A_ub = np.array(A_rows)
+    b_ub = np.array(b_rows)
+    
+    bounds = [(0, None) for _ in range(n)]
+    
+    result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if result.success:
+        return result.x, -result.fun
+    else:
+        return np.zeros(n), 0.0
+
+
+def position_objective(params, n_circles):
+    """Objective function for position optimization: negative sum of max radii."""
+    centers = params.reshape(n_circles, 2)
+    
+    # Clip centers to valid range
+    centers = np.clip(centers, 1e-6, 1 - 1e-6)
+    
+    radii, sum_r = compute_max_radii_lp(centers)
+    return -sum_r
+
+
+def make_hexagonal_init(n, perturbation=0.0, seed=0):
+    """
+    Initialize circles in a hexagonal/triangular grid pattern.
+    Pattern: rows with 6,5,6,5,4 circles = 26 total
+    """
+    rng = np.random.RandomState(seed)
+    
+    # Target pattern: 6, 5, 6, 5, 4 = 26 circles
+    row_counts = [6, 5, 6, 5, 4]
+    
+    # Estimate radius
+    # Horizontal: 12r <= 1 => r <= 0.0833
+    # Vertical: r(2 + 4*sqrt(3)) <= 1 => r <= 0.112
+    # Use the tighter constraint
+    r_est = 0.083
+    
+    centers = np.zeros((n, 2))
+    idx = 0
+    
+    num_rows = len(row_counts)
+    # Vertical spacing for hexagonal packing
+    vert_spacing = np.sqrt(3) * r_est
+    
+    for row in range(num_rows):
+        count = row_counts[row]
+        # Horizontal spacing
+        horiz_spacing = 2 * r_est
+        # Offset for odd rows (hexagonal pattern)
+        x_offset = horiz_spacing / 2 if row % 2 == 1 else 0
+        
+        # Compute y position
+        y_pos = r_est + row * vert_spacing
+        
+        # Scale y to fit in [0, 1]
+        # Total height needed: 2*r_est + (num_rows-1) * vert_spacing
+        total_height = 2 * r_est + (num_rows - 1) * vert_spacing
+        y_scale = 1.0 / total_height
+        y_pos = y_pos * y_scale
+        
+        for col in range(count):
+            if idx < n:
+                x_pos = r_est + x_offset + col * horiz_spacing
+                x_scale = 1.0 / (2 * r_est + (count - 1) * horiz_spacing)
+                x_pos = x_pos * x_scale
+                
+                centers[idx, 0] = x_pos
+                centers[idx, 1] = y_pos
+                idx += 1
+    
+    # Apply perturbation
+    if perturbation > 0:
+        centers += rng.randn(n, 2) * perturbation
+        centers = np.clip(centers, 0.01, 0.99)
+    
+    return centers
+
+
+def make_random_init(n, seed=0):
+    """Initialize circles in random positions."""
+    rng = np.random.RandomState(seed)
+    centers = rng.uniform(0.05, 0.95, size=(n, 2))
+    return centers
+
+
+def make_grid_init(n, seed=0):
+    """Initialize circles in a regular grid pattern."""
+    rng = np.random.RandomState(seed)
+    
+    # Try different grid sizes
+    # 6x5 = 30, remove 4
+    # 5x6 = 30, remove 4
+    # 7x4 = 28, remove 2
+    
+    rows = 5
+    cols = 6
+    
+    centers = np.zeros((n, 2))
+    idx = 0
+    
+    for i in range(rows):
+        for j in range(cols):
+            if idx < n:
+                x = (j + 0.5) / cols
+                y = (i + 0.5) / rows
+                centers[idx, 0] = x + rng.randn() * 0.01
+                centers[idx, 1] = y + rng.randn() * 0.01
+                idx += 1
+    
+    centers = np.clip(centers, 0.01, 0.99)
+    return centers
+
+
+def run_packing():
+    """
+    Pack 26 circles in a unit square to maximize sum of radii.
+    
+    Strategy:
+    1. Try multiple initial configurations
+    2. Use Nelder-Mead to optimize positions
+    3. Use LP to compute optimal radii for each position configuration
+    4. Return the best result
+    """
+    n = 26
+    
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+    
+    # Try many different initial configurations
+    configs_tried = 0
+    
+    # Hexagonal initializations with various perturbations
+    for seed in range(20):
+        for pert in [0.0, 0.005, 0.01, 0.02, 0.03, 0.05]:
+            centers_init = make_hexagonal_init(n, perturbation=pert, seed=seed)
+            
+            # Optimize positions using Nelder-Mead
+            params_init = centers_init.ravel()
+            
+            result = minimize(
+                position_objective,
+                params_init,
+                args=(n,),
+                method='Nelder-Mead',
+                options={
+                    'maxiter': 20000,
+                    'xatol': 1e-12,
+                    'fatol': 1e-12,
+                    'adaptive': True
+                }
+            )
+            
+            centers_opt = result.x.reshape(n, 2)
+            centers_opt = np.clip(centers_opt, 1e-6, 1 - 1e-6)
+            
+            radii_opt, sum_r = compute_max_radii_lp(centers_opt)
+            
+            if sum_r > best_sum:
+                best_sum = sum_r
+                best_centers = centers_opt.copy()
+                best_radii = radii_opt.copy()
+            
+            configs_tried += 1
+    
+    # Grid initializations with perturbations
+    for seed in range(10):
+        centers_init = make_grid_init(n, seed=seed)
+        
+        params_init = centers_init.ravel()
+        
+        result = minimize(
+            position_objective,
+            params_init,
+            args=(n,),
+            method='Nelder-Mead',
+            options={
+                'maxiter': 15000,
+                'xatol': 1e-12,
+                'fatol': 1e-12,
+                'adaptive': True
+            }
+        )
+        
+        centers_opt = result.x.reshape(n, 2)
+        centers_opt = np.clip(centers_opt, 1e-6, 1 - 1e-6)
+        
+        radii_opt, sum_r = compute_max_radii_lp(centers_opt)
+        
+        if sum_r > best_sum:
+            best_sum = sum_r
+            best_centers = centers_opt.copy()
+            best_radii = radii_opt.copy()
+    
+    # Random initializations
+    for seed in range(15):
+        centers_init = make_random_init(n, seed=seed)
+        
+        params_init = centers_init.ravel()
+        
+        result = minimize(
+            position_objective,
+            params_init,
+            args=(n,),
+            method='Nelder-Mead',
+            options={
+                'maxiter': 15000,
+                'xatol': 1e-12,
+                'fatol': 1e-12,
+                'adaptive': True
+            }
+        )
+        
+        centers_opt = result.x.reshape(n, 2)
+        centers_opt = np.clip(centers_opt, 1e-6, 1 - 1e-6)
+        
+        radii_opt, sum_r = compute_max_radii_lp(centers_opt)
+        
+        if sum_r > best_sum:
+            best_sum = sum_r
+            best_centers = centers_opt.copy()
+            best_radii = radii_opt.copy()
+    
+    # Fine-tuning: use Powell's method on the best configuration found
+    params_fine = best_centers.ravel()
+    result_fine = minimize(
+        position_objective,
+        params_fine,
+        args=(n,),
+        method='Powell',
+        options={
+            'maxiter': 50000,
+            'xtol': 1e-12,
+            'ftol': 1e-12
+        }
+    )
+    
+    centers_fine = result_fine.x.reshape(n, 2)
+    centers_fine = np.clip(centers_fine, 1e-6, 1 - 1e-6)
+    
+    radii_fine, sum_fine = compute_max_radii_lp(centers_fine)
+    
+    if sum_fine > best_sum:
+        best_sum = sum_fine
+        best_centers = centers_fine.copy()
+        best_radii = radii_fine.copy()
+    
+    # Additional fine-tuning with Powell
+    params_fine2 = best_centers.ravel()
+    result_fine2 = minimize(
+        position_objective,
+        params_fine2,
+        args=(n,),
+        method='Powell',
+        options={
+            'maxiter': 100000,
+            'xtol': 1e-13,
+            'ftol': 1e-13
+        }
+    )
+    
+    centers_fine2 = result_fine2.x.reshape(n, 2)
+    centers_fine2 = np.clip(centers_fine2, 1e-6, 1 - 1e-6)
+    
+    radii_fine2, sum_fine2 = compute_max_radii_lp(centers_fine2)
+    
+    if sum_fine2 > best_sum:
+        best_sum = sum_fine2
+        best_centers = centers_fine2.copy()
+        best_radii = radii_fine2.copy()
+    
+    # Verify and clean up: ensure no tiny negative radii
+    best_radii = np.maximum(best_radii, 0)
+    best_centers = np.clip(best_centers, 0, 1)
+    
+    return best_centers, best_radii, best_sum
+```

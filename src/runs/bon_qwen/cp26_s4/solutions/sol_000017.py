@@ -1,0 +1,184 @@
+# sol_000017 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 04e92922) state=0ec223f8 sum of radii=2.228507 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_radii(centers):
+    """
+    Calculates the maximum possible radius for each circle given its center 
+    and the centers of all other circles, ensuring they are within the unit square.
+    """
+    n = centers.shape[0]
+    radii = np.zeros(n)
+    
+    # Distance to boundaries for all circles
+    # r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    # This is equivalent to r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+    dist_to_boundary = np.minimum(
+        np.minimum(centers[:, 0], 1 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1 - centers[:, 1])
+    )
+    
+    # Initialize radii with boundary constraints
+    radii[:] = dist_to_boundary
+    
+    # Update radii based on inter-circle distances
+    # r_i + r_j <= dist(i, j) => r_i <= dist(i, j) - r_j
+    # Iterative update or direct min calculation?
+    # Direct calculation: r_i = min( r_i, min_{j!=i} dist(i,j)/2 )
+    # Note: This assumes r_j is also constrained. 
+    # Strictly, if we fix centers, the optimal radii are determined by the "bottleneck".
+    # r_i = min( dist_to_boundary[i], min_{j!=i} dist(i,j)/2 )
+    # However, this is only strictly correct if all circles try to expand equally.
+    # For the optimization objective sum(r), fixing centers implies r_i is limited by neighbors.
+    # If we assume equal expansion, r_i = min(boundary, dist/2).
+    
+    # Calculate pairwise distances
+    # Efficiently compute min distance to any other circle
+    # Using broadcasting might be memory heavy for large N, but 26 is small.
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    # Set diagonal to infinity to ignore self-distance
+    np.fill_diagonal(dists, np.inf)
+    
+    # Min distance to nearest neighbor
+    min_neighbor_dist = np.min(dists, axis=1)
+    
+    # Radius limited by half the distance to nearest neighbor
+    radii_neighbor = min_neighbor_dist / 2.0
+    
+    # The valid radius is the minimum of boundary constraint and neighbor constraint
+    radii = np.minimum(dist_to_boundary, radii_neighbor)
+    
+    return radii
+
+def objective(centers_flat):
+    """
+    Objective function to minimize (negative sum of radii).
+    """
+    centers = centers_flat.reshape(26, 2)
+    radii = get_radii(centers)
+    return -np.sum(radii)
+
+def run_packing():
+    # Initialize centers with a hexagonal lattice pattern
+    centers = np.zeros((26, 2))
+    
+    # We want to fit 26 circles. A 5x5 grid is 25 circles.
+    # Let's try to distribute them in rows. 
+    # A hexagonal packing with row lengths 5, 5, 5, 5, 6 might be tight.
+    # Let's try a denser packing. 5 rows of 5 and 1 extra?
+    # Or just a general grid and let optimizer fix it.
+    # A simple approach: generate a grid and pick 26 points?
+    # Better: explicitly construct rows.
+    
+    # Let's try a configuration that fills the square well.
+    # 5 rows.
+    # Row counts: 6, 5, 5, 5, 5 -> Sum 26.
+    # But 6 circles in a row is tight for width.
+    # Maybe 5, 5, 5, 5, 6 is bad.
+    # How about 6, 4, 6, 4, 6? Sum 26.
+    # Or 5, 5, 5, 5, 5, 1.
+    
+    # Let's try to place them on a triangular grid with some spacing.
+    # Estimate radius ~ 0.105. Spacing ~ 0.21.
+    # Height of triangle ~ 0.18.
+    # 1 / 0.18 ~ 5.5 rows.
+    
+    # Let's construct rows manually.
+    # Row 0: y = r
+    # Row 1: y = r + h
+    # ...
+    
+    # We don't know r yet. Let's assume a grid and scale/shift.
+    # Let's place 26 points in a hexagonal pattern roughly centered.
+    
+    row_counts = [6, 5, 6, 5, 4] # Sum 26? 6+5+6+5+4 = 26.
+    # Or [5, 5, 5, 5, 6] -> 26.
+    # Let's use [5, 5, 5, 5, 6] but shift the 6-row to fit?
+    # Actually, a 5x5 grid plus 1 in center is a good start for optimizer.
+    
+    # Let's generate a 6x6 grid and pick 26 points?
+    # Or just a dense random set?
+    # A lattice is safer.
+    
+    # Let's try 5 rows with counts: 5, 5, 5, 5, 6.
+    # We will place them roughly.
+    # y-coordinates: 0.1, 0.3, 0.5, 0.7, 0.9 (approx)
+    # x-coordinates: 0.1, 0.3, 0.5, 0.7, 0.9 (approx)
+    
+    # Let's create a list of points.
+    points = []
+    y_step = 1.0 / 6.0 # 6 intervals
+    x_step = 1.0 / 6.0
+    
+    # Try a hexagonal arrangement
+    # Rows at y = 0.1, 0.3, 0.5, 0.7, 0.9
+    # Shift x for odd rows
+    
+    rows_y = [0.1, 0.3, 0.5, 0.7, 0.9]
+    # Row 0: 5 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 5 circles
+    # Row 3: 5 circles
+    # Row 4: 6 circles? Hard to fit 6.
+    
+    # Alternative: 6 rows?
+    # y = 0.1, 0.25, 0.4, 0.55, 0.7, 0.85
+    # Counts: 4, 5, 4, 5, 4, 4 -> 26.
+    
+    # Let's try this 6-row pattern.
+    y_coords = [0.1, 0.25, 0.4, 0.55, 0.7, 0.85]
+    counts = [4, 5, 4, 5, 4, 4]
+    
+    idx = 0
+    for i, y in enumerate(y_coords):
+        n_circles = counts[i]
+        # Center x positions
+        # Total width available approx 1.
+        # Spacing 1/(n_circles+1) ?
+        # Let's distribute uniformly in [0.1, 0.9] range roughly
+        x_start = (1 - (n_circles - 1) * 0.25) / 2 # rough guess
+        # Better: just distribute in [0,1]
+        x_pos = np.linspace(0.05, 0.95, n_circles)
+        
+        # If shifted row (hexagonal), shift x by half spacing
+        if i % 2 == 1:
+            spacing = x_pos[1] - x_pos[0]
+            x_pos = x_pos + spacing / 2
+            # Clip to bounds
+            x_pos = np.clip(x_pos, 0.05, 0.95)
+            
+        for x in x_pos:
+            centers[idx] = [x, y]
+            idx += 1
+            
+    # If we didn't fill 26, pad or adjust. 
+    # 4+5+4+5+4+4 = 26. Perfect.
+    
+    # Reshape for optimizer
+    x0 = centers.flatten()
+    
+    # Bounds [0, 1] for all coordinates
+    bounds = [(0, 1)] * 52
+    
+    # Optimization
+    # Nelder-Mead is robust for non-smooth functions
+    result = minimize(objective, x0, method='Nelder-Mead', 
+                      bounds=bounds, 
+                      options={'xatol': 1e-7, 'fatol': 1e-9, 'maxiter': 10000})
+    
+    best_centers = result.x.reshape(26, 2)
+    best_radii = get_radii(best_centers)
+    sum_radii = np.sum(best_radii)
+    
+    return best_centers, best_radii, sum_radii
+
+if __name__ == "__main__":
+    centers, radii, total = run_packing()
+    print(f"Sum of radii: {total}")

@@ -1,156 +1,167 @@
 # sol_000077 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 22281c24) state=05e42789 sum of radii=0.000000 correctness=1.0
+# generation=0 parent=seed (state ed1177e6) state=776f6efe sum of radii=1.720680 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 import math
+from scipy.optimize import linprog
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+def get_max_radii_lp(centers):
     """
-    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
-    
-    Returns:
-        tuple: (centers, radii, sum_radii)
+    Given fixed centers, solve LP to maximize sum of radii.
+    Constraints: r_i + r_j <= dist(i, j), r_i <= boundaries.
     """
-    n_circles = 26
+    n = len(centers)
+    if n == 0:
+        return np.array([])
+
+    # Objective: Maximize sum(r) -> Minimize -sum(r)
+    c = -np.ones(n)
+
+    A_ub = []
+    b_ub = []
+
+    # Compute pairwise distances
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
     
-    def get_loss(optimized_vars):
-        # Unpack variables
-        # Structure: [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
-        # Total length: 26 * 3 = 78
-        centers = optimized_vars[:52].reshape(26, 2)
-        radii = optimized_vars[52:]
-        
-        penalty = 0.0
-        target_sum = -np.sum(radii) # We maximize sum, so minimize negative sum
-        
-        # Boundary constraints and negative radii
-        for i in range(n_circles):
-            x, y = centers[i]
-            r = radii[i]
-            
-            # Penalty for radius < 0 (shouldn't happen with bounds, but safe to check)
-            if r < 0:
-                penalty += 1000.0 * abs(r)
-            
-            # Penalty for being outside [0,1]
-            if x - r < 0: penalty += 1000.0 * abs(x - r)
-            if x + r > 1: penalty += 1000.0 * abs(x + r - 1)
-            if y - r < 0: penalty += 1000.0 * abs(y - r)
-            if y + r > 1: penalty += 1000.0 * abs(y + r - 1)
-
-        # Overlap constraints
-        for i in range(n_circles):
-            for j in range(i + 1, n_circles):
-                dist_sq = (centers[i, 0] - centers[j, 0])**2 + (centers[i, 1] - centers[j, 1])**2
-                dist = math.sqrt(dist_sq)
-                min_dist = radii[i] + radii[j]
-                
-                if dist < min_dist:
-                    penalty += 1000.0 * (min_dist - dist)
-        
-        return target_sum + penalty
-
-    # Best solution found
-    best_solution = None
-    best_score = -np.inf
-
-    # Run multiple times with different initializations
-    for _ in range(10):
-        # 1. Initialize with a 5x5 grid for 25 circles, 1 circle in a gap
-        centers_init = np.zeros((26, 2))
-        radii_init = np.full(26, 0.1)
-        
-        grid_pts = [0.1, 0.3, 0.5, 0.7, 0.9]
-        idx = 0
-        for y in grid_pts:
-            for x in grid_pts:
-                if idx < 25:
-                    centers_init[idx] = [x, y]
-                    idx += 1
-        
-        # Place 26th circle in a gap (e.g., at 0.2, 0.2 with slightly smaller radius to avoid overlap initially)
-        centers_init[25] = [0.2, 0.2]
-        radii_init[25] = 0.04 
-
-        # Random perturbation to help optimization
-        centers_init += np.random.normal(0, 0.005, centers_init.shape)
-        radii_init += np.random.normal(0, 0.005, radii_init.shape)
-        radii_init = np.maximum(radii_init, 0.01) # Ensure positive radii
-
-        # Flatten for optimizer
-        x0 = np.concatenate([centers_init.flatten(), radii_init])
-
-        # Bounds for centers [0, 1] and radii [0, 0.5]
-        bounds = []
-        for _ in range(26):
-            bounds.extend([(0, 1), (0, 1)]) # x, y
-            bounds.append((0, 0.5))          # radius
-
-        # Optimize
-        result = minimize(get_loss, x0, method='L-BFGS-B', bounds=bounds, 
-                          options={'ftol': 1e-9, 'gtol': 1e-6, 'maxiter': 1000})
-
-        if result.success and -result.fun > best_score:
-            best_score = -result.fun
-            best_solution = result.x
-
-    if best_solution is None:
-        # Fallback to grid if optimization failed
-        centers = np.zeros((26, 2))
-        radii = np.full(26, 0.1)
-        grid_pts = [0.1, 0.3, 0.5, 0.7, 0.9]
-        idx = 0
-        for y in grid_pts:
-            for x in grid_pts:
-                if idx < 25:
-                    centers[idx] = [x, y]
-                    idx += 1
-        centers[25] = [0.2, 0.2]
-        radii[25] = 0.01 # tiny circle
-        return centers, radii, np.sum(radii)
-
-    # Extract best solution
-    centers_opt = best_solution[:52].reshape(26, 2)
-    radii_opt = best_solution[52:]
-    
-    # Final validation and cleaning (project to feasible set just in case)
-    # If any radius is negative, clamp to 0
-    radii_opt = np.maximum(radii_opt, 0)
-    
-    # Ensure centers are valid
-    for i in range(26):
-        r = radii_opt[i]
-        centers_opt[i, 0] = np.clip(centers_opt[i, 0], r, 1 - r)
-        centers_opt[i, 1] = np.clip(centers_opt[i, 1], r, 1 - r)
-
-    sum_radii = np.sum(radii_opt)
-    return centers_opt, radii_opt, sum_radii
-
-if __name__ == "__main__":
-    import numpy as np
-    # Simple test
-    centers, radii, total_r = run_packing()
-    
-    # Validation logic embedded in prompt logic
-    n = centers.shape[0]
-    valid = True
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
     for i in range(n):
-        if np.isnan(centers[i]).any() or np.isnan(radii[i]):
-            valid = False
-        if radii[i] < 0:
-            valid = False
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -1e-6 or x + r > 1 + 1e-6 or y - r < -1e-6 or y + r > 1 + 1e-6:
-            valid = False
         for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-6:
-                valid = False
+            d = dists[i, j]
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(d)
     
-    print(f"Valid: {valid}")
-    print(f"Sum of radii: {total_r}")
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+    for i in range(n):
+        x, y = centers[i]
+        
+        row = np.zeros(n); row[i] = 1.0
+        A_ub.append(row); b_ub.append(x)
+        
+        row = np.zeros(n); row[i] = 1.0
+        A_ub.append(row); b_ub.append(1.0 - x)
+        
+        row = np.zeros(n); row[i] = 1.0
+        A_ub.append(row); b_ub.append(y)
+        
+        row = np.zeros(n); row[i] = 1.0
+        A_ub.append(row); b_ub.append(1.0 - y)
+
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    bounds = [(0, None) for _ in range(n)]
+    
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+        else:
+            return np.full(n, 1e-9)
+    except Exception:
+        return np.full(n, 1e-9)
+
+def jiggling_optimize(centers, iterations=2000):
+    """
+    Refine centers to spread them out using force-directed method.
+    """
+    n = len(centers)
+    if n == 0:
+        return centers
+        
+    radii = np.full(n, 0.05)
+    
+    for t in range(iterations):
+        # Update radii estimate periodically based on current configuration
+        if t % 20 == 0:
+            x = centers[:, 0]
+            y = centers[:, 1]
+            b_dist = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+            
+            diff = centers[:, None, :] - centers[None, :, :]
+            dists = np.sqrt(np.sum(diff**2, axis=2))
+            np.fill_diagonal(dists, np.inf)
+            min_neighbor_dist = np.min(dists, axis=1)
+            
+            # Heuristic radius
+            radii = np.minimum(b_dist, 0.5 * min_neighbor_dist)
+            radii = np.maximum(radii, 1e-5)
+
+        # Calculate repulsion forces
+        diff = centers[:, None, :] - centers[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        dists_safe = np.where(dists == 0, 1e-9, dists)
+        
+        unit_vecs = diff / dists_safe[:, :, np.newaxis]
+        
+        r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlap = np.maximum(r_sum - dists, 0)
+        force_mag = overlap * 5.0
+        
+        force_vecs = -force_mag[:, :, np.newaxis] * unit_vecs
+        forces = np.sum(force_vecs, axis=1)
+        
+        # Boundary forces
+        forces[:, 0] += np.where(centers[:, 0] < radii, (radii - centers[:, 0]) * 10.0, 0.0)
+        forces[:, 0] -= np.where(centers[:, 0] > 1.0 - radii, (centers[:, 0] - (1.0 - radii)) * 10.0, 0.0)
+        forces[:, 1] += np.where(centers[:, 1] < radii, (radii - centers[:, 1]) * 10.0, 0.0)
+        forces[:, 1] -= np.where(centers[:, 1] > 1.0 - radii, (centers[:, 1] - (1.0 - radii)) * 10.0, 0.0)
+        
+        step = 0.01 * (1.0 - t / iterations)
+        centers += forces * step
+        centers = np.clip(centers, 0.0, 1.0)
+        
+    return centers
+
+def run_packing() -> tuple:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    """
+    N = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Multiple random restarts to find global optimum
+    seeds = [42, 123, 456, 789, 1000, 2000, 3000]
+    
+    for seed in seeds:
+        np.random.seed(seed)
+        current_centers = np.random.rand(N, 2)
+        
+        # Jiggling to optimize positions
+        current_centers = jiggling_optimize(current_centers, iterations=3000)
+        
+        # LP to optimize radii
+        current_radii = get_max_radii_lp(current_centers)
+        current_sum = np.sum(current_radii)
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = current_centers.copy()
+            best_radii = current_radii.copy()
+
+    # Final refinement on the best found configuration
+    if best_centers is not None:
+        best_centers = jiggling_optimize(best_centers, iterations=5000)
+        best_radii = get_max_radii_lp(best_centers)
+        best_sum = np.sum(best_radii)
+        
+    if best_centers is None:
+        # Fallback grid packing
+        best_centers = np.zeros((N, 2))
+        best_radii = np.full(N, 0.1)
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                if idx < N:
+                    best_centers[idx] = [0.1 + j*0.2, 0.1 + i*0.2]
+                    idx += 1
+        best_sum = 2.5
+        
+    return best_centers, best_radii, float(best_sum)

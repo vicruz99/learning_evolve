@@ -1,0 +1,186 @@
+# sol_000057 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 26e3ad40) state=6473185c sum of radii=2.591050 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+# Constants
+N_CIRCLES = 26
+
+def objective(vars):
+    """
+    Objective function to minimize: negative sum of radii.
+    vars layout: [x0, y0, r0, x1, y1, r1, ..., x25, y25, r25]
+    """
+    # Radii are at indices 2, 5, 8, ...
+    radii = vars[2::3]
+    return -np.sum(radii)
+
+def get_bounds(n):
+    """
+    Generate bounds for the optimization variables.
+    x, y in [0, 1], r in [0, 0.5]
+    """
+    bounds = []
+    for _ in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+    return bounds
+
+def constraint_fun(vars, n):
+    """
+    Compute all inequality constraints.
+    Returns a numpy array where all elements must be >= 0.
+    
+    Constraints:
+    1. Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r
+    2. Overlap: dist_ij^2 >= (r_i + r_j)^2
+    """
+    c = vars.reshape((n, 3))
+    xs = c[:, 0]
+    ys = c[:, 1]
+    rs = c[:, 2]
+    
+    constraints = []
+    
+    # Boundary constraints
+    # x >= r  => x - r >= 0
+    constraints.append(xs - rs)
+    # x <= 1-r => 1 - x - r >= 0
+    constraints.append(1.0 - xs - rs)
+    # y >= r  => y - r >= 0
+    constraints.append(ys - rs)
+    # y <= 1-r => 1 - y - r >= 0
+    constraints.append(1.0 - ys - rs)
+    
+    # Overlap constraints
+    # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+    # Compute pairwise squared distances
+    # Broadcasting: (n, 1) - (1, n) -> (n, n)
+    diff_x = xs[:, np.newaxis] - xs[np.newaxis, :]
+    diff_y = ys[:, np.newaxis] - ys[np.newaxis, :]
+    dist_sq = diff_x**2 + diff_y**2
+    
+    sum_r = rs[:, np.newaxis] + rs[np.newaxis, :]
+    sum_r_sq = sum_r**2
+    
+    # Constraint value
+    overlap_matrix = dist_sq - sum_r_sq
+    
+    # We only need upper triangle (strictly upper) for unique pairs
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    overlaps = overlap_matrix[mask]
+    
+    constraints.append(overlaps)
+    
+    return np.concatenate(constraints)
+
+# Global constraint function for N=26
+def constraints_global(vars):
+    return constraint_fun(vars, N_CIRCLES)
+
+def generate_hex_init(n):
+    """
+    Generate an initial guess based on a hexagonal lattice pattern.
+    """
+    pts = []
+    # Try to fit points in a hex grid within [0.05, 0.95] roughly
+    # Spacing approx 0.15
+    y_step = 0.18
+    x_step = 0.16
+    
+    row_idx = 0
+    y = 0.05
+    while y <= 0.95 and len(pts) < n:
+        shift = x_step / 2.0 if row_idx % 2 == 1 else 0.0
+        x = 0.05 + shift
+        while x <= 0.95 and len(pts) < n:
+            pts.append([x, y])
+            x += x_step
+        y += y_step
+        row_idx += 1
+        
+    # If not enough points, fill with random
+    while len(pts) < n:
+        pts.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)])
+        
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Main function to run the packing optimization.
+    """
+    best_result = None
+    best_val = -np.inf
+    bounds = get_bounds(N_CIRCLES)
+    cons = {'type': 'ineq', 'fun': constraints_global}
+    
+    # Try multiple initializations
+    # 1. Hexagonal Grid
+    # 2. Random (several seeds)
+    
+    inits = [generate_hex_init(N_CIRCLES)]
+    
+    # Add random inits
+    for seed in range(10):
+        np.random.seed(seed)
+        random_centers = np.random.uniform(0.05, 0.95, size=(N_CIRCLES, 2))
+        inits.append(random_centers)
+        
+    for idx, centers_init in enumerate(inits):
+        # Initialize radii to a small valid value
+        radii_init = np.full(N_CIRCLES, 0.02)
+        
+        # Construct initial variables vector
+        x0 = np.empty(N_CIRCLES * 3)
+        for i in range(N_CIRCLES):
+            x0[3*i] = centers_init[i, 0]
+            x0[3*i+1] = centers_init[i, 1]
+            x0[3*i+2] = radii_init[i]
+            
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-10})
+            
+            # Check validity and objective
+            # We need to check constraints manually because res.success is not always reliable for non-convex
+            c_vals = constraints_global(res.x)
+            # Allow small numerical tolerance
+            if np.min(c_vals) >= -1e-5:
+                current_sum = -res.fun
+                if current_sum > best_val:
+                    best_val = current_sum
+                    best_result = res
+        except Exception:
+            continue
+            
+    if best_result is None:
+        # Fallback to a simple valid packing if optimization fails
+        # Grid packing with small radii
+        centers = np.linspace(0.1, 0.9, 5)
+        centers = np.column_stack(np.meshgrid(centers, centers)).reshape(-1, 2)
+        # Take first 26
+        centers = centers[:26]
+        radii = np.full(26, 0.01)
+        return centers, radii, np.sum(radii)
+        
+    # Extract solution
+    sol = best_result.x
+    centers = np.empty((N_CIRCLES, 2))
+    radii = np.empty(N_CIRCLES)
+    for i in range(N_CIRCLES):
+        centers[i, 0] = sol[3*i]
+        centers[i, 1] = sol[3*i+1]
+        radii[i] = sol[3*i+2]
+        
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+
+# Final program structure required by prompt
+# The run_packing function is defined above.
+# We just need to ensure it is callable and imports are present.

@@ -1,0 +1,233 @@
+# sol_000177 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 64b41a5f) state=f597ff1c sum of radii=2.192277 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # 1. Initialize centers with a hexagonal packing pattern
+    centers = np.zeros((n, 2))
+    
+    # Parameters for hexagonal grid initialization
+    # We try to fit points in a grid, then let optimization expand them
+    r_init = 0.1
+    dx = 2 * r_init
+    dy = r_init * np.sqrt(3)
+    
+    count = 0
+    row = 0
+    while count < n:
+        y = r_init + row * dy
+        if y + r_init > 1.0:
+            row += 1
+            y = r_init + row * dy
+            if y + r_init > 1.0:
+                break # Should not happen with small r_init
+        
+        shift = r_init if (row % 2 == 1) else 0.0
+        col = 0
+        while count < n:
+            x = r_init + shift + col * dx
+            if x + r_init > 1.0:
+                break
+            
+            centers[count] = [x, y]
+            count += 1
+            col += 1
+        row += 1
+        
+    # If for some reason we didn't get enough (unlikely with these params), fill randomly
+    while count < n:
+        centers[count] = np.random.rand(2)
+        count += 1
+
+    # 2. Optimization Loop
+    # We will run for a fixed number of iterations or until convergence
+    # Since this is a simulation, we fix iterations.
+    
+    # Pre-allocate LP structures to save time? 
+    # Not strictly necessary for N=26, but good practice.
+    # Constraints:
+    # 1. Pairwise: r_i + r_j <= dist_ij
+    # 2. Boundary: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    
+    num_pairs = n * (n - 1) // 2
+    num_boundary = 4 * n
+    num_constraints = num_pairs + num_boundary
+    
+    # A_ub matrix structure
+    # Rows 0 to num_pairs-1: Pairwise
+    # Rows num_pairs to end: Boundary
+    
+    # We will rebuild A_ub and b_ub every iteration because distances change
+    
+    # Objective: Minimize -sum(radii) -> c = -1
+    c = -np.ones(n)
+    
+    for iteration in range(500):
+        # Update distances and constraints
+        b_ub = np.zeros(num_constraints)
+        A_ub = np.zeros((num_constraints, n))
+        
+        constraint_idx = 0
+        
+        # Pairwise constraints
+        # We store indices to map back for force calculation if needed, 
+        # but for simple repulsion we can just iterate pairs again.
+        # To use duals efficiently, we need to know which dual corresponds to which pair.
+        # Let's store pair mapping.
+        pair_map = [] # (i, j)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                A_ub[constraint_idx, i] = 1.0
+                A_ub[constraint_idx, j] = 1.0
+                b_ub[constraint_idx] = dist
+                pair_map.append((i, j))
+                constraint_idx += 1
+                
+        # Boundary constraints
+        for i in range(n):
+            x, y = centers[i]
+            
+            # r_i <= x_i
+            A_ub[constraint_idx, i] = 1.0
+            b_ub[constraint_idx] = x
+            pair_map.append((i, 'left')) # Marker for boundary
+            constraint_idx += 1
+            
+            # r_i <= 1 - x_i
+            A_ub[constraint_idx, i] = 1.0
+            b_ub[constraint_idx] = 1 - x
+            pair_map.append((i, 'right'))
+            constraint_idx += 1
+            
+            # r_i <= y_i
+            A_ub[constraint_idx, i] = 1.0
+            b_ub[constraint_idx] = y
+            pair_map.append((i, 'bottom'))
+            constraint_idx += 1
+            
+            # r_i <= 1 - y_i
+            A_ub[constraint_idx, i] = 1.0
+            b_ub[constraint_idx] = 1 - y
+            pair_map.append((i, 'top'))
+            constraint_idx += 1
+            
+        # Bounds for radii: r_i >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        # Solve LP
+        # method='highs' is robust and provides marginals (duals)
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if not res.success:
+            # Fallback or break
+            radii = np.zeros(n)
+        else:
+            radii = res.x
+            
+            # Retrieve dual variables (marginals) for inequality constraints
+            # res.marginals.ineqlin corresponds to A_ub @ x <= b_ub
+            # Note: linprog minimizes c^T x. Duals are typically non-negative.
+            # The sensitivity interpretation: if b increases, optimal value increases by dual * delta_b.
+            # But we minimize -sum(r). So if b increases, we can increase r, decreasing objective (more negative).
+            # Actually, standard dual sign conventions in scipy:
+            # For min c^T x s.t. Ax <= b, duals y >= 0.
+            # Change in obj approx y^T delta_b.
+            # If b increases (relaxation), we can increase r, so sum(r) increases, obj decreases.
+            # So y should be positive? 
+            # Let's just use absolute values or check sign. 
+            # Usually marginals are non-negative for <= constraints in minimization.
+            
+            try:
+                duals = res.marginals.ineqlin
+            except AttributeError:
+                duals = np.zeros(num_constraints)
+            
+            # Compute forces on centers
+            forces = np.zeros((n, 2))
+            
+            # Process pairwise duals
+            for idx, (i, j) in enumerate(pair_map[:num_pairs]):
+                # If constraint is active (dual > 0 or close to tight)
+                # A loose threshold on dual or checking slack is safer.
+                # Slack = b - A@x = dist - (r_i + r_j)
+                slack = b_ub[idx] - (radii[i] + radii[j])
+                
+                if slack < 1e-4: # Active constraint
+                    dual = abs(duals[idx]) # Ensure positive
+                    if dual > 1e-6:
+                        # Repulsion force
+                        vec = centers[i] - centers[j]
+                        dist = np.linalg.norm(vec)
+                        if dist > 1e-9:
+                            # Force proportional to dual and gradient of distance
+                            # Gradient of dist w.r.t x_i is (x_i - x_j)/dist
+                            # Contribution to force: dual * gradient
+                            force_vec = vec / dist * dual
+                            forces[i] += force_vec
+                            forces[j] -= force_vec
+            
+            # Process boundary duals
+            for idx in range(num_pairs, num_constraints):
+                dual = abs(duals[idx])
+                if dual > 1e-6:
+                    entry = pair_map[idx]
+                    i = entry[0]
+                    wall = entry[1]
+                    
+                    if wall == 'left':   # r_i <= x_i. Increasing x helps.
+                        forces[i][0] += dual
+                    elif wall == 'right': # r_i <= 1-x_i. Decreasing x helps.
+                        forces[i][0] -= dual
+                    elif wall == 'bottom': # r_i <= y_i. Increasing y helps.
+                        forces[i][1] += dual
+                    elif wall == 'top':    # r_i <= 1-y_i. Decreasing y helps.
+                        forces[i][1] -= dual
+
+            # Apply forces with decaying step size
+            step_size = 0.05 * (1.0 / (1.0 + iteration * 0.05))
+            centers += forces * step_size
+            
+            # Keep centers strictly inside to avoid numerical issues with LP bounds
+            # But validation allows touching. However, if center is at 0, r must be 0.
+            # We want r > 0 ideally.
+            centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+
+    # Final check/validation step is implicit in the loop, 
+    # but we return the last valid state.
+    # We should ensure the returned radii are consistent with centers.
+    # Re-run LP one last time to get exact optimal radii for final centers.
+    b_ub = np.zeros(num_constraints)
+    A_ub = np.zeros((num_constraints, n))
+    constraint_idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            A_ub[constraint_idx, i] = 1.0
+            A_ub[constraint_idx, j] = 1.0
+            b_ub[constraint_idx] = dist
+            constraint_idx += 1
+    for i in range(n):
+        x, y = centers[i]
+        A_ub[constraint_idx, i] = 1.0; b_ub[constraint_idx] = x; constraint_idx += 1
+        A_ub[constraint_idx, i] = 1.0; b_ub[constraint_idx] = 1 - x; constraint_idx += 1
+        A_ub[constraint_idx, i] = 1.0; b_ub[constraint_idx] = y; constraint_idx += 1
+        A_ub[constraint_idx, i] = 1.0; b_ub[constraint_idx] = 1 - y; constraint_idx += 1
+        
+    res_final = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)]*n, method='highs')
+    final_radii = res_final.x if res_final.success else np.zeros(n)
+    
+    # Ensure no negative radii due to float errors
+    final_radii = np.maximum(final_radii, 0.0)
+    
+    sum_radii = np.sum(final_radii)
+    
+    return centers, final_radii, sum_radii

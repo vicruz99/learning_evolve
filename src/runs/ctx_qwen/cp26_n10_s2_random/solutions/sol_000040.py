@@ -1,0 +1,176 @@
+# sol_000040 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000002 (state 2c120403) state=fae37767 sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+IU, JU = np.triu_indices(N, k=1)
+
+def objective(x):
+    """Objective: minimize negative sum of radii (i.e., maximize sum of radii)"""
+    return -np.sum(x[2::3])
+
+def constraints_func(x):
+    """
+    Computes all inequality constraints (must be >= 0)
+    1. Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r
+    2. Non-overlap: dist^2 >= (r_i + r_j)^2
+    """
+    xs = x[0::3]
+    ys = x[1::3]
+    rs = x[2::3]
+    
+    # Boundary constraints
+    c_bound = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+    
+    # Overlap constraints (vectorized)
+    dx = xs[IU] - xs[JU]
+    dy = ys[IU] - ys[JU]
+    dr = rs[IU] + rs[JU]
+    c_overlap = dx**2 + dy**2 - dr**2
+    
+    return np.concatenate([c_bound, c_overlap])
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [0, 0.5]"""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def run_packing() -> tuple:
+    np.random.seed(42)
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # 1. Initial Hexagonal Grid Configuration
+    r0 = 0.09
+    centers = []
+    y = r0
+    row = 0
+    while len(centers) < N:
+        x = r0 if row % 2 == 0 else 2 * r0
+        while x + r0 <= 1.0 + 1e-9 and len(centers) < N:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    # Fill remaining spots randomly if hex grid falls short
+    while len(centers) < N:
+        centers.append([np.random.uniform(r0, 1-r0), np.random.uniform(r0, 1-r0)])
+    centers = np.array(centers[:N])
+    radii = np.full(N, 0.085)
+    
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    bounds = get_bounds()
+    
+    # 2. Multi-start Optimization Loop
+    for trial in range(40):
+        if trial > 0:
+            # Perturb the best known solution to escape local minima
+            c_pert = best_centers + np.random.normal(0, 0.005, (N, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            r_pert = best_radii + np.random.normal(0, 0.002, N)
+            r_pert = np.clip(r_pert, 0.01, 0.3)
+            x0 = np.zeros(N*3)
+            for i in range(N):
+                x0[3*i] = c_pert[i, 0]
+                x0[3*i+1] = c_pert[i, 1]
+                x0[3*i+2] = r_pert[i]
+        else:
+            # Flatten initial hex grid
+            x0 = np.zeros(N*3)
+            for i in range(N):
+                x0[3*i] = centers[i, 0]
+                x0[3*i+1] = centers[i, 1]
+                x0[3*i+2] = radii[i]
+                
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraints_func},
+                           options={'maxiter': 1500, 'ftol': 1e-12})
+            
+            if res.success or res.nit > 100:
+                cand_centers = res.x.reshape(N, 3)[:, :2]
+                cand_radii = res.x.reshape(N, 3)[:, 2]
+                
+                # Ensure positive radii and boundary respect
+                cand_radii = np.maximum(cand_radii, 1e-7)
+                cand_centers = np.clip(cand_centers, cand_radii[:, np.newaxis], 1.0 - cand_radii[:, np.newaxis])
+                
+                # Strict overlap repair
+                for _ in range(20):
+                    overlap = False
+                    for i in range(N):
+                        for j in range(i+1, N):
+                            d = np.linalg.norm(cand_centers[i] - cand_centers[j])
+                            if d < cand_radii[i] + cand_radii[j] - 1e-9:
+                                overlap = True
+                                shrink = (cand_radii[i] + cand_radii[j] - d) / 2.0
+                                cand_radii[i] -= shrink * 0.5
+                                cand_radii[j] -= shrink * 0.5
+                    if not overlap:
+                        break
+                        
+                # Growth phase: expand radii uniformly until constraints hit
+                for _ in range(5):
+                    min_gap = np.inf
+                    for i in range(N):
+                        gap = min(cand_centers[i,0]-cand_radii[i], 1.0-cand_centers[i,0]-cand_radii[i],
+                                  cand_centers[i,1]-cand_radii[i], 1.0-cand_centers[i,1]-cand_radii[i])
+                        for j in range(N):
+                            if i != j:
+                                d = np.linalg.norm(cand_centers[i]-cand_centers[j])
+                                gap = min(gap, (d - cand_radii[i] - cand_radii[j])/2.0)
+                        min_gap = min(min_gap, gap)
+                    if min_gap > 1e-6:
+                        cand_radii += min_gap * 0.999
+                        cand_centers = np.clip(cand_centers, cand_radii[:, np.newaxis], 1.0 - cand_radii[:, np.newaxis])
+                    else:
+                        break
+                        
+                cand_sum = np.sum(cand_radii)
+                if cand_sum > best_sum:
+                    best_sum = cand_sum
+                    best_centers = cand_centers.copy()
+                    best_radii = cand_radii.copy()
+        except Exception:
+            pass
+            
+    # 3. Final Validation & Safety Clipping
+    centers_out = best_centers
+    radii_out = best_radii
+    
+    # Final overlap resolution
+    for _ in range(10):
+        overlap = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers_out[i] - centers_out[j])
+                if d < radii_out[i] + radii_out[j] - 1e-9:
+                    overlap = True
+                    shrink = (radii_out[i] + radii_out[j] - d) / 2.0
+                    radii_out[i] -= shrink * 0.5
+                    radii_out[j] -= shrink * 0.5
+        if not overlap:
+            break
+            
+    # Final boundary enforcement
+    for i in range(N):
+        x, y = centers_out[i]
+        r = radii_out[i]
+        centers_out[i, 0] = np.clip(x, r, 1.0 - r)
+        centers_out[i, 1] = np.clip(y, r, 1.0 - r)
+        
+    return centers_out, radii_out, float(np.sum(radii_out))

@@ -1,0 +1,242 @@
+
+
+<strategy>
+To push past the current sum of radii (~2.635983), we need a highly refined optimization strategy that exploits the exact subgradient of the maximum radius sum with respect to circle centers. The objective function $F(C) = \sum r_i^*$ (where $r^*$ is the optimal radius vector from an LP) is piecewise linear in distances and non-smooth in centers. By computing LP dual variables (marginals), we obtain exact gradient directions that indicate how to move centers to relieve tight constraints and grow radii.
+
+Strategy:
+1. **LP Gradient Ascent**: Solve the radius maximization LP for fixed centers, extract dual marginals for pairwise and boundary constraints, and compute the gradient $\nabla_C F$. Move centers along this gradient with an adaptive step size and periodic jitter to escape local plateaus.
+2. **Diverse Initialization**: Combine hexagonal lattice patterns (which naturally promote high density), force-directed repulsion configs (to avoid clustering), and random starts. This ensures we explore multiple basins of attraction.
+3. **Coordinate-wise Local Search**: After gradient ascent converges, perform a local search that iteratively perturbs each circle individually. This fine-tunes positions to exploit microscopic gaps that gradient ascent might miss due to non-smoothness.
+4. **Strict Numerical Repair**: Iteratively clamp radii to boundary limits and shrink overlapping pairs symmetrically to guarantee the validator's $10^{-12}$ tolerance is met without sacrificing meaningful radius volume.
+5. **Efficiency**: Precompute the LP constraint matrix structure. Use `scipy.optimize.linprog` with `method='highs'` for speed. Limit iterations intelligently with early stopping on gradient norm.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+N = 26
+
+# Precompute LP constraint matrix structure (constant for fixed N)
+PAIR_INDICES = []
+for i in range(N):
+    for j in range(i + 1, N):
+        PAIR_INDICES.append((i, j))
+N_PAIRS = len(PAIR_INDICES)
+
+A_LP = np.zeros((N_PAIRS + 4 * N, N))
+for k, (i, j) in enumerate(PAIR_INDICES):
+    A_LP[k, i] = 1.0
+    A_LP[k, j] = 1.0
+for i in range(N):
+    base = N_PAIRS + 4 * i
+    A_LP[base, i] = 1.0
+    A_LP[base + 1, i] = 1.0
+    A_LP[base + 2, i] = 1.0
+    A_LP[base + 3, i] = 1.0
+
+def solve_lp_and_grad(c):
+    """Solves LP for max sum of radii given centers, returns radii, sum, and gradient."""
+    n = c.shape[0]
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]),
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    b_ub = np.empty(N_PAIRS + 4 * N)
+    k = 0
+    for i, j in PAIR_INDICES:
+        b_ub[k] = dists[i, j]
+        k += 1
+    for i in range(n):
+        b_ub[k] = c[i, 0]; k += 1
+        b_ub[k] = 1.0 - c[i, 0]; k += 1
+        b_ub[k] = c[i, 1]; k += 1
+        b_ub[k] = 1.0 - c[i, 1]; k += 1
+        
+    bounds = [(0.0, u) for u in ub]
+    res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if not res.success:
+        return np.zeros(n), 0.0, np.zeros_like(c)
+        
+    r = res.x
+    grad = np.zeros_like(c)
+    marginals = res.ineqlin.marginals
+    
+    # Pairwise constraint gradients
+    k = 0
+    for i, j in PAIR_INDICES:
+        lam = marginals[k]
+        if lam > 1e-6:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (c[i] - c[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        k += 1
+        
+    # Boundary constraint gradients
+    b_start = N_PAIRS
+    for i in range(n):
+        mu_L = marginals[b_start + 4*i]
+        mu_R = marginals[b_start + 4*i + 1]
+        mu_B = marginals[b_start + 4*i + 2]
+        mu_T = marginals[b_start + 4*i + 3]
+        grad[i, 0] += mu_L - mu_R
+        grad[i, 1] += mu_B - mu_T
+        
+    return r, np.sum(r), grad
+
+def optimize_gradient(c0, rng, steps=1000, init_step=0.006):
+    """Gradient ascent on centers to maximize LP sum of radii."""
+    c = c0.copy()
+    best_c = c.copy()
+    best_sum = -1.0
+    step = init_step
+    r_best, s_best, _ = solve_lp_and_grad(c)
+    best_sum = s_best
+    
+    for k in range(steps):
+        r, s, g = solve_lp_and_grad(c)
+        if s > best_sum:
+            best_sum = s
+            best_c = c.copy()
+            r_best = r.copy()
+            
+        g_norm = np.linalg.norm(g)
+        if g_norm < 1e-10:
+            break
+            
+        c += step * (g / g_norm)
+        c = np.clip(c, 0.02, 0.98)
+        
+        if k % 200 == 199:
+            step *= 0.85
+            
+        if k % 150 == 0:
+            c += rng.normal(0, step * 0.3, c.shape)
+            c = np.clip(c, 0.02, 0.98)
+            
+    return best_c, best_sum, r_best
+
+def local_search(c0, rng, epochs=4):
+    """Coordinate-wise perturbation search to escape non-smooth local minima."""
+    c = c0.copy()
+    _, s_best, _ = solve_lp_and_grad(c)
+    
+    for ep in range(epochs):
+        step_size = 0.003 * (0.85 ** ep)
+        for i in range(N):
+            best_local_s = s_best
+            best_local_c = c.copy()
+            for _ in range(30):
+                c_try = c.copy()
+                shift = rng.normal(0, step_size, 2)
+                c_try[i] = np.clip(c[i] + shift, 0.02, 0.98)
+                _, s_try, _ = solve_lp_and_grad(c_try)
+                if s_try > best_local_s:
+                    best_local_s = s_try
+                    best_local_c = c_try.copy()
+            c = best_local_c
+            s_best = best_local_s
+            
+    return c, s_best
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    
+    # Hexagonal lattice patterns
+    patterns = [[5,6,5,6,4], [6,5,6,5,4], [5,5,5,5,6], [4,6,6,6,4], [5,5,6,5,5]]
+    for pat in patterns:
+        for r0 in [0.09, 0.095, 0.10]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            starts.append(np.array(c[:N]))
+            
+    # Random starts
+    for _ in range(5):
+        starts.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    # Force-directed repulsion starts
+    for seed in range(3):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        for _ in range(300):
+            f = np.zeros_like(c)
+            diff = c[:, None, :] - c[None, :, :]
+            d = np.linalg.norm(diff, axis=2)
+            d = np.maximum(d, 1e-4)
+            f = np.sum(diff / (d**2)[:, :, None], axis=1)
+            c += 0.002 * f
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+        
+    return starts
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    starts = generate_starts(rng)
+    
+    # Phase 1: Gradient Ascent from multiple starts
+    for c0 in starts:
+        c_opt, s_opt, r_opt = optimize_gradient(c0, rng, steps=1000, init_step=0.008)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            best_r = r_opt.copy()
+            
+    # Phase 2: Local Search refinement
+    c_local, s_local = local_search(best_c, rng, epochs=4)
+    r_local, _, _ = solve_lp_and_grad(c_local)
+    if s_local > best_sum:
+        best_sum = s_local
+        best_c = c_local.copy()
+        best_r = r_local.copy()
+        
+    # Phase 3: Final Gradient Polish
+    c_final, s_final, r_final = optimize_gradient(best_c, rng, steps=600, init_step=0.004)
+    if s_final > best_sum:
+        best_sum = s_final
+        best_c = c_final.copy()
+        best_r = r_final.copy()
+        
+    # Phase 4: Strict Numerical Repair
+    centers = best_c.copy()
+    radii = best_r.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr - 1e-12
+                changed = True
+        if not changed:
+            break
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

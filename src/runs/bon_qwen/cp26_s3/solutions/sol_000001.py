@@ -1,0 +1,148 @@
+# sol_000001 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 3ad176de) state=40e78236 sum of radii=2.175989 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def _compute_loss(vars, n=26):
+    centers = vars[:2*n].reshape(n, 2)
+    radii = vars[2*n:]
+    
+    # We want to maximize sum of radii, so minimize negative sum
+    loss = -np.sum(radii)
+    w = 2000.0
+    
+    # Circle-circle overlap penalty
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx*dx + dy*dy)
+            req = radii[i] + radii[j]
+            if dist < req:
+                loss += w * (req - dist)**2
+                
+    # Boundary penalty
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x < r: loss += w * (r - x)**2
+        if x > 1 - r: loss += w * (x + r - 1)**2
+        if y < r: loss += w * (r - y)**2
+        if y > 1 - r: loss += w * (y + r - 1)**2
+        if r < 0: loss += w * r**2
+        
+    return loss
+
+def _jiggle_pack(centers, radii, iters=400):
+    """Force-directed packing to resolve overlaps and expand radii"""
+    n = len(radii)
+    for _ in range(iters):
+        for i in range(n):
+            fx, fy = 0.0, 0.0
+            for j in range(n):
+                if i == j: continue
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                req = radii[i] + radii[j]
+                if dist < req and dist > 1e-6:
+                    # Repulsive force proportional to overlap
+                    force = (req - dist) / dist
+                    fx += force * dx
+                    fy += force * dy
+            # Boundary repulsion
+            x, y = centers[i]
+            r = radii[i]
+            if x < r: fx += (r - x) * 15.0
+            if x > 1 - r: fx -= (x + r - 1) * 15.0
+            if y < r: fy += (r - y) * 15.0
+            if y > 1 - r: fy -= (y + r - 1) * 15.0
+            
+            centers[i, 0] += fx * 0.05
+            centers[i, 1] += fy * 0.05
+        # Slowly expand all radii
+        radii += 0.00008
+    return centers, radii
+
+def run_packing():
+    np.random.seed(2024)
+    n = 26
+    best_vars = None
+    best_score = -np.inf
+    
+    # Prepare diverse initial configurations
+    configs = []
+    
+    # 1. Random distribution
+    c1 = np.random.rand(n, 2) * 0.6 + 0.2
+    r1 = np.full(n, 0.06)
+    configs.append((c1, r1))
+    
+    # 2. 5x5 Grid + 1 center
+    c2 = np.array([[0.1 + i*0.2, 0.1 + j*0.2] for i in range(5) for j in range(5)])
+    c2 = np.vstack([c2, [0.5, 0.5]])
+    r2 = np.full(n, 0.08)
+    configs.append((c2, r2))
+    
+    # 3. Hexagonal-like staggered rows (6,5,6,5,4)
+    c3 = []
+    counts = [6, 5, 6, 5, 4]
+    y = 0.12
+    dy = 0.8 / 4.0
+    for idx, cnt in enumerate(counts):
+        x_start = (1.0 - (cnt - 1) * 0.16) / 2.0
+        for col in range(cnt):
+            x = x_start + col * 0.16
+            if idx % 2 == 1:
+                x += 0.08
+            c3.append([x, y])
+        y += dy
+    c3 = np.array(c3[:n])
+    r3 = np.full(n, 0.09)
+    configs.append((c3, r3))
+    
+    bnds = [(0, 1)] * (2*n) + [(0, 0.2)] * n
+    
+    # Optimize each configuration
+    for c_init, r_init in configs:
+        # Pre-pack to resolve any initial overlaps and get a good local structure
+        c_j, r_j = _jiggle_pack(c_init.copy(), r_init.copy(), iters=500)
+        v0 = np.concatenate([c_j.ravel(), r_j])
+        
+        res = minimize(_compute_loss, v0, args=(n,), method='L-BFGS-B', bounds=bnds, 
+                       options={'maxiter': 6000, 'ftol': 1e-11, 'gtol': 1e-8})
+        
+        score = -res.fun
+        if score > best_score:
+            best_score = score
+            best_vars = res.x
+            
+    centers = best_vars[:2*n].reshape(n, 2)
+    radii = best_vars[2*n:]
+    
+    # Final validation and safe scaling to guarantee constraints
+    while True:
+        valid = True
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                valid = False
+                break
+            for j in range(i + 1, n):
+                d = np.sqrt((centers[i,0] - centers[j,0])**2 + (centers[i,1] - centers[j,1])**2)
+                if d < radii[i] + radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            break
+        # Scale down radii slightly to resolve numerical overlaps
+        radii *= 0.998
+        
+    return centers, radii, np.sum(radii)

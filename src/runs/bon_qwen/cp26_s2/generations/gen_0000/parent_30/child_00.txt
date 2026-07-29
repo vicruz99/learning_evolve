@@ -1,0 +1,377 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we can employ an iterative optimization strategy combining Linear Programming (LP) with Gradient Ascent. This approach alternates between optimizing the radii for fixed centers and optimizing the center positions based on the sensitivity of the optimal radii sum.
+
+1.  **Initialization**: We start with a well-distributed set of centers to ensure good initial packing density. A perturbed hexagonal lattice is a strong candidate. We place 26 points in a configuration that mimics dense packing, scaled to fit within the unit square, and add a small random jitter to prevent symmetries that might hinder convergence.
+
+2.  **Iterative Optimization Loop**: We iterate a set number of times (e.g., 500). In each iteration, we perform two sub-steps:
+    *   **Sub-step A: Solve for Optimal Radii (LP)**. Given the current center positions, we solve a linear program to find the maximum possible radii. The objective is to maximize the sum of radii, subject to constraints that circles do not overlap (distance between centers $\ge$ sum of radii) and stay within the unit square boundaries. We use `cvxpy` for this, as it allows easy access to dual variables (Lagrange multipliers), which represent the "pressure" or sensitivity of the objective function to constraint changes.
+    *   **Sub-step B: Gradient Ascent on Centers**. Using the dual variables from the LP, we compute the gradient of the sum of radii with respect to the center coordinates. The dual variables associated with the inter-circle distance constraints act as repulsive forces between touching circles. Dual variables from boundary constraints act as forces pushing circles away from the edges. We update the center positions by moving them in the direction of this gradient (repulsion), effectively trying to create more space to accommodate larger radii. The new positions are clipped to stay within $[0, 1]$.
+
+3.  **Fallback & Stability**: To prevent numerical issues (like division by zero when centers coincide), we add a small epsilon to distances. We also ensure radii remain non-negative. If the LP solver fails, we fall back to a simple heuristic.
+
+4.  **Result Extraction**: After convergence or reaching the iteration limit, we return the final centers, the computed radii from the last LP solve, and the total sum of radii. This method is robust and mathematically grounded, allowing the system to self-organize into a dense, high-value packing configuration.
+</strategy>
+
+```python
+import numpy as np
+import cvxpy as cp
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square to maximize the sum of radii.
+    Uses an iterative approach: LP for radii, Gradient Ascent for centers.
+    """
+    n = 26
+    np.random.seed(42)
+
+    # 1. Initialization: Hexagonal lattice pattern
+    # Rows: 6, 5, 5, 5, 5 = 26
+    rows_counts = [6, 5, 5, 5, 5]
+    centers = []
+    y_curr = 0.0
+    row_idx = 0
+    
+    # Approximate height to fit 5 rows in [0, 1]
+    # We will scale later. Initial coords in lattice space.
+    # Vertical step sqrt(3)/2
+    dy = np.sqrt(3) / 2
+    # Horizontal step 1.0 (relative)
+    
+    for count in rows_counts:
+        # Shift odd rows by 0.5
+        if row_idx % 2 == 1:
+            x_offset = 0.5
+        else:
+            x_offset = 0.0
+        
+        # Place 'count' circles
+        # Center them around the row width? 
+        # Let's just place them 0..count-1
+        for col in range(count):
+            x = x_offset + col
+            y = row_idx * dy
+            centers.append([x, y])
+        row_idx += 1
+        
+    centers = np.array(centers)
+    
+    # Scale and center to unit square [0, 1]
+    # Find bounding box
+    min_x, min_y = centers.min(axis=0)
+    max_x, max_y = centers.max(axis=0)
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    # Add margins to keep inside [0, 1] initially
+    scale = 0.95 / max(width, height)
+    centers = (centers - np.array([min_x, min_y])) * scale
+    centers += 0.5 * (1 - scale * max(width, height)) # Center it
+    
+    # Add small jitter
+    centers += np.random.uniform(-0.01, 0.01, centers.shape)
+    # Clip to ensure valid start
+    centers = np.clip(centers, 0.02, 0.98)
+
+    # 2. Optimization Loop
+    num_iterations = 600
+    learning_rate = 0.05
+    epsilon = 1e-8
+    
+    # Precompute indices for distance constraints to avoid loops in LP construction?
+    # Or just build LP every time (26 vars is small).
+    
+    current_sum_radii = 0.0
+    
+    for it in range(num_iterations):
+        # --- Sub-step A: Solve LP for Radii ---
+        # Variables: r_i
+        r = cp.Variable(n)
+        
+        # Objective: Maximize sum of radii
+        objective = cp.Maximize(cp.sum(r))
+        
+        constraints = []
+        
+        # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+        for i in range(n):
+            x, y = centers[i]
+            constraints.append(r[i] <= x)
+            constraints.append(r[i] <= 1 - x)
+            constraints.append(r[i] <= y)
+            constraints.append(r[i] <= 1 - y)
+            constraints.append(r[i] >= 0)
+            
+        # Inter-circle constraints: r_i + r_j <= distance
+        # To avoid O(N^2) variables in constraints object if heavy, but N=26 is small.
+        # We store dual variables to access later.
+        dist_constraints = []
+        dual_vars = []
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Distance
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                # Constraint: r_i + r_j <= d
+                cons = r[i] + r[j] <= d
+                constraints.append(cons)
+                dist_constraints.append(cons)
+        
+        prob = cp.Problem(objective, constraints)
+        
+        try:
+            prob.solve(solver=cp.ECOS, verbose=False) # ECOS is robust
+            if prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                # If failed, maybe centers are too close or bad.
+                # Fallback: small radii
+                radii = np.full(n, 0.01)
+                centers = np.clip(centers + np.random.uniform(-0.01, 0.01, centers.shape), 0.0, 1.0)
+                continue
+        except Exception:
+            radii = np.full(n, 0.01)
+            centers = np.clip(centers + np.random.uniform(-0.01, 0.01, centers.shape), 0.0, 1.0)
+            continue
+            
+        radii = r.value
+        if radii is None:
+            radii = np.zeros(n)
+            
+        current_sum_radii = np.sum(radii)
+        
+        # --- Sub-step B: Gradient Ascent on Centers ---
+        # Compute forces based on dual variables
+        # Force on i = sum_{j} lambda_{ij} * unit_vector(i->j) + boundary_forces
+        
+        forces = np.zeros_like(centers)
+        
+        # We need to map dual variables back to indices.
+        # The constraints list contains:
+        # 0..3n-1: boundaries
+        # 3n..end: distance constraints
+        
+        # Let's re-identify them or just iterate constraints list
+        # cvxpy constraints list order matches appending order.
+        
+        # Boundary constraints indices
+        # For each i: 4 constraints
+        # r_i <= x_i (idx = 4*i)
+        # r_i <= 1-x_i (idx = 4*i + 1)
+        # r_i <= y_i (idx = 4*i + 2)
+        # r_i <= 1-y_i (idx = 4*i + 3)
+        
+        # Distance constraints start after 4*n
+        dist_start_idx = 4 * n
+        
+        for i in range(n):
+            # Boundary duals
+            # We need to access dual variables. 
+            # In cvxpy, constraint.dual_variable holds the value.
+            
+            # Left boundary: r_i <= x_i. Dual lambda >= 0.
+            # Gradient of obj wrt x_i involves lambda.
+            # Term in Lagrangian: lambda * (r_i - x_i).
+            # dL/dx_i = -lambda.
+            # d(obj)/dx_i = - dL/dx_i = lambda.
+            # So force pushes x_i in +x direction (away from left wall).
+            
+            # Right boundary: r_i <= 1 - x_i => r_i + x_i <= 1.
+            # Lagrangian term: lambda * (r_i + x_i - 1).
+            # dL/dx_i = lambda.
+            # d(obj)/dx_i = -lambda.
+            # Force pushes x_i in -x direction (away from right wall).
+            
+            # Similar for y.
+            
+            # Note: Accessing duals by index is tricky if solver reorders?
+            # Better to store references.
+            pass
+
+        # Re-build constraints to capture references for duals
+        # Doing this inside loop is cleaner for reference access
+        constraints_ref = []
+        dist_constraints_ref = []
+        
+        for i in range(n):
+            x, y = centers[i]
+            c1 = r[i] <= x
+            c2 = r[i] <= 1 - x
+            c3 = r[i] <= y
+            c4 = r[i] <= 1 - y
+            constraints_ref.extend([c1, c2, c3, c4])
+            
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                cons = r[i] + r[j] <= d
+                dist_constraints_ref.append(cons)
+                constraints_ref.append(cons)
+
+        # Re-solve to get fresh duals linked to these references? 
+        # Actually prob.solve() updates the duals of the constraints passed to it.
+        # But we created a new list. We must use the constraints from the problem we solved.
+        # The 'constraints' list in the first block is what was passed.
+        # However, we didn't save references there.
+        # Let's modify the first block to save references.
+        
+        # RE-DO Sub-step A with reference saving
+        r = cp.Variable(n)
+        objective = cp.Maximize(cp.sum(r))
+        constraints = []
+        constraint_refs = [] # To store objects
+        
+        for i in range(n):
+            x, y = centers[i]
+            c1 = r[i] <= x
+            c2 = r[i] <= 1 - x
+            c3 = r[i] <= y
+            c4 = r[i] <= 1 - y
+            constraints.extend([c1, c2, c3, c4])
+            constraint_refs.extend([c1, c2, c3, c4])
+            
+        dist_refs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                cons = r[i] + r[j] <= d
+                constraints.append(cons)
+                constraint_refs.append(cons)
+                dist_refs.append(cons) # Store specifically for distance
+        
+        prob = cp.Problem(objective, constraints)
+        try:
+            prob.solve(solver=cp.ECOS, verbose=False)
+            if prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                 radii = np.full(n, 0.01)
+                 centers = np.clip(centers + np.random.uniform(-0.01, 0.01, centers.shape), 0.0, 1.0)
+                 continue
+        except:
+            radii = np.full(n, 0.01)
+            centers = np.clip(centers + np.random.uniform(-0.01, 0.01, centers.shape), 0.0, 1.0)
+            continue
+            
+        radii = r.value
+        if radii is None: radii = np.zeros(n)
+        current_sum_radii = np.sum(radii)
+        
+        # Compute Gradient
+        forces = np.zeros_like(centers)
+        
+        # Boundary Forces
+        # Indices in constraint_refs:
+        # i=0: 0,1,2,3
+        # i=1: 4,5,6,7
+        # ...
+        # Base index for i is 4*i
+        
+        for i in range(n):
+            base = 4 * i
+            # Left: r <= x. Dual val is constraint_refs[base].dual_variable.value
+            # Force +x
+            val_left = constraint_refs[base].dual_variable.value
+            if val_left is not None: forces[i, 0] += val_left
+            
+            # Right: r <= 1-x. Dual val constraint_refs[base+1].dual_variable.value
+            # Force -x
+            val_right = constraint_refs[base+1].dual_variable.value
+            if val_right is not None: forces[i, 0] -= val_right
+            
+            # Bottom: r <= y. Dual val constraint_refs[base+2].dual_variable.value
+            # Force +y
+            val_bottom = constraint_refs[base+2].dual_variable.value
+            if val_bottom is not None: forces[i, 1] += val_bottom
+            
+            # Top: r <= 1-y. Dual val constraint_refs[base+3].dual_variable.value
+            # Force -y
+            val_top = constraint_refs[base+3].dual_variable.value
+            if val_top is not None: forces[i, 1] -= val_top
+
+        # Distance Forces
+        # Constraints start at index 4*n
+        # Order: (0,1), (0,2)... (0,n-1), (1,2)...
+        # We need to map back to (i,j).
+        # Let's just iterate dist_refs and track index.
+        
+        # Re-iterate to match dist_refs order
+        counter = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Get dual value
+                # dist_refs is a list of constraint objects
+                # But we appended to constraint_refs.
+                # dist_refs[k] corresponds to constraint_refs[4*n + k]
+                # Let's use dist_refs directly if we stored them.
+                # Wait, I stored 'cons' in dist_refs in the re-do block.
+                
+                # Check dist_refs list
+                cons = dist_refs[counter]
+                val = cons.dual_variable.value
+                
+                if val is not None and val > 1e-9:
+                    # Force repulsive
+                    # Vector i -> j is centers[j] - centers[i]
+                    # Force on i should be away from j -> centers[i] - centers[j]
+                    # Direction: (x_i - x_j) / dist
+                    
+                    diff = centers[i] - centers[j]
+                    dist = np.linalg.norm(diff)
+                    if dist > 1e-9:
+                        direction = diff / dist
+                        forces[i] += val * direction
+                        forces[j] -= val * direction # Newton's 3rd law
+                    else:
+                        # Coincident centers, random push
+                        forces[i] += np.random.uniform(-1, 1, 2) * val
+                        forces[j] -= np.random.uniform(-1, 1, 2) * val
+                        
+                counter += 1
+                
+        # Update centers
+        # Adaptive learning rate or fixed
+        # Normalize forces to avoid huge steps?
+        # Forces are marginal gains (dimensionless? No, derivative of sum radii wrt pos).
+        # Units: Radii are length. Pos are length. Deriv is unitless?
+        # r <= x. dr/dx <= 1.
+        # r_i + r_j <= d. dr/dx ~ unit vector.
+        # So forces are roughly of order 1.
+        
+        # Learning rate decay?
+        lr = learning_rate * (0.99 ** it) 
+        
+        centers += lr * forces
+        
+        # Project back to feasible region [0, 1]
+        # But strictly, centers must allow some radius.
+        # We clip to [0.001, 0.999] to be safe?
+        # Actually, if center is 0, radius must be 0.
+        # Clip to [0, 1] is mathematically sufficient, but radii will adjust.
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        # Small random perturbation to escape local optima?
+        if it % 50 == 0:
+            centers += np.random.uniform(-0.005, 0.005, centers.shape)
+            centers = np.clip(centers, 0.0, 1.0)
+
+    # Final LP solve to ensure radii are optimal for final centers
+    r = cp.Variable(n)
+    objective = cp.Maximize(cp.sum(r))
+    constraints = []
+    for i in range(n):
+        x, y = centers[i]
+        constraints.extend([r[i] <= x, r[i] <= 1-x, r[i] <= y, r[i] <= 1-y, r[i] >= 0])
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            constraints.append(r[i] + r[j] <= d)
+    prob = cp.Problem(objective, constraints)
+    prob.solve(solver=cp.ECOS, verbose=False)
+    final_radii = r.value
+    if final_radii is None:
+        final_radii = np.zeros(n)
+    
+    # Final validation and clipping
+    # Ensure non-negative
+    final_radii = np.maximum(final_radii, 0)
+    
+    return centers, final_radii, float(np.sum(final_radii))
+```

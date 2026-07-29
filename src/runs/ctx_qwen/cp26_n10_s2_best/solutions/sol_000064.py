@@ -1,0 +1,133 @@
+# sol_000064 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000026 (state f081a56f) state=5f2614c9 sum of radii=2.622578 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_func(v, n):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraint_func(v, n):
+    """
+    Computes inequality constraints: boundaries and pairwise non-overlap.
+    Returns a flattened array where all elements must be >= 0.
+    """
+    cx = v[:n]
+    cy = v[n:2*n]
+    r = v[2*n:]
+    
+    cons_list = []
+    
+    # 1. Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    cons_list.append(cx - r)
+    cons_list.append(1.0 - cx - r)
+    cons_list.append(cy - r)
+    cons_list.append(1.0 - cy - r)
+    
+    # 2. Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    # Broadcast to create distance matrices
+    dx = cx[:, np.newaxis] - cx[np.newaxis, :]
+    dy = cy[:, np.newaxis] - cy[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Extract only upper triangle to avoid duplicate constraints
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    cons_list.append(dist_sq[mask] - r_sum_sq[mask])
+    
+    return np.concatenate(cons_list)
+
+def run_packing():
+    n = 26
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    cons_dict = {'type': 'ineq', 'fun': constraint_func, 'args': (n,)}
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # --- Phase 1: Generate diverse initial configurations ---
+    configs = []
+    
+    # 1. Base Hexagonal Lattice tailored for 26 circles
+    # Row pattern: 6, 5, 6, 5, 4
+    rows_config = [6, 5, 6, 5, 4]
+    base_centers = []
+    y_pos = 0.12
+    for r_idx, count in enumerate(rows_config):
+        # Shift odd rows horizontally for hexagonal nesting
+        x_start = 0.13 + (r_idx % 2) * 0.075
+        spacing = 0.15
+        for i in range(count):
+            if len(base_centers) >= n:
+                break
+            x_pos = x_start + i * spacing
+            base_centers.append([x_pos, y_pos])
+        y_pos += 0.165
+    base_centers = np.array(base_centers[:n])
+    configs.append(base_centers)
+    
+    # 2. Perturbed Hexagonal Lattices
+    for i in range(8):
+        np.random.seed(i * 100 + 42)
+        pert_centers = base_centers.copy() + np.random.uniform(-0.025, 0.025, base_centers.shape)
+        pert_centers = np.clip(pert_centers, 0.05, 0.95)
+        configs.append(pert_centers)
+        
+    # 3. Structured Random (grid-like but jittered)
+    for i in range(4):
+        np.random.seed(i * 50 + 7)
+        rand_centers = np.random.uniform(0.08, 0.92, size=(n, 2))
+        configs.append(rand_centers)
+        
+    # --- Phase 2: Initial Optimization Sweep ---
+    for cfg in configs:
+        r_init = np.full(n, 0.04)  # Small feasible radius
+        v0 = np.concatenate([cfg.flatten(), r_init])
+        
+        try:
+            res = minimize(objective_func, v0, method='SLSQP', bounds=bounds, args=(n,),
+                           constraints=cons_dict, 
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if res.success:
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # --- Phase 3: Intensive Refinement ---
+    if best_v is not None:
+        try:
+            res_refined = minimize(objective_func, best_v, method='SLSQP', bounds=bounds, args=(n,),
+                                   constraints=cons_dict,
+                                   options={'maxiter': 6000, 'ftol': 1e-14, 'disp': False})
+            if -res_refined.fun > best_sum:
+                best_v = res_refined.x
+                best_sum = -res_refined.fun
+        except Exception:
+            pass
+            
+    # --- Post-processing & Return ---
+    if best_v is not None:
+        cx = best_v[:n]
+        cy = best_v[n:2*n]
+        r = best_v[2*n:]
+        centers = np.column_stack([cx, cy])
+        
+        # Strict validity enforcement: shrink radii slightly to guarantee 
+        # constraints satisfy the validator's 1e-12 tolerance margin
+        r *= 0.99999999
+        
+        return centers, r, float(np.sum(r))
+    else:
+        # Fallback valid configuration (should not be reached)
+        centers = np.random.uniform(0.1, 0.9, size=(n, 2))
+        r = np.full(n, 0.02)
+        return centers, r, float(np.sum(r))

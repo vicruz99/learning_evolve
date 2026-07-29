@@ -1,0 +1,143 @@
+# sol_000032 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000006 (state 1103014d) state=f3144755 sum of radii=2.615658 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective_func(vars_vec):
+    """Minimize negative sum of radii <=> Maximize sum of radii."""
+    return -np.sum(vars_vec[2::3])
+
+def constraint_func(vars_vec):
+    """
+    Returns inequality constraints g(vars_vec) >= 0.
+    Includes boundary containment and pairwise non-overlap.
+    """
+    c = vars_vec.reshape((N_CIRCLES, 3))
+    centers = c[:, :2]
+    r = c[:, 2]
+    
+    cons = []
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    cons.append(centers[:, 0] - r)
+    cons.append(1.0 - centers[:, 0] - r)
+    cons.append(centers[:, 1] - r)
+    cons.append(1.0 - centers[:, 1] - r)
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = centers[:, 0, np.newaxis] - centers[:, 0]
+    dy = centers[:, 1, np.newaxis] - centers[:, 1]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, np.newaxis] + r
+    r_sum_sq = r_sum**2
+    
+    i_idx, j_idx = np.triu_indices(N_CIRCLES, k=1)
+    cons.append(dist_sq[i_idx, j_idx] - r_sum_sq[i_idx, j_idx])
+    
+    return np.concatenate(cons)
+
+def run_packing():
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    # Generate diverse initial configurations
+    inits = []
+    
+    # 1. Hexagonal lattice (high density packing pattern)
+    pts_hex = []
+    r0 = 0.07
+    dy = np.sqrt(3) * r0
+    y_pos = r0
+    row = 0
+    while len(pts_hex) < N_CIRCLES:
+        x_pos = r0 + (0.5 * 2 * r0 if row % 2 == 1 else 0.0)
+        while x_pos <= 1.0 - r0 and len(pts_hex) < N_CIRCLES:
+            pts_hex.append([x_pos, y_pos])
+            x_pos += 2.0 * r0
+        y_pos += dy
+        row += 1
+    inits.append(np.array(pts_hex))
+    
+    # 2. 5x5 grid + 1 center (symmetric baseline)
+    pts_grid = []
+    for i in range(5):
+        for j in range(5):
+            pts_grid.append([0.1 + 0.2*i, 0.1 + 0.2*j])
+    pts_grid.append([0.5, 0.5])
+    inits.append(np.array(pts_grid))
+    
+    # 3. Random spread initializations
+    rng = np.random.RandomState(42)
+    for _ in range(6):
+        inits.append(rng.rand(N_CIRCLES, 2))
+        
+    # Optimization loop
+    for init_pts in inits:
+        if init_pts.shape[0] < N_CIRCLES:
+            continue
+            
+        # Build initial vector with small radii to guarantee strict feasibility
+        x0 = np.zeros(3 * N_CIRCLES)
+        for i in range(N_CIRCLES):
+            x0[3*i] = init_pts[i, 0]
+            x0[3*i+1] = init_pts[i, 1]
+            x0[3*i+2] = 0.02 
+            
+        try:
+            res = minimize(objective_func, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 4000, 'ftol': 1e-12, 'disp': False})
+            if not np.isnan(res.fun):
+                curr_sum = -res.fun
+                c_vals = constraint_func(res.x)
+                if np.min(c_vals) >= -1e-7 and curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+        # Perturbation phase to escape local minima
+        if best_vars is not None:
+            local_rng = np.random.RandomState()
+            for _ in range(8):
+                x_pert = best_vars + local_rng.randn(3 * N_CIRCLES) * 0.008
+                # Keep radii within reasonable bounds to help optimizer
+                x_pert[2::3] = np.clip(x_pert[2::3], 0.01, 0.4) 
+                
+                try:
+                    res2 = minimize(objective_func, x_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                                    options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+                    if not np.isnan(res2.fun):
+                        curr_sum2 = -res2.fun
+                        c_vals2 = constraint_func(res2.x)
+                        if np.min(c_vals2) >= -1e-7 and curr_sum2 > best_sum:
+                            best_sum = curr_sum2
+                            best_vars = res2.x.copy()
+                except Exception:
+                    pass
+
+    # Final high-precision refinement from best found
+    if best_vars is not None:
+        try:
+            res_final = minimize(objective_func, best_vars, method='SLSQP', bounds=bounds, constraints=cons,
+                                 options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if not np.isnan(res_final.fun):
+                c_final = constraint_func(res_final.x)
+                if np.min(c_final) >= -1e-7:
+                    best_vars = res_final.x
+                    best_sum = -res_final.fun
+        except Exception:
+            pass
+
+    centers = best_vars.reshape((N_CIRCLES, 3))[:, :2]
+    radii = best_vars.reshape((N_CIRCLES, 3))[:, 2]
+    return centers, radii, float(best_sum)

@@ -1,0 +1,129 @@
+# sol_000132 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state cc363b95) state=44df23fe sum of radii=2.130638 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def generate_hex_grid(n, r_init):
+    """Generate a hexagonal lattice of n points inside [0,1]x[0,1]"""
+    pts = []
+    y = r_init
+    row_idx = 0
+    while len(pts) < n:
+        x = r_init
+        # Offset x for odd rows to form hexagonal structure
+        if row_idx % 2 == 1:
+            x += r_init  # horizontal shift by diameter
+        while x + r_init <= 1.001:
+            if len(pts) < n:
+                pts.append([x, y])
+            x += 2 * r_init
+        y += 1.5 * r_init  # vertical step for hex grid
+        row_idx += 1
+    return np.array(pts[:n])
+
+def run_packing() -> tuple:
+    n = 26
+    # Estimate initial radius based on density
+    # Target sum ~ 2.636 -> r ~ 0.101
+    r_init = 0.08 
+    
+    # 1. Initial Configuration (Hexagonal Grid)
+    centers_init = generate_hex_grid(n, r_init)
+    # Reshape to flat vector for scipy: [x1, y1, x2, y2, ..., x26, y26, r]
+    init_vars = np.concatenate([centers_init.flatten(), [r_init]])
+
+    def objective(vars):
+        # We want to maximize sum of radii. Since we assume equal radii r,
+        # we maximize r (minimize -r).
+        # vars[-1] is the radius r
+        return -vars[-1]
+
+    # Constraints
+    constraints = []
+
+    # Boundary constraints: r <= x <= 1-r  =>  x - r >= 0 and x + r <= 1
+    for i in range(n):
+        idx_x = 2 * i
+        idx_y = 2 * i + 1
+        idx_r = 2 * n
+        
+        # x - r >= 0
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i, r_idx=idx_r: v[i] - v[r_idx]})
+        # 1 - x - r >= 0
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i, r_idx=idx_r: 1.0 - v[i] - v[r_idx]})
+        # y - r >= 0
+        constraints.append({'type': 'ineq', 'fun': lambda v, j=i, r_idx=idx_r: v[j] - v[r_idx]})
+        # 1 - y - r >= 0
+        constraints.append({'type': 'ineq', 'fun': lambda v, j=i, r_idx=idx_r: 1.0 - v[j] - v[r_idx]})
+
+    # Non-overlap constraints: dist(i, j)^2 >= (2r)^2
+    # (xi - xj)^2 + (yi - yj)^2 - 4r^2 >= 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            idx_xi, idx_yi = 2 * i, 2 * i + 1
+            idx_xj, idx_yj = 2 * j, 2 * j + 1
+            idx_r = 2 * n
+            
+            def dist_constraint(v, i=i, j=j, xi=idx_xi, yi=idx_yi, xj=idx_xj, yj=idx_yj, r_idx=idx_r):
+                dx = v[xi] - v[xj]
+                dy = v[yi] - v[yj]
+                r = v[r_idx]
+                return (dx**2 + dy**2) - 4 * (r**2)
+            
+            constraints.append({'type': 'ineq', 'fun': dist_constraint})
+
+    # Bounds for variables
+    # x, y in [0, 1]
+    # r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0)])
+    bounds.append((0.0, 0.5))
+
+    # 2. Optimization
+    res = minimize(objective, init_vars, method='SLSQP', bounds=bounds, constraints=constraints, 
+                   options={'maxiter': 1000, 'ftol': 1e-9, 'disp': False})
+
+    # 3. Extract results
+    if not res.success:
+        # Fallback to initial if optimization fails (rare with good init)
+        centers = centers_init
+        radii = np.full(n, r_init)
+    else:
+        centers = res.x[:2*n].reshape(n, 2)
+        r_opt = res.x[2*n]
+        radii = np.full(n, r_opt)
+
+    # 4. Projection (Clamping)
+    # Ensure strict compliance with boundaries
+    for i in range(n):
+        r = radii[i]
+        x, y = centers[i]
+        # Project into valid region [r, 1-r]
+        centers[i, 0] = np.clip(x, r, 1.0 - r)
+        centers[i, 1] = np.clip(y, r, 1.0 - r)
+
+    # Resolve overlaps by slightly shrinking radii if necessary
+    # (This is a safety net for numerical precision)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            required_dist = radii[i] + radii[j]
+            if dist < required_dist:
+                # Overlap detected, shrink radii to touch
+                scale = dist / required_dist
+                # Distribute shrinkage proportionally or just reduce sum
+                # Simplest: reduce the larger radius or both equally
+                # Since they are equal, just reduce r
+                delta = (required_dist - dist) * 0.5 # small adjustment
+                # In equal radius case, r becomes dist / 2
+                new_r = dist / 2
+                radii[i] = new_r
+                radii[j] = new_r
+    
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii

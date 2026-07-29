@@ -1,0 +1,213 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.631, we need a more robust global search for center coordinates combined with an exact radius solver. The problem can be decoupled: for any fixed set of centers, the optimal radii are found exactly via a Linear Program (LP). This transforms the problem into optimizing 52 continuous variables (center coordinates) with a non-smooth but well-defined objective function: $F(X) = -\sum r_i^*(X)$.
+
+Strategy:
+1. **Exact Radius Solver**: Use `scipy.optimize.linprog` with the `highs` method to solve the LP efficiently. Constraints ensure circles stay within bounds and don't overlap: $r_i \le \text{dist\_to\_wall}$ and $r_i + r_j \le \text{dist}(c_i, c_j)$.
+2. **Diverse Initialization**: Generate starting configurations using:
+   - Hexagonal lattices with random rotations and scales (optimal packings often approximate hexagonal symmetry)
+   - Force-directed layouts (Coulomb repulsion) to spread points evenly
+   - Perturbed grids
+3. **Multi-Start Local Search**: Use `Powell` method (derivative-free) to optimize centers from each initialization. Powell is robust for non-smooth objectives and typically converges faster than Nelder-Mead for this dimensionality.
+4. **Single-Move Refinement**: After finding the best local optimum, run a dedicated hill-climbing routine that moves one circle at a time. This is highly effective for escaping symmetric local minima common in packing problems and fine-tuning contact networks.
+5. **Efficiency**: Precompute constraint indices, limit iterations intelligently, and avoid redundant calculations to ensure the code runs well within time limits while exploring the landscape thoroughly.
+
+This approach systematically explores high-density configurations and polishes them to numerical precision, reliably pushing the sum of radii toward the theoretical optimum (~2.636).
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def get_tri_indices(N):
+    """Precompute upper triangular indices for pairwise constraints."""
+    return np.triu_indices(N, k=1)
+
+def solve_radii_lp(centers, i_idx, j_idx):
+    """
+    Solves the LP to maximize sum of radii given fixed centers.
+    Returns (radii, sum_radii).
+    """
+    N = centers.shape[0]
+    c = -np.ones(N)  # Minimize -sum(r) <=> Maximize sum(r)
+    
+    # Precompute pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Constraint matrix and vector
+    # Format: A_ub @ r <= b_ub
+    m = 4 * N + len(i_idx)
+    A_ub = np.zeros((m, N))
+    b_ub = np.zeros(m)
+    
+    row_idx = 0
+    for i in range(N):
+        x, y = centers[i]
+        # Boundary constraints: r_i <= x, 1-x, y, 1-y
+        bounds_val = np.array([x, 1.0 - x, y, 1.0 - y])
+        for v in bounds_val:
+            A_ub[row_idx, i] = 1.0
+            b_ub[row_idx] = v
+            row_idx += 1
+            
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    row_pair = np.zeros(N)
+    for k in range(len(i_idx)):
+        i, j = i_idx[k], j_idx[k]
+        row_pair[i] = 1.0
+        row_pair[j] = 1.0
+        A_ub[row_idx] = row_pair
+        b_ub[row_idx] = dists[i, j]
+        row_pair[i] = 0.0
+        row_pair[j] = 0.0
+        row_idx += 1
+        
+    bounds = [(0.0, None)] * N
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback if LP fails
+    return np.full(N, 1e-6), 0.0
+
+def center_objective(coords_flat, N, i_idx, j_idx):
+    """Objective function for center optimization: minimize negative sum of radii."""
+    centers = coords_flat.reshape(N, 2)
+    _, sum_r = solve_radii_lp(centers, i_idx, j_idx)
+    return -sum_r
+
+def generate_inits(N, rng):
+    """Generates diverse initial center configurations."""
+    inits = []
+    
+    # 1. Hexagonal lattice variations
+    counts = [5, 6, 5, 6, 4]
+    for _ in range(10):
+        pts = []
+        scale = rng.uniform(0.9, 1.15)
+        rot = rng.uniform(-0.2, 0.2)
+        y = 0.05
+        r_est = 0.1 * scale
+        dy = r_est * np.sqrt(3.0)
+        
+        for r_idx, cnt in enumerate(counts):
+            shift = (r_idx % 2) * r_est
+            x = 0.05 + shift
+            for _ in range(cnt):
+                if len(pts) < N:
+                    pts.append([x, y])
+                x += 2.0 * r_est
+            y += dy
+            
+        pts = np.array(pts[:N])
+        if rot != 0.0:
+            c, s = np.cos(rot), np.sin(rot)
+            rot_mat = np.array([[c, -s], [s, c]])
+            pts = (pts - 0.5) @ rot_mat.T + 0.5
+            
+        pts += rng.uniform(-0.015, 0.015, pts.shape)
+        inits.append(np.clip(pts, 0.01, 0.99))
+        
+    # 2. Force-directed layout variations
+    for _ in range(8):
+        pts = rng.uniform(0.1, 0.9, (N, 2))
+        for _ in range(60):
+            forces = np.zeros_like(pts)
+            diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+            dists = np.sqrt(np.sum(diff**2, axis=2))
+            np.fill_diagonal(dists, 1e5)
+            f_mag = 1.0 / (dists**2 + 0.01)
+            forces += np.sum(f_mag[:, :, np.newaxis] * diff / (dists[:, :, np.newaxis] + 1e-5), axis=1)
+            
+            margin = 0.08
+            for d in [0, 1]:
+                below = pts[:, d] < margin
+                above = pts[:, d] > 1.0 - margin
+                forces[below, d] += 3.0 * (margin - pts[below, d])
+                forces[above, d] -= 3.0 * (pts[above, d] - (1.0 - margin))
+                
+            pts += 0.005 * forces
+            pts = np.clip(pts, 0.02, 0.98)
+        inits.append(pts)
+        
+    # 3. Grid variations
+    for _ in range(4):
+        g = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)])
+        g = np.vstack([g, [0.5, 0.5]])
+        g += rng.uniform(-0.02, 0.02, g.shape)
+        inits.append(np.clip(g, 0.02, 0.98))
+        
+    return inits
+
+def refine_single_move(coords, N, i_idx, j_idx, rng, max_steps=1500, step=0.008):
+    """Hill climbing refinement by moving one circle at a time to escape local minima."""
+    curr_obj = center_objective(coords, N, i_idx, j_idx)
+    best_coords = coords.copy()
+    
+    for _ in range(max_steps):
+        idx = rng.integers(N)
+        move_x = (rng.random() - 0.5) * 2 * step
+        move_y = (rng.random() - 0.5) * 2 * step
+        
+        new_coords = best_coords.copy()
+        new_coords[2*idx] = np.clip(best_coords[2*idx] + move_x, 0.005, 0.995)
+        new_coords[2*idx+1] = np.clip(best_coords[2*idx+1] + move_y, 0.005, 0.995)
+        
+        new_obj = center_objective(new_coords, N, i_idx, j_idx)
+        if new_obj < curr_obj:
+            best_coords = new_coords
+            curr_obj = new_obj
+            step *= 0.995  # Slowly decrease step size for fine-tuning
+            
+    return best_coords
+
+def run_packing():
+    N = 26
+    i_idx, j_idx = get_tri_indices(N)
+    rng = np.random.default_rng(123)
+    
+    best_sum = -1.0
+    best_coords = None
+    
+    inits = generate_inits(N, rng)
+    
+    # Phase 1: Multi-start local optimization using Powell method
+    for init_pts in inits:
+        coords = init_pts.flatten()
+        try:
+            res = minimize(center_objective, coords, args=(N, i_idx, j_idx),
+                           method='Powell',
+                           options={'maxiter': 1500, 'xtol': 1e-8, 'ftol': 1e-12, 'disp': False})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_coords = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Single-move refinement to escape local minima and polish contacts
+    if best_coords is not None:
+        best_coords = refine_single_move(best_coords, N, i_idx, j_idx, rng, max_steps=2000, step=0.006)
+        
+        # Re-evaluate final sum after refinement
+        centers = best_coords.reshape(N, 2)
+        radii, final_sum = solve_radii_lp(centers, i_idx, j_idx)
+        if final_sum > best_sum:
+            best_sum = final_sum
+            best_coords = centers.flatten()
+            
+    # Fallback (should not be reached given robust initialization)
+    if best_coords is None:
+        best_coords = rng.uniform(0.1, 0.9, (N, 2)).flatten()
+        centers = best_coords.reshape(N, 2)
+        radii, best_sum = solve_radii_lp(centers, i_idx, j_idx)
+        
+    centers = best_coords.reshape(N, 2)
+    radii, final_sum = solve_radii_lp(centers, i_idx, j_idx)
+    
+    return centers, radii, float(final_sum)
+```

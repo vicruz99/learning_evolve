@@ -1,0 +1,271 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.631, I will implement a more robust optimization pipeline that leverages the exact gradients from the LP dual variables, combined with derivative-free local search to escape non-smooth regions caused by changing active constraints.
+
+Key improvements:
+1. **L-BFGS-B with Exact LP Gradients**: Instead of manual gradient ascent, I will use `scipy.optimize.minimize` with `L-BFGS-B` and provide the exact gradient derived from LP dual multipliers. This handles step-size adaptation automatically and converges much faster.
+2. **Robust Dual Extraction**: Handle different SciPy versions safely when extracting LP marginals.
+3. **Coordinate-wise Nelder-Mead Refinement**: After gradient-based optimization, optimize each circle's position individually. This 1D/2D local search is highly effective at squeezing out additional radius sum in non-smooth landscapes.
+4. **Diverse & Structured Initializations**: Generate hexagonal patterns, force-directed layouts, and corner-biased starts to cover the configuration space thoroughly.
+5. **Strict Repair & Validation Compliance**: Ensure the final output strictly satisfies `dist >= r_i + r_j - 1e-12` and boundary constraints, preventing numerical rejection.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+TRIU_IND = np.triu_indices(N, 1)
+NUM_PAIRS = N * (N - 1) // 2
+
+def build_lp_matrices():
+    """Pre-construct the constant structure of the LP constraint matrix."""
+    A = np.zeros((NUM_PAIRS + 4 * N, N))
+    pairs = []
+    k = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            pairs.append((i, j))
+            k += 1
+    for i in range(N):
+        base = NUM_PAIRS + 4 * i
+        A[base, i] = 1.0
+        A[base + 1, i] = 1.0
+        A[base + 2, i] = 1.0
+        A[base + 3, i] = 1.0
+    return A, pairs
+
+A_LP, LP_PAIRS = build_lp_matrices()
+
+def solve_lp_and_grad(centers):
+    """Solves LP for maximal radii given fixed centers. Returns radii, sum, and exact gradient."""
+    c = np.clip(centers, 1e-7, 1.0 - 1e-7)
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]),
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 1e-12)
+    
+    diffs = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.zeros(A_LP.shape[0])
+    idx = 0
+    for i, j in LP_PAIRS:
+        b[idx] = dists[i, j]
+        idx += 1
+    for i in range(N):
+        b[idx] = c[i, 0]; idx += 1
+        b[idx] = 1.0 - c[i, 0]; idx += 1
+        b[idx] = c[i, 1]; idx += 1
+        b[idx] = 1.0 - c[i, 1]; idx += 1
+        
+    res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b, 
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    
+    if not res.success:
+        return np.zeros(N), 0.0, np.zeros_like(c)
+        
+    radii = res.x
+    s_sum = np.sum(radii)
+    
+    duals = np.zeros_like(b)
+    # Safe extraction of dual marginals across SciPy versions
+    if hasattr(res, 'marginals') and hasattr(res.marginals, 'ineqlin'):
+        duals = np.asarray(res.marginals.ineqlin)
+    elif hasattr(res, 'ineqlin') and hasattr(res.ineqlin, 'marginals'):
+        duals = np.asarray(res.ineqlin.marginals)
+        
+    grad = np.zeros_like(c)
+    idx = 0
+    for i, j in LP_PAIRS:
+        mu = duals[idx]
+        if mu > 1e-9:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (c[i] - c[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+        idx += 1
+        
+    bound_start = NUM_PAIRS
+    for i in range(N):
+        grad[i, 0] += duals[bound_start + 4*i] - duals[bound_start + 4*i + 1]
+        grad[i, 1] += duals[bound_start + 4*i + 2] - duals[bound_start + 4*i + 3]
+        
+    return radii, s_sum, grad
+
+def obj_grad_lbfgs(v):
+    """Objective and gradient for L-BFGS-B: minimize negative sum of radii."""
+    centers = v.reshape(N, 2)
+    _, s, g = solve_lp_and_grad(centers)
+    return -s, -g.flatten()
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [5, 5, 6, 5, 5],
+        [6, 4, 6, 5, 5], [4, 6, 6, 6, 4], [5, 4, 6, 6, 5],
+        [6, 6, 5, 5, 4], [5, 5, 5, 5, 6], [6, 5, 5, 5, 5],
+        [5, 7, 5, 5, 4], [5, 5, 5, 6, 5], [6, 5, 6, 4, 5]
+    ]
+    for pat in patterns:
+        for r0 in [0.088, 0.095, 0.102, 0.108]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.004, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+            starts.append(c)
+            
+    # Force-directed layouts for high initial separation
+    for _ in range(15):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(600):
+            forces = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i+1, N):
+                    d_vec = c[i] - c[j]
+                    d = np.linalg.norm(d_vec)
+                    if d < 0.2 and d > 1e-6:
+                        f = (0.2 - d) / (d**2 + 1e-6) * 0.01
+                        forces[i] += d_vec * f
+                        forces[j] -= d_vec * f
+            c += forces
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+        
+    return starts
+
+def repair(centers, radii):
+    """Deterministic repair to guarantee strict validation compliance."""
+    radii = radii.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple:
+    """Packs 26 circles in a unit square to maximize the sum of radii."""
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    bounds_xy = [(0.001, 0.999)] * (2 * N)
+    
+    starts = generate_starts(rng)
+    
+    # Phase 1: Multi-start L-BFGS-B optimization
+    for c0 in starts:
+        v0 = c0.flatten()
+        try:
+            res = minimize(obj_grad_lbfgs, v0, jac=True, method='L-BFGS-B', bounds=bounds_xy,
+                          options={'maxiter': 5000, 'ftol': 1e-14, 'gtol': 1e-12})
+            c_opt = res.x.reshape(N, 2)
+            _, s_opt, _ = solve_lp_and_grad(c_opt)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r, _, _ = solve_lp_and_grad(c_opt)
+        except Exception:
+            pass
+            
+    # Phase 2: Basin hopping / Perturbation search
+    for step in range(30):
+        noise = 0.012 * (0.90 ** step)
+        c_pert = best_c + rng.normal(0, noise, best_c.shape)
+        c_pert = np.clip(c_pert, 0.05, 0.95)
+        
+        try:
+            res = minimize(obj_grad_lbfgs, c_pert.flatten(), jac=True, method='L-BFGS-B', bounds=bounds_xy,
+                          options={'maxiter': 3000, 'ftol': 1e-14})
+            c_opt = res.x.reshape(N, 2)
+            _, s_opt, _ = solve_lp_and_grad(c_opt)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r, _, _ = solve_lp_and_grad(c_opt)
+        except Exception:
+            pass
+            
+    # Phase 3: Coordinate-wise Nelder-Mead refinement (escapes non-smooth LP gradient plateaus)
+    for _ in range(4):
+        improved = True
+        while improved:
+            improved = False
+            for i in range(N):
+                def obj_1d(p):
+                    tmp = best_c.copy()
+                    tmp[i] = p
+                    return -solve_lp_and_grad(tmp)[1]
+                try:
+                    res = minimize(obj_1d, best_c[i], method='Nelder-Mead',
+                                  options={'maxiter': 500, 'xatol': 1e-8, 'fatol': 1e-12})
+                    if -res.fun > best_sum + 1e-9:
+                        best_sum = -res.fun
+                        best_c[i] = res.x
+                        improved = True
+                except Exception:
+                    pass
+                    
+    # Phase 4: SLSQP Joint Polish for final precision
+    v0 = np.concatenate([best_c.flatten(), best_r])
+    def slsqp_obj(v): return -np.sum(v[2*N:])
+    def slsqp_cons(v):
+        c = v[:2*N].reshape(N, 2)
+        r = v[2*N:]
+        con = [c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r]
+        i, j = TRIU_IND
+        dx = c[i, 0] - c[j, 0]
+        dy = c[i, 1] - c[j, 1]
+        dr = r[i] + r[j]
+        con.append(dx**2 + dy**2 - dr**2)
+        return np.concatenate(con)
+        
+    bounds_sl = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    try:
+        res = minimize(slsqp_obj, v0, method='SLSQP', bounds=bounds_sl,
+                       constraints={'type': 'ineq', 'fun': slsqp_cons},
+                       options={'maxiter': 10000, 'ftol': 1e-14})
+        if np.min(slsqp_cons(res.x)) >= -1e-7:
+            s = np.sum(res.x[2*N:])
+            if s > best_sum:
+                best_sum = s
+                best_c = res.x[:2*N].reshape(N, 2)
+                best_r = res.x[2*N:]
+    except Exception:
+        pass
+        
+    # Final LP to get exact radii for final centers
+    best_r, final_sum, _ = solve_lp_and_grad(best_c)
+    if final_sum > best_sum:
+        best_sum = final_sum
+        best_r = best_r
+        
+    radii = repair(best_c.copy(), best_r.copy())
+    return best_c, radii, float(np.sum(radii))
+```

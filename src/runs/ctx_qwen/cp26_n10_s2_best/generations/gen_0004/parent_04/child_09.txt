@@ -1,0 +1,219 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a multi-phase optimization strategy that combines geometric intuition with robust numerical optimization:
+
+1. **Diverse Initial Configurations**: Generate starting points from rotated hexagonal lattices (optimal for dense packing), staggered grids, and force-relaxed random scatter. This covers the configuration space broadly and increases the chance of finding the global optimum.
+2. **Strict Feasibility Initialization**: For each configuration, compute initial radii based on the minimum distance to square boundaries and neighboring circles, scaled down (e.g., by 0.88) to guarantee strict feasibility before optimization begins.
+3. **Multi-Start SLSQP Optimization**: Use `scipy.optimize.minimize` with the SLSQP algorithm, which handles nonlinear inequality constraints efficiently. We maximize the sum of radii subject to boundary constraints and squared pairwise distance constraints (for numerical stability).
+4. **Iterative Perturbation & Refinement**: After finding the best local optimum, run a perturbation loop. In each step, slightly randomize centers, shrink radii to create "breathing room", recompute feasible radii, and re-optimize. This escapes shallow local minima common in packing problems.
+5. **Strict Post-Processing**: Apply deterministic boundary and non-overlap enforcement with small safety margins (`1e-9`) to guarantee compliance with the validator's tolerance (`1e-12`), compensating for any floating-point drift during optimization.
+
+This approach systematically explores the landscape, refines promising solutions, and rigorously enforces constraints to push the sum of radii beyond 2.636.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Compute inequality constraints: boundaries and pairwise non-overlap (squared)."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c_bound = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c_pair = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    
+    return np.concatenate([c_bound, c_pair])
+
+def compute_feasible_radii(centers):
+    """Compute strictly feasible initial radii based on local geometry."""
+    r = np.full(N, 0.25)
+    
+    # Distance to square boundaries
+    r = np.minimum(r, np.minimum(centers[:, 0], 1.0 - centers[:, 0]))
+    r = np.minimum(r, np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    # Distance to other centers
+    dx = centers[:, 0, np.newaxis] - centers[np.newaxis, :, 0]
+    dy = centers[:, 1, np.newaxis] - centers[np.newaxis, :, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    r = np.minimum(r, np.min(dists, axis=1) / 2.0)
+    
+    # Scale down slightly to guarantee strict feasibility for optimizer start
+    return np.clip(r * 0.88, 0.001, 0.25)
+
+def generate_inits():
+    """Generate a diverse set of initial configurations."""
+    inits = []
+    
+    # 1. Rotated hexagonal lattices
+    for seed in range(25):
+        np.random.seed(seed)
+        r0 = 0.09 + np.random.uniform(-0.015, 0.015)
+        angle = np.random.uniform(-0.3, 0.3)
+        shift = np.random.uniform(-0.05, 0.05, 2)
+        
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N + 10:
+            x_start = r0 + (row % 2) * r0
+            x = x_start
+            while x <= 1.0 - r0 and len(pts) < N + 10:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3.0)
+            row += 1
+            
+        pts = np.array(pts[:N])
+        c, s = np.cos(angle), np.sin(angle)
+        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+        pts += shift
+        pts = np.clip(pts, 0.02, 0.98)
+        
+        r = compute_feasible_radii(pts)
+        inits.append(np.concatenate([pts[:, 0], pts[:, 1], r]))
+        
+    # 2. Staggered grid configurations
+    for seed in range(12):
+        np.random.seed(seed + 100)
+        pts = []
+        for i in range(6):
+            for j in range(5):
+                pts.append([0.08 + i * 0.16, 0.08 + j * 0.20])
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.015, 0.015, pts.shape)
+        pts = np.clip(pts, 0.02, 0.98)
+        
+        r = compute_feasible_radii(pts)
+        inits.append(np.concatenate([pts[:, 0], pts[:, 1], r]))
+        
+    # 3. Force-relaxed random configurations
+    for seed in range(15):
+        np.random.seed(seed + 200)
+        pts = np.random.uniform(0.1, 0.9, (N, 2))
+        for _ in range(120):
+            forces = np.zeros_like(pts)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    diff = pts[i] - pts[j]
+                    d = np.hypot(diff[0], diff[1])
+                    if d < 0.25 and d > 1e-5:
+                        f = (0.25 - d) * 0.5 / d
+                        forces[i] += f * diff
+                        forces[j] -= f * diff
+            pts += forces * 0.05
+            pts = np.clip(pts, 0.05, 0.95)
+            
+        r = compute_feasible_radii(pts)
+        inits.append(np.concatenate([pts[:, 0], pts[:, 1], r]))
+        
+    return inits
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    bounds = [(0.0, 1.0)] * (2 * N) + [(1e-4, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_v = None
+    
+    inits = generate_inits()
+    
+    # Phase 1: Multi-start optimization
+    for v0 in inits:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, 
+                           options={'maxiter': 15000, 'ftol': 1e-13, 'disp': False})
+            
+            s = -res.fun
+            if s > best_sum:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        best_v = inits[0]
+        
+    # Phase 2: Iterative perturbation & refinement to escape local minima
+    current_v = best_v.copy()
+    for step in range(35):
+        np.random.seed(step + 500)
+        v_pert = current_v.copy()
+        
+        noise_scale = 0.006 * (1.0 - step / 35.0)
+        v_pert[:2*N] += np.random.uniform(-noise_scale, noise_scale, 2*N)
+        v_pert[:2*N] = np.clip(v_pert[:2*N], 0.01, 0.99)
+        
+        # Shrink radii to create slack and guarantee restart feasibility
+        centers_p = v_pert[:2*N].reshape(N, 2)
+        v_pert[2*N:] = compute_feasible_radii(centers_p) * 0.90
+        
+        try:
+            res = minimize(objective, v_pert, method='SLSQP', bounds=bounds,
+                           constraints=cons, 
+                           options={'maxiter': 12000, 'ftol': 1e-13, 'disp': False})
+            
+            s = -res.fun
+            if s > best_sum:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    current_v = best_v.copy()
+        except Exception:
+            pass
+            
+    # Extract results
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Phase 3: Strict post-processing to guarantee validator compliance
+    # 1. Enforce boundary constraints strictly
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    cr = np.maximum(cr, 0.0)
+    
+    # 2. Enforce non-overlap constraints iteratively with safety margin
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                if cr[i] + cr[j] > d - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    return centers, cr, float(np.sum(cr))
+```

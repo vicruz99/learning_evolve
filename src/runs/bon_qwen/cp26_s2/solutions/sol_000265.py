@@ -1,0 +1,244 @@
+# sol_000265 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 3433cac4) state=61149e3f sum of radii=1.718546 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Solves the circle packing problem for 26 circles in a unit square.
+    Returns (centers, radii, sum_radii).
+    """
+    n_circles = 26
+    
+    # Heuristic initialization: Hexagonal Grid
+    # Rows with 5, 4, 5, 4, 5, 3 circles sum to 26.
+    # This pattern is dense and likely close to optimal.
+    initial_centers = []
+    r_init = 0.1 # Starting radius estimate
+    
+    # Vertical spacing for hexagonal packing: r * sqrt(3)
+    # We use a normalized spacing and scale later, or just place them.
+    # Let's calculate positions based on r=0.1 first, then optimizer will expand.
+    dx = 2.0 * r_init
+    dy = np.sqrt(3) * r_init
+    
+    rows_config = [5, 4, 5, 4, 5, 3]
+    y_pos = r_init # Start just above bottom wall
+    
+    for count in rows_config:
+        # Calculate x offset to center the row
+        # Width occupied by 'count' circles is (count-1)*2r + 2r = count*2r
+        # We want this centered in [0, 1].
+        # Start x = (1 - count*2r) / 2 + r
+        
+        row_width = count * 2 * r_init
+        x_start = (1.0 - row_width) / 2.0 + r_init
+        
+        # Shift every other row (indices 1, 3, 5) by r in x direction?
+        # In standard hex packing, rows alternate shift of r (half diameter).
+        # Our loop index i: 0, 1, 2...
+        # If i is odd, shift by r_init.
+        
+        current_row_idx = len([c for sub in initial_centers for c in sub]) if isinstance(initial_centers, list) else 0 
+        # Simpler counter
+        row_idx = len(initial_centers)
+        
+        # Wait, logic for shifting:
+        # Row 0 (5 items): x = 0.1, 0.3, 0.5, 0.7, 0.9
+        # Row 1 (4 items): x = 0.2, 0.4, 0.6, 0.8 (Shifted by 0.1)
+        # This works if we adjust x_start.
+        
+        shift = 0.0
+        if row_idx % 2 == 1:
+            shift = r_init # Shift by radius
+            
+        # Recalculate x_start considering shift?
+        # Actually, let's just place them on a grid and let the optimizer fix it.
+        # But centering helps.
+        
+        # Let's just generate points roughly.
+        current_x = x_start + shift
+        for _ in range(count):
+            initial_centers.append([current_x, y_pos])
+            current_x += dx
+            
+        y_pos += dy
+
+    centers = np.array(initial_centers)
+    
+    # Ensure we have exactly 26
+    if len(centers) > n_circles:
+        centers = centers[:n_circles]
+    elif len(centers) < n_circles:
+        # Pad with random points if heuristic was short (unlikely with config above)
+        missing = n_circles - len(centers)
+        pad = np.random.rand(missing, 2) * 0.8 + 0.1
+        centers = np.vstack([centers, pad])
+
+    # Optimization function
+    # We will try to maximize the minimum radius 'r'
+    # Variables: r, x1, y1, x2, y2, ...
+    # But scipy works better with 1D array.
+    
+    # Let's define an objective that maximizes r while penalizing violations.
+    # However, it's often easier to fix r and check feasibility, then binary search.
+    # Or optimize r directly.
+    
+    # Let's try optimizing r directly with constraints handled by penalties.
+    # To make it robust, we will run a few iterations of "push apart" for a fixed r,
+    # then increase r.
+    
+    current_r = 0.05
+    current_centers = centers.copy()
+    
+    # Iterative growth
+    steps = 1000
+    # We want to reach high r.
+    # Let's just run a loop where we try to increase r and resolve conflicts.
+    
+    # Better: Use scipy to find max r.
+    # Objective: -r
+    # Constraints: dist(i,j) >= 2r, boundaries >= r.
+    # This is hard for standard solvers due to non-convexity.
+    
+    # Alternative: Force based relaxation.
+    
+    def resolve_conflicts(centers, r, n_iter=500, lr=0.01):
+        """
+        Push circles apart to satisfy non-overlap for a given radius r.
+        Returns updated centers and a measure of remaining violation.
+        """
+        c = centers.copy().astype(float)
+        
+        for _ in range(n_iter):
+            forces = np.zeros_like(c)
+            max_violation = 0.0
+            
+            # Pairwise repulsion
+            for i in range(len(c)):
+                for j in range(i + 1, len(c)):
+                    diff = c[i] - c[j]
+                    dist = np.linalg.norm(diff)
+                    if dist == 0:
+                        dist = 1e-9
+                        diff = np.random.rand(2) * 0.01 # Break symmetry
+                    
+                    min_dist = 2.0 * r
+                    if dist < min_dist:
+                        overlap = min_dist - dist
+                        max_violation = max(max_violation, overlap)
+                        force_mag = overlap / dist # Simple repulsion
+                        f_vec = diff * force_mag
+                        forces[i] += f_vec
+                        forces[j] -= f_vec
+            
+            # Boundary repulsion
+            for i in range(len(c)):
+                x, y = c[i]
+                # Left
+                if x < r:
+                    forces[i, 0] += (r - x)
+                    max_violation = max(max_violation, r - x)
+                # Right
+                if x > 1.0 - r:
+                    forces[i, 0] -= (x - (1.0 - r))
+                    max_violation = max(max_violation, x - (1.0 - r))
+                # Bottom
+                if y < r:
+                    forces[i, 1] += (r - y)
+                    max_violation = max(max_violation, r - y)
+                # Top
+                if y > 1.0 - r:
+                    forces[i, 1] -= (y - (1.0 - r))
+                    max_violation = max(max_violation, y - (1.0 - r))
+            
+            # Update positions
+            c += lr * forces
+            
+            # Clamp to box to prevent explosion, though forces should keep them in
+            c = np.clip(c, 0.0, 1.0)
+            
+            if max_violation < 1e-7:
+                break
+                
+        return c, max_violation
+
+    # Strategy: Binary search for max r
+    low_r = 0.0
+    high_r = 0.15 # Upper bound (diameter 0.3, 5 fit in row -> width 1.5 impossible, so < 0.15)
+    best_r = 0.0
+    best_centers = None
+    
+    # Pre-allocate best config
+    # We run the search. To speed up, we use the resolve_conflicts function.
+    
+    # To improve success rate, we can restart resolve_conflicts with random jitter if it fails.
+    
+    tolerance = 1e-6
+    
+    for _ in range(30): # 30 iterations of binary search
+        mid_r = (low_r + high_r) / 2.0
+        
+        # Try to resolve for mid_r
+        # Use current best centers as seed, or random if first time
+        seed_centers = best_centers.copy() if best_centers is not None else centers.copy()
+        
+        # Add small random jitter to escape local minima
+        seed_centers += np.random.normal(0, 0.001, seed_centers.shape)
+        seed_centers = np.clip(seed_centers, mid_r, 1.0 - mid_r)
+        
+        resolved_centers, violation = resolve_conflicts(seed_centers, mid_r, n_iter=200, lr=0.005)
+        
+        # If violation is small enough, r is feasible
+        if violation < tolerance:
+            best_r = mid_r
+            best_centers = resolved_centers
+            low_r = mid_r
+        else:
+            high_r = mid_r
+            
+    # Final optimization: Once we found a valid packing, try to increase r slightly 
+    # by resolving with tighter tolerance or just return.
+    # The binary search finds the boundary.
+    
+    # Let's do a few more steps to polish
+    if best_centers is not None:
+        # Try to increase r a bit more by resolving
+        current_r = best_r
+        for step in range(100):
+            delta = 1e-4
+            r_try = current_r + delta
+            # Resolve
+            # Use previous centers
+            centers_try, viol = resolve_conflicts(best_centers, r_try, n_iter=300, lr=0.002)
+            if viol < tolerance:
+                best_centers = centers_try
+                current_r = r_try
+            else:
+                # If failed, maybe decrease slightly to stabilize? 
+                # Or just stop.
+                # Let's try to recover by backing off slightly
+                r_try = current_r - 1e-5
+                centers_try, viol = resolve_conflicts(best_centers, r_try, n_iter=300, lr=0.002)
+                if viol < tolerance:
+                    best_centers = centers_try
+                    current_r = r_try
+                break # Stop if we can't improve
+
+    final_radii = np.full(n_circles, current_r)
+    sum_radii = float(np.sum(final_radii))
+    
+    return best_centers, final_radii, sum_radii
+
+if __name__ == "__main__":
+    # Test run
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Radius: {r[0]}")
+    # Check validity manually if needed
+    # from validation import validate_packing
+    # print(validate_packing(c, r))

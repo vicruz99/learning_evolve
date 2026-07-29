@@ -1,0 +1,177 @@
+
+
+<strategy>
+To improve the sum of radii for 26 circles in a unit square, we address three key areas:
+1. **Parameterization**: Use a coordinate transformation $x = r + u(1-2r)$, $y = r + v(1-2r)$ with $u,v \in [0,1]$ and $r \in [\epsilon, 0.5]$. This automatically satisfies boundary constraints, reducing the constraint set to only pairwise non-overlaps and improving solver stability.
+2. **Diverse Initialization**: Local optimizers like SLSQP easily get trapped. We generate 20 diverse starting configurations:
+   - Hexagonal lattices at various scales (loose to tight)
+   - Pure random placements
+   - Corner/edge-biased placements that intuitively allow larger circles near boundaries
+3. **Multi-stage Refinement**: Run SLSQP on each initialization. Keep the best valid result, then perform a high-precision refinement phase with tighter tolerances and more iterations to squeeze out additional volume.
+4. **Robustness**: Add strict numerical checks to ensure returned configurations satisfy constraints within tolerance, and provide a safe fallback if optimization fails.
+
+This strategy balances global exploration (via diverse inits) with local exploitation (via SLSQP + refinement), targeting the known optimal packing structures for circle arrangements in squares.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective function: maximize sum of radii (minimize negative sum)."""
+    return -np.sum(vars[0::3])
+
+def constraint_func(vars):
+    """
+    Constraint function: ensures non-overlap between all circle pairs.
+    Returns array of constraint values >= 0.
+    """
+    n = 26
+    radii = vars[0::3]
+    u = vars[1::3]
+    v = vars[2::3]
+    
+    # Transform normalized coordinates to actual positions
+    x = radii + u * (1.0 - 2.0 * radii)
+    y = radii + v * (1.0 - 2.0 * radii)
+    
+    # Compute pairwise squared distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Compute squared minimum allowed distances
+    r_sum = radii[:, None] + radii[None, :]
+    min_dist_sq = r_sum**2
+    
+    # Extract upper triangular part (i < j) to avoid duplicates and self
+    i, j = np.triu_indices(n, k=1)
+    return dist_sq[i, j] - min_dist_sq[i, j]
+
+def run_packing():
+    n = 26
+    best_sol = None
+    best_val = -np.inf
+    
+    # Bounds: r in [1e-5, 0.49], u in [0, 1], v in [0, 1]
+    bounds = [(1e-5, 0.49), (0, 1), (0, 1)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    inits = []
+    
+    # 1. Hexagonal lattice inits with various scales
+    for scale in [0.9, 0.95, 1.0, 1.05, 1.1]:
+        r_init = 0.08 * scale
+        positions = []
+        y_pos = r_init
+        row = 0
+        while len(positions) < n:
+            x_pos = r_init
+            while x_pos <= 1.0 - r_init:
+                if len(positions) < n:
+                    positions.append((x_pos, y_pos))
+                x_pos += 2.0 * r_init
+            y_pos += np.sqrt(3.0) * r_init
+            row += 1
+            
+        positions = positions[:n]
+        denom = 1.0 - 2.0 * r_init
+        u_init = np.array([(p[0] - r_init) / denom for p in positions])
+        v_init = np.array([(p[1] - r_init) / denom for p in positions])
+        
+        vars0 = np.empty(n * 3)
+        vars0[0::3] = r_init
+        vars0[1::3] = u_init
+        vars0[2::3] = v_init
+        inits.append(vars0)
+        
+    # 2. Random inits
+    for seed in range(10):
+        np.random.seed(seed)
+        r_init = np.random.uniform(0.05, 0.12)
+        u_init = np.random.rand(n)
+        v_init = np.random.rand(n)
+        vars0 = np.empty(n * 3)
+        vars0[0::3] = r_init
+        vars0[1::3] = u_init
+        vars0[2::3] = v_init
+        inits.append(vars0)
+        
+    # 3. Corner/Edge biased inits
+    for seed in range(5):
+        np.random.seed(42 + seed)
+        positions = []
+        for cx, cy in [(0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9),
+                        (0.5, 0.1), (0.5, 0.9), (0.1, 0.5), (0.9, 0.5)]:
+            positions.append((cx, cy))
+        for _ in range(n - 8):
+            positions.append((np.random.rand(), np.random.rand()))
+            
+        positions = positions[:n]
+        radii_est = np.zeros(n)
+        for i in range(n):
+            min_d = 1.0
+            for j in range(n):
+                if i == j: continue
+                d = np.sqrt((positions[i][0]-positions[j][0])**2 + **(positions[i][1]-positions[j][1])2)
+                min_d = min(min_d, d)
+            d_bound = min(positions[i][0], 1-positions[i][0], positions[i][1], 1-positions[i][1])
+            radii_est[i] = min(min_d/2, d_bound) * 0.95
+            
+        denom = 1.0 - 2.0 * radii_est
+        u_init = np.array([(p[0] - r) / d for p, r, d in zip(positions, radii_est, denom)])
+        v_init = np.array([(p[1] - r) / d for p, r, d in zip(positions, radii_est, denom)])
+        u_init = np.clip(u_init, 0, 1)
+        v_init = np.clip(v_init, 0, 1)
+        
+        vars0 = np.empty(n * 3)
+        vars0[0::3] = radii_est
+        vars0[1::3] = u_init
+        vars0[2::3] = v_init
+        inits.append(vars0)
+
+    # Run optimization on each initialization
+    for vars0 in inits:
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+            val = -res.fun
+            c_val = constraint_func(res.x)
+            if np.min(c_val) >= -1e-8 and val > best_val:
+                best_val = val
+                best_sol = res.x
+        except Exception:
+            continue
+            
+    # High-precision refinement on the best configuration found
+    if best_sol is not None:
+        try:
+            res_ref = minimize(objective, best_sol, method='SLSQP', bounds=bounds, 
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+            if res_ref.success and -res_ref.fun > best_val - 1e-9:
+                c_val = constraint_func(res_ref.x)
+                if np.min(c_val) >= -1e-9:
+                    best_sol = res_ref.x
+                    best_val = -res_ref.fun
+        except Exception:
+            pass
+
+    # Fallback if optimization fails
+    if best_sol is None:
+        r_fall = 0.05
+        vars0 = np.empty(n*3)
+        vars0[0::3] = r_fall
+        vars0[1::3] = np.linspace(0, 1, n)
+        vars0[2::3] = np.linspace(0, 1, n)
+        best_sol = vars0
+
+    # Reconstruct centers from optimized parameters
+    radii = best_sol[0::3]
+    u = best_sol[1::3]
+    v = best_sol[2::3]
+    x = radii + u * (1.0 - 2.0 * radii)
+    y = radii + v * (1.0 - 2.0 * radii)
+    centers = np.column_stack((x, y))
+    
+    return centers, radii, np.sum(radii)
+```

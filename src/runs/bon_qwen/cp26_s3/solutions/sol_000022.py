@@ -1,0 +1,226 @@
+# sol_000022 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1c033854) state=54a82cf3 sum of radii=2.397728 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a two-stage approach:
+    1. Initialize centers on a hexagonal grid.
+    2. Optimize centers using a randomized hill-climbing algorithm,
+       solving an LP for radii at each step.
+    """
+    n_circles = 26
+    np.random.seed(42) # For reproducibility
+
+    # --- Helper Function: Solve LP for radii given centers ---
+    def solve_radii(centers):
+        """
+        Solves the LP to find optimal radii for given centers.
+        Returns (radii, sum_radii) or (zeros, 0) if infeasible (unlikely).
+        """
+        # Objective: Maximize sum(r_i) => Minimize -sum(r_i)
+        c_obj = np.ones(n_circles) * -1
+
+        # Constraints Matrix A_ub * r <= b_ub
+        # We will build lists of rows and rhs
+        A_rows = []
+        b_vals = []
+
+        # 1. Pairwise distance constraints: r_i + r_j <= dist(i, j)
+        # Only upper triangle i < j
+        for i in range(n_circles):
+            xi, yi = centers[i]
+            row_i = np.zeros(n_circles)
+            row_i[i] = 1.0
+            
+            for j in range(i + 1, n_circles):
+                xj, yj = centers[j]
+                dist = math.hypot(xi - xj, yi - yj)
+                
+                # Reuse row_i, set entry for j
+                row_ij = row_i.copy()
+                row_ij[j] = 1.0
+                
+                A_rows.append(row_ij)
+                b_vals.append(dist)
+
+        # 2. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+        for i in range(n_circles):
+            xi, yi = centers[i]
+            row = np.zeros(n_circles)
+            row[i] = 1.0
+            
+            # r_i <= xi
+            A_rows.append(row)
+            b_vals.append(xi)
+            # r_i <= 1 - xi
+            A_rows.append(row)
+            b_vals.append(1.0 - xi)
+            # r_i <= yi
+            A_rows.append(row)
+            b_vals.append(yi)
+            # r_i <= 1 - yi
+            A_rows.append(row)
+            b_vals.append(1.0 - yi)
+
+        A_ub = np.array(A_rows)
+        b_ub = np.array(b_vals)
+
+        # Bounds for radii: 0 <= r_i <= 1 (loose upper bound)
+        bounds = [(0, 1.0)] * n_circles
+
+        try:
+            # Use 'highs' method for speed
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                radii = res.x
+                return radii, -res.fun
+            else:
+                # Fallback if LP fails (should not happen with valid centers)
+                return np.zeros(n_circles), 0.0
+        except Exception:
+            return np.zeros(n_circles), 0.0
+
+    # --- Initialization: Hexagonal Grid ---
+    # We aim for a configuration close to optimal density.
+    # 6 rows pattern: 5, 4, 5, 4, 5, 3 sums to 26.
+    # This is a reasonable starting geometry for 26 circles.
+    
+    def generate_hex_grid():
+        centers = []
+        # Approximate radius for estimation
+        r_est = 0.095 
+        
+        rows_config = [5, 4, 5, 4, 5, 3] # Number of circles per row
+        
+        # Vertical spacing
+        # Total height 1. With 6 rows, we have 5 gaps.
+        # Height occupied by circles: 2 * r_est. Remaining: 1 - 2*r_est.
+        # Gap size ~ (1 - 2*r_est) / 5
+        # But for hex packing, vertical dist is sqrt(3)*r.
+        # Let's just place them and let optimizer fix.
+        
+        y_current = 0.1
+        # Dynamic step based on number of rows
+        # We want to spread 6 rows in [0.1, 0.9] roughly
+        step_y = 0.8 / 5.0 
+        
+        row_idx = 0
+        for num_circles in rows_config:
+            # x-coords
+            if row_idx % 2 == 0:
+                # Even rows: standard spacing
+                # Start at 0.1, end at 0.9?
+                # Span for num_circles is (num_circles-1)*dx + 2*r ~ 1?
+                # Just distribute uniformly in [0.05, 0.95]
+                xs = np.linspace(0.05, 0.95, num_circles)
+            else:
+                # Odd rows: shifted
+                xs = np.linspace(0.15, 0.85, num_circles)
+            
+            for x in xs:
+                centers.append([x, y_current])
+            
+            y_current += step_y
+            row_idx += 1
+            
+        return np.array(centers[:n_circles])
+
+    # --- Optimization Loop (Hill Climbing with Simulated Annealing) ---
+    centers = generate_hex_grid()
+    best_centers = centers.copy()
+    
+    # Initial evaluation
+    radii, current_sum = solve_radii(centers)
+    best_sum = current_sum
+    
+    # Parameters
+    max_iter = 1500
+    initial_step = 0.05
+    temperature = 1.0
+    decay = 0.995
+    
+    for it in range(max_iter):
+        # Perturb centers
+        # Pick a random circle to move
+        idx = np.random.randint(0, n_circles)
+        step_size = initial_step * (temperature ** (it/max_iter))
+        
+        dx = np.random.uniform(-step_size, step_size)
+        dy = np.random.uniform(-step_size, step_size)
+        
+        new_centers = centers.copy()
+        new_centers[idx, 0] += dx
+        new_centers[idx, 1] += dy
+        
+        # Keep within bounds (0,1) - soft constraint, LP handles strict, but helps search
+        new_centers[idx, 0] = np.clip(new_centers[idx, 0], 0, 1)
+        new_centers[idx, 1] = np.clip(new_centers[idx, 1], 0, 1)
+        
+        new_radii, new_sum = solve_radii(new_centers)
+        
+        # Acceptance criterion
+        if new_sum > current_sum:
+            current_sum = new_sum
+            centers = new_centers
+            if new_sum > best_sum:
+                best_sum = new_sum
+                best_centers = centers.copy()
+                best_radii = new_radii.copy()
+                # Reset step size slightly on improvement?
+                initial_step = 0.05 
+        else:
+            # Metropolis criterion
+            prob = math.exp((new_sum - current_sum) / (0.01 + 1e-5))
+            if np.random.random() < prob:
+                current_sum = new_sum
+                centers = new_centers
+        
+        # Cool down
+        temperature *= decay
+
+    # Final refinement: Small random perturbations around best
+    centers = best_centers
+    radii, current_sum = solve_radii(centers)
+    
+    # Try some local jitter
+    for _ in range(500):
+        idx = np.random.randint(0, n_circles)
+        step = 0.005
+        dx = np.random.uniform(-step, step)
+        dy = np.random.uniform(-step, step)
+        
+        temp_centers = centers.copy()
+        temp_centers[idx, 0] += dx
+        temp_centers[idx, 1] += dy
+        temp_centers[idx, 0] = np.clip(temp_centers[idx, 0], 0, 1)
+        temp_centers[idx, 1] = np.clip(temp_centers[idx, 1], 0, 1)
+        
+        temp_radii, temp_sum = solve_radii(temp_centers)
+        
+        if temp_sum > current_sum:
+            current_sum = temp_sum
+            centers = temp_centers
+            radii = temp_radii
+            
+    # Final validation and return
+    # Ensure radii are valid (non-negative)
+    radii = np.maximum(radii, 0.0)
+    
+    # The problem asks for centers and radii.
+    # We return the best found.
+    return centers, radii, current_sum
+
+# If running directly
+if __name__ == "__main__":
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # Basic check
+    print(f"Centers shape: {c.shape}, Radii shape: {r.shape}")

@@ -1,0 +1,223 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization pipeline that escapes local minima typical of gradient-based methods. The strategy combines three complementary phases:
+
+1. **Force-Directed Relaxation**: Initialize with a hexagonal lattice and run a physics-inspired simulation. Circles repel each other when overlapping and are pushed away from boundaries. Radii are dynamically updated to their maximum feasible values given current centers, and slowly grown over time. This phase is excellent at finding high-density configurations from scratch.
+
+2. **Constrained Optimization (SLSQP)**: Use the dense packing from phase 1 as a starting point for `scipy.optimize.minimize` with the SLSQP method. We use squared distance constraints (`dist^2 >= (r_i + r_j)^2`) for better numerical conditioning and smooth gradients. This refines the positions and radii to local optimality.
+
+3. **Radius Growth & Perturbation Loop**: To push past local optima, we iteratively scale up the radii of the best configuration by ~1%, resolve overlaps via a deterministic repair function, and re-run SLSQP. This "pressure" forces the optimizer to rearrange circles into tighter, previously unexplored arrangements. We also inject controlled random perturbations to break symmetry.
+
+A strict repair function is applied at the end to guarantee mathematical validity against the checker's tolerance. This hybrid approach consistently beats pure gradient or pure heuristic methods for circle packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute upper triangle indices for O(1) constraint evaluation
+i_idx, j_idx = np.triu_indices(N, 1)
+
+def constraints_sq(p):
+    """
+    Computes boundary and non-overlap constraints.
+    Returns a 1D array where each element must be >= 0 for feasibility.
+    Uses squared distances for smoother gradients.
+    """
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3]
+    
+    # Boundary constraints: circle inside [0,1]x[0,1]
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[i_idx] + r[j_idx]
+    
+    return np.concatenate([c, dist_sq - r_sum**2])
+
+def objective(p):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(p[2::3])
+
+def make_p(c, r):
+    """Flatten centers and radii into optimization variable vector."""
+    p = np.zeros(3 * N)
+    p[0::3] = c[:, 0]
+    p[1::3] = c[:, 1]
+    p[2::3] = r
+    return p
+
+def get_cr(p):
+    """Unpack optimization variable vector into centers and radii."""
+    return np.column_stack((p[0::3], p[1::3])), p[2::3]
+
+def run_force_directed(c, r, steps=12000):
+    """
+    Physics-based relaxation to find high-density packing.
+    Circles repel on overlap, walls push back, radii grow slowly.
+    """
+    dt = 0.004
+    for t in range(steps):
+        f = np.zeros_like(c)
+        
+        # Pairwise repulsion
+        diff = c[:, None, :] - c[None, :, :]
+        dist = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+        np.fill_diagonal(dist, np.inf)
+        
+        overlap = np.maximum(0, (r[:, None] + r[None, :]) - dist)
+        dir_vec = diff / dist[..., None]
+        f += np.sum(overlap[..., None] * dir_vec * 60.0, axis=1)
+        
+        # Wall repulsion
+        mask_l = c[:, 0] < r
+        f[mask_l, 0] += (r[mask_l] - c[mask_l, 0]) * 120.0
+        mask_r = c[:, 0] > 1.0 - r
+        f[mask_r, 0] -= (c[mask_r, 0] - (1.0 - r[mask_r])) * 120.0
+        mask_b = c[:, 1] < r
+        f[mask_b, 1] += (r[mask_b] - c[mask_b, 1]) * 120.0
+        mask_t = c[:, 1] > 1.0 - r
+        f[mask_t, 1] -= (c[mask_t, 1] - (1.0 - r[mask_t])) * 120.0
+        
+        c += f * dt
+        c = np.clip(c, 1e-6, 1.0 - 1e-6)
+        
+        # Update radii to max feasible for current centers
+        rb = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), np.minimum(c[:, 1], 1.0 - c[:, 1]))
+        r_pair = 0.5 * np.min(dist, axis=1)
+        r = np.minimum(rb, r_pair)
+        
+        # Slow radius growth to push density limits
+        if t % 40 == 0:
+            r *= 1.0003
+        if t % 800 == 0:
+            dt *= 0.985
+            
+    return c, r
+
+def repair_and_validate(c, r, margin=1e-9):
+    """Deterministically fix boundary violations and overlaps."""
+    # Clamp to boundaries
+    for i in range(N):
+        max_r = min(c[i, 0], 1.0 - c[i, 0], c[i, 1], 1.0 - c[i, 1])
+        if r[i] > max_r - margin:
+            r[i] = max(max_r - margin, 0.0)
+            
+    # Resolve overlaps by proportional shrinking
+    for _ in range(80):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(c[i, 0] - c[j, 0], c[i, 1] - c[j, 1])
+                if d < r[i] + r[j] - margin:
+                    ov = r[i] + r[j] - d
+                    r[i] -= ov * 0.51
+                    r[j] -= ov * 0.51
+                    changed = True
+        if not changed:
+            break
+    r = np.maximum(r, 0.0)
+    return c, r
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    best_c, best_r = None, None
+    best_sum = -1.0
+    
+    # Hexagonal lattice initialization generator
+    def hex_init(perturb=0.0):
+        c = np.zeros((N, 2))
+        r_base = 0.09
+        idx = 0
+        y = r_base
+        row = 0
+        while idx < N:
+            xs = r_base if row % 2 == 0 else 2 * r_base
+            x = xs
+            while x + r_base <= 1.0 + 1e-9 and idx < N:
+                c[idx] = [x + np.random.normal(0, perturb), y + np.random.normal(0, perturb)]
+                idx += 1
+                x += 2 * r_base
+            y += np.sqrt(3) * r_base
+            row += 1
+        c = np.clip(c, 0.05, 0.95)
+        return c, np.full(N, 0.075)
+
+    # Phase 1: Force-directed relaxation from diverse starts
+    for seed in range(12):
+        np.random.seed(seed)
+        c0, r0 = hex_init(perturb=0.004 * (seed + 1))
+        c, r = run_force_directed(c0, r0, steps=10000)
+        s = np.sum(r)
+        if s > best_sum:
+            best_c, best_r, best_sum = c.copy(), r.copy(), s
+            
+    # Setup for constrained optimization
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints_sq}
+    
+    # Phase 2: SLSQP refinement of best force-directed result
+    p0 = make_p(best_c, best_r)
+    c, r = get_cr(p0)
+    c, r = repair_and_validate(c, r)
+    p0 = make_p(c, r)
+    
+    try:
+        res = minimize(objective, p0, method='SLSQP', bounds=bounds, 
+                       constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+        c, r = get_cr(res.x)
+        c, r = repair_and_validate(c, r)
+        s = np.sum(r)
+        if s > best_sum:
+            best_c, best_r, best_sum = c, r, s
+    except Exception:
+        pass
+
+    # Phase 3: Iterative Radius Growth + Optimization
+    # Applies "pressure" to force circles into tighter configurations
+    for _ in range(18):
+        r_grow = best_r * 1.008
+        c_grow = best_c.copy()
+        c_grow, r_grow = repair_and_validate(c_grow, r_grow)
+        p_grow = make_p(c_grow, r_grow)
+        
+        try:
+            res = minimize(objective, p_grow, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-14})
+            c, r = get_cr(res.x)
+            c, r = repair_and_validate(c, r)
+            s = np.sum(r)
+            if s > best_sum:
+                best_c, best_r, best_sum = c, r, s
+        except Exception:
+            pass
+            
+    # Phase 4: Symmetry breaking perturbations
+    for _ in range(15):
+        c_pert = best_c + np.random.normal(0, 0.003, best_c.shape)
+        c_pert = np.clip(c_pert, 0.02, 0.98)
+        r_pert = best_r.copy()
+        c_pert, r_pert = repair_and_validate(c_pert, r_pert)
+        p_pert = make_p(c_pert, r_pert)
+        
+        try:
+            res = minimize(objective, p_pert, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-14})
+            c, r = get_cr(res.x)
+            c, r = repair_and_validate(c, r)
+            s = np.sum(r)
+            if s > best_sum:
+                best_c, best_r, best_sum = c, r, s
+        except Exception:
+            pass
+            
+    # Final strict validation & clamping
+    best_c, best_r = repair_and_validate(best_c, best_r)
+    return best_c, best_r, float(np.sum(best_r))
+```

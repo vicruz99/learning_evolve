@@ -1,79 +1,89 @@
 # sol_000158 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 39a6f529) state=eeed6755 sum of radii=1.054637 correctness=1.0
+# generation=0 parent=seed (state 2bb08abb) state=962b8c95 sum of radii=2.500529 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
+import scipy.optimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    N = 26
-    np.random.seed(42)
+def compute_constraints(v):
+    """
+    Computes all inequality constraints for the packing problem.
+    Returns an array where all elements must be >= 0.
+    """
+    n = 26
+    r = v[-1]
+    centers = v[:-1].reshape(n, 2)
     
-    # Initialize centers and radii
-    centers = np.random.uniform(0.15, 0.85, (N, 2))
-    radii = np.full(N, 0.02)
+    # Boundary constraints: 4n
+    # x >= r, 1-x >= r, y >= r, 1-y >= r
+    bnd = np.concatenate([
+        centers[:, 0] - r,
+        1.0 - centers[:, 0] - r,
+        centers[:, 1] - r,
+        1.0 - centers[:, 1] - r
+    ])
     
-    dt = 0.025
-    steps = 5000
+    # Pairwise non-overlap constraints: n*(n-1)/2
+    # dist_sq >= 4r^2  <=>  dist_sq - 4r^2 >= 0
+    dx = centers[:, 0, np.newaxis] - centers[:, 0]
+    dy = centers[:, 1, np.newaxis] - centers[:, 1]
+    dist_sq = dx**2 + dy**2
     
-    for step in range(steps):
-        # Compute pairwise distances efficiently
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff**2, axis=2))
-        np.fill_diagonal(dists, np.inf)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    pair_vals = dist_sq[mask] - 4.0 * r**2
+    
+    return np.concatenate([bnd, pair_vals])
+
+def objective(v):
+    """Objective function: maximize radius r (minimize -r)"""
+    return -v[-1]
+
+def run_packing():
+    n = 26
+    best_r = 0.0
+    best_vars = None
+    
+    # Define constraints and bounds
+    constraints = {'type': 'ineq', 'fun': compute_constraints}
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)]
+    
+    # Multiple restarts to avoid local optima
+    for seed in range(10):
+        np.random.seed(seed)
+        # Grid initialization with small random perturbation
+        k = 6
+        grid = np.linspace(0.15, 0.85, k)
+        init = []
+        for i in range(n):
+            r_idx = i // k
+            c_idx = i % k
+            init.append([grid[c_idx], grid[r_idx]])
+        init_centers = np.array(init) + np.random.randn(n, 2) * 0.015
+        init_centers = np.clip(init_centers, 0.02, 0.98)
         
-        # Calculate maximum allowable radius for each circle based on current state
-        limits_circles = np.min(dists - radii[np.newaxis, :], axis=1)
-        limits_bound = np.min(
-            np.stack([centers[:, 0], 1 - centers[:, 0], 
-                      centers[:, 1], 1 - centers[:, 1]], axis=1), axis=1
-        )
-        limits = np.minimum(limits_circles, limits_bound)
+        # Variable layout: [x0, y0, x1, y1, ..., x25, y25, r]
+        x0 = np.hstack([init_centers.flatten(), [0.05]])
         
-        # Compute repulsive forces for overlaps and boundary violations
-        forces = np.zeros_like(centers)
-        for i in range(N):
-            for j in range(i+1, N):
-                d = dists[i, j]
-                r_sum = radii[i] + radii[j]
-                if d < r_sum and d > 1e-8:
-                    # Stronger repulsion for deeper overlaps
-                    repulsion = (r_sum - d) * 10.0
-                    dx = centers[i, 0] - centers[j, 0]
-                    dy = centers[i, 1] - centers[j, 1]
-                    fx, fy = repulsion * dx/d, repulsion * dy/d
-                    forces[i] += [fx, fy]
-                    forces[j] -= [fx, fy]
+        try:
+            res = scipy.optimize.minimize(objective, x0, method='SLSQP', 
+                                          constraints=constraints, bounds=bounds, 
+                                          options={'maxiter': 4000, 'ftol': 1e-10, 'disp': False})
+            r_val = res.x[-1]
+            if r_val > best_r:
+                best_r = r_val
+                best_vars = res.x.copy()
+        except Exception:
+            continue
             
-            # Boundary forces
-            r = radii[i]
-            if centers[i, 0] < r: forces[i, 0] += (r - centers[i, 0]) * 15.0
-            if centers[i, 0] > 1-r: forces[i, 0] -= (1-r - centers[i, 0]) * 15.0
-            if centers[i, 1] < r: forces[i, 1] += (r - centers[i, 1]) * 15.0
-            if centers[i, 1] > 1-r: forces[i, 1] -= (1-r - centers[i, 1]) * 15.0
-            
-        # Update centers with decaying step size
-        current_dt = dt * (0.9992 ** step)
-        centers += current_dt * forces
-        centers = np.clip(centers, 1e-6, 1-1e-6)
+    if best_vars is None:
+        # Fallback configuration
+        best_r = 0.09
+        centers = np.tile([0.5, 0.5], (n, 1))
+        radii = np.full(n, best_r)
+        return centers, radii, 26 * best_r
         
-        # Grow radii towards the available slack
-        # Only increase if there is room, otherwise hold steady while forces resolve conflicts
-        radii += 0.08 * np.maximum(0, limits - radii)
-        radii = np.clip(radii, 1e-6, 0.5)
-        
-    # Final strict validation and clamping
-    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    limits = np.min(np.stack([
-        centers[:, 0], 1 - centers[:, 0],
-        centers[:, 1], 1 - centers[:, 1],
-        np.min(dists - radii[np.newaxis, :], axis=1)
-    ], axis=1), axis=1)
-    
-    radii = np.minimum(radii, limits)
-    radii = np.maximum(radii, 1e-6)
-    
-    return centers, radii, float(np.sum(radii))
+    centers = best_vars[:-1].reshape(n, 2)
+    radii = np.full(n, best_r)
+    return centers, radii, 26 * best_r

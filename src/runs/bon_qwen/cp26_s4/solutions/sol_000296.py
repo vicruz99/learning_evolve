@@ -1,0 +1,99 @@
+# sol_000296 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 57e53fd2) state=2403159c sum of radii=2.620584 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def obj_func(x, n):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(x[2*n:])
+
+def con_func(x, n):
+    """Constraint function: boundary and non-overlap constraints."""
+    centers = x[:2*n].reshape(n, 2)
+    r = x[2*n:]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, etc.
+    b_cons = np.concatenate([
+        centers[:, 0] - r,
+        1.0 - centers[:, 0] - r,
+        centers[:, 1] - r,
+        1.0 - centers[:, 1] - r
+    ])
+    
+    # Non-overlap constraints: dist(i,j) >= r_i + r_j
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    i, j = np.triu_indices(n, k=1)
+    n_cons = dists[i, j] - r[i] - r[j]
+    
+    return np.concatenate([b_cons, n_cons])
+
+def run_packing():
+    n = 26
+    # Bounds: centers in [0, 1], radii in [0, 0.5]
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    np.random.seed(42)
+    init_guesses = []
+    
+    # Initialization 1: Perturbed 5x5 grid + 1 circle in a gap
+    pts1 = []
+    for i in range(5):
+        for j in range(5):
+            pts1.append([(2*i + 1) / 10.0, (2*j + 1) / 10.0])
+    pts1.append([0.2, 0.2])
+    pts1 = np.array(pts1) + np.random.normal(0, 0.005, size=(n, 2))
+    pts1 = np.clip(pts1, 0.05, 0.95)
+    init_guesses.append(np.concatenate([pts1.flatten(), np.full(n, 0.085)]))
+    
+    # Initialization 2: Random distribution
+    pts2 = np.random.uniform(0.2, 0.8, size=(n, 2))
+    init_guesses.append(np.concatenate([pts2.flatten(), np.full(n, 0.06)]))
+    
+    # Initialization 3: Hexagonal-like pattern
+    pts3 = []
+    y = 0.1
+    for row in range(6):
+        x_start = 0.1 if row % 2 == 0 else 0.2
+        num_in_row = 5 if row % 2 == 0 else 4
+        for k in range(num_in_row):
+            if len(pts3) < n:
+                pts3.append([x_start + k * 0.2, y])
+        y += 0.15
+    pts3 = np.array(pts3[:n]) + np.random.normal(0, 0.005, size=(n, 2))
+    pts3 = np.clip(pts3, 0.05, 0.95)
+    init_guesses.append(np.concatenate([pts3.flatten(), np.full(n, 0.075)]))
+    
+    best_res = None
+    best_val = np.inf
+    
+    # Define constraints once
+    cons = {'type': 'ineq', 'fun': con_func, 'args': (n,)}
+    
+    for x0 in init_guesses:
+        try:
+            res = minimize(obj_func, x0, args=(n,), method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 1000, 'ftol': 1e-9, 'disp': False})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_res = res
+        except Exception:
+            continue
+            
+    if best_res is not None:
+        centers = best_res.x[:2*n].reshape(n, 2)
+        radii = best_res.x[2*n:]
+    else:
+        # Fallback to grid initialization
+        centers = init_guesses[0][:2*n].reshape(n, 2)
+        radii = init_guesses[0][2*n:]
+        
+    # Ensure non-negative radii and valid range
+    radii = np.maximum(radii, 0.0)
+    centers = np.clip(centers, 0.0, 1.0)
+    
+    return centers, radii, float(np.sum(radii))

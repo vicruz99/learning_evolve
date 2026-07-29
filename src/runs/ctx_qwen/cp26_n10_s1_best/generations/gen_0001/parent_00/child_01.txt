@@ -1,0 +1,147 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.631), we need a more robust optimization strategy that avoids local minima and efficiently explores the feasible region boundary. Key improvements:
+
+1. **Squared Distance Constraints**: Replace `dist - (r_i + r_j) >= 0` with `dx^2 + dy^2 - (r_i + r_j)^2 >= 0`. This removes the non-differentiable square root, providing smoother gradients for SLSQP and faster convergence.
+2. **High-Quality Initialization**: Generate initial configurations using hexagonal and grid lattices scaled to the unit square, then compute conservative maximum radii for these fixed centers. Starting near the feasible boundary helps the optimizer find better local maxima.
+3. **Multiple Restarts & Validation**: Run the optimizer from many different seeds/methods. After each run, apply a slight shrinkage and boundary clipping to guarantee strict feasibility (handling numerical tolerances), then validate. Keep track of the best valid configuration.
+4. **Vectorized/Structured Code**: Ensure all helper functions are top-level with no closures or lambdas, adhering to constraints while maintaining efficiency.
+
+This approach systematically pushes circles against constraints (boundaries and each other) where the sum of radii is maximized, while using smooth constraints to guide the optimizer reliably.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def get_init_centers(n, method='hex', seed=0):
+    np.random.seed(seed)
+    centers = np.zeros((n, 2))
+    if method == 'hex':
+        pts = []
+        dx, dy = 0.15, 0.15 * np.sqrt(3) / 2
+        for i in range(10):
+            for j in range(10):
+                x = 0.05 + j*dx + (i%2)*(dx/2)
+                y = 0.05 + i*dy
+                if 0.1 <= x <= 0.9 and 0.1 <= y <= 0.9:
+                    pts.append([x, y])
+        pts = np.array(pts)
+        if len(pts) < n:
+            pts = np.random.uniform(0.2, 0.8, (n, 2))
+        centers = pts[:n] + np.random.normal(0, 0.005, (n, 2))
+    elif method == 'grid':
+        xs = np.linspace(0.1, 0.9, 5)
+        ys = np.linspace(0.1, 0.9, 5)
+        grid = np.meshgrid(xs, ys)
+        pts = np.vstack([grid[0].ravel(), grid[1].ravel()]).T
+        pts = pts[:n] + np.random.normal(0, 0.01, (n, 2))
+        centers = pts
+    else:
+        centers = np.random.uniform(0.15, 0.85, (n, 2))
+        
+    centers = np.clip(centers, 0.1, 0.9)
+    return centers
+
+def compute_safe_radii(centers, n):
+    r = np.full(n, 0.5)
+    for i in range(n):
+        cx, cy = centers[i]
+        r[i] = min(cx, 1.0-cx, cy, 1.0-cy)
+        for j in range(n):
+            if i == j:
+                continue
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            if d/2.0 < r[i]:
+                r[i] = d/2.0
+    return r
+
+def objective(params, n):
+    return -np.sum(params[2::3])
+
+def constraint_func(params, n):
+    n_cons = 4*n + n*(n-1)//2
+    c = np.empty(n_cons)
+    idx = 0
+    for i in range(n):
+        x, y, r = params[3*i], params[3*i+1], params[3*i+2]
+        c[idx] = x - r; idx += 1
+        c[idx] = 1.0 - x - r; idx += 1
+        c[idx] = y - r; idx += 1
+        c[idx] = 1.0 - y - r; idx += 1
+        
+    for i in range(n):
+        for j in range(i+1, n):
+            dx = params[3*i] - params[3*j]
+            dy = params[3*i+1] - params[3*j+1]
+            dr = params[3*i+2] + params[3*j+2]
+            c[idx] = dx*dx + dy*dy - dr*dr
+            idx += 1
+    return c
+
+def run_packing():
+    n = 26
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple configurations with different seeds and layouts
+    for seed in range(20):
+        for method in ['hex', 'grid', 'rand']:
+            centers = get_init_centers(n, method, seed)
+            radii = compute_safe_radii(centers, n) * 0.95
+            
+            x0 = np.zeros(3*n)
+            for i in range(n):
+                x0[3*i] = centers[i, 0]
+                x0[3*i+1] = centers[i, 1]
+                x0[3*i+2] = radii[i]
+                
+            try:
+                res = minimize(objective, x0, args=(n,), method='SLSQP', bounds=bounds,
+                               constraints={'type': 'ineq', 'fun': constraint_func, 'args': (n,)},
+                               options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+                
+                if res.success or -res.fun > best_sum:
+                    centers_opt = res.x.reshape(n, 3)[:, :2]
+                    radii_opt = res.x.reshape(n, 3)[:, 2].copy()
+                    
+                    # Ensure strict validity to handle numerical solver tolerances
+                    radii_opt *= 0.9999 
+                    centers_opt = np.clip(centers_opt, radii_opt, 1.0 - radii_opt)
+                    
+                    # Quick validation check
+                    valid = True
+                    for i in range(n):
+                        for j in range(i+1, n):
+                            d = np.hypot(centers_opt[i,0]-centers_opt[j,0], centers_opt[i,1]-centers_opt[j,1])
+                            if d < radii_opt[i] + radii_opt[j] - 1e-12:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                            
+                    if valid:
+                        s = np.sum(radii_opt)
+                        if s > best_sum:
+                            best_sum = s
+                            best_centers = centers_opt.copy()
+                            best_radii = radii_opt.copy()
+            except Exception:
+                continue
+                
+    # Fallback configuration
+    if best_centers is None:
+        centers = get_init_centers(n, 'hex', 0)
+        radii = compute_safe_radii(centers, n) * 0.9
+        best_centers = centers
+        best_radii = radii
+        best_sum = np.sum(radii)
+        
+    return best_centers, best_radii, float(best_sum)
+```

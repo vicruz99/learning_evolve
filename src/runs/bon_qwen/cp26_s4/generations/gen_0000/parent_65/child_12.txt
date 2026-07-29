@@ -1,0 +1,227 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a two-phase strategy: a physics-based initialization to ensure feasibility, followed by rigorous numerical optimization.
+
+### 1. Initialization (Physics-Based Relaxation)
+To provide a valid starting point for the optimizer, we initialize the 26 circles and run a repulsion simulation.
+*   **Placement:** Circles are placed in a hexagonal grid pattern to maximize packing density, with an initial small radius of 0.05.
+*   **Repulsion:** We iterate through the configuration, applying repulsive forces if circles overlap or touch boundaries. This "un-jams" the packing and ensures the initial state is strictly valid.
+
+### 2. Numerical Optimization (SLSQP)
+Once a valid configuration is reached, we use `scipy.optimize.minimize` with the SLSQP method to maximize the sum of radii.
+*   **Variables:** A vector of 78 variables representing the $(x, y, r)$ for each of the 26 circles.
+*   **Objective:** Minimize the negative sum of radii ($-\sum r_i$).
+*   **Constraints:** 
+    *   **Boundary:** Ensures circles remain within the $[0,1] \times [0,1]$ square.
+    *   **Overlap:** Ensures the squared distance between centers is at least the square of the sum of radii.
+*   **Jacobian:** We provide analytic Jacobian matrices for the constraints. This is critical for solver stability and speed, particularly for the quadratic overlap terms.
+*   **Vectorization:** Constraints are vectorized into single functions returning large arrays, which `scipy` handles efficiently.
+
+This hybrid approach leverages the speed of heuristic initialization with the precision of gradient-based optimization to find a high-density packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+
+    # 1. Initialization using a hexagonal grid pattern
+    centers = np.zeros((n, 2))
+    idx = 0
+    # Use a spacing that allows initial placement
+    # Hexagonal packing: x-offset by 1, y-offset by sqrt(3)/2
+    # We scale this to fit in the square roughly
+    spacing = 0.14
+    rows = 6
+    for i in range(rows):
+        # Calculate number of circles in this row to reach exactly 26
+        # 5, 4, 5, 4, 5, 3 = 26
+        if i % 2 == 0:
+            count_in_row = 5
+        else:
+            count_in_row = 4
+        
+        # If this is the last row, adjust to fill exactly n
+        if idx + count_in_row > n:
+            count_in_row = n - idx
+            
+        for j in range(count_in_row):
+            # x coordinate: offset by 1.0 for even rows, 0.5 for odd rows relative to grid
+            # Scaled to fit 1.0 square with margin
+            base_x = j * spacing + 0.1
+            if i % 2 != 0:
+                base_x += spacing / 2.0
+            x = base_x
+            
+            # y coordinate
+            y = i * spacing * 0.866 + 0.1
+            centers[idx] = [x, y]
+            idx += 1
+
+    # Initial radii
+    radii = np.full(n, 0.05)
+
+    # 2. Physics-based relaxation to ensure strict feasibility
+    # Repel circles if they are too close
+    for _ in range(500):
+        forces = np.zeros((n, 2))
+        for i in range(n):
+            # Boundary forces
+            if centers[i, 0] < radii[i]: forces[i, 0] += 1.0
+            if centers[i, 0] > 1.0 - radii[i]: forces[i, 0] -= 1.0
+            if centers[i, 1] < radii[i]: forces[i, 1] += 1.0
+            if centers[i, 1] > 1.0 - radii[i]: forces[i, 1] -= 1.0
+            
+            # Neighbor repulsion
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist and dist > 1e-9:
+                    # Push apart proportional to overlap
+                    overlap = min_dist - dist
+                    force_mag = overlap / dist
+                    fx = dx * force_mag
+                    fy = dy * force_mag
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+        
+        # Update centers
+        centers += 0.1 * forces
+        # Clip to [0, 1] to handle boundary enforcement
+        centers = np.clip(centers, 0, 1)
+
+    # Flatten for scipy
+    x0 = np.hstack([centers.T, radii])
+
+    # 3. Optimization Setup
+    def objective(z):
+        return -np.sum(z[52:]) # Maximize sum of radii
+
+    def overlap_constraints(z):
+        # Returns vector of size N_pairs: dist^2 - (r1+r2)^2
+        # Vectorized calculation for speed
+        xs = z[0:26]
+        ys = z[26:52]
+        rs = z[52:78]
+        
+        # Create distance matrices
+        dx = xs[:, None] - xs[None, :]
+        dy = ys[:, None] - ys[None, :]
+        dist_sq = dx**2 + dy**2
+        
+        r_sum = rs[:, None] + rs[None, :]
+        val = dist_sq - r_sum**2
+        
+        # Extract upper triangle (i < j)
+        triu_indices = np.triu_indices(n, k=1)
+        return val[triu_indices]
+
+    def overlap_jac(z):
+        # Jacobian of overlap constraints w.r.t z
+        # Shape: (N_pairs, 78)
+        xs = z[0:26]
+        ys = z[26:52]
+        rs = z[52:78]
+        
+        # We only need derivatives for pairs (i, j) where i < j
+        # There are 325 such pairs.
+        
+        # Precompute dx, dy for all pairs
+        dx = xs[:, None] - xs[None, :] # (26, 26)
+        dy = ys[:, None] - ys[None, :]
+        r_sum = rs[:, None] + rs[None, :]
+        
+        # Initialize Jacobian
+        # Rows are pairs (i, j), Cols are variables
+        # Col 0..25: x, 26..51: y, 52..77: r
+        
+        N_pairs = n * (n - 1) // 2
+        jac = np.zeros((N_pairs, 78))
+        
+        idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Constraint: (xi-xj)^2 + (yi-yj)^2 - (ri+rj)^2 >= 0
+                
+                # d/dxi: 2(xi-xj)
+                jac[idx, i] = 2 * (xs[i] - xs[j])
+                # d/dxj: -2(xi-xj)
+                jac[idx, j] = -2 * (xs[i] - xs[j])
+                
+                # d/dyi: 2(yi-yj)
+                jac[idx, 26 + i] = 2 * (ys[i] - ys[j])
+                # d/dyj: -2(yi-yj)
+                jac[idx, 26 + j] = -2 * (ys[i] - ys[j])
+                
+                # d/dri: -2(ri+rj)
+                jac[idx, 52 + i] = -2 * (rs[i] + rs[j])
+                # d/drj: -2(ri+rj)
+                jac[idx, 52 + j] = -2 * (rs[i] + rs[j])
+                
+                idx += 1
+        return jac
+
+    def boundary_constraints(z):
+        xs = z[0:26]
+        ys = z[26:52]
+        rs = z[52:78]
+        return np.hstack([xs - rs, 1 - xs - rs, ys - rs, 1 - ys - rs])
+
+    def boundary_jac(z):
+        # Shape: (104, 78)
+        jac = np.zeros((104, 78))
+        for i in range(n):
+            # x - r >= 0  => d/dx=1, d/dr=-1
+            jac[i, i] = 1
+            jac[i, 52 + i] = -1
+            
+            # 1 - x - r >= 0 => d/dx=-1, d/dr=-1
+            jac[26 + i, i] = -1
+            jac[26 + i, 52 + i] = -1
+            
+            # y - r >= 0 => d/dy=1, d/dr=-1
+            jac[52 + i, 26 + i] = 1
+            jac[52 + i, 52 + i] = -1
+            
+            # 1 - y - r >= 0 => d/dy=-1, d/dr=-1
+            jac[78 + i, 26 + i] = -1
+            jac[78 + i, 52 + i] = -1
+        return jac
+
+    # Define constraints for SLSQP
+    constraints = [
+        {'type': 'ineq', 'fun': overlap_constraints, 'jac': overlap_jac},
+        {'type': 'ineq', 'fun': boundary_constraints, 'jac': boundary_jac}
+    ]
+
+    # Bounds
+    bounds = [
+        (0, 1) if i < 52 else (0, 1) for i in range(78)
+    ]
+
+    # Solve
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                   constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-9})
+
+    if res.success:
+        final_z = res.x
+    else:
+        # Fallback to best found if failed, though usually SLSQP finds something
+        final_z = x0
+
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    for i in range(n):
+        final_centers[i, 0] = final_z[i]
+        final_centers[i, 1] = final_z[26 + i]
+        final_radii[i] = final_z[52 + i]
+
+    return final_centers, final_radii, np.sum(final_radii)
+```

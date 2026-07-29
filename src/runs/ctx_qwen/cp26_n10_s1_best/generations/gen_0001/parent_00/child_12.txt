@@ -1,0 +1,221 @@
+
+
+<strategy>
+To improve the packing sum of radii from 2.631 to the target 2.636+, I will:
+1. **Use Analytical Jacobians**: SLSQP's numerical differentiation for 429 constraints can be slow and noisy. Providing exact gradients for boundary and overlap constraints drastically improves convergence speed, precision, and ability to escape shallow local minima.
+2. **Switch to Squared Distance Constraints**: Instead of `dist - r1 - r2 >= 0`, I'll use `dx^2 + dy^2 - (r1+r2)^2 >= 0`. This removes the square root singularity at zero distance and is smoother for gradient-based optimizers.
+3. **Robust Initialization & Refinement**: Combine hexagonal lattice starts with random perturbations. After the first optimization pass, perform iterative refinement by adding controlled noise to the best solution and re-running SLSQP to explore the local basin more thoroughly.
+4. **Strict Feasibility Handling**: Ensure initial guesses are strictly feasible (small radii, well-separated centers) so SLSQP starts in the interior of the feasible region. Add a final safety clipping step to guarantee validation passes despite floating-point tolerances.
+5. **Adhere to Constraints**: All helper functions will be top-level with no closures or lambdas, as required.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(params):
+    """Maximize sum of radii by minimizing its negative."""
+    # Radii are at indices 2, 5, 8, ...
+    return -np.sum(params[2::3])
+
+def compute_constraints(params):
+    """Compute all inequality constraint values: g(params) >= 0."""
+    n = len(params) // 3
+    num_c = 4 * n + n * (n - 1) // 2
+    cons = np.zeros(num_c)
+    k = 0
+    
+    # Boundary constraints for each circle
+    for i in range(n):
+        xi, yi, ri = params[3*i], params[3*i+1], params[3*i+2]
+        
+        # x >= r
+        cons[k] = xi - ri
+        k += 1
+        # 1 - x >= r
+        cons[k] = 1.0 - xi - ri
+        k += 1
+        # y >= r
+        cons[k] = yi - ri
+        k += 1
+        # 1 - y >= r
+        cons[k] = 1.0 - yi - ri
+        k += 1
+        
+    # Non-overlap constraints for each pair
+    for i in range(n):
+        for j in range(i + 1, n):
+            xi, yi, ri = params[3*i], params[3*i+1], params[3*i+2]
+            xj, yj, rj = params[3*j], params[3*j+1], params[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            dr = ri + rj
+            # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+            cons[k] = dx*dx + dy*dy - dr*dr
+            k += 1
+            
+    return cons
+
+def compute_jacobian(params):
+    """Compute the Jacobian matrix of constraints."""
+    n = len(params) // 3
+    num_c = 4 * n + n * (n - 1) // 2
+    jac = np.zeros((num_c, 3 * n))
+    k = 0
+    
+    for i in range(n):
+        # x_i - r_i >= 0
+        jac[k, 3*i] = 1.0
+        jac[k, 3*i+2] = -1.0
+        k += 1
+        # 1 - x_i - r_i >= 0
+        jac[k, 3*i] = -1.0
+        jac[k, 3*i+2] = -1.0
+        k += 1
+        # y_i - r_i >= 0
+        jac[k, 3*i+1] = 1.0
+        jac[k, 3*i+2] = -1.0
+        k += 1
+        # 1 - y_i - r_i >= 0
+        jac[k, 3*i+1] = -1.0
+        jac[k, 3*i+2] = -1.0
+        k += 1
+        
+    for i in range(n):
+        for j in range(i + 1, n):
+            xi, yi, ri = params[3*i], params[3*i+1], params[3*i+2]
+            xj, yj, rj = params[3*j], params[3*j+1], params[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            dr = ri + rj
+            
+            jac[k, 3*i] = 2.0 * dx
+            jac[k, 3*i+1] = 2.0 * dy
+            jac[k, 3*i+2] = -2.0 * dr
+            jac[k, 3*j] = -2.0 * dx
+            jac[k, 3*j+1] = -2.0 * dy
+            jac[k, 3*j+2] = -2.0 * dr
+            k += 1
+            
+    return jac
+
+def get_constraints_dict():
+    """Return constraint dictionary for scipy."""
+    return {'type': 'ineq', 'fun': compute_constraints, 'jac': compute_jacobian}
+
+def create_hex_init(seed):
+    """Generate hexagonal lattice initialization with noise."""
+    np.random.seed(seed)
+    centers = np.zeros((N_CIRCLES, 2))
+    radii = np.full(N_CIRCLES, 0.05)
+    idx = 0
+    
+    for row in range(8):
+        for col in range(6):
+            if idx >= N_CIRCLES:
+                break
+            x = 0.12 + col * 0.15 + (row % 2) * 0.075
+            y = 0.12 + row * 0.13
+            centers[idx, 0] = x + np.random.uniform(-0.02, 0.02)
+            centers[idx, 1] = y + np.random.uniform(-0.02, 0.02)
+            idx += 1
+    return centers, radii
+
+def create_rand_init(seed):
+    """Generate random initialization."""
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (N_CIRCLES, 2))
+    radii = np.full(N_CIRCLES, 0.04)
+    return centers, radii
+
+def to_params(centers, radii):
+    """Flatten centers and radii into optimization vector."""
+    params = np.zeros(3 * N_CIRCLES)
+    params[0::3] = centers[:, 0]
+    params[1::3] = centers[:, 1]
+    params[2::3] = radii
+    return params
+
+def from_params(params):
+    """Extract centers and radii from optimization vector."""
+    centers = np.zeros((N_CIRCLES, 2))
+    radii = np.zeros(N_CIRCLES)
+    centers[:, 0] = params[0::3]
+    centers[:, 1] = params[1::3]
+    radii = params[2::3]
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in unit square to maximize sum of radii."""
+    bounds = []
+    for _ in range(N_CIRCLES):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = get_constraints_dict()
+    best_sum = -np.inf
+    best_params = None
+    
+    # Phase 1: Multiple starts to find global optimum basin
+    for seed in range(15):
+        if seed < 8:
+            c, r = create_hex_init(seed)
+        else:
+            c, r = create_rand_init(seed)
+            
+        p0 = to_params(c, r)
+        
+        try:
+            res = minimize(
+                objective, p0, method='SLSQP', bounds=bounds,
+                constraints=cons, 
+                options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False}
+            )
+            if not np.isnan(res.fun):
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_params = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Local refinement with controlled perturbations
+    if best_params is not None:
+        for _ in range(6):
+            # Add small Gaussian noise to escape local plateaus
+            p_pert = best_params + np.random.normal(0, 1e-5, size=best_params.shape)
+            
+            # Project back to feasible region roughly
+            for i in range(N_CIRCLES):
+                r_val = max(0.01, p_pert[3*i+2])
+                p_pert[3*i] = np.clip(p_pert[3*i], r_val, 1.0 - r_val)
+                p_pert[3*i+1] = np.clip(p_pert[3*i+1], r_val, 1.0 - r_val)
+                p_pert[3*i+2] = r_val
+                
+            try:
+                res = minimize(
+                    objective, p_pert, method='SLSQP', bounds=bounds,
+                    constraints=cons, 
+                    options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False}
+                )
+                if not np.isnan(res.fun):
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_params = res.x.copy()
+            except Exception:
+                pass
+
+    # Extract final result
+    centers, radii = from_params(best_params)
+    
+    # Safety clipping to guarantee strict validity against numerical precision
+    for i in range(N_CIRCLES):
+        r = max(0.0, radii[i])
+        radii[i] = r
+        centers[i, 0] = np.clip(centers[i, 0], r + 1e-13, 1.0 - r - 1e-13)
+        centers[i, 1] = np.clip(centers[i, 1], r + 1e-13, 1.0 - r - 1e-13)
+        
+    return centers, radii, float(np.sum(radii))
+```

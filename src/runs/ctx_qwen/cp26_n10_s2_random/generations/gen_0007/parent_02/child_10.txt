@@ -1,0 +1,190 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization pipeline that combines global search, structured initializations, and precise local refinement. Circle packing problems are highly non-convex with many local minima. 
+
+Key improvements over past approaches:
+1. **Global Search on Centers**: Use `differential_evolution` to optimize centers directly. The objective is the maximum sum of radii computed via Linear Programming (LP). DE handles the non-smooth LP objective well and escapes shallow basins.
+2. **Structured Initializations**: Hexagonal lattices are optimal for dense packing. We generate multiple row patterns and scales, then perturb them to break symmetry before local optimization.
+3. **Joint Non-Linear Optimization**: Use SLSQP to simultaneously optimize centers and radii. Constraints are formulated using squared distances (`dist^2 >= (r_i + r_j)^2`) for better gradient smoothness compared to linear distances.
+4. **Center-Only Refinement**: After joint optimization, run Powell's method on centers with the LP objective to squeeze out micro-adjustments that SLSQP might miss.
+5. **Iterative Repair**: A deterministic shrinking/clamping phase guarantees strict compliance with the validator's tolerance (`1e-12`).
+
+This hybrid strategy balances exploration (DE, multi-start hex grids) with exploitation (SLSQP, Powell) and guarantees validity.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+N = 26
+
+# Precompute LP constraint matrix structure
+def _init_lp():
+    n_pairs = N * (N - 1) // 2
+    A_ub = np.zeros((n_pairs, N))
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            idx += 1
+    return A_ub
+
+A_LP = _init_lp()
+TRI_INDICES = np.triu_indices(N, k=1)
+
+def solve_lp(centers):
+    """Solves LP to find maximum sum of radii for fixed centers."""
+    c = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), 
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 0.0)
+    
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[TRI_INDICES]
+    
+    bounds_r = list(zip(np.zeros(N), ub))
+    res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b_ub, bounds=bounds_r, method='highs')
+    if res.success and res.fun is not None:
+        return res.x, -res.fun
+    return np.zeros(N), 0.0
+
+def lp_obj(x):
+    """Objective for center optimization: minimize negative LP sum of radii."""
+    _, s = solve_lp(x.reshape(N, 2))
+    return -s
+
+def joint_obj(v):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def joint_cons(v):
+    """Computes boundary and non-overlap constraints (must be >= 0)."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    # Boundary constraints
+    cons = [c[:,0]-r, 1.0-c[:,0]-r, c[:,1]-r, 1.0-c[:,1]-r]
+    # Overlap constraints: squared distance >= squared sum of radii
+    dx = c[TRI_INDICES[0],0] - c[TRI_INDICES[1],0]
+    dy = c[TRI_INDICES[0],1] - c[TRI_INDICES[1],1]
+    dr = r[TRI_INDICES[0]] + r[TRI_INDICES[1]]
+    cons.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(cons)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_c, best_r, best_sum = None, None, -1.0
+    
+    # --- Phase 1: Differential Evolution on centers ---
+    bounds_de = [(0.05, 0.95)] * (2*N)
+    try:
+        res_de = differential_evolution(lp_obj, bounds_de, popsize=15, maxiter=120, 
+                                        seed=42, workers=1, tol=1e-7, polish=False)
+        c_de = res_de.x.reshape(N, 2)
+        r_de, s_de = solve_lp(c_de)
+        best_c, best_r, best_sum = c_de, r_de, s_de
+    except Exception:
+        pass
+
+    # --- Phase 2: Hexagonal patterns + SLSQP Joint Optimization ---
+    patterns = [[6,5,6,5,4], [5,6,5,6,4], [5,5,5,5,6], [6,5,5,5,5], [4,6,6,6,4], [5,5,6,5,5]]
+    for pat in patterns:
+        for scale in [0.92, 0.98, 1.05]:
+            c = []
+            y = 0.10 * scale
+            for r_idx, cnt in enumerate(pat):
+                shift = 0.10 * scale if r_idx % 2 == 1 else 0.0
+                x = 0.10 * scale + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x + rng.normal(0, 0.003), y + rng.normal(0, 0.003)])
+                    x += 2.0 * 0.10 * scale
+                y += 0.10 * scale * np.sqrt(3)
+            c = np.array(c[:N])
+            c = np.clip(c, 0.05, 0.95)
+            
+            ub = np.minimum(np.minimum(c[:,0], 1-c[:,0]), np.minimum(c[:,1], 1-c[:,1]))
+            dists = np.linalg.norm(c[:,None,:] - c[None,:, :], axis=2)
+            np.fill_diagonal(dists, np.inf)
+            r_init = np.minimum(ub, 0.5 * np.min(dists, axis=1)) * 0.85
+            
+            v0 = np.concatenate([c.flatten(), r_init])
+            bounds_v = [(0.0, 1.0)]*(2*N) + [(0.0, 0.5)]*N
+            
+            for _ in range(2):
+                v_curr = v0 + rng.normal(0, 0.0015, v0.shape)
+                v_curr = np.clip(v_curr, 0.02, 0.98)
+                v_curr[2*N:] = np.clip(v_curr[2*N:], 0.02, 0.45)
+                try:
+                    res = minimize(joint_obj, v_curr, method='SLSQP', bounds=bounds_v,
+                                  constraints={'type':'ineq', 'fun': joint_cons},
+                                  options={'maxiter': 4000, 'ftol': 1e-12})
+                    if np.min(joint_cons(res.x)) >= -1e-7:
+                        s = np.sum(res.x[2*N:])
+                        if s > best_sum:
+                            best_sum = s
+                            best_c = res.x[:2*N].reshape(N,2)
+                            best_r = res.x[2*N:]
+                except Exception:
+                    pass
+
+    # --- Phase 3: Joint refinement & Powell center search ---
+    if best_c is not None:
+        bounds_v = [(0.0, 1.0)]*(2*N) + [(0.0, 0.5)]*N
+        for _ in range(5):
+            v_curr = np.concatenate([best_c.flatten(), best_r])
+            v_curr += rng.normal(0, 0.0008, v_curr.shape)
+            v_curr = np.clip(v_curr, 0.01, 0.99)
+            v_curr[2*N:] = np.clip(v_curr[2*N:], 0.01, 0.45)
+            try:
+                res = minimize(joint_obj, v_curr, method='SLSQP', bounds=bounds_v,
+                              constraints={'type':'ineq', 'fun': joint_cons},
+                              options={'maxiter': 5000, 'ftol': 1e-12})
+                if np.min(joint_cons(res.x)) >= -1e-8:
+                    s = np.sum(res.x[2*N:])
+                    if s > best_sum:
+                        best_sum = s
+                        best_c = res.x[:2*N].reshape(N,2)
+                        best_r = res.x[2*N:]
+            except Exception:
+                pass
+                
+        # Powell on centers to escape joint optima basins
+        try:
+            res_pw = minimize(lp_obj, best_c.flatten(), method='Powell', 
+                             bounds=[(0.0,1.0)]*(2*N), options={'maxiter':1500, 'ftol':1e-12})
+            c_pw = res_pw.x.reshape(N,2)
+            r_pw, s_pw = solve_lp(c_pw)
+            if s_pw > best_sum:
+                best_sum = s_pw
+                best_c = c_pw
+                best_r = r_pw
+        except Exception:
+            pass
+
+    # --- Phase 4: Strict Numerical Repair ---
+    centers = best_c.copy()
+    radii = best_r.copy()
+    for _ in range(60):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i]-centers[j])
+                req = radii[i]+radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d)/2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mx = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+        if not changed: break
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

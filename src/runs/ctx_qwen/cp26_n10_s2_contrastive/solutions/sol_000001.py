@@ -1,0 +1,218 @@
+# sol_000001 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1057391e) state=df85a4c4 sum of radii=2.120925 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Runs the optimization to pack 26 circles in a unit square maximizing sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n = 26
+    best_sum_radii = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Number of restarts to avoid local minima
+    n_restarts = 5
+    
+    for _ in range(n_restarts):
+        # 1. Initialization
+        # Create a staggered grid (hexagonal-like) for better initial density
+        centers_init = np.zeros((n, 2))
+        radii_init = np.full(n, 0.05) # Start with a small valid radius
+        
+        idx = 0
+        # Grid parameters
+        # Try to fit in a roughly square shape
+        # 6 columns x 5 rows = 30 points, take 26
+        cols = 6
+        rows = 5
+        
+        # Calculate spacing
+        # Width 1.0, 6 circles. 
+        # If we place centers at x = r, 3r, ... 11r (touching), width is 12r.
+        # We have margin. Let's space them evenly.
+        # Available width approx 0.8 (leaving 0.1 margins).
+        # 5 intervals -> 0.16 spacing.
+        spacing_x = 0.16
+        spacing_y = 0.16 * np.sqrt(3) / 2 # Hexagonal vertical spacing
+        
+        # Offset for even rows to create hexagonal structure
+        offset_x = spacing_x / 2
+        
+        for r_idx in range(rows):
+            for c_idx in range(cols):
+                if idx >= n:
+                    break
+                
+                x = 0.1 + c_idx * spacing_x
+                y = 0.1 + r_idx * spacing_y
+                
+                # Shift even rows
+                if r_idx % 2 == 1:
+                    x += offset_x
+                
+                # Clamp to valid range [0.1, 0.9] to ensure initial validity with r=0.05
+                x = np.clip(x, 0.1, 0.9)
+                y = np.clip(y, 0.1, 0.9)
+                
+                centers_init[idx] = [x, y]
+                idx += 1
+            if idx >= n:
+                break
+                
+        # Flatten variables: [x0, y0, r0, x1, y1, r1, ...]
+        x0 = np.zeros(3 * n)
+        for i in range(n):
+            x0[3*i] = centers_init[i, 0]
+            x0[3*i+1] = centers_init[i, 1]
+            x0[3*i+2] = radii_init[i]
+            
+        # Bounds: x, y in [0, 1], r in [0, 0.5]
+        bounds = [(0, 1) for _ in range(2*n)] # x, y bounds
+        bounds += [(0, 0.5) for _ in range(n)] # r bounds
+        
+        # 2. Objective Function: Minimize negative sum of radii
+        def objective(vars):
+            return -np.sum(vars[2::3]) # Sum of radii components
+        
+        # 3. Constraints
+        # We define a single function returning a 1D array of constraint values.
+        # All values must be >= 0.
+        def constraints(vars):
+            # Unpack
+            x = vars[0::3]
+            y = vars[1::3]
+            r = vars[2::3]
+            
+            cons_list = []
+            
+            # Boundary Constraints (4 per circle)
+            # x - r >= 0
+            cons_list.extend(x - r)
+            # 1 - x - r >= 0
+            cons_list.extend(1.0 - x - r)
+            # y - r >= 0
+            cons_list.extend(y - r)
+            # 1 - y - r >= 0
+            cons_list.extend(1.0 - y - r)
+            
+            # Separation Constraints (1 per pair)
+            # dist^2 >= (r_i + r_j)^2  =>  dist^2 - (r_i + r_j)^2 >= 0
+            # We compute this for all pairs i < j
+            for i in range(n):
+                xi, yi, ri = x[i], y[i], r[i]
+                # Vectorized difference for j > i
+                # x[j] - x[i]
+                dx = x[i+1:] - xi
+                dy = y[i+1:] - yi
+                dr = r[i+1:] + ri
+                
+                dist_sq = dx**2 + dy**2
+                rad_sum_sq = dr**2
+                
+                cons = dist_sq - rad_sum_sq
+                cons_list.extend(cons)
+                
+            return np.array(cons_list)
+
+        # 4. Optimization
+        # SLSQP is chosen for handling non-linear constraints
+        try:
+            res = minimize(
+                objective, 
+                x0, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints={'type': 'ineq', 'fun': constraints}, 
+                options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False}
+            )
+            
+            if res.success or res.fun > best_sum_radii: # res.fun is negative sum
+                # Extract results
+                final_centers = np.zeros((n, 2))
+                final_radii = np.zeros(n)
+                for i in range(n):
+                    final_centers[i] = [res.x[3*i], res.x[3*i+1]]
+                    final_radii[i] = res.x[3*i+2]
+                
+                current_sum = np.sum(final_radii)
+                if current_sum > best_sum_radii:
+                    best_sum_radii = current_sum
+                    best_centers = final_centers.copy()
+                    best_radii = final_radii.copy()
+                    
+        except Exception as e:
+            # If optimization fails, continue to next restart
+            pass
+
+    # Final validation check (optional, for safety)
+    # The problem statement asks us to return the result. 
+    # We assume the optimizer respected constraints within tolerance.
+    
+    return best_centers, best_radii, best_sum_radii
+
+# Validation function provided in prompt (read-only)
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+# To test locally, we can run it
+if __name__ == "__main__":
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Valid: {validate_packing(c, r)}")

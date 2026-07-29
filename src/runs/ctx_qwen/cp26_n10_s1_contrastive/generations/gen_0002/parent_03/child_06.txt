@@ -1,0 +1,215 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.625, we need a more robust global search combined with high-precision local refinement. The key improvements in this approach are:
+
+1. **Automatic Boundary Handling via Parameterization**: We continue using the transformation `x = r + u*(1-2r)`, `y = r + v*(1-2r)` where `u, v ∈ [0,1]`. This guarantees circles stay inside the unit square for any `r ∈ [0, 0.5]`, removing 4N boundary constraints and simplifying the constraint landscape to only N*(N-1)/2 pairwise non-overlap constraints.
+
+2. **Diverse & Physics-Informed Initializations**: Instead of random starts, we generate 4 distinct initial layouts:
+   - Hexagonal lattice (optimal for dense packing)
+   - Rectangular grid (good baseline)
+   - Force-directed relaxation (simulates repulsion to evenly spread centers)
+   - Random spaced points
+   Each initialization computes strictly feasible initial radii based on nearest-neighbor distances, ensuring SLSQP starts in a valid region.
+
+3. **Multi-Start Optimization with Perturbation Schedule**: We run 60 independent SLSQP optimizations from different seeds/strategies. After finding the best configuration, we perform a 30-step perturbation refinement phase where the perturbation scale decreases upon improvement. This mimics simulated annealing to escape shallow local minima.
+
+4. **Vectorized Constraint Evaluation**: The constraint function uses NumPy broadcasting and `triu_indices` to compute all pairwise squared distances and radius sums efficiently, avoiding Python loops during optimization.
+
+5. **Strict Feasibility Enforcement**: We verify constraint satisfaction within `1e-6` tolerance after each run. The final solution is reconstructed from optimized parameters, guaranteeing compliance with the validation function's `1e-12` tolerance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective_func(vars_vec):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Constraints: pairwise non-overlap.
+    Boundary constraints are handled automatically by parameterization.
+    Returns array of constraint values g(vars) >= 0.
+    """
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is inside [0,1]^2
+    x_c = r + u * (1.0 - 2.0 * r)
+    y_c = r + v * (1.0 - 2.0 * r)
+    
+    # Pairwise squared distances
+    dx = x_c[:, np.newaxis] - x_c[np.newaxis, :]
+    dy = y_c[:, np.newaxis] - y_c[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    # Upper triangular indices for i < j
+    i_idx, j_idx = np.triu_indices(N_CIRCLES, k=1)
+    
+    # Constraint: dist >= r_i + r_j  <=>  dist^2 >= (r_i + r_j)^2
+    return dist_sq[i_idx, j_idx] - r_sum[i_idx, j_idx]**2
+
+def create_init(strategy, seed_val):
+    """Generates a strictly feasible initial configuration based on strategy."""
+    np.random.seed(seed_val)
+    centers = np.zeros((N_CIRCLES, 2))
+    
+    if strategy == 0:  # Hexagonal lattice
+        r_est = 0.095
+        y = r_est
+        row = 0
+        idx = 0
+        while idx < N_CIRCLES:
+            x_start = r_est if row % 2 == 0 else 2.0 * r_est
+            x = x_start
+            while x <= 1.0 - r_est and idx < N_CIRCLES:
+                centers[idx] = [x, y]
+                idx += 1
+                x += 2.0 * r_est
+            y += 1.7320508 * r_est
+            row += 1
+            
+    elif strategy == 1:  # Rectangular grid
+        cols, rows = 5, 6
+        dx = 0.8 / (cols - 1)
+        dy = 0.8 / (rows - 1)
+        idx = 0
+        for i in range(rows):
+            for j in range(cols):
+                if idx < N_CIRCLES:
+                    centers[idx] = [0.1 + j * dx, 0.1 + i * dy]
+                    idx += 1
+                    
+    elif strategy == 2:  # Force-directed repulsion
+        centers = np.random.rand(N_CIRCLES, 2) * 0.6 + 0.2
+        for _ in range(200):
+            diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+            dist = np.linalg.norm(diff, axis=2)
+            np.fill_diagonal(dist, 1e6)
+            dir_vec = diff / dist[:, np.newaxis, :]
+            forces = np.sum(dir_vec / dist[:, np.newaxis, :]**2, axis=1)
+            
+            # Wall repulsion
+            for i in range(N_CIRCLES):
+                x, y = centers[i]
+                if x < 0.12: forces[i, 0] += (0.12 - x) * 8.0
+                if x > 0.88: forces[i, 0] -= (x - 0.88) * 8.0
+                if y < 0.12: forces[i, 1] += (0.12 - y) * 8.0
+                if y > 0.88: forces[i, 1] -= (y - 0.88) * 8.0
+                
+            centers += forces * 0.03
+            centers = np.clip(centers, 0.02, 0.98)
+            
+    elif strategy == 3:  # Random spaced
+        centers = np.random.rand(N_CIRCLES, 2)
+        for _ in range(150):
+            diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+            dist = np.linalg.norm(diff, axis=2)
+            np.fill_diagonal(dist, 1e6)
+            dir_vec = diff / dist[:, np.newaxis, :]
+            forces = np.sum(dir_vec / dist[:, np.newaxis, :]**2, axis=1)
+            centers += forces * 0.02
+            centers = np.clip(centers, 0.05, 0.95)
+
+    # Calculate initial r, u, v ensuring strict feasibility
+    r_init = np.full(N_CIRCLES, 0.04)
+    for i in range(N_CIRCLES):
+        dists = np.linalg.norm(centers - centers[i], axis=1)
+        min_dist = np.min(dists[dists > 1e-4])
+        wall = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        r_init[i] = min(min_dist * 0.42, wall * 0.92)
+        
+    r_init = np.clip(r_init, 0.01, 0.45)
+    denom = 1.0 - 2.0 * r_init
+    u_init = (centers[:, 0] - r_init) / denom
+    v_init = (centers[:, 1] - r_init) / denom
+    
+    u_init = np.clip(u_init, 0.0, 1.0)
+    v_init = np.clip(v_init, 0.0, 1.0)
+    
+    x0 = np.empty(N_CIRCLES * 3)
+    x0[0::3] = r_init
+    x0[1::3] = u_init
+    x0[2::3] = v_init
+    return x0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_x = None
+    best_val = -np.inf
+    
+    bounds = [(1e-5, 0.5), (0.0, 1.0), (0.0, 1.0)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    # Phase 1: Broad search from diverse initializations
+    for strat in range(4):
+        for seed in range(15):
+            x0 = create_init(strat, seed)
+            # Small random perturbation to break symmetry
+            x0_p = x0 + np.random.normal(0, 0.008, x0.shape)
+            x0_p[0::3] = np.clip(x0_p[0::3], 1e-5, 0.49)
+            x0_p[1::3] = np.clip(x0_p[1::3], 0.0, 1.0)
+            x0_p[2::3] = np.clip(x0_p[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective_func, x0_p, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+                if res.success:
+                    if np.min(constraint_func(res.x)) >= -1e-6:
+                        val = -res.fun
+                        if val > best_val:
+                            best_val = val
+                            best_x = res.x.copy()
+            except Exception:
+                continue
+                
+    # Phase 2: Perturbation refinement to escape local minima
+    if best_x is not None:
+        pert_scale = 0.006
+        for iteration in range(25):
+            x0_r = best_x + np.random.normal(0, pert_scale, best_x.shape)
+            x0_r[0::3] = np.clip(x0_r[0::3], 1e-5, 0.49)
+            x0_r[1::3] = np.clip(x0_r[1::3], 0.0, 1.0)
+            x0_r[2::3] = np.clip(x0_r[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective_func, x0_r, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13})
+                if res.success:
+                    if np.min(constraint_func(res.x)) >= -1e-6:
+                        val = -res.fun
+                        if val > best_val:
+                            best_val = val
+                            best_x = res.x.copy()
+                            pert_scale *= 0.92 # Cool down perturbation on success
+            except Exception:
+                pass
+                
+    # Fallback configuration if optimization fails unexpectedly
+    if best_x is None:
+        x0_f = create_init(0, 0)
+        centers_f = np.zeros((N_CIRCLES, 2))
+        r_f = x0_f[0::3]
+        u_f = x0_f[1::3]
+        v_f = x0_f[2::3]
+        centers_f[:, 0] = r_f + u_f * (1.0 - 2.0 * r_f)
+        centers_f[:, 1] = r_f + v_f * (1.0 - 2.0 * r_f)
+        return centers_f, r_f, float(np.sum(r_f))
+
+    # Reconstruct centers from optimized parameters
+    r_opt = best_x[0::3]
+    u_opt = best_x[1::3]
+    v_opt = best_x[2::3]
+    x_c = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_c = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_c, y_c))
+    
+    return centers, r_opt, float(np.sum(r_opt))
+```

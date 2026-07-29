@@ -1,0 +1,202 @@
+# sol_000066 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000035 (state cfcb3616) state=fe72b04a sum of radii=2.628083 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars_vec):
+    """Objective: maximize sum of radii <=> minimize negative sum."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Computes inequality constraints: pairwise non-overlap.
+    Boundary constraints are handled analytically by the parameterization.
+    Returns array where each element >= 0 indicates satisfied constraint.
+    """
+    n = 26
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is inside [0,1]^2
+    # x = r when u=0 (touching left wall)
+    # x = 1-r when u=1 (touching right wall)
+    one_minus_2r = 1.0 - 2.0 * r
+    x = r + u * one_minus_2r
+    y = r + v * one_minus_2r
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum_sq = (r[:, np.newaxis] + r[np.newaxis, :])**2
+    
+    # Upper triangular indices for i < j
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Constraint: dist >= r_i + r_j  <=>  dist^2 >= (r_i + r_j)^2
+    return dist_sq[i_idx, j_idx] - r_sum_sq[i_idx, j_idx]
+
+def get_hex_init(n, seed, scale=1.0):
+    """Generates a hexagonal lattice initialization."""
+    np.random.seed(seed)
+    r_est = 0.088 * scale
+    pts = []
+    y = r_est
+    row = 0
+    while len(pts) < n:
+        x = r_est + (row % 2) * r_est
+        while x <= 1.0 - r_est and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    pts = np.array(pts[:n])
+    pts += np.random.uniform(-0.008, 0.008, pts.shape)
+    pts = np.clip(pts, r_est, 1.0 - r_est)
+    return pts, r_est
+
+def get_grid_init(n, seed, scale=1.0):
+    """Generates a perturbed square grid initialization."""
+    np.random.seed(seed)
+    r_est = 0.082 * scale
+    cols, rows = 5, 6
+    step_x = (1.0 - 2.0 * r_est) / (cols - 1)
+    step_y = (1.0 - 2.0 * r_est) / (rows - 1)
+    pts = []
+    for i in range(rows):
+        for j in range(cols):
+            if len(pts) < n:
+                pts.append([r_est + j * step_x, r_est + i * step_y])
+    pts = np.array(pts)
+    pts += np.random.uniform(-0.008, 0.008, pts.shape)
+    pts = np.clip(pts, r_est, 1.0 - r_est)
+    return pts, r_est
+
+def get_random_init(n, seed):
+    """Generates a strictly feasible random initialization."""
+    np.random.seed(seed)
+    r_est = 0.075
+    pts = np.random.uniform(r_est, 1.0 - r_est, (n, 2))
+    return pts, r_est
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sol = None
+    best_val = -np.inf
+    
+    # Generate diverse initializations
+    inits = []
+    
+    # Hexagonal variations
+    for s in range(5):
+        for sc in [0.92, 1.0, 1.08]:
+            pts, r_est = get_hex_init(n, seed=s*100+int(sc*100), scale=sc)
+            u_init = (pts[:, 0] - r_est) / (1.0 - 2.0 * r_est)
+            v_init = (pts[:, 1] - r_est) / (1.0 - 2.0 * r_est)
+            u_init = np.clip(u_init, 0.0, 1.0)
+            v_init = np.clip(v_init, 0.0, 1.0)
+            vars0 = np.empty(n * 3)
+            vars0[0::3] = r_est
+            vars0[1::3] = u_init
+            vars0[2::3] = v_init
+            inits.append(vars0)
+            
+    # Grid variations
+    for s in range(5):
+        for sc in [0.92, 1.0, 1.08]:
+            pts, r_est = get_grid_init(n, seed=s*100+int(sc*100), scale=sc)
+            u_init = (pts[:, 0] - r_est) / (1.0 - 2.0 * r_est)
+            v_init = (pts[:, 1] - r_est) / (1.0 - 2.0 * r_est)
+            u_init = np.clip(u_init, 0.0, 1.0)
+            v_init = np.clip(v_init, 0.0, 1.0)
+            vars0 = np.empty(n * 3)
+            vars0[0::3] = r_est
+            vars0[1::3] = u_init
+            vars0[2::3] = v_init
+            inits.append(vars0)
+            
+    # Random starts
+    for s in range(10):
+        pts, r_est = get_random_init(n, seed=s+200)
+        u_init = (pts[:, 0] - r_est) / (1.0 - 2.0 * r_est)
+        v_init = (pts[:, 1] - r_est) / (1.0 - 2.0 * r_est)
+        u_init = np.clip(u_init, 0.0, 1.0)
+        v_init = np.clip(v_init, 0.0, 1.0)
+        vars0 = np.empty(n * 3)
+        vars0[0::3] = r_est
+        vars0[1::3] = u_init
+        vars0[2::3] = v_init
+        inits.append(vars0)
+
+    # Phase 1: Optimize from each initialization
+    for i, vars0 in enumerate(inits):
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12, 'disp': False})
+            
+            cons_val = constraint_func(res.x)
+            if np.min(cons_val) >= -1e-6:
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_sol = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_sol is None:
+        best_sol = inits[0]
+        best_val = -objective(best_sol)
+
+    # Phase 2: Local perturbation search to escape local minima
+    np.random.seed(42)
+    for _ in range(20):
+        pert_sol = best_sol.copy()
+        pert_sol[0::3] += np.random.uniform(-0.004, 0.004, n)
+        pert_sol[1::3] += np.random.uniform(-0.04, 0.04, n)
+        pert_sol[2::3] += np.random.uniform(-0.04, 0.04, n)
+        
+        pert_sol[0::3] = np.clip(pert_sol[0::3], 1e-6, 0.5)
+        pert_sol[1::3] = np.clip(pert_sol[1::3], 0.0, 1.0)
+        pert_sol[2::3] = np.clip(pert_sol[2::3], 0.0, 1.0)
+        
+        try:
+            res = minimize(objective, pert_sol, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2500, 'ftol': 1e-12, 'disp': False})
+            cons_val = constraint_func(res.x)
+            if np.min(cons_val) >= -1e-6:
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_sol = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 3: High-precision refinement
+    try:
+        res_final = minimize(objective, best_sol, method='SLSQP', bounds=bounds,
+                             constraints=cons, options={'maxiter': 6000, 'ftol': 1e-14, 'disp': False})
+        if constraint_func(res_final.x).min() >= -1e-6 and -res_final.fun > best_val:
+            best_sol = res_final.x
+    except Exception:
+        pass
+
+    # Reconstruct centers from optimized parameters
+    r_opt = best_sol[0::3]
+    u_opt = best_sol[1::3]
+    v_opt = best_sol[2::3]
+    one_minus_2r = 1.0 - 2.0 * r_opt
+    x_opt = r_opt + u_opt * one_minus_2r
+    y_opt = r_opt + v_opt * one_minus_2r
+    centers = np.column_stack((x_opt, y_opt))
+    
+    return centers, r_opt, float(np.sum(r_opt))

@@ -1,0 +1,142 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we use a hybrid optimization strategy combining force-directed simulation with constrained local optimization:
+
+1. **Force-Directed Expansion**: We initialize circles in a perturbed grid pattern. A physics-based simulation iteratively grows circle radii while applying repulsive forces to resolve overlaps and boundary forces to keep circles inside the square. This phase effectively explores the configuration space and finds a dense, feasible packing.
+2. **Constrained Refinement (SLSQP)**: The simulation output serves as a high-quality initial guess for `scipy.optimize.minimize` using the SLSQP algorithm. SLSQP strictly enforces all non-overlap and boundary constraints while directly maximizing the sum of radii.
+3. **Robustness**: We run multiple random seeds to escape local optima. All helper functions are defined at the top level without problematic closures. Constraint functions use default arguments to safely capture loop indices.
+4. **Validation Safety**: Final coordinates are clipped to ensure strict feasibility within numerical tolerance before returning.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(vars):
+    """Objective: maximize sum of radii (minimize negative sum)."""
+    return -np.sum(vars[2::3])
+
+def make_constraints(n):
+    """Generate inequality constraints for SLSQP."""
+    cons = []
+    for i in range(n):
+        # x_i - r_i >= 0
+        def con_x_min(v, idx=i): return v[3*idx] - v[3*idx+2]
+        cons.append({'type': 'ineq', 'fun': con_x_min})
+        # 1 - x_i - r_i >= 0
+        def con_x_max(v, idx=i): return 1 - v[3*idx] - v[3*idx+2]
+        cons.append({'type': 'ineq', 'fun': con_x_max})
+        # y_i - r_i >= 0
+        def con_y_min(v, idx=i): return v[3*idx+1] - v[3*idx+2]
+        cons.append({'type': 'ineq', 'fun': con_y_min})
+        # 1 - y_i - r_i >= 0
+        def con_y_max(v, idx=i): return 1 - v[3*idx+1] - v[3*idx+2]
+        cons.append({'type': 'ineq', 'fun': con_y_max})
+        # r_i >= 0
+        def con_r_pos(v, idx=i): return v[3*idx+2]
+        cons.append({'type': 'ineq', 'fun': con_r_pos})
+        
+    # Non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    for i in range(n):
+        for j in range(i+1, n):
+            def overlap_c(v, i=i, j=j):
+                dx = v[3*i] - v[3*j]
+                dy = v[3*i+1] - v[3*j+1]
+                dr = v[3*i+2] + v[3*j+2]
+                return dx*dx + dy*dy - dr*dr
+            cons.append({'type': 'ineq', 'fun': overlap_c})
+    return cons
+
+def run_packing():
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    constraints = make_constraints(n)
+    bounds = [(0, 1)] * (3 * n)
+
+    # Run multiple seeds to find robust global optimum
+    for seed in range(8):
+        np.random.seed(seed)
+        
+        # Grid-based initialization with small random perturbation
+        pts = []
+        for i in range(n):
+            x = (i % 6) / 5.0 + 0.15
+            y = (i // 6) / 4.0 + 0.15
+            x = min(x, 0.85)
+            y = min(y, 0.85)
+            pts.append([x + np.random.normal(0, 0.05), y + np.random.normal(0, 0.05)])
+        centers = np.clip(np.array(pts), 0.1, 0.9)
+        radii = np.ones(n) * 0.03
+        
+        # Force-directed expansion simulation
+        n_steps = 800
+        step_size = 0.05
+        radius_growth = 0.0003
+        repulsion_k = 3.0
+        boundary_k = 10.0
+        
+        for step in range(n_steps):
+            diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+            dist = np.sqrt(np.sum(diff**2, axis=2))
+            dist = np.where(dist < 1e-9, 1e-9, dist)
+            
+            r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+            overlap = np.maximum(0, r_sum - dist)
+            np.fill_diagonal(overlap, 0)
+            
+            forces = np.zeros_like(centers)
+            for i in range(n):
+                for j in range(i+1, n):
+                    if overlap[i, j] > 1e-7:
+                        force_mag = repulsion_k * overlap[i, j]
+                        dir_ij = diff[i, j] / dist[i, j]
+                        forces[i] += force_mag * dir_ij
+                        forces[j] -= force_mag * dir_ij
+                        
+            for i in range(n):
+                cx, cy = centers[i]
+                r = radii[i]
+                if cx < r: forces[i, 0] += boundary_k * (r - cx)
+                if cx > 1 - r: forces[i, 0] -= boundary_k * (cx - (1 - r))
+                if cy < r: forces[i, 1] += boundary_k * (r - cy)
+                if cy > 1 - r: forces[i, 1] -= boundary_k * (cy - (1 - r))
+                
+            decay = max(0.05, 1 - step / n_steps)
+            centers += step_size * decay * forces
+            centers = np.clip(centers, radii[:, np.newaxis], 1 - radii[:, np.newaxis])
+            radii += radius_growth * decay
+            
+        # Prepare for SLSQP refinement
+        vars = np.empty(3 * n)
+        vars[0::3] = centers[:, 0]
+        vars[1::3] = centers[:, 1]
+        vars[2::3] = radii
+        
+        try:
+            res = minimize(compute_objective, vars, method='SLSQP',
+                           bounds=bounds, constraints=constraints,
+                           options={'maxiter': 2000, 'ftol': 1e-9, 'disp': False})
+            if res.success:
+                curr_sum = np.sum(res.x[2::3])
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_centers = np.array([res.x[i::3] for i in range(2)]).T
+                    best_radii = res.x[2::3].copy()
+        except Exception:
+            pass
+
+    # Fallback if optimization fails
+    if best_centers is None:
+        best_centers = np.random.rand(n, 2)
+        best_radii = np.ones(n) * 0.02
+        best_sum = np.sum(best_radii)
+        
+    # Final safety projection to guarantee boundary constraints
+    best_centers = np.clip(best_centers, best_radii[:, np.newaxis], 1 - best_radii[:, np.newaxis])
+    
+    return best_centers, best_radii, best_sum
+```

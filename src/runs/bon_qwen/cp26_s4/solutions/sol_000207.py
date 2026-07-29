@@ -1,0 +1,152 @@
+# sol_000207 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 7f4d5c4f) state=4ba70c5e sum of radii=2.458923 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Assumes equal radii for all circles.
+    """
+    n = 26
+    
+    # Function to compute constraints
+    # Constraints must return values >= 0
+    def constraints_func(vars):
+        r = vars[0]
+        centers = vars[1:].reshape(n, 2)
+        x = centers[:, 0]
+        y = centers[:, 1]
+        
+        # List to store constraint values
+        cons = []
+        
+        # 1. Boundary constraints
+        # x >= r  => x - r >= 0
+        cons.extend(x - r)
+        # x <= 1-r => 1 - r - x >= 0
+        cons.extend(1 - r - x)
+        # y >= r
+        cons.extend(y - r)
+        # y <= 1-r
+        cons.extend(1 - r - y)
+        
+        # 2. Non-overlap constraints
+        # dist_ij >= 2r => dist_ij - 2r >= 0
+        # Compute pairwise distances
+        # Using broadcasting for efficiency
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :] # shape (n, n, 2)
+        dists = np.sqrt(np.sum(diff**2, axis=2)) # shape (n, n)
+        
+        # Upper triangular indices (i < j)
+        triu_indices = np.triu_indices(n, k=1)
+        pairwise_dists = dists[triu_indices]
+        
+        # Constraint: dist - 2r >= 0
+        cons.extend(pairwise_dists - 2 * r)
+        
+        return np.array(cons)
+
+    # Objective function: minimize -r (maximize r)
+    def objective(vars):
+        return -vars[0]
+
+    # Initial guess
+    # Use a hexagonal grid pattern for better initialization
+    # Estimate initial radius. 25 circles fit in 5x5 grid with r=0.1.
+    # 26 circles might fit with slightly larger r due to hexagonal packing efficiency.
+    r_init = 0.105
+    
+    # Generate hexagonal grid points
+    points = []
+    # Hexagonal spacing
+    # Horizontal spacing 2r, vertical spacing r*sqrt(3)
+    # Shift odd rows by r
+    # Let's generate a dense set of points and pick 26
+    
+    # Approximate grid size
+    # If r=0.1, width=1.0 allows 5 cols. Height=1.0 allows ~6 rows in hex packing.
+    
+    col_step = 2 * r_init
+    row_step = r_init * np.sqrt(3)
+    
+    # Generate points
+    row = 0
+    while row * row_step < 1.0 + r_init:
+        col = 0
+        # Shift for odd rows
+        x_offset = r_init if row % 2 == 1 else 0
+        while col * col_step + x_offset < 1.0 + r_init:
+            # Center coordinates relative to origin (0,0) shifted by r
+            # Actually, just generate centers in [0,1]
+            cx = x_offset + col * col_step
+            cy = row * row_step
+            
+            # Check bounds [r_init, 1-r_init]
+            if r_init <= cx <= 1 - r_init and r_init <= cy <= 1 - r_init:
+                points.append([cx, cy])
+            
+            col += 1
+        row += 1
+        
+    # If we have more than 26, select 26. If fewer, pad with random.
+    # Prefer points closer to center? Or just first 26.
+    # Random shuffle to avoid bias
+    np.random.seed(42)
+    if len(points) >= n:
+        np.random.shuffle(points)
+        init_centers = np.array(points[:n])
+    else:
+        # Fill remaining with random points
+        needed = n - len(points)
+        rand_points = np.random.rand(needed, 2) * (1 - 2*r_init) + r_init
+        init_centers = np.vstack([np.array(points), rand_points])
+        
+    # Construct initial variable vector [r, x1, y1, ..., x26, y26]
+    x0 = np.concatenate(([r_init], init_centers.flatten()))
+    
+    # Define constraints for SLSQP
+    cons = {'type': 'ineq', 'fun': constraints_func}
+    
+    # Bounds for variables
+    # r in [0, 0.5]
+    # x, y in [0, 1] (though constraints enforce tighter bounds)
+    bounds = [(0.0, 0.5)] + [(0.0, 1.0)] * (2 * n)
+    
+    # Optimization
+    try:
+        result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=[cons], 
+                          options={'maxiter': 2000, 'ftol': 1e-12})
+        if result.success or result.fun < -0.01: # If optimized
+            best_vars = result.x
+        else:
+            # Fallback to initial if optimization failed completely (unlikely)
+            best_vars = x0
+    except Exception:
+        best_vars = x0
+
+    best_r = best_vars[0]
+    best_centers = best_vars[1:].reshape(n, 2)
+    
+    # Post-process: Ensure strict validity by clamping if necessary (rarely needed if constraints met)
+    # But float errors might occur.
+    # The validation allows 1e-12 tolerance.
+    
+    # Calculate sum of radii
+    radii = np.full(n, best_r)
+    sum_radii = float(np.sum(radii))
+    
+    return best_centers, radii, sum_radii
+
+# For local testing/validation
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    # Note: The validate_packing function is provided in the prompt context but we can't import it directly here if not defined.
+    # But we assume the output format is correct.
+    print(f"Sum of radii: {s}")
+    print(f"Radius: {radii[0]}")
+    print(f"Centers shape: {centers.shape}")

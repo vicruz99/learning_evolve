@@ -1,0 +1,244 @@
+# sol_000032 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 55285a70) state=cb4f4554 sum of radii=2.621094 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def compute_pairwise_distances(centers):
+    """Compute pairwise distances between centers."""
+    n = centers.shape[0]
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    return dist
+
+def get_hexagonal_initialization(n, r_init, row_config=None):
+    """Generate hexagonal grid initialization for n circles."""
+    if row_config is None:
+        # 5 rows of 5 + 1 row of 1 = 26
+        row_config = [5, 5, 5, 5, 5, 1]
+    
+    centers = np.zeros((n, 2))
+    radii = np.full(n, r_init)
+    
+    idx = 0
+    for row in range(len(row_config)):
+        n_in_row = row_config[row]
+        y = r_init + row * r_init * math.sqrt(3)
+        
+        for col in range(n_in_row):
+            if row % 2 == 0:
+                x = r_init + col * 2 * r_init
+            else:
+                x = r_init + col * 2 * r_init + r_init
+            if idx < n:
+                centers[idx] = [x, y]
+                radii[idx] = r_init
+                idx += 1
+    
+    return centers, radii
+
+def scale_to_fit(centers, radii, margin=0.05):
+    """Scale configuration to fit in unit square with margin."""
+    max_x = np.max(centers[:, 0] + radii)
+    max_y = np.max(centers[:, 1] + radii)
+    if max_x == 0 and max_y == 0:
+        return centers, radii
+    scale = (1.0 - margin) / max(max_x, max_y, 1e-10)
+    centers = centers * scale
+    radii = radii * scale
+    return centers, radii
+
+def check_validity(centers, radii):
+    """Check if configuration is valid (no overlaps, inside bounds)."""
+    n = centers.shape[0]
+    
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-10 or x + r > 1 + 1e-10:
+            return False
+        if y - r < -1e-10 or y + r > 1 + 1e-10:
+            return False
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-10:
+                return False
+    
+    return True
+
+def optimization_objective(vars, n):
+    """Objective: maximize sum of radii (negated for minimization)."""
+    radii = vars[2 * n:]
+    return -np.sum(radii)
+
+def boundary_constraints(vars, n):
+    """Boundary constraints: circles inside unit square."""
+    centers = vars[:2 * n].reshape((n, 2))
+    radii = vars[2 * n:]
+    c = np.concatenate([
+        centers[:, 0] - radii,       # x - r >= 0
+        1.0 - centers[:, 0] - radii, # 1 - x - r >= 0
+        centers[:, 1] - radii,       # y - r >= 0
+        1.0 - centers[:, 1] - radii, # 1 - y - r >= 0
+    ])
+    return c
+
+def nonoverlap_constraints(vars, n):
+    """Non-overlap constraints: distance >= sum of radii."""
+    centers = vars[:2 * n].reshape((n, 2))
+    radii = vars[2 * n:]
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    idx = np.tril_indices(n, -1)
+    c = dist[idx] - radii[idx[0]] - radii[idx[1]]
+    return c
+
+def run_optimization(centers, radii, n, max_iter=2000, ftol=1e-10):
+    """Run SLSQP optimization."""
+    def objective(vars):
+        return optimization_objective(vars, n)
+    
+    def constr_bound(vars):
+        return boundary_constraints(vars, n)
+    
+    def constr_nooverlap(vars):
+        return nonoverlap_constraints(vars, n)
+    
+    constraints = [
+        {'type': 'ineq', 'fun': constr_bound},
+        {'type': 'ineq', 'fun': constr_nooverlap},
+    ]
+    
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    try:
+        result = minimize(objective, x0, method='SLSQP',
+                         bounds=bounds, constraints=constraints,
+                         options={'maxiter': max_iter, 'ftol': ftol,
+                                  'disp': False})
+        return result
+    except Exception:
+        return None
+
+def perturb_configuration(centers, radii, sigma=0.01):
+    """Add small random perturbation to configuration."""
+    n = centers.shape[0]
+    np.random.seed(42)
+    new_centers = centers.copy()
+    new_centers += np.random.randn(n, 2) * sigma
+    new_radii = radii.copy()
+    new_radii += np.random.randn(n) * sigma * 0.5
+    new_radii = np.maximum(new_radii, 0.01)
+    return new_centers, new_radii
+
+def fix_boundaries(centers, radii):
+    """Ensure circles are inside the unit square."""
+    n = centers.shape[0]
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        centers[i, 0] = max(r, min(1 - r, x))
+        centers[i, 1] = max(r, min(1 - r, y))
+    return centers, radii
+
+def run_packing():
+    """Main packing function."""
+    n = 26
+    
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+    
+    # Try multiple initial configurations
+    row_configs = [
+        [5, 5, 5, 5, 5, 1],  # Standard hexagonal
+        [5, 5, 5, 5, 6],     # Alternative
+        [6, 5, 5, 5, 5],     # Alternative
+        [5, 6, 5, 5, 5],     # Alternative
+    ]
+    
+    r_inits = [0.09, 0.095, 0.1]
+    
+    for row_config in row_configs:
+        if sum(row_config) != n:
+            continue
+        
+        for r_init in r_inits:
+            centers, radii = get_hexagonal_initialization(n, r_init, row_config)
+            centers, radii = scale_to_fit(centers, radii, margin=0.03)
+            centers, radii = fix_boundaries(centers, radii)
+            
+            # Try without perturbation
+            result = run_optimization(centers, radii, n, max_iter=3000, ftol=1e-11)
+            if result is not None and result.success:
+                opt_centers = result.x[:2 * n].reshape((n, 2))
+                opt_radii = result.x[2 * n:]
+                opt_sum = np.sum(opt_radii)
+                
+                if opt_sum > best_sum:
+                    best_sum = opt_sum
+                    best_centers = opt_centers.copy()
+                    best_radii = opt_radii.copy()
+            
+            # Try with perturbation
+            for _ in range(3):
+                pert_centers, pert_radii = perturb_configuration(centers, radii, sigma=0.005)
+                pert_centers, pert_radii = fix_boundaries(pert_centers, pert_radii)
+                pert_centers, pert_radii = scale_to_fit(pert_centers, pert_radii, margin=0.02)
+                
+                result = run_optimization(pert_centers, pert_radii, n, max_iter=3000, ftol=1e-11)
+                if result is not None:
+                    opt_centers = result.x[:2 * n].reshape((n, 2))
+                    opt_radii = result.x[2 * n:]
+                    opt_sum = np.sum(opt_radii)
+                    
+                    if opt_sum > best_sum:
+                        best_sum = opt_sum
+                        best_centers = opt_centers.copy()
+                        best_radii = opt_radii.copy()
+    
+    # Final refinement pass
+    if best_centers is not None:
+        for _ in range(5):
+            centers, radii = perturb_configuration(best_centers, best_radii, sigma=0.002)
+            centers, radii = fix_boundaries(centers, radii)
+            result = run_optimization(centers, radii, n, max_iter=5000, ftol=1e-12)
+            if result is not None:
+                opt_centers = result.x[:2 * n].reshape((n, 2))
+                opt_radii = result.x[2 * n:]
+                opt_sum = np.sum(opt_radii)
+                
+                if opt_sum > best_sum:
+                    best_sum = opt_sum
+                    best_centers = opt_centers.copy()
+                    best_radii = opt_radii.copy()
+    
+    # Ensure valid output
+    if best_centers is None:
+        # Fallback: equal circles in hexagonal grid
+        r = 0.095
+        centers, radii = get_hexagonal_initialization(n, r)
+        centers, radii = scale_to_fit(centers, radii, margin=0.05)
+        best_centers = centers
+        best_radii = radii
+        best_sum = np.sum(radii)
+    
+    # Final fix to ensure validity
+    best_centers, best_radii = fix_boundaries(best_centers, best_radii)
+    
+    # Clamp radii to ensure no boundary violations
+    for i in range(n):
+        r = best_radii[i]
+        x, y = best_centers[i]
+        r = min(r, x, 1 - x, y, 1 - y)
+        best_radii[i] = max(r, 0)
+    
+    return best_centers, best_radii, np.sum(best_radii)

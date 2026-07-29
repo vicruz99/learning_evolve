@@ -1,0 +1,207 @@
+# sol_000051 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000034 (state 93f7f230) state=9287631e sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def unpack(x):
+    """Converts flat optimization vector to centers and radii arrays."""
+    centers = np.zeros((N, 2))
+    radii = np.zeros(N)
+    centers[:, 0] = x[0::3]
+    centers[:, 1] = x[1::3]
+    radii[:] = x[2::3]
+    return centers, radii
+
+def objective(x):
+    """Objective to minimize: negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Returns array of constraint values g(x) >= 0."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    # Boundary constraints
+    b = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dr = r[:, None] + r[None, :]
+    
+    dist_sq = dx**2 + dy**2
+    r_sum_sq = dr**2
+    
+    tri = np.tril_indices(N, -1)
+    o = dist_sq[tri] - r_sum_sq[tri]
+    
+    return np.concatenate([b, o])
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [0, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def force_init(seed):
+    """Force-directed expansion initialization."""
+    np.random.seed(seed)
+    cx = np.random.uniform(0.25, 0.75, N)
+    cy = np.random.uniform(0.25, 0.75, N)
+    r = np.full(N, 0.04)
+    
+    for step in range(800):
+        r *= 1.0003
+        # Resolve overlaps iteratively
+        for _ in range(3):
+            for i in range(N):
+                for j in range(i + 1, N):
+                    dx = cx[j] - cx[i]
+                    dy = cy[j] - cy[i]
+                    d = np.hypot(dx, dy)
+                    req = r[i] + r[j]
+                    if d < req and d > 1e-8:
+                        shift = (req - d) * 0.5
+                        inv_d = 1.0 / d
+                        cx[i] -= shift * dx * inv_d
+                        cy[i] -= shift * dy * inv_d
+                        cx[j] += shift * dx * inv_d
+                        cy[j] += shift * dy * inv_d
+        # Enforce boundaries
+        for i in range(N):
+            cx[i] = np.clip(cx[i], r[i], 1.0 - r[i])
+            cy[i] = np.clip(cy[i], r[i], 1.0 - r[i])
+        # Jitter to escape symmetry
+        if step % 50 == 0:
+            cx += np.random.normal(0, 0.002, N)
+            cy += np.random.normal(0, 0.002, N)
+    return cx, cy, r
+
+def hex_init(seed):
+    """Hexagonal lattice initialization."""
+    np.random.seed(seed)
+    cx = np.zeros(N)
+    cy = np.zeros(N)
+    r = np.full(N, 0.085)
+    idx = 0
+    y = 0.085
+    row = 0
+    while idx < N and y + 0.085 <= 1.0:
+        x = 0.085 + (row % 2) * 0.085
+        while idx < N and x + 0.085 <= 1.0:
+            cx[idx] = x
+            cy[idx] = y
+            idx += 1
+            x += 2 * 0.085
+        y += np.sqrt(3) * 0.085
+        row += 1
+    while idx < N:
+        cx[idx] = np.random.uniform(0.2, 0.8)
+        cy[idx] = np.random.uniform(0.2, 0.8)
+        idx += 1
+    cx += np.random.normal(0, 0.005, N)
+    cy += np.random.normal(0, 0.005, N)
+    return cx, cy, r
+
+def validate_and_repair(centers, radii):
+    """Strict validation and minimal shrinkage repair."""
+    n = centers.shape[0]
+    for _ in range(100):
+        valid = True
+        for i in range(n):
+            if radii[i] < 0:
+                valid = False
+                break
+            if (centers[i, 0] < radii[i] - 1e-10 or centers[i, 0] > 1.0 - radii[i] + 1e-10 or
+                centers[i, 1] < radii[i] - 1e-10 or centers[i, 1] > 1.0 - radii[i] + 1e-10):
+                valid = False
+                break
+        if valid:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-10:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            return centers, radii
+        radii *= 0.995
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_x = None
+    best_sum = -1.0
+    
+    # Phase 1: Diverse starts
+    inits = []
+    for s in range(5):
+        inits.append(force_init(s))
+    for s in range(5):
+        inits.append(hex_init(s))
+        
+    for cx, cy, r in inits:
+        x0 = np.zeros(3 * N)
+        x0[0::3] = cx
+        x0[1::3] = cy
+        x0[2::3] = r
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 20000, 'ftol': 1e-13, 'disp': False})
+            if -res.fun > best_sum:
+                val = constraints(res.x)
+                if np.min(val) >= -1e-6:
+                    best_sum = -res.fun
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Perturbation and refinement to escape local minima
+    if best_x is not None:
+        for _ in range(15):
+            x_pert = best_x + np.random.normal(0, 1e-4, 3 * N)
+            # Project to feasible bounds
+            for i in range(N):
+                r_i = max(1e-6, x_pert[3 * i + 2])
+                x_pert[3 * i] = np.clip(x_pert[3 * i], r_i, 1.0 - r_i)
+                x_pert[3 * i + 1] = np.clip(x_pert[3 * i + 1], r_i, 1.0 - r_i)
+                x_pert[3 * i + 2] = r_i
+                
+            try:
+                res = minimize(objective, x_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 15000, 'ftol': 1e-13, 'disp': False})
+                if -res.fun > best_sum:
+                    val = constraints(res.x)
+                    if np.min(val) >= -1e-6:
+                        best_sum = -res.fun
+                        best_x = res.x.copy()
+            except Exception:
+                pass
+                
+    # Fallback
+    if best_x is None:
+        cx, cy, r = hex_init(0)
+        best_x = np.zeros(3 * N)
+        best_x[0::3] = cx
+        best_x[1::3] = cy
+        best_x[2::3] = r
+        best_sum = np.sum(r)
+        
+    centers, radii = unpack(best_x)
+    centers, radii = validate_and_repair(centers, radii)
+    
+    return centers, radii, float(np.sum(radii))

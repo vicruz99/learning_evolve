@@ -1,0 +1,168 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square and push the sum of radii closer to the target of 2.636, we employ a hybrid optimization strategy:
+
+1. **LP-based Center Optimization**: For any fixed set of centers, finding the optimal radii that maximize their sum subject to non-overlap and boundary constraints is a Linear Programming problem. This reduces the joint optimization problem to a 52-dimensional problem over centers only. The objective function becomes $F(C) = \max \sum r_i$ s.t. $r_i + r_j \le \|c_i - c_j\|$ and boundary constraints.
+2. **Global Search with Differential Evolution**: We use `differential_evolution` on the 52D center space. Since the LP solver is fast, we can afford thousands of evaluations to explore diverse topologies beyond standard grids.
+3. **Local Refinement with Powell**: After DE, we run `Powell` (derivative-free, robust for non-smooth objectives) to locally refine the center configuration.
+4. **Joint SLSQP Polish**: We map the best LP-derived centers and radii into a single vector and run `SLSQP` on the original smooth joint formulation (using squared distance constraints to avoid singularities). This precisely tightens the packing to numerical limits.
+5. **Multiple Hexagonal Restarts**: We supplement the DE search with targeted restarts from perturbed hexagonal lattices, which are known to be near-optimal for dense circle packings.
+6. **Robust Post-processing**: Finally, we iteratively clip radii to strictly satisfy boundary and non-overlap constraints within numerical tolerance, guaranteeing validity for the checker.
+
+This combination of global topology search, LP decomposition, and precise joint polishing reliably escapes shallow local minima and achieves tighter packings.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution, linprog
+
+N = 26
+
+def solve_radii_lp(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            k += 1
+            
+    bounds_r = []
+    for i in range(n):
+        x, y = centers[i]
+        ub = min(x, 1.0 - x, y, 1.0 - y)
+        bounds_r.append((0.0, max(0.0, ub)))
+        
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.zeros(n), 0.0
+
+def obj_centers(x):
+    """Objective for center optimization: negative LP-optimal sum of radii."""
+    centers = x.reshape(N, 2)
+    _, val = solve_radii_lp(centers)
+    return -val
+
+def objective_joint(x):
+    """Objective for joint optimization: negative sum of radii."""
+    return -np.sum(x[2*N:])
+
+def constraints_joint(x):
+    """Inequality constraints: boundary and pairwise non-overlap (squared)."""
+    cx = x[:N]
+    cy = x[N:2*N]
+    r = x[2*N:]
+    
+    c = np.empty(4 * N + N * (N - 1) // 2)
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[:, None] + r[None, :]
+    
+    idx = np.triu_indices(N, k=1)
+    c[4*N:] = dist_sq[idx] - r_sum[idx]**2
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # 1. Global search on centers using Differential Evolution
+    bounds_c = [(0.0, 1.0)] * (2 * N)
+    res_de = differential_evolution(obj_centers, bounds_c, popsize=12, maxiter=80, seed=42, polish=False)
+    
+    best_c = res_de.x.reshape(N, 2)
+    best_r, best_sum = solve_radii_lp(best_c)
+    
+    # 2. Local refinement of centers using Powell (handles non-smooth LP objective well)
+    res_loc = minimize(obj_centers, res_de.x, method='Powell', options={'maxiter': 1500, 'ftol': 1e-12})
+    if res_loc.fun < res_de.fun:
+        best_c = res_loc.x.reshape(N, 2)
+        best_r, best_sum = solve_radii_lp(best_c)
+        
+    # 3. Joint optimization starting from LP result using SLSQP
+    bounds_j = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons_j = {'type': 'ineq', 'fun': constraints_joint}
+    
+    x0_j = np.concatenate([best_c.ravel(), best_r])
+    res_j = minimize(objective_joint, x0_j, method='SLSQP', bounds=bounds_j, constraints=cons_j,
+                     options={'maxiter': 5000, 'ftol': 1e-14})
+    curr_sum = -res_j.fun
+    curr_c = res_j.x[:2*N].reshape(N, 2)
+    curr_r = res_j.x[2*N:]
+    
+    best_sum = curr_sum
+    best_c = curr_c
+    best_r = curr_r
+    
+    # 4. Additional restarts from perturbed hexagonal patterns
+    for seed in range(8):
+        rng = np.random.RandomState(seed)
+        hex_c = np.zeros((N, 2))
+        idx = 0
+        row = 0
+        spacing = 0.175 + rng.uniform(0, 0.02)
+        margin = 0.04 + rng.uniform(0, 0.01)
+        y = margin
+        while idx < N and y < 1.0 - margin:
+            x = margin + (row % 2) * spacing / 2.0
+            while x < 1.0 - margin and idx < N:
+                hex_c[idx] = [x + rng.uniform(-0.008, 0.008), y + rng.uniform(-0.008, 0.008)]
+                idx += 1
+                x += spacing
+            y += spacing * np.sqrt(3) / 2.0
+            row += 1
+        while idx < N:
+            hex_c[idx] = rng.uniform(0.15, 0.85, 2)
+            idx += 1
+            
+        r_hex = np.full(N, 0.045)
+        x0_hex = np.concatenate([hex_c.ravel(), r_hex])
+        try:
+            res_hex = minimize(objective_joint, x0_hex, method='SLSQP', bounds=bounds_j, constraints=cons_j,
+                               options={'maxiter': 5000, 'ftol': 1e-14})
+            s_hex = -res_hex.fun
+            if s_hex > best_sum:
+                best_sum = s_hex
+                best_c = res_hex.x[:2*N].reshape(N, 2)
+                best_r = res_hex.x[2*N:]
+        except Exception:
+            pass
+
+    # 5. Post-processing to strictly guarantee validity within numerical tolerance
+    for _ in range(300):
+        changed = False
+        # Boundary violations
+        for i in range(N):
+            mx = min(best_c[i,0], 1.0-best_c[i,0], best_c[i,1], 1.0-best_c[i,1])
+            if best_r[i] > mx + 1e-11:
+                best_r[i] = max(0.0, mx - 1e-11)
+                changed = True
+        # Overlap violations
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+                if d < best_r[i] + best_r[j] - 1e-11:
+                    excess = best_r[i] + best_r[j] - d
+                    best_r[i] -= excess/2.0
+                    best_r[j] -= excess/2.0
+                    changed = True
+        if not changed:
+            break
+            
+    best_r = np.maximum(best_r, 0.0)
+    return best_c, best_r, float(np.sum(best_r))
+```

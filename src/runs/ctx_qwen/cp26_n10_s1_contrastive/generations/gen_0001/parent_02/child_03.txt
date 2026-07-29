@@ -1,0 +1,170 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a robust multi-restart constrained optimization strategy. The key insights are:
+1. **Initial Configuration Matters**: Historical results show that a perturbed 5x5 grid with a 26th circle near the center consistently outperforms pure hexagonal or random layouts. We will heavily weight grid-like initializations.
+2. **Feasible Start**: Optimization with inequality constraints (like SLSQP) converges much faster and more reliably when started from a strictly feasible point. We initialize all circles with a safely small radius (~0.08) and positions that guarantee no overlaps, allowing the optimizer to freely expand them.
+3. **Vectorized Constraints**: Computing pairwise non-overlap constraints naively is slow. We use NumPy broadcasting to compute all $26 \times 26$ distance and radius-sum matrices simultaneously, then extract the upper triangular part. This reduces constraint evaluation time drastically.
+4. **Multi-Restart & Refinement**: We run SLSQP across ~60 diverse initial seeds (grid, hex, random perturbations). The best feasible result is then subjected to a high-precision final refinement pass (`maxiter=5000`, `ftol=1e-13`) to push the sum of radii beyond local plateaus towards the 2.636 target.
+5. **Strict Top-Level Structure**: All helper functions are defined at the module level without closures or lambdas, adhering strictly to the prompt constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    radii = vars.reshape(N_CIRCLES, 3)[:, 2]
+    return -np.sum(radii)
+
+def constraint_func(vars):
+    """
+    Returns a 1D array of constraint values.
+    All constraints are formulated as g(vars) >= 0.
+    Includes boundary constraints and pairwise non-overlap constraints.
+    """
+    pts = vars.reshape(N_CIRCLES, 3)
+    centers = pts[:, :2]
+    radii = pts[:, 2]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    c_boundary = np.column_stack([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ]).flatten()
+    
+    # Pairwise non-overlap constraints: dist_sq - (r_i + r_j)^2 >= 0
+    dx = centers[:, np.newaxis, 0] - centers[np.newaxis, :, 0]
+    dy = centers[:, np.newaxis, 1] - centers[np.newaxis, :, 1]
+    dist_sq = dx**2 + dy**2
+    rad_sum_sq = (radii[:, np.newaxis] + radii[np.newaxis, :])**2
+    
+    # Extract upper triangular indices for i < j to avoid duplicates and self-comparison
+    i, j = np.triu_indices(N_CIRCLES, k=1)
+    c_overlap = dist_sq[i, j] - rad_sum_sq[i, j]
+    
+    return np.concatenate([c_boundary, c_overlap])
+
+def get_initial_guess(strategy, seed):
+    """Generates a feasible initial configuration based on strategy and random seed."""
+    np.random.seed(seed)
+    positions = []
+    r_init = 0.08
+    
+    if strategy == 'grid':
+        # 5x5 grid + 1 center historically yields best results
+        for i in range(5):
+            for j in range(5):
+                positions.append([0.1 + 0.2*i, 0.1 + 0.2*j])
+        positions.append([0.5, 0.5])
+        r_init = 0.085
+    elif strategy == 'hex':
+        # Hexagonal lattice packing
+        y = r_init
+        row = 0
+        while len(positions) < N_CIRCLES:
+            x = r_init if row % 2 == 0 else 2*r_init
+            while x <= 1.0 - r_init and len(positions) < N_CIRCLES:
+                positions.append([x, y])
+                x += 2*r_init
+            y += np.sqrt(3)*r_init
+            row += 1
+    elif strategy == 'random':
+        # Poisson-disk-like sampling for diversity
+        attempts = 0
+        while len(positions) < N_CIRCLES and attempts < 5000:
+            p = [np.random.uniform(r_init, 1-r_init), np.random.uniform(r_init, 1-r_init)]
+            ok = True
+            for q in positions:
+                if np.hypot(p[0]-q[0], p[1]-q[1]) < 2*r_init + 0.005:
+                    ok = False
+                    break
+            if ok:
+                positions.append(p)
+            attempts += 1
+    else:
+        # Fallback to grid
+        for i in range(5):
+            for j in range(5):
+                positions.append([0.1 + 0.2*i, 0.1 + 0.2*j])
+        positions.append([0.5, 0.5])
+        r_init = 0.085
+        
+    vars_init = np.zeros(3 * N_CIRCLES)
+    for idx, p in enumerate(positions[:N_CIRCLES]):
+        # Add controlled perturbation to break symmetry while maintaining feasibility
+        vars_init[3*idx] = np.clip(p[0] + np.random.normal(0, 0.015), 0.05, 0.95)
+        vars_init[3*idx+1] = np.clip(p[1] + np.random.normal(0, 0.015), 0.05, 0.95)
+        vars_init[3*idx+2] = np.clip(r_init + np.random.normal(0, 0.005), 0.02, 0.2)
+        
+    return vars_init
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    best_vars = None
+    best_sum = -1.0
+    
+    # Variable bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = []
+    for _ in range(N_CIRCLES):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    # Diversified restart schedule focusing on high-performing grid topology
+    strategies = ['grid', 'grid', 'grid', 'grid', 'hex', 'hex', 'random', 'random']
+    seeds = range(12)
+    
+    for strat in strategies:
+        for seed in seeds:
+            vars_init = get_initial_guess(strat, seed)
+            try:
+                res = minimize(
+                    objective, 
+                    vars_init, 
+                    method='SLSQP', 
+                    bounds=bounds, 
+                    constraints=cons, 
+                    options={'maxiter': 1200, 'ftol': 1e-11}
+                )
+                
+                curr_sum = -res.fun
+                # Verify strict feasibility with a small tolerance
+                c_val = constraint_func(res.x)
+                if np.min(c_val) >= -1e-6 and curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # High-precision refinement on the best configuration found
+    if best_vars is not None:
+        try:
+            res_final = minimize(
+                objective, 
+                best_vars, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=cons, 
+                options={'maxiter': 5000, 'ftol': 1e-14}
+            )
+            if np.min(constraint_func(res_final.x)) >= -1e-6:
+                best_vars = res_final.x
+        except Exception:
+            pass
+            
+    centers = best_vars.reshape(N_CIRCLES, 3)[:, :2]
+    radii = best_vars.reshape(N_CIRCLES, 3)[:, 2]
+    
+    # Safety clamp for numerical drift
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, np.sum(radii)
+```

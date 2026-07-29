@@ -1,0 +1,204 @@
+# sol_000099 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000083 (state 006ca278) state=bdb8b013 sum of radii=2.568257 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+TRIU_IDX = np.triu_indices(N, k=1)
+
+def compute_sum_radii_obj(c_flat):
+    """Objective for center-only optimization: maximize sum of max feasible radii."""
+    c = c_flat.reshape(N, 2)
+    # Distance to boundaries
+    rb = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    # Pairwise distances
+    dx = c[:, 0, np.newaxis] - c[:, 0]
+    dy = c[:, 1, np.newaxis] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    # Radius limited by nearest neighbor
+    rp = 0.5 * np.min(dists, axis=1)
+    return -np.sum(np.minimum(rb, rp))
+
+def get_full_obj(vars):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(vars[2*N:])
+
+def get_full_cons(vars):
+    """Inequality constraints: boundaries and non-overlap."""
+    c = vars[:2*N].reshape(N, 2)
+    r = vars[2*N:]
+    cons = [
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ]
+    dx = c[:, 0, np.newaxis] - c[:, 0]
+    dy = c[:, 1, np.newaxis] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    # Pairwise separation constraints
+    cons.append(dists[TRIU_IDX] - (r[TRIU_IDX[0]] + r[TRIU_IDX[1]]))
+    return np.concatenate(cons)
+
+def get_bounds_full():
+    """Variable bounds: centers in [0,1], radii in [1e-7, 0.5]."""
+    return [(0.0, 1.0)] * (2*N) + [(1e-7, 0.5)] * N
+
+def generate_initial_centers(method, seed=0):
+    """Generates diverse initial center configurations."""
+    rng = np.random.default_rng(seed)
+    if method == 'hex':
+        centers = []
+        rows = [5, 6, 5, 6, 4]  # Sums to 26
+        r = 0.105
+        y = r
+        dy = np.sqrt(3.0) * r
+        dx = 2.0 * r
+        for i, cnt in enumerate(rows):
+            offset = (dx / 2.0) if (i % 2 == 1) else 0.0
+            x = r + offset
+            for _ in range(cnt):
+                centers.append([x, y])
+                x += dx
+            y += dy
+        centers = np.array(centers[:N])
+    elif method == 'grid':
+        x = np.linspace(0.12, 0.88, 5)
+        y = np.linspace(0.12, 0.88, 5)
+        cx, cy = np.meshgrid(x, y)
+        centers = np.column_stack((cx.flatten(), cy.flatten()))
+        centers = np.vstack([centers, [0.5, 0.5]])
+    else:  # random
+        centers = rng.uniform(0.1, 0.9, (N, 2))
+        
+    centers += rng.normal(0, 0.01, centers.shape)
+    return np.clip(centers, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a two-phase strategy: Powell on centers, then SLSQP on (centers, radii),
+    followed by iterative growth refinement.
+    """
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    # ---------------------------------------------------------
+    # Phase 1: Powell Optimization on Centers Only
+    # ---------------------------------------------------------
+    starts = []
+    for i in range(12):
+        starts.append(generate_initial_centers('hex', seed=i).flatten())
+    for i in range(10):
+        starts.append(generate_initial_centers('grid', seed=i).flatten())
+    for i in range(15):
+        starts.append(generate_initial_centers('random', seed=i).flatten())
+        
+    bounds_c = [(0.0, 1.0)] * (2*N)
+    
+    for c0 in starts:
+        try:
+            res = minimize(compute_sum_radii_obj, c0, method='Powell', bounds=bounds_c,
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_c = res.x.reshape(N, 2)
+        except Exception:
+            continue
+            
+    if best_c is None:
+        best_c = generate_initial_centers('hex', seed=0)
+        
+    # Compute initial radii from optimized centers
+    c = best_c
+    rb = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    dx = c[:, 0, np.newaxis] - c[:, 0]
+    dy = c[:, 1, np.newaxis] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, np.inf)
+    rp = 0.5 * np.min(dists, axis=1)
+    best_r = np.minimum(rb, rp)
+    
+    # ---------------------------------------------------------
+    # Phase 2: SLSQP Joint Polish
+    # ---------------------------------------------------------
+    bounds_full = get_bounds_full()
+    x0 = np.concatenate([best_c.flatten(), best_r])
+    try:
+        res = minimize(get_full_obj, x0, method='SLSQP', bounds=bounds_full,
+                       constraints={'type': 'ineq', 'fun': get_full_cons},
+                       options={'maxiter': 12000, 'ftol': 1e-14})
+        if np.all(get_full_cons(res.x) >= -1e-10):
+            best_c = res.x[:2*N].reshape(N, 2)
+            best_r = res.x[2*N:]
+            best_sum = np.sum(best_r)
+    except Exception:
+        pass
+        
+    # ---------------------------------------------------------
+    # Phase 3: Iterative Growth & Perturbation
+    # ---------------------------------------------------------
+    curr_c = best_c.copy()
+    curr_r = best_r.copy()
+    
+    for step in range(80):
+        # Apply pressure by growing radii
+        curr_r *= 1.0015
+        # Add decaying noise to escape local minima
+        noise_scale = 0.0012 * np.exp(-step / 25.0)
+        curr_c += rng.normal(0, noise_scale, (N, 2))
+        curr_c = np.clip(curr_c, 0.02, 0.98)
+        
+        x0 = np.concatenate([curr_c.flatten(), curr_r])
+        try:
+            res = minimize(get_full_obj, x0, method='SLSQP', bounds=bounds_full,
+                           constraints={'type': 'ineq', 'fun': get_full_cons},
+                           options={'maxiter': 6000, 'ftol': 1e-14})
+            if np.all(get_full_cons(res.x) >= -1e-10):
+                nc = res.x[:2*N].reshape(N, 2)
+                nr = res.x[2*N:]
+                ns = np.sum(nr)
+                if ns > best_sum:
+                    best_sum = ns
+                    best_c = nc
+                    best_r = nr
+                curr_c, curr_r = nc, nr
+        except Exception:
+            continue
+            
+    # ---------------------------------------------------------
+    # Phase 4: Strict Repair for Validation Tolerance
+    # ---------------------------------------------------------
+    for _ in range(40):
+        changed = False
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(best_c[i, 0], 1.0 - best_c[i, 0], best_c[i, 1], 1.0 - best_c[i, 1])
+            if best_r[i] > mx + 1e-12:
+                best_r[i] = mx
+                changed = True
+                
+        # Resolve overlaps proportionally
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+                if d < best_r[i] + best_r[j] - 1e-12:
+                    ov = best_r[i] + best_r[j] - d
+                    best_r[i] -= ov / 2.0
+                    best_r[j] -= ov / 2.0
+                    changed = True
+        if not changed:
+            break
+            
+    best_r = np.maximum(best_r, 0.0)
+    return best_c, best_r, float(np.sum(best_r))

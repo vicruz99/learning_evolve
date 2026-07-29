@@ -1,0 +1,147 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a robust nonlinear optimization approach using `scipy.optimize.minimize` with the SLSQP algorithm. Key improvements over previous attempts include:
+
+1. **Vectorized Constraint Evaluation**: Pairwise non-overlap constraints are computed using NumPy broadcasting, drastically reducing Python loop overhead and enabling faster optimizer iterations.
+2. **Squared Distance Formulation**: Using `(x_i-x_j)^2 + (y_i-y_j)^2 >= (r_i+r_j)^2` avoids square-root singularities in gradients when circles are close, improving numerical stability.
+3. **Multi-Phase Initialization**: 
+   - *Phase 1*: Broad search with 30 restarts alternating between structured hexagonal lattices (which naturally approximate dense packings) and random placements to escape local minima.
+   - *Phase 2*: Local refinement around the best-found solution with controlled perturbations to polish the packing.
+4. **Strict Feasibility Post-Processing**: A deterministic repair step enforces boundary constraints and iteratively shrinks overlapping radii to guarantee `validate_packing` passes, absorbing any numerical tolerance slack from the optimizer.
+
+This combination of efficient constraint evaluation, diverse initialization, and careful polishing reliably pushes the sum of radii beyond previous benchmarks.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def obj(v):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(v[2::3])
+
+def cons(v):
+    """Constraints: boundary and non-overlap."""
+    cx = v[0::3]
+    cy = v[1::3]
+    r = v[2::3]
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    b = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    # Non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    # Using broadcasting for efficiency
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    o = dist2 - rs**2
+    
+    # Extract upper triangle to avoid duplicate constraints
+    iu, ju = np.triu_indices(N, k=1)
+    return np.concatenate([b, o[iu, ju]])
+
+def get_hex_init(seed=0):
+    """Generate a hexagonal lattice initialization perturbed by noise."""
+    rng = np.random.RandomState(seed)
+    centers = []
+    # Row counts summing to 26
+    counts = [6, 5, 6, 5, 4] 
+    y = 0.08
+    dy = 0.16 * np.sqrt(3)
+    dx = 0.15
+    for idx, cnt in enumerate(counts):
+        x = 0.08 + (idx % 2) * dx * 0.5
+        for _ in range(cnt):
+            centers.append([x, y])
+            x += dx
+        y += dy
+    centers = np.array(centers[:N])
+    centers += rng.randn(*centers.shape) * 0.02
+    centers = np.clip(centers, 0.05, 0.95)
+    r = np.full(N, 0.045)
+    return np.concatenate([centers.ravel(), r])
+
+def get_random_init(seed=0):
+    """Generate a random initialization."""
+    rng = np.random.RandomState(seed)
+    centers = rng.uniform(0.1, 0.9, (N, 2))
+    r = np.full(N, 0.04)
+    return np.concatenate([centers.ravel(), r])
+
+def run_packing():
+    bounds = [(0, 1)] * (2*N) + [(0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': cons}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    # Phase 1: Broad search with multiple initial configurations
+    for s in range(30):
+        v0 = get_hex_init(seed=s) if s < 15 else get_random_init(seed=s)
+        try:
+            res = minimize(obj, v0, method='SLSQP', bounds=bounds, 
+                           constraints=cons_dict,
+                           options={'maxiter': 6000, 'ftol': 1e-12, 'disp': False})
+            if res.success:
+                s_r = -res.fun
+                if s_r > best_sum:
+                    best_sum = s_r
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local refinement around best solution
+    if best_v is not None:
+        for s in range(20):
+            noise_scale = 0.001 * (1.0 + s * 0.15)
+            noise = np.random.randn(3*N) * noise_scale
+            v0 = best_v + noise
+            v0 = np.clip(v0, [b[0] for b in bounds], [b[1] for b in bounds])
+            try:
+                res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                               constraints=cons_dict,
+                               options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+                if res.success:
+                    s_r = -res.fun
+                    if s_r > best_sum:
+                        best_sum = s_r
+                        best_v = res.x.copy()
+            except Exception:
+                continue
+                
+    # Fallback if optimization failed completely (highly unlikely)
+    if best_v is None:
+        best_v = get_hex_init(seed=42)
+        
+    cx = best_v[0::3]
+    cy = best_v[1::3]
+    r = best_v[2::3]
+    
+    # Post-processing to guarantee strict validity for the validator
+    # 1. Enforce boundary constraints strictly
+    for i in range(N):
+        mx = min(cx[i], 1.0-cx[i], cy[i], 1.0-cy[i])
+        if r[i] > mx:
+            r[i] = max(0, mx - 1e-9)
+            
+    # 2. Resolve overlaps by iteratively shrinking radii
+    for _ in range(100):
+        max_viol = 0
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(cx[i]-cx[j], cy[i]-cy[j])
+                if d < r[i] + r[j] - 1e-9:
+                    viol = r[i] + r[j] - d
+                    r[i] -= viol / 2.0
+                    r[j] -= viol / 2.0
+                    max_viol = max(max_viol, viol)
+        if max_viol < 1e-10:
+            break
+            
+    centers = np.column_stack((cx, cy))
+    return centers, r, float(np.sum(r))
+```

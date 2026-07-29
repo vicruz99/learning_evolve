@@ -1,0 +1,162 @@
+# sol_000094 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000053 (state 2e035c71) state=6d47a5c9 sum of radii=2.626088 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute pairwise indices for efficient constraint evaluation
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and non-overlap (vectorized)."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    # Boundary constraints
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    d_sq = dx**2 + dy**2
+    r_sum = r[PAIR_I] + r[PAIR_J]
+    c = np.concatenate([c, d_sq - r_sum**2])
+    return c
+
+def compute_max_radii(centers):
+    """Compute the maximum feasible radius for each circle given fixed centers."""
+    r = np.zeros(N)
+    for i in range(N):
+        # Distance to boundaries
+        mx = min(centers[i, 0], 1.0 - centers[i, 0], 
+                 centers[i, 1], 1.0 - centers[i, 1])
+        # Distance to other circles
+        for j in range(i + 1, N):
+            d = np.hypot(centers[i, 0] - centers[j, 0], 
+                         centers[i, 1] - centers[j, 1])
+            mx = min(mx, d / 2.0)
+        r[i] = mx
+    return r
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    best_v = None
+    best_sum = -1.0
+    
+    configs = []
+    np.random.seed(42)
+
+    # 1. Hexagonal lattice configurations with various shifts
+    for s in np.linspace(0.0, 0.08, 6):
+        pts = []
+        y = 0.1 + s
+        row = 0
+        while len(pts) < N:
+            x = 0.1 + s + (row % 2) * 0.085
+            while x <= 0.92 and len(pts) < N:
+                pts.append([x, y])
+                x += 0.17
+            y += 0.148
+            row += 1
+        configs.append(np.array(pts[:N]))
+
+    # 2. Repulsion-initialized random configurations
+    # This spreads points out naturally, mimicking a dense packing prior
+    for _ in range(15):
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        for _ in range(80):
+            forces = np.zeros_like(pts)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    diff = pts[i] - pts[j]
+                    d = np.hypot(diff[0], diff[1])
+                    if d < 0.25 and d > 1e-5:
+                        rep = diff / d * (0.25 - d)
+                        forces[i] += rep
+                        forces[j] -= rep
+            pts += 0.008 * forces
+            pts = np.clip(pts, 0.05, 0.95)
+        configs.append(pts)
+
+    # 3. Perturbed grid configurations
+    for _ in range(8):
+        g = np.array([[i*0.18+0.1, j*0.18+0.1] for i in range(6) for j in range(5)])
+        configs.append(g[:N] + np.random.uniform(-0.04, 0.04, (N, 2)))
+
+    # Primary optimization pass
+    for cfg in configs:
+        # Compute feasible starting radii to guarantee optimizer begins in valid region
+        r_init = compute_max_radii(cfg) * 0.85
+        v0 = np.concatenate([cfg[:, 0], cfg[:, 1], r_init])
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraints},
+                           options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+            curr = -res.fun
+            if curr > best_sum:
+                # Verify feasibility tolerance before accepting
+                if np.min(constraints(res.x)) >= -1e-5:
+                    best_sum = curr
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Fallback (should not be reached given robust initialization)
+    if best_v is None:
+        best_v = np.zeros(3*N)
+        best_v[2*N:] = 0.02
+        
+    # Iterative scaling refinement to escape local minima
+    # Slightly over-expand radii, force feasibility, and re-optimize
+    for _ in range(4):
+        v_tmp = best_v.copy()
+        v_tmp[2*N:] *= 1.025  # Push boundaries
+        v_tmp[2*N:] *= 0.96   # Quick projection back to feasible
+        try:
+            res = minimize(objective, v_tmp, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraints},
+                           options={'maxiter': 6000, 'ftol': 1e-13, 'disp': False})
+            if -res.fun > best_sum and np.min(constraints(res.x)) >= -1e-5:
+                best_sum = -res.fun
+                best_v = res.x.copy()
+        except Exception:
+            pass
+
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:]
+
+    # Strict post-processing to guarantee validator compliance
+    # 1. Enforce boundary constraints strictly
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    
+    # 2. Enforce non-overlap constraints iteratively
+    for _ in range(15):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i]-cx[j], cy[i]-cy[j])
+                if d < cr[i] + cr[j] - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) * 0.5 + 1e-8
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    return np.column_stack((cx, cy)), cr, float(np.sum(cr))

@@ -1,0 +1,221 @@
+# sol_000045 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000036 (state 025191a3) state=257d6214 sum of radii=2.634292 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+# Precompute overlap indices for efficiency
+TRIL_IDX = np.tril_indices(N_CIRCLES, -1)
+
+def objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def get_constraints(x):
+    """Compute all inequality constraints g(x) >= 0."""
+    n = N_CIRCLES
+    xs = x[0::3]
+    ys = x[1::3]
+    rs = x[2::3]
+    
+    # Boundary constraints
+    c = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+    
+    # Overlap constraints (squared distance - sum_radii^2 >= 0)
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dr = rs[:, None] + rs[None, :]
+    
+    c = np.concatenate([c, dx[TRIL_IDX]**2 + dy[TRIL_IDX]**2 - dr[TRIL_IDX]**2])
+    return c
+
+def get_bounds():
+    """Variable bounds."""
+    return [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N_CIRCLES
+
+def force_directed_spread(centers, steps=300):
+    """Simple force-directed layout to spread points evenly."""
+    n = centers.shape[0]
+    for _ in range(steps):
+        forces = np.zeros_like(centers)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[j] - centers[i]
+                dist = np.hypot(diff[0], diff[1])
+                if dist < 0.3 and dist > 1e-6:
+                    f = 0.001 / (dist**2 + 0.001)
+                    forces[i] -= f * diff
+                    forces[j] += f * diff
+        # Repel from center slightly to push to boundaries
+        for i in range(n):
+            diff = centers[i] - 0.5
+            dist = np.hypot(diff[0], diff[1])
+            if dist > 0.01:
+                forces[i] += 0.0005 * diff / dist
+                
+        centers += forces * 0.1
+        centers = np.clip(centers, 0.05, 0.95)
+    return centers
+
+def make_init(seed, strategy='hex'):
+    """Generate initial configuration vector."""
+    np.random.seed(seed)
+    n = N_CIRCLES
+    centers = np.zeros((n, 2))
+    
+    if strategy == 'hex':
+        r = 0.09
+        y = r
+        row = 0
+        idx = 0
+        while idx < n and y + r <= 1.0:
+            x = r if row % 2 == 0 else 2.0 * r
+            while idx < n and x + r <= 1.0:
+                centers[idx] = [x, y]
+                idx += 1
+                x += 2.0 * r
+            y += np.sqrt(3) * r
+            row += 1
+        while idx < n:
+            centers[idx] = np.random.uniform(0.2, 0.8, 2)
+            idx += 1
+            
+        # Rotate and scale
+        cx, cy = 0.5, 0.5
+        centers -= [cx, cy]
+        ang = np.random.uniform(-0.3, 0.3)
+        c, s = np.cos(ang), np.sin(ang)
+        centers = centers @ np.array([[c, -s], [s, c]])
+        centers *= np.random.uniform(0.9, 1.1)
+        centers += [cx, cy]
+        
+    elif strategy == 'rand':
+        centers = np.random.uniform(0.15, 0.85, (n, 2))
+        centers = force_directed_spread(centers, steps=300)
+        
+    # Perturb
+    centers += np.random.uniform(-0.01, 0.01, centers.shape)
+    centers = np.clip(centers, 0.02, 0.98)
+    
+    x0 = np.zeros(3 * n)
+    x0[0::3] = centers[:, 0]
+    x0[1::3] = centers[:, 1]
+    x0[2::3] = 0.085
+    return x0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    n = N_CIRCLES
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': get_constraints}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Phase 1: Multiple diverse starts
+    inits = []
+    for seed in range(30):
+        inits.append(make_init(seed, 'hex'))
+        if seed % 2 == 0:
+            inits.append(make_init(seed, 'rand'))
+            
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+            if not np.isnan(res.fun) and -res.fun > best_sum:
+                c_vals = get_constraints(res.x)
+                if np.min(c_vals) >= -1e-5:
+                    best_sum = -res.fun
+                    best_x = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Refinement around best
+    if best_x is not None:
+        for it in range(15):
+            noise = 0.003 * (0.85**it)
+            x0 = best_x + np.random.normal(0, noise, best_x.shape)
+            for i in range(n):
+                r = max(0.01, x0[3*i+2])
+                x0[3*i] = np.clip(x0[3*i], r, 1.0-r)
+                x0[3*i+1] = np.clip(x0[3*i+1], r, 1.0-r)
+                x0[3*i+2] = r
+                
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+                if not np.isnan(res.fun):
+                    c_vals = get_constraints(res.x)
+                    if np.min(c_vals) >= -1e-5 and -res.fun > best_sum:
+                        best_sum = -res.fun
+                        best_x = res.x.copy()
+            except Exception:
+                pass
+                
+    # Phase 3: Try to expand radii uniformly
+    if best_x is not None:
+        x0 = best_x.copy()
+        x0[2::3] *= 1.03
+        for i in range(n):
+            r = x0[3*i+2]
+            x0[3*i] = np.clip(x0[3*i], r, 1.0-r)
+            x0[3*i+1] = np.clip(x0[3*i+1], r, 1.0-r)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 15000, 'ftol': 1e-13, 'disp': False})
+            if not np.isnan(res.fun):
+                c_vals = get_constraints(res.x)
+                if np.min(c_vals) >= -1e-5 and -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    # Fallback
+    if best_x is None:
+        best_x = make_init(0, 'hex')
+        best_sum = -objective(best_x)
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    
+    # Final validation and minimal repair
+    valid = True
+    for i in range(n):
+        if radii[i] < 0: valid=False; break
+        if centers[i,0] < radii[i] - 1e-9 or centers[i,0] > 1 - radii[i] + 1e-9: valid=False; break
+        if centers[i,1] < radii[i] - 1e-9 or centers[i,1] > 1 - radii[i] + 1e-9: valid=False; break
+    if valid:
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-9: valid=False; break
+            if not valid: break
+            
+    if not valid:
+        factor = 0.999
+        for _ in range(50):
+            radii *= factor
+            for i in range(n):
+                centers[i,0] = np.clip(centers[i,0], radii[i], 1-radii[i])
+                centers[i,1] = np.clip(centers[i,1], radii[i], 1-radii[i])
+            is_ok = True
+            for i in range(n):
+                for j in range(i+1, n):
+                    d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                    if d < radii[i] + radii[j] - 1e-9: is_ok=False; break
+                if not is_ok: break
+            if is_ok: break
+            
+    return centers, radii, float(np.sum(radii))

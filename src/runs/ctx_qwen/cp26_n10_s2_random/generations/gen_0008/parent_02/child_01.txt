@@ -1,0 +1,224 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, I will employ a multi-phase optimization strategy that leverages the exact linear programming formulation for radius computation while aggressively optimizing center coordinates:
+
+1. **LP-based Radius Computation**: For any fixed set of centers, the maximal radii can be found exactly by solving a Linear Program. The constraints are pairwise non-overlap ($r_i + r_j \le d_{ij}$) and boundary containment ($r_i \le \text{dist to walls}$). This LP is extremely fast for N=26 and provides an exact, differentiable (piecewise) objective landscape for center optimization.
+
+2. **Gradient Extraction via LP Duals**: The dual variables (marginals) from the LP provide exact subgradients of the objective function with respect to center positions. Active pairwise constraints generate repulsive forces proportional to the dual multipliers, while active boundary constraints generate forces pushing circles toward corners/edges. This allows for highly efficient gradient ascent.
+
+3. **Multi-Phase Center Optimization**:
+   - **Phase 1 (Powell)**: Run derivative-free Powell optimization from ~30 diverse starting configurations (hexagonal lattices with varying densities/rotations, corner-focused layouts, and random spreads). Powell is robust for finding good basins without needing gradients.
+   - **Phase 2 (Gradient Ascent)**: Use the LP dual gradients to perform adaptive gradient ascent. This efficiently pushes circles apart and toward high-value boundary locations, escaping shallow local minima that trap derivative-free methods. Adaptive step decay and periodic jitter prevent stagnation.
+   - **Phase 3 (Local Coordinate Search)**: Perform a fine-grained local search by perturbing each circle in cardinal/diagonal directions. Accept moves that strictly increase the LP-computed sum of radii. This micro-adjusts positions to squeeze out extra radius.
+
+4. **Strict Numerical Repair**: After optimization, run a deterministic repair loop that clamps radii to boundary distances and symmetrically shrinks overlapping circles until all constraints are satisfied within the validator's `1e-12` tolerance.
+
+This hybrid approach combines the global exploration strength of multi-start Powell, the directional efficiency of exact LP gradients, and the precision of local search, consistently pushing packings beyond standard heuristics.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def solve_lp(centers):
+    """Solves LP for maximal radii given fixed centers and returns radii, sum, and gradient."""
+    n = centers.shape[0]
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    n_pairs = n * (n - 1) // 2
+    A = np.zeros((n_pairs + 4 * n, n))
+    b = np.zeros(n_pairs + 4 * n)
+    
+    idx = 0
+    pair_list = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = dists[i, j]
+            pair_list.append((i, j))
+            idx += 1
+            
+    for i in range(n):
+        for val in [centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1]]:
+            A[idx, i] = 1.0
+            b[idx] = val
+            idx += 1
+            
+    res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+    if not res.success:
+        return np.zeros(n), 0.0, np.zeros_like(centers)
+        
+    radii = res.x
+    duals = res.ineqlin.marginals
+    
+    grad = np.zeros_like(centers)
+    
+    # Pairwise repulsive forces from active distance constraints
+    for mu, (i, j) in zip(duals[:n_pairs], pair_list):
+        if mu > 1e-9:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+                
+    # Boundary forces from active wall constraints
+    base = n_pairs
+    for i in range(n):
+        grad[i, 0] += duals[base + 4 * i] - duals[base + 4 * i + 1]
+        grad[i, 1] += duals[base + 4 * i + 2] - duals[base + 4 * i + 3]
+        
+    return radii, np.sum(radii), grad
+
+def repair(centers, radii):
+    """Deterministically repairs overlaps and boundary violations to satisfy validator tolerance."""
+    for _ in range(50):
+        changed = False
+        # Boundary clamping
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-10:
+                radii[i] = mr
+                changed = True
+        # Pairwise symmetric shrinkage
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-10:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def generate_starts(rng):
+    """Generates diverse initial center configurations."""
+    starts = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6], [4, 6, 6, 6, 4],
+        [6, 6, 5, 5, 4], [5, 5, 6, 5, 5], [5, 4, 6, 6, 5], [6, 5, 5, 5, 5],
+        [5, 5, 5, 6, 5], [6, 4, 6, 5, 5], [4, 5, 6, 5, 6], [5, 6, 4, 5, 6]
+    ]
+    for pat in patterns:
+        for r0 in [0.085, 0.092, 0.098, 0.105]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.02, 0.98)
+            starts.append(c)
+            
+    # Dense random starts
+    for _ in range(10):
+        starts.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    # Corner-focused starts
+    for _ in range(5):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        c[:4] = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        c += rng.normal(0, 0.01, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        starts.append(c)
+        
+    return starts
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    starts = generate_starts(rng)
+    
+    best_c = None
+    best_sum = -1.0
+    best_r = None
+    
+    bounds = [(0.0, 1.0)] * (2 * N)
+    
+    # Phase 1: Powell optimization from diverse starts
+    for c0 in starts:
+        try:
+            res = minimize(lambda x: -solve_lp(x.reshape(N, 2))[1], c0.flatten(), method='Powell', bounds=bounds,
+                           options={'maxiter': 2500, 'ftol': 1e-13, 'xtol': 1e-13})
+            c_opt = res.x.reshape(N, 2)
+            r, s, _ = solve_lp(c_opt)
+            if s > best_sum:
+                best_sum = s
+                best_c = c_opt.copy()
+                best_r = r.copy()
+        except Exception:
+            pass
+            
+    if best_c is None:
+        best_c = starts[0]
+        best_r, best_sum, _ = solve_lp(best_c)
+        
+    # Phase 2: Gradient Ascent using LP duals
+    c = best_c.copy()
+    step = 0.006
+    for k in range(600):
+        r, s, grad = solve_lp(c)
+        if s > best_sum:
+            best_sum = s
+            best_c = c.copy()
+            best_r = r.copy()
+            
+        g_norm = np.linalg.norm(grad)
+        if g_norm < 1e-10:
+            break
+            
+        c += step * (grad / g_norm)
+        c = np.clip(c, 0.02, 0.98)
+        
+        if k % 80 == 40:
+            step *= 0.85
+            
+        if k % 200 == 100:
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.02, 0.98)
+            
+    # Phase 3: Local coordinate search for micro-adjustments
+    c = best_c.copy()
+    step = 0.005
+    for _ in range(80):
+        improved = False
+        _, curr_s, _ = solve_lp(c)
+        for i in range(N):
+            best_pos = c[i].copy()
+            best_s = curr_s
+            for dx, dy in [(step, 0), (-step, 0), (0, step), (0, -step),
+                           (step, step), (-step, step), (step, -step), (-step, -step)]:
+                nc = c.copy()
+                nc[i] = np.clip(c[i] + [dx, dy], 0.01, 0.99)
+                _, s_new, _ = solve_lp(nc)
+                if s_new > best_s + 1e-10:
+                    best_s = s_new
+                    best_pos = nc[i].copy()
+            if best_s > curr_s + 1e-10:
+                c[i] = best_pos
+                improved = True
+        if improved:
+            best_r, best_sum, _ = solve_lp(c)
+        else:
+            step *= 0.85
+        if step < 1e-7:
+            break
+            
+    centers = best_c.copy()
+    radii = repair(centers, best_r.copy())
+    return centers, radii, float(np.sum(radii))
+```

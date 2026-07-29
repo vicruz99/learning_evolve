@@ -1,0 +1,206 @@
+
+
+<strategy>
+The core challenge in circle packing optimization is handling the boundary constraints and pairwise non-overlap constraints simultaneously, which often causes solvers like SLSQP to stall or violate boundaries numerically. 
+
+My strategy employs a geometric parameterization that **automatically satisfies boundary constraints**, reducing the optimization problem to only pairwise separation constraints. Specifically, for each circle $i$, we represent its center $(x_i, y_i)$ and radius $r_i$ using auxiliary variables $(u_i, v_i) \in [0,1]$:
+$x_i = r_i + u_i(1 - 2r_i)$
+$y_i = r_i + v_i(1 - 2r_i)$
+This mapping guarantees $r_i \le x_i, y_i \le 1 - r_i$, so circles are always inside $[0,1]^2$ without explicit boundary constraints. The optimization variables become $(r_i, u_i, v_i)$, and the only constraints are $(x_i-x_j)^2 + (y_i-y_j)^2 \ge (r_i+r_j)^2$.
+
+I will:
+1. Generate diverse initial configurations (hexagonal lattices, grids, random spreads) with controlled jitter.
+2. Map each to the $(r, u, v)$ space with a safety margin to ensure strict initial feasibility.
+3. Run SLSQP from all starts, accepting the best feasible result.
+4. Perform extensive local perturbations on the best solution to escape local minima.
+5. Apply a high-precision final polish.
+This approach focuses the solver's effort on the complex topological interactions rather than boundary enforcement, typically yielding tighter packings and higher sums of radii.
+</strategy>
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+U_IDX, V_IDX = np.triu_indices(N, k=1)
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Computes inequality constraints: pairwise separation.
+    Boundary constraints are automatically satisfied via parameterization.
+    Returns array of values that must be >= 0.
+    """
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is strictly inside [0,1]^2
+    denom = 1.0 - 2.0 * r
+    x = r + u * denom
+    y = r + v * denom
+    
+    # Pairwise squared distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum = r[:, None] + r[None, :]
+    r_sum_sq = r_sum**2
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[U_IDX, V_IDX] - r_sum_sq[U_IDX, V_IDX]
+
+def generate_init_from_centers(centers, safety):
+    """Generates a strictly feasible initial configuration in (r, u, v) space."""
+    n = centers.shape[0]
+    r = np.zeros(n)
+    for i in range(n):
+        d_wall = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        d_min = np.inf
+        for j in range(n):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i]-centers[j])**2))
+                if d < d_min: d_min = d
+        r[i] = safety * min(d_wall, 0.5 * d_min)
+        
+    # Clamp r to be strictly inside (0, 0.5)
+    r = np.clip(r, 1e-5, 0.49)
+    
+    denom = 1.0 - 2.0 * r
+    u = (centers[:,0] - r) / denom
+    v = (centers[:,1] - r) / denom
+    u = np.clip(u, 0.0, 1.0)
+    v = np.clip(v, 0.0, 1.0)
+    
+    vars0 = np.empty(3 * n)
+    vars0[0::3] = r
+    vars0[1::3] = u
+    vars0[2::3] = v
+    return vars0
+
+def run_packing():
+    bounds = [(1e-6, 0.499), (0.0, 1.0), (0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -np.inf
+    best_v = None
+    
+    init_centers_list = []
+    
+    # 1. Hexagonal variations
+    for seed in range(30):
+        np.random.seed(seed)
+        pts = []
+        r_est = 0.085 + 0.02 * (seed % 4)
+        y = r_est
+        row = 0
+        while len(pts) < N:
+            x_off = (row % 2) * r_est
+            x = r_est + x_off
+            while x <= 1.0 - r_est and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r_est
+            y += np.sqrt(3.0) * r_est
+            row += 1
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        init_centers_list.append(pts)
+        
+    # 2. Grid variations
+    for seed in range(10):
+        np.random.seed(seed + 100)
+        pts = np.zeros((N, 2))
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                pts[idx] = [0.1 + 0.2*i, 0.1 + 0.2*j]
+                idx += 1
+        pts[25] = [0.5, 0.5]
+        pts += np.random.uniform(-0.03, 0.03, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        init_centers_list.append(pts)
+        
+    # 3. Random spread
+    for seed in range(10):
+        np.random.seed(seed + 200)
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        init_centers_list.append(pts)
+        
+    # Run optimization from diverse starts
+    for idx, pts in enumerate(init_centers_list):
+        for safety in [0.9, 0.95]:
+            v0 = generate_init_from_centers(pts, safety=safety)
+            try:
+                res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+                cons_val = constraint_func(res.x)
+                if np.min(cons_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    # Perturbation phase to escape local minima
+    if best_v is not None:
+        for k in range(100):
+            np.random.seed(k + 500)
+            v_pert = best_v.copy()
+            v_pert[0::3] += np.random.normal(0, 0.002, N)
+            v_pert[1::3] += np.random.normal(0, 0.008, N)
+            v_pert[2::3] += np.random.normal(0, 0.008, N)
+            
+            v_pert[0::3] = np.clip(v_pert[0::3], 1e-6, 0.499)
+            v_pert[1::3] = np.clip(v_pert[1::3], 0.0, 1.0)
+            v_pert[2::3] = np.clip(v_pert[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, v_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                cons_val = constraint_func(res.x)
+                if np.min(cons_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+        # Final high-precision polish
+        try:
+            res_final = minimize(objective, best_v, method='SLSQP', bounds=bounds, constraints=cons,
+                                 options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraint_func(res_final.x)) >= -1e-8:
+                best_v = res_final.x
+                best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    # Fallback safety net
+    if best_v is None:
+        centers = np.random.uniform(0.2, 0.8, (N, 2))
+        radii = np.full(N, 0.05)
+        best_v = np.zeros(3*N)
+        best_v[0::3] = radii
+        best_v[1::3] = (centers[:,0] - radii) / (1.0 - 2.0 * radii)
+        best_v[2::3] = (centers[:,1] - radii) / (1.0 - 2.0 * radii)
+        best_sum = np.sum(radii)
+        
+    # Reconstruct centers from optimized parameters
+    r_opt = best_v[0::3]
+    u_opt = best_v[1::3]
+    v_opt = best_v[2::3]
+    denom = 1.0 - 2.0 * r_opt
+    x_opt = r_opt + u_opt * denom
+    y_opt = r_opt + v_opt * denom
+    centers = np.column_stack((x_opt, y_opt))
+    radii = r_opt
+    
+    return centers, radii, float(best_sum)
+```

@@ -1,192 +1,257 @@
 # sol_000122 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 69804dab) state=f8f1ba24 sum of radii=2.197214 correctness=1.0
+# generation=0 parent=seed (state 22de7e34) state=147d211f sum of radii=2.623565 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize as opt
-import math
+from scipy.optimize import minimize
 
-def generate_initial_grid():
-    """Generates a hexagonal-like grid initialization for 26 circles."""
-    n = 26
-    rows = 6
-    cols = math.ceil(n / rows)
-    
-    # Base spacing to fit roughly in unit square
-    # Width for cols, Height for rows
-    # Use a density that leaves room for expansion
-    x_spacing = 1.0 / cols
-    y_spacing = 1.0 / rows * 1.2 
-    
-    centers = np.zeros((n, 2))
-    count = 0
-    r = 0.02  # Small initial radius
-    
-    for i in range(rows):
-        # Stagger every other row
-        offset = x_spacing / 2 if i % 2 == 1 else 0
-        num_in_row = math.ceil((n - count) / (rows - i))
-        num_in_row = min(num_in_row, cols)
-        
-        # Adjust number to fit exactly n
-        if count + num_in_row > n:
-            num_in_row = n - count
-            
-        for j in range(num_in_row):
-            x = (j + 1) * x_spacing - x_spacing/2 + offset
-            y = (i + 1) * y_spacing - y_spacing/2
-            
-            # Wrap into unit square if needed (simple clamping for init)
-            x = max(0.05, min(0.95, x))
-            y = max(0.05, min(0.95, y))
-            
-            centers[count] = [x, y]
-            count += 1
-            if count >= n:
-                break
-        if count >= n:
-            break
-            
-    # Trim or pad if necessary
-    if centers.shape[0] < n:
-        pad = np.random.rand(n - centers.shape[0], 2) * 0.8 + 0.1
-        centers = np.vstack([centers, pad])
-        
-    return centers[:n], np.full(n, r)
 
-def get_max_radii_lp(centers):
-    """Solves LP to find max sum of radii for fixed centers."""
-    n = centers.shape[0]
-    c = np.ones(n) # Maximize sum(r_i)
+def objective_func(vars, n):
+    """Objective: maximize sum of radii (minimize negative sum)."""
+    radii = vars[2::3]
+    return -np.sum(radii)
+
+
+def constraints_func(vars, n):
+    """All inequality constraints as a single array."""
+    c = []
     
-    A_ub = []
-    b_ub = []
-    
-    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-    # r_i - x_i <= 0
+    # Boundary and non-negativity constraints (5 per circle)
     for i in range(n):
-        # r_i <= x_i  => 1*r_i + 0*others <= x_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        A_ub.append(row)
-        b_ub.append(centers[i, 0])
-        
-        # r_i <= 1 - x_i => r_i <= 1 - x_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        A_ub.append(row)
-        b_ub.append(1.0 - centers[i, 0])
-        
-        # r_i <= y_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        A_ub.append(row)
-        b_ub.append(centers[i, 1])
-        
-        # r_i <= 1 - y_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        A_ub.append(row)
-        b_ub.append(1.0 - centers[i, 1])
-
-    # Overlap constraints: r_i + r_j <= dist_ij
+        x = vars[3 * i]
+        y = vars[3 * i + 1]
+        r = vars[3 * i + 2]
+        c.append(x - r)           # x >= r
+        c.append(1.0 - x - r)     # 1-x >= r
+        c.append(y - r)           # y >= r
+        c.append(1.0 - y - r)     # 1-y >= r
+        c.append(r)               # r >= 0
+    
+    # Overlap constraints (one per pair)
     for i in range(n):
+        xi = vars[3 * i]
+        yi = vars[3 * i + 1]
+        ri = vars[3 * i + 2]
         for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            row = np.zeros(n)
-            row[i] = 1.0
-            row[j] = 1.0
-            A_ub.append(row)
-            b_ub.append(dist)
-            
-    A_ub = np.array(A_ub)
-    b_ub = np.array(b_ub)
+            dx = xi - vars[3 * j]
+            dy = yi - vars[3 * j + 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            c.append(dist - ri - vars[3 * j + 2])
     
-    bounds = [(0, None)] * n
-    
-    # Solve LP
-    res = opt.linprog(-c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-    
-    if res.success:
-        return res.x
-    else:
-        # Fallback to small radii if LP fails
-        return np.full(n, 0.01)
+    return np.array(c)
 
-def optimize_centers(centers, radii, iterations=50, lr=0.01):
-    """Moves centers to increase space for radii."""
-    n = centers.shape[0]
-    centers = centers.copy()
+
+def make_hexagonal_initial(n):
+    """Create hexagonal packing initial configuration."""
+    x0 = np.zeros(3 * n)
     
-    for _ in range(iterations):
-        grad = np.zeros_like(centers)
-        
-        for i in range(n):
-            for j in range(i + 1, n):
-                diff = centers[i] - centers[j]
-                dist = np.linalg.norm(diff)
-                if dist < 1e-9: dist = 1e-9
-                
-                # Repulsive force based on overlap
-                overlap = radii[i] + radii[j] - dist
-                if overlap > 0:
-                    force = overlap / dist * radii[i] # Weight by radius
-                    grad[i] += diff / dist * force
-                    grad[j] -= diff / dist * force
-        
-        # Update centers
-        centers += lr * grad
-        
-        # Project back to valid square [r, 1-r]
-        for i in range(n):
-            r = radii[i]
-            centers[i, 0] = np.clip(centers[i, 0], r, 1.0 - r)
-            centers[i, 1] = np.clip(centers[i, 1], r, 1.0 - r)
-            
-    return centers
+    circles_per_row = [5, 5, 5, 5, 4, 2]
+    r_init = 0.075
+    
+    idx = 0
+    for row_idx, count in enumerate(circles_per_row):
+        y = (row_idx + 0.5) * (1.0 / 6.0)
+        if row_idx % 2 == 0:
+            for col in range(count):
+                x = (col + 0.5) * (1.0 / count)
+                x0[3 * idx] = x
+                x0[3 * idx + 1] = y
+                x0[3 * idx + 2] = r_init
+                idx += 1
+        else:
+            for col in range(count):
+                spacing = 1.0 / (count + 1)
+                x = (col + 1) * spacing
+                x0[3 * idx] = x
+                x0[3 * idx + 1] = y
+                x0[3 * idx + 2] = r_init
+                idx += 1
+    
+    return x0
+
+
+def make_random_initial(n, seed=None):
+    """Create random initial configuration with even spacing."""
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState()
+    
+    x0 = np.zeros(3 * n)
+    
+    cols = 5
+    rows = 6
+    
+    for i in range(n):
+        row = i // cols
+        col = i % cols
+        x0[3 * i] = (col + 0.5) / cols + rng.uniform(-0.03, 0.03)
+        x0[3 * i + 1] = (row + 0.5) / rows + rng.uniform(-0.03, 0.03)
+        x0[3 * i + 2] = 0.06 + rng.uniform(0, 0.03)
+    
+    # Clip to valid bounds
+    x0[:2 * n] = np.clip(x0[:2 * n], 0.02, 0.98)
+    x0[2 * n:] = np.clip(x0[2 * n:], 0.01, 0.3)
+    
+    return x0
+
+
+def make_corner_heavy_initial(n):
+    """Initial configuration with larger circles in corners."""
+    x0 = np.zeros(3 * n)
+    
+    # Place 4 larger circles in corners
+    corner_positions = [[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]]
+    corner_radii = 0.15
+    
+    idx = 0
+    for pos in corner_positions:
+        x0[3 * idx] = pos[0]
+        x0[3 * idx + 1] = pos[1]
+        x0[3 * idx + 2] = corner_radii
+        idx += 1
+    
+    # Place remaining 22 circles in a grid pattern
+    remaining = n - 4
+    cols = 5
+    rows = 4
+    
+    for i in range(remaining):
+        row = i // cols
+        col = i % cols
+        x = (col + 0.5) / cols
+        y = (row + 0.5) / rows
+        # Offset to avoid exact overlap with corners
+        if x < 0.4:
+            x += 0.1
+        if y < 0.4:
+            y += 0.05
+        x0[3 * idx] = np.clip(x, 0.05, 0.95)
+        x0[3 * idx + 1] = np.clip(y, 0.05, 0.95)
+        x0[3 * idx + 2] = 0.06
+        idx += 1
+    
+    return x0
+
+
+def optimize_packing(x0, n, max_iter=5000):
+    """Run single optimization from given initial point."""
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0))   # x
+        bounds.append((0.0, 1.0))   # y
+        bounds.append((0.0, 0.5))   # r
+    
+    result = minimize(
+        objective_func,
+        x0,
+        args=(n,),
+        method='SLSQP',
+        bounds=bounds,
+        constraints={'type': 'ineq', 'fun': constraints_func, 'args': (n,)},
+        options={
+            'maxiter': max_iter,
+            'ftol': 1e-15,
+            'disp': False
+        }
+    )
+    return result
+
+
+def extract_solution(result, n):
+    """Extract centers and radii from optimization result."""
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i, 0] = result.x[3 * i]
+        centers[i, 1] = result.x[3 * i + 1]
+        radii[i] = result.x[3 * i + 2]
+    return centers, radii
+
+
+def refine_solution(centers, radii, n, max_iter=3000):
+    """Refine a solution from its current state."""
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers[i, 0]
+        x0[3 * i + 1] = centers[i, 1]
+        x0[3 * i + 2] = radii[i]
+    
+    result = optimize_packing(x0, n, max_iter)
+    return extract_solution(result, n)
+
 
 def run_packing():
-    best_sum = -1.0
+    n = 26
     best_centers = None
     best_radii = None
+    best_sum = -np.inf
     
-    # Run multiple times with random perturbations
-    for _ in range(15):
-        centers, radii = generate_initial_grid()
+    # Strategy 1: Hexagonal initial
+    for seed in range(5):
+        x0 = make_hexagonal_initial(n)
+        # Add small perturbation
+        x0_perturbed = x0.copy()
+        rng = np.random.RandomState(seed * 100 + 42)
+        x0_perturbed[:2 * n] += rng.uniform(-0.02, 0.02, 2 * n)
+        x0_perturbed[:2 * n] = np.clip(x0_perturbed[:2 * n], 0.01, 0.99)
+        x0_perturbed[2 * n:] = np.clip(x0_perturbed[2 * n:], 0.01, 0.4)
         
-        # Initial LP to set reasonable radii
-        radii = get_max_radii_lp(centers)
+        result = optimize_packing(x0_perturbed, n, max_iter=6000)
+        current_sum = -result.fun
         
-        # Iterative refinement
-        for step in range(10):
-            # 1. Optimize centers to make room
-            # Use decreasing learning rate
-            lr = 0.05 / (step + 1)
-            centers = optimize_centers(centers, radii, iterations=20, lr=lr)
-            
-            # 2. Optimize radii given new centers
-            radii = get_max_radii_lp(centers)
-            
-            # Check validity and update best
-            # Simple check: ensure radii are not too small
-            if np.all(radii >= 0):
-                current_sum = np.sum(radii)
-                if current_sum > best_sum:
-                    best_sum = current_sum
-                    best_centers = centers.copy()
-                    best_radii = radii.copy()
-                    
-    # Final validation and clean-up
-    if best_centers is None:
-        # Fallback to a valid but simple packing
-        best_centers, best_radii = generate_initial_grid()
-        best_sum = np.sum(best_radii)
-
-    return best_centers, best_radii, float(best_sum)
-
-# Function to run and return results as required
-def get_solution():
-    centers, radii, s = run_packing()
-    return centers, radii, s
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers, best_radii = extract_solution(result, n)
+    
+    # Strategy 2: Random initial configurations
+    for seed in range(10):
+        x0 = make_random_initial(n, seed=seed + 100)
+        result = optimize_packing(x0, n, max_iter=6000)
+        current_sum = -result.fun
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers, best_radii = extract_solution(result, n)
+    
+    # Strategy 3: Corner-heavy initial
+    for seed in range(3):
+        x0 = make_corner_heavy_initial(n)
+        rng = np.random.RandomState(seed * 200 + 99)
+        x0_perturbed = x0.copy()
+        x0_perturbed[:2 * n] += rng.uniform(-0.015, 0.015, 2 * n)
+        x0_perturbed[:2 * n] = np.clip(x0_perturbed[:2 * n], 0.01, 0.99)
+        x0_perturbed[2 * n:] = np.clip(x0_perturbed[2 * n:], 0.01, 0.4)
+        
+        result = optimize_packing(x0_perturbed, n, max_iter=6000)
+        current_sum = -result.fun
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers, best_radii = extract_solution(result, n)
+    
+    # Refinement: run optimization again from best solution with higher precision
+    if best_centers is not None:
+        refined_centers, refined_radii = refine_solution(
+            best_centers, best_radii, n, max_iter=8000
+        )
+        refined_sum = np.sum(refined_radii)
+        if refined_sum > best_sum:
+            best_centers = refined_centers
+            best_radii = refined_radii
+            best_sum = refined_sum
+    
+    # Second refinement pass
+    if best_centers is not None:
+        refined_centers, refined_radii = refine_solution(
+            best_centers, best_radii, n, max_iter=10000
+        )
+        refined_sum = np.sum(refined_radii)
+        if refined_sum > best_sum:
+            best_centers = refined_centers
+            best_radii = refined_radii
+            best_sum = refined_sum
+    
+    return best_centers, best_radii, best_sum

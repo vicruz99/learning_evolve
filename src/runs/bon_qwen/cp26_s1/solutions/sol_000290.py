@@ -1,0 +1,91 @@
+# sol_000290 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 86cff419) state=0c35affd sum of radii=2.166667 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(params):
+    # We minimize negative R to maximize R
+    R = params[52]
+    return -R
+
+def constraints_func(params):
+    centers = params[:52].reshape(26, 2)
+    R = params[52]
+    con = []
+    
+    # Boundary constraints: circles must be inside [0,1]x[0,1]
+    # x - R >= 0, 1 - x - R >= 0, y - R >= 0, 1 - y - R >= 0
+    con.extend(centers[:, 0] - R)
+    con.extend(1.0 - centers[:, 0] - R)
+    con.extend(centers[:, 1] - R)
+    con.extend(1.0 - centers[:, 1] - R)
+    
+    # Inter-circle non-overlap constraints
+    # dist^2 >= (2R)^2  =>  dist^2 - 4R^2 >= 0
+    for i in range(26):
+        for j in range(i + 1, 26):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            con.append(dx*dx + dy*dy - 4*R*R)
+            
+    return np.array(con)
+
+def generate_initial_guess():
+    """Generates a hexagonal lattice initialization for 26 circles."""
+    n = 26
+    s = 0.18  # Lattice spacing parameter
+    centers = []
+    # Row configuration for 26 circles in hex pattern
+    row_counts = [6, 5, 6, 5, 4]
+    y = 0.0
+    for i, count in enumerate(row_counts):
+        x_start = 0.0 if i % 2 == 0 else s / 2.0
+        for j in range(count):
+            centers.append([x_start + j * s, y])
+        y += s * np.sqrt(3) / 2.0
+        
+    centers = np.array(centers)
+    
+    # Center and scale configuration to [0, 1]^2 with margin
+    centers -= centers.min(axis=0)
+    extent = centers.max(axis=0) - centers.min(axis=0)
+    centers = centers / extent * 0.8 + 0.1  # Places points in [0.1, 0.9]
+    
+    R_init = 0.09  # Initial radius, safely within bounds and non-overlapping
+    params = np.concatenate([centers.flatten(), [R_init]])
+    return params
+
+def run_packing():
+    n = 26
+    x0 = generate_initial_guess()
+    
+    # Bounds: coordinates in [0, 1], radius in [0, 0.15]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.15)]
+    cons = {'type': 'ineq', 'fun': constraints_func}
+    
+    # Run SLSQP optimization
+    res = minimize(
+        objective, 
+        x0, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=cons, 
+        options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False}
+    )
+    
+    if res.success:
+        centers = res.x[:52].reshape(26, 2)
+        R_opt = res.x[52]
+        radii = np.full(26, R_opt)
+        sum_radii = np.sum(radii)
+    else:
+        # Fallback to initial guess if optimizer fails
+        centers = x0[:52].reshape(26, 2)
+        radii = np.full(26, x0[52])
+        sum_radii = np.sum(radii)
+        
+    return centers, radii, sum_radii

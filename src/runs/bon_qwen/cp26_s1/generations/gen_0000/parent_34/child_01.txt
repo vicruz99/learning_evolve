@@ -1,159 +1,254 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we treat this as a constrained non-linear optimization problem. We aim to maximize $\sum r_i$ subject to non-overlap and boundary constraints. 
+To pack 26 circles in a unit square maximizing sum of radii, I'll use a multi-strategy approach:
 
-Strategy:
-1. **Optimization Formulation**: We minimize $-\sum r_i$ using L-BFGS-B. Constraints are handled via a quadratic penalty method added to the objective function. This avoids complex constraint handling routines and allows efficient gradient computation.
-2. **Penalty Terms**: 
-   - Boundary: $P \cdot \sum \max(0, r_i - x_i)^2 + \max(0, r_i - (1-x_i))^2 + \dots$
-   - Overlap: $P \cdot \sum_{i<j} \max(0, r_i + r_j - \|c_i - c_j\|)^2$
-   The penalty parameter $P$ is set high enough to enforce constraints while allowing radii to grow.
-3. **Analytic Gradients**: We provide exact gradients for the objective and penalty terms to ensure fast and stable convergence.
-4. **Multiple Restarts**: To escape local minima, we initialize the optimizer from several configurations: a structured grid, a hexagonal-like arrangement, and random placements.
-5. **Validation & Selection**: After optimization, we filter results using the provided validation function and keep the configuration with the highest sum of radii.
+1. **Equal circles optimization**: The target 2.636 is very close to 26 × 0.1015, suggesting near-optimal equal-circle hexagonal packing. I'll optimize positions for equal circles using Nelder-Mead (handles non-smooth min-radius objective well).
+
+2. **Multiple initialization patterns**: Try different hexagonal row patterns (6-5-6-5-4, 5-6-5-6-4, etc.) and add random perturbations.
+
+3. **Variable radius refinement**: After finding good equal-circle packing, try optimizing with variable radii using penalty-based BFGS to potentially squeeze out more sum.
+
+4. **Global refinement**: Use dual_annealing for global search on equal-circle problem.
+
+The key insight is that the problem is non-convex with many local minima, so multiple restarts and careful initialization are crucial. Hexagonal lattice is the densest circle packing pattern, so that's the natural starting point.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, dual_annealing
 
-def obj_grad(var, n, P, return_grad=True):
-    cx = var[0::3]
-    cy = var[1::3]
-    r = var[2::3]
+
+def compute_min_radius(centers):
+    """Compute maximum equal radius that fits given centers."""
+    n = len(centers)
+    min_r = 1.0
     
-    obj = -np.sum(r)
-    grad = np.zeros_like(var)
-    grad[2::3] = -1.0
-    
-    # Boundary penalties and gradients
+    # Boundary constraints
     for i in range(n):
-        # Left boundary
-        v = r[i] - cx[i]
-        if v > 0:
-            g = 2 * P * v
-            obj += P * v**2
-            grad[3*i+2] += g
-            grad[3*i] -= g
-        # Right boundary
-        v = r[i] - (1 - cx[i])
-        if v > 0:
-            g = 2 * P * v
-            obj += P * v**2
-            grad[3*i+2] += g
-            grad[3*i] += g
-        # Bottom boundary
-        v = r[i] - cy[i]
-        if v > 0:
-            g = 2 * P * v
-            obj += P * v**2
-            grad[3*i+2] += g
-            grad[3*i+1] -= g
-        # Top boundary
-        v = r[i] - (1 - cy[i])
-        if v > 0:
-            g = 2 * P * v
-            obj += P * v**2
-            grad[3*i+2] += g
-            grad[3*i+1] += g
-            
-    # Overlap penalties and gradients
+        min_r = min(min_r, centers[i, 0], 1 - centers[i, 0],
+                     centers[i, 1], 1 - centers[i, 1])
+    
+    # Overlap constraints
     for i in range(n):
         for j in range(i + 1, n):
-            dx = cx[i] - cx[j]
-            dy = cy[i] - cy[j]
-            d_sq = dx*dx + dy*dy
-            d = np.sqrt(d_sq)
-            if d < 1e-12:
-                d = 1e-12
-                dx = 1e-12
-            overlap = r[i] + r[j] - d
-            if overlap > 0:
-                g = 2 * P * overlap
-                obj += P * overlap**2
-                grad[3*i+2] += g
-                grad[3*j+2] += g
-                dir_x = dx / d
-                dir_y = dy / d
-                grad[3*i] -= g * dir_x
-                grad[3*i+1] -= g * dir_y
-                grad[3*j] += g * dir_x
-                grad[3*j+1] += g * dir_y
-                
-    if return_grad:
-        return obj, grad
-    return obj
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            min_r = min(min_r, dist / 2)
+    
+    return min_r
 
-def objective_func(var):
-    return obj_grad(var, 26, 5000.0, return_grad=False)
 
-def gradient_func(var):
-    return obj_grad(var, 26, 5000.0, return_grad=True)[1]
+def obj_min_radius(x, n):
+    """Objective for equal circles: maximize minimum radius."""
+    centers = x.reshape(n, 2)
+    return -compute_min_radius(centers)
+
+
+def make_hex_init(n, seed, row_pattern=None):
+    """Create hexagonal initialization."""
+    np.random.seed(seed)
+    centers = np.zeros((n, 2))
+    
+    if row_pattern is None:
+        row_pattern = [6, 5, 6, 5, 4]
+    
+    idx = 0
+    dx = 0.162
+    dy = dx * np.sqrt(3) / 2  # Hexagonal vertical spacing
+    
+    for row, count in enumerate(row_pattern):
+        for col in range(count):
+            if idx >= n:
+                break
+            x = 0.08 + col * dx + (dx / 2 if row % 2 == 1 else 0)
+            y = 0.08 + row * dy
+            centers[idx] = [x + np.random.uniform(-0.005, 0.005),
+                            y + np.random.uniform(-0.005, 0.005)]
+            idx += 1
+    
+    return centers
+
+
+def validate(centers, radii, tol=1e-9):
+    """Check if packing is valid."""
+    n = len(radii)
+    
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -tol or x + r > 1 + tol or y - r < -tol or y + r > 1 + tol:
+            return False
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - tol:
+                return False
+    
+    return True
+
 
 def run_packing():
     n = 26
-    best_sum_r = -1.0
+    
+    best_sum = 0.0
     best_centers = None
     best_radii = None
     
-    # Prepare initial configurations
-    inits = []
+    # Strategy 1: Optimize equal circles with multiple row patterns
+    patterns = [
+        [6, 5, 6, 5, 4],
+        [5, 6, 5, 6, 4],
+        [5, 5, 6, 5, 5],
+        [6, 4, 6, 6, 4],
+        [4, 6, 6, 6, 4],
+    ]
     
-    # 1. Structured grid initialization
-    cx0, cy0, r0 = [], [], []
-    for i in range(5):
-        for j in range(5):
-            cx0.append(0.2 + 0.2*i)
-            cy0.append(0.2 + 0.2*j)
-            r0.append(0.1)
-    cx0.append(0.5)
-    cy0.append(0.5)
-    r0.append(0.1)
-    inits.append((cx0, cy0, r0))
+    for pattern in patterns:
+        for seed in range(15):
+            c0 = make_hex_init(n, seed, pattern)
+            
+            # Nelder-Mead optimization for equal circles
+            result = minimize(
+                obj_min_radius,
+                c0.flatten(),
+                args=(n,),
+                method='Nelder-Mead',
+                options={'maxiter': 200000, 'xatol': 1e-12, 'fatol': 1e-14}
+            )
+            
+            fc = result.x.reshape(n, 2)
+            r = compute_min_radius(fc)
+            
+            if r > best_sum / n:
+                radii = np.ones(n) * r
+                if validate(fc, radii):
+                    best_sum = n * r
+                    best_centers = fc.copy()
+                    best_radii = radii.copy()
     
-    # 2. Random initializations
-    np.random.seed(42)
-    for _ in range(5):
-        cx_r = np.random.uniform(0.1, 0.9, n)
-        cy_r = np.random.uniform(0.1, 0.9, n)
-        r_r = np.full(n, 0.05)
-        inits.append((cx_r, cy_r, r_r))
+    # Strategy 2: Dual annealing for global search (equal circles)
+    try:
+        bounds = [(0, 1)] * (2 * n)
+        da_result = dual_annealing(
+            obj_min_radius,
+            bounds,
+            args=(n,),
+            maxiter=5000,
+            seed=42
+        )
+        fc = da_result.x.reshape(n, 2)
+        r = compute_min_radius(fc)
         
-    bounds = [(0, 1)] * n + [(0, 1)] * n + [(0, 0.5)] * n
+        if r > best_sum / n:
+            radii = np.ones(n) * r
+            if validate(fc, radii):
+                best_sum = n * r
+                best_centers = fc.copy()
+                best_radii = radii.copy()
+    except Exception:
+        pass
     
-    for cx_init, cy_init, r_init in inits:
-        var0 = np.zeros(3*n)
-        var0[0::3] = cx_init
-        var0[1::3] = cy_init
-        var0[2::3] = r_init
+    # Strategy 3: Variable radius optimization from best equal-circle result
+    if best_centers is not None:
+        x0 = np.concatenate([best_centers.flatten(), best_radii])
         
-        res = minimize(objective_func, var0, jac=gradient_func, method='L-BFGS-B', 
-                       bounds=bounds, options={'maxiter': 5000, 'ftol': 1e-15})
-        
-        cx_opt = res.x[0::3]
-        cy_opt = res.x[1::3]
-        r_opt = res.x[2::3]
-        
-        # Ensure radii are strictly positive
-        r_opt = np.clip(r_opt, 1e-6, None)
-        centers = np.column_stack((cx_opt, cy_opt))
-        
-        if validate_packing(centers, r_opt):
-            s_r = np.sum(r_opt)
-            if s_r > best_sum_r:
-                best_sum_r = s_r
-                best_centers = centers.copy()
-                best_radii = r_opt.copy()
+        for seed in range(20):
+            np.random.seed(seed)
+            c0 = best_centers.copy() + np.random.uniform(-0.003, 0.003, (n, 2))
+            c0 = np.clip(c0, 0.01, 0.99)
+            r0 = best_radii.copy() + np.random.uniform(-0.002, 0.002, n)
+            r0 = np.maximum(r0, 0.01)
+            x0 = np.concatenate([c0.flatten(), r0])
+            
+            def penalized_obj(x):
+                c = x[:2 * n].reshape(n, 2)
+                r = x[2 * n:]
+                r = np.maximum(r, 1e-10)
                 
-    # Fallback in case optimization fails to find valid packing
-    if best_centers is None:
-        centers_f = np.zeros((n, 2))
-        radii_f = np.full(n, 0.01)
-        for i in range(n):
-            centers_f[i, 0] = 0.1 + (i % 6) * 0.15
-            centers_f[i, 1] = 0.1 + (i // 6) * 0.15
-        return centers_f, radii_f, np.sum(radii_f)
+                val = -np.sum(r)
+                P = 50000
+                
+                # Boundary penalties
+                for i in range(n):
+                    val += P * max(0, r[i] - c[i, 0]) ** 2
+                    val += P * max(0, c[i, 0] + r[i] - 1) ** 2
+                    val += P * max(0, r[i] - c[i, 1]) ** 2
+                    val += P * max(0, c[i, 1] + r[i] - 1) ** 2
+                
+                # Overlap penalties
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        d = np.sqrt(np.sum((c[i] - c[j]) ** 2))
+                        val += P * max(0, r[i] + r[j] - d) ** 2
+                
+                return val
+            
+            res = minimize(
+                penalized_obj,
+                x0,
+                method='BFGS',
+                options={'maxiter': 150000, 'gtol': 1e-14}
+            )
+            
+            fc = res.x[:2 * n].reshape(n, 2)
+            fr = np.maximum(res.x[2 * n:], 1e-10)
+            
+            if validate(fc, fr):
+                s = np.sum(fr)
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = fc.copy()
+                    best_radii = fr.copy()
+    
+    # Strategy 4: Try fresh variable-radius optimization with different seeds
+    for seed in range(30):
+        c0, r0 = make_hex_init(n, seed, [6, 5, 6, 5, 4]), np.ones(n) * 0.095
+        x0 = np.concatenate([c0.flatten(), r0])
         
-    return best_centers, best_radii, best_sum_r
+        def penalized_obj(x):
+            c = x[:2 * n].reshape(n, 2)
+            r = x[2 * n:]
+            r = np.maximum(r, 1e-10)
+            
+            val = -np.sum(r)
+            P = 50000
+            
+            for i in range(n):
+                val += P * max(0, r[i] - c[i, 0]) ** 2
+                val += P * max(0, c[i, 0] + r[i] - 1) ** 2
+                val += P * max(0, r[i] - c[i, 1]) ** 2
+                val += P * max(0, c[i, 1] + r[i] - 1) ** 2
+            
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.sqrt(np.sum((c[i] - c[j]) ** 2))
+                    val += P * max(0, r[i] + r[j] - d) ** 2
+            
+            return val
+        
+        res = minimize(
+            penalized_obj,
+            x0,
+            method='BFGS',
+            options={'maxiter': 100000, 'gtol': 1e-14}
+        )
+        
+        fc = res.x[:2 * n].reshape(n, 2)
+        fr = np.maximum(res.x[2 * n:], 1e-10)
+        
+        if validate(fc, fr):
+            s = np.sum(fr)
+            if s > best_sum:
+                best_sum = s
+                best_centers = fc.copy()
+                best_radii = fr.copy()
+    
+    # Final fallback
+    if best_centers is None:
+        best_centers = make_hex_init(n, 0)
+        best_radii = np.ones(n) * 0.09
+        best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, best_sum
 ```

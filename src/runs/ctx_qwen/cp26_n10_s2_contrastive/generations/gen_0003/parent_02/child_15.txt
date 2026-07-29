@@ -1,0 +1,205 @@
+
+
+<strategy>
+The current best sum of radii (~2.626) is close to, but still below the target of 2.636. The primary bottleneck in previous attempts is the reliance on SLSQP alone, which struggles with the highly non-convex landscape of circle packing constraints and often gets trapped in local minima or converges slowly.
+
+To break through this barrier, I will employ a **gradient-based force simulation** driven by Linear Programming dual variables (shadow prices). Here's the strategy:
+1. **LP-Dual Gradient Computation**: For any fixed set of centers, the maximum sum of radii is found via an LP. The dual variables (`marginals`) for the pairwise constraints $r_i + r_j \le d_{ij}$ directly give the sensitivity $\frac{\partial (\sum r)}{\partial d_{ij}}$. By chain rule, this yields an exact repulsive force vector on each center proportional to $\lambda_{ij} \frac{c_i - c_j}{d_{ij}}$.
+2. **Force-Directed Optimization**: We iteratively update centers using these forces with a decaying step size. This efficiently navigates the configuration space towards higher sum-of-radii states without the overhead of full quadratic programming at each step.
+3. **Hybrid Refinement**: After force optimization pushes the configuration into a high-quality basin, we run a final SLSQP pass to strictly satisfy all constraints and polish the solution.
+4. **Diverse Initialization**: We seed the process with hexagonal lattices of varying spacings, their perturbations, and random configurations to ensure broad exploration.
+5. **Strict Post-Processing**: A deterministic pass enforces boundary and non-overlap constraints within numerical tolerance, guaranteeing validity for the validation function.
+
+This approach leverages the exact gradient of the LP value function, which is known to converge rapidly to near-optimal packings in computational geometry.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(I_IDX)
+
+def objective(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[2*N:])
+
+def constraints(params):
+    """Inequality constraints: boundary and non-overlap."""
+    c = params[:2*N].reshape(N, 2)
+    r = params[2*N:]
+    
+    cons = []
+    # Boundary constraints
+    cons.append(c[:, 0] - r)
+    cons.append(1.0 - c[:, 0] - r)
+    cons.append(c[:, 1] - r)
+    cons.append(1.0 - c[:, 1] - r)
+    
+    # Pairwise non-overlap constraints
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    cons.append(dists[I_IDX, J_IDX] - r_sum[I_IDX, J_IDX])
+    
+    return np.concatenate(cons)
+
+def solve_lp_radii(centers):
+    """Solve LP to find optimal radii for fixed centers and return duals."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    A_ub = np.zeros((NUM_PAIRS, n))
+    A_ub[np.arange(NUM_PAIRS), I_IDX] = 1.0
+    A_ub[np.arange(NUM_PAIRS), J_IDX] = 1.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    b_ub = dists[I_IDX, J_IDX]
+    
+    bounds = [(0.0, 0.5)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            marginals = np.zeros(NUM_PAIRS)
+            if hasattr(res, 'ineqlin') and hasattr(res.ineqlin, 'marginals'):
+                marginals = res.ineqlin.marginals[:NUM_PAIRS].flatten()
+            return res.x, -res.fun, marginals
+    except Exception:
+        pass
+    return np.zeros(n), 0.0, np.zeros(NUM_PAIRS)
+
+def force_optimize(centers, steps=250, alpha=0.035):
+    """Optimize centers using LP dual-driven repulsive forces."""
+    c = centers.copy()
+    n = N
+    for t in range(steps):
+        r, obj, lambdas = solve_lp_radii(c)
+        if obj <= 1e-7: 
+            break
+            
+        forces = np.zeros((n, 2))
+        dx = c[I_IDX, 0] - c[J_IDX, 0]
+        dy = c[I_IDX, 1] - c[J_IDX, 1]
+        dists = np.hypot(dx, dy)
+        dists_safe = np.where(dists > 1e-9, dists, 1e-9)
+        
+        fx = lambdas * dx / dists_safe
+        fy = lambdas * dy / dists_safe
+        
+        np.add.at(forces[:, 0], I_IDX, fx)
+        np.add.at(forces[:, 0], J_IDX, -fx)
+        np.add.at(forces[:, 1], I_IDX, fy)
+        np.add.at(forces[:, 1], J_IDX, -fy)
+        
+        # Decaying step size for convergence
+        curr_alpha = alpha * (1.0 - t / steps)
+        c += curr_alpha * forces
+        c = np.clip(c, 0.02, 0.98)
+        
+    return c
+
+def run_packing():
+    bounds_opt = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    # 1. Hexagonal patterns with varying spacing
+    for s in np.linspace(0.13, 0.19, 8):
+        c_hex = np.zeros((N, 2))
+        idx = 0
+        y = s/2
+        row = 0
+        while idx < N and y < 1.0 - s/2:
+            x = s/2 + (row % 2) * s/2
+            while x < 1.0 - s/2 and idx < N:
+                c_hex[idx] = [x, y]
+                x += s
+                idx += 1
+            y += s * np.sqrt(3) / 2.0
+            row += 1
+        while idx < N:
+            c_hex[idx] = [0.5, 0.5]
+            idx += 1
+        inits.append(c_hex)
+        
+    # 2. Perturbed hexagonal patterns
+    for seed in range(20):
+        rng = np.random.RandomState(seed)
+        base = inits[seed % len(inits)]
+        c_pert = base + rng.normal(0, 0.025, (N, 2))
+        c_pert = np.clip(c_pert, 0.05, 0.95)
+        inits.append(c_pert)
+        
+    # 3. Random configurations
+    for seed in range(15):
+        rng = np.random.RandomState(seed + 200)
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+
+    # Main optimization loop
+    for c0 in inits:
+        # Phase 1: Force-directed optimization
+        c_force = force_optimize(c0, steps=250, alpha=0.035)
+        r_force, s_force, _ = solve_lp_radii(c_force)
+        
+        if s_force > best_sum:
+            best_sum = s_force
+            best_c = c_force.copy()
+            best_r = r_force.copy()
+            
+        # Phase 2: SLSQP refinement for strict constraint satisfaction
+        r0 = np.maximum(r_force, 1e-4)
+        x0 = np.concatenate([c_force.flatten(), r0])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds_opt,
+                           constraints=cons_dict,
+                           options={'maxiter': 15000, 'ftol': 1e-14, 'disp': False})
+            
+            co = res.x[:2*N].reshape(N, 2)
+            ro = np.maximum(res.x[2*N:], 0.0)
+            
+            # Recompute via LP to ensure radii are maximized for these centers
+            r_lp, s_lp, _ = solve_lp_radii(co)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_c = co.copy()
+                best_r = r_lp.copy()
+        except Exception:
+            pass
+
+    # Phase 3: Strict post-processing to guarantee validity
+    if best_c is not None:
+        # Enforce boundaries strictly
+        for i in range(N):
+            mx = min(best_c[i,0], 1-best_c[i,0], best_c[i,1], 1-best_c[i,1])
+            best_r[i] = min(best_r[i], mx - 1e-9)
+            best_r[i] = max(best_r[i], 0.0)
+            
+        # Iteratively resolve any remaining numerical overlaps
+        for _ in range(100):
+            changed = False
+            for i in range(N):
+                for j in range(i+1, N):
+                    d = np.hypot(best_c[i,0]-best_c[j,0], best_c[i,1]-best_c[j,1])
+                    if d < best_r[i] + best_r[j] - 1e-10:
+                        exc = best_r[i] + best_r[j] - d
+                        best_r[i] -= exc/2
+                        best_r[j] -= exc/2
+                        changed = True
+            if not changed:
+                break
+        best_sum = np.sum(best_r)
+        
+    # Fallback (should not be reached)
+    if best_c is None:
+        best_c = np.random.uniform(0.2, 0.8, (N, 2))
+        best_r = np.full(N, 0.02)
+        best_sum = np.sum(best_r)
+        
+    return best_c, best_r, float(best_sum)
+```

@@ -1,0 +1,265 @@
+# sol_000108 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 82191eeb) state=f7d0c715 sum of radii=2.413235 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        return False
+    if np.isnan(radii).any():
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        elif np.isnan(radii[i]):
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+def get_overlap_penalty(centers, radii):
+    """
+    Calculates a penalty score based on overlaps and boundary violations.
+    Higher penalty means worse configuration.
+    """
+    n = len(radii)
+    penalty = 0.0
+    
+    # Boundary penalties
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        
+        # Left
+        if x - r < 0:
+            penalty += (x - r)**2 * 1000
+        # Right
+        if x + r > 1:
+            penalty += (x + r - 1)**2 * 1000
+        # Bottom
+        if y - r < 0:
+            penalty += (y - r)**2 * 1000
+        # Top
+        if y + r > 1:
+            penalty += (y + r - 1)**2 * 1000
+
+    # Overlap penalties
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            min_dist = radii[i] + radii[j]
+            if dist < min_dist:
+                overlap = min_dist - dist
+                penalty += overlap**2 * 10000 # High weight for overlaps
+                
+    return penalty
+
+def objective_function(params, n_circles):
+    """
+    Objective function to minimize: -Sum of radii + Penalty
+    """
+    centers = params[:n_circles*2].reshape(n_circles, 2)
+    radii = params[n_circles*2:]
+    
+    # Ensure radii are positive (soft constraint via penalty or clipping)
+    # But optimizer might push them negative. Let's penalize negative radii heavily.
+    penalty = 0.0
+    for r in radii:
+        if r < 0:
+            penalty += 10000 * r**2
+            
+    penalty += get_overlap_penalty(centers, radii)
+    
+    # We want to maximize sum of radii, so minimize negative sum
+    return -np.sum(radii) + penalty
+
+def run_packing():
+    n_circles = 26
+    
+    # 1. Initialization: Hexagonal-like lattice
+    # We want to place 26 circles. A 5x5 grid has 25. 
+    # Let's try a hexagonal arrangement.
+    # Rows with counts: 5, 6, 5, 6, 4? Sum = 26.
+    # Or just a random dense packing optimized later.
+    # Let's try a structured hexagonal grid.
+    
+    centers = np.zeros((n_circles, 2))
+    radii = np.ones(n_circles) * 0.08 # Initial small radius
+    
+    idx = 0
+    # Try to fit in a hexagonal pattern
+    # Row height: r * sqrt(3). But r is variable. Let's use spacing 0.2 initially.
+    spacing = 0.2
+    h_spacing = spacing * np.sqrt(3) / 2
+    
+    y = spacing / 2 # Start with some margin? No, centers need to be > r. 
+    # If r=0.08, center >= 0.08.
+    
+    row_counts = [6, 5, 6, 5, 4] # Sum 26? 6+5+6+5+4 = 26.
+    # Check width: 6 circles -> width approx 5*spacing + 2r = 1.0 + 0.16 = 1.16 (Too wide)
+    # 5 circles -> 4*spacing + 2r = 0.8 + 0.16 = 0.96 (Fits)
+    # So we can't have rows of 6 with spacing 0.2.
+    # Let's adjust spacing dynamically or just place them randomly and let optimizer fix.
+    
+    # Better initialization: Random uniform, but clustered?
+    # Or just a perturbed grid.
+    
+    # Let's try a simple grid first, then optimize.
+    # 5x5 grid + 1 center?
+    # 5x5 grid centers:
+    grid_coords = []
+    for i in range(5):
+        for j in range(5):
+            x = (i + 1) * 0.2 # 0.2, 0.4, 0.6, 0.8, 1.0 -> 1.0 is bad (edge)
+            # Actually 5 circles fit in [0,1] with spacing 0.2 if centered at 0.1, 0.3...
+            x = (i + 0.5) * 0.2 # 0.1, 0.3, 0.5, 0.7, 0.9
+            y = (j + 0.5) * 0.2
+            grid_coords.append((x, y))
+            
+    # We have 25 coords. Add one more.
+    # Add in the middle of a gap? Or just random?
+    # Let's add one at (0.5, 0.5) but it overlaps.
+    # Let's just place 26 points in a random valid config and optimize.
+    
+    # Better: Place in a hexagonal lattice pattern with scaling.
+    # Let's just use a dense random start or a specific pattern.
+    # Pattern: 5 rows.
+    # Row 0: 5 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 5 circles
+    # Row 3: 5 circles
+    # Row 4: 6 circles? No.
+    
+    # Let's try 5 rows of 5, plus 1.
+    # But 5x5 is tight.
+    # Let's just use a random initialization with a slight bias towards center?
+    # No, boundary circles are important.
+    
+    # Let's use a force-based simulation to pack them first.
+    np.random.seed(42)
+    centers = np.random.uniform(0.2, 0.8, size=(n_circles, 2))
+    radii = np.ones(n_circles) * 0.05
+    
+    # Force based relaxation
+    for step in range(1000):
+        forces = np.zeros_like(centers)
+        
+        # Repulsion between circles
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist and dist > 1e-9:
+                    overlap = min_dist - dist
+                    force_vec = diff / dist * overlap * 10.0
+                    forces[i] += force_vec
+                    forces[j] -= force_vec
+        
+        # Repulsion from walls
+        for i in range(n_circles):
+            r = radii[i]
+            x, y = centers[i]
+            if x < r:
+                forces[i, 0] += (r - x) * 10.0
+            if x > 1 - r:
+                forces[i, 0] -= (x - (1 - r)) * 10.0
+            if y < r:
+                forces[i, 1] += (r - y) * 10.0
+            if y > 1 - r:
+                forces[i, 1] -= (y - (1 - r)) * 10.0
+                
+        # Apply forces
+        centers += forces * 0.1
+        # Clamp centers to valid range roughly
+        centers = np.clip(centers, 0, 1)
+        
+        # Grow radii slowly if no big overlaps
+        # Calculate max overlap
+        max_overlap = 0
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                ov = radii[i] + radii[j] - dist
+                if ov > max_overlap:
+                    max_overlap = ov
+        
+        # Boundary overlap
+        for i in range(n_circles):
+            r = radii[i]
+            x, y = centers[i]
+            b_ov = max(0, r - x, x + r - 1, r - y, y + r - 1)
+            if b_ov > max_overlap:
+                max_overlap = b_ov
+                
+        # If overlap is small, grow radii
+        if max_overlap < 0.001:
+            growth = 0.0001 * (1 + step/100)
+            radii += growth
+            # Cap radii
+            radii = np.minimum(radii, 0.5)
+            
+    # After simulation, run scipy optimization to fine tune
+    # Variables: x1, y1, r1, ...
+    initial_params = np.concatenate([centers.flatten(), radii])
+    
+    # Bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = [(0, 1)] * (n_circles * 2) + [(0, 0.5)] * n_circles
+    
+    # Use L-BFGS-B or SLSQP
+    # SLSQP handles constraints better but we used penalty.
+    # Let's use L-BFGS-B with penalty.
+    
+    res = opt.minimize(
+        objective_function, 
+        initial_params, 
+        args=(n_circles,), 
+        method='L-BFGS-B', 
+        bounds=bounds,
+        options={'maxiter': 2000, 'ftol': 1e-12}
+    )
+    
+    final_params = res.x
+    final_centers = final_params[:n_circles*2].reshape(n_circles, 2)
+    final_radii = final_params[n_circles*2:]
+    
+    # Ensure radii are positive
+    final_radii = np.maximum(final_radii, 1e-9)
+    
+    # Check validity
+    if not validate_packing(final_centers, final_radii):
+        # If invalid, try to fix by reducing radii slightly or clipping
+        # This might happen if penalty wasn't high enough
+        # Let's do a safety reduction
+        scale = 0.95
+        while not validate_packing(final_centers, final_radii * scale):
+            scale *= 0.95
+        final_radii *= scale
+        
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii

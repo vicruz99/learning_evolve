@@ -1,0 +1,146 @@
+
+
+<strategy>
+To improve upon the current sum of radii (~2.631), I will employ a hybrid optimization strategy combining global exploration with precise local refinement:
+
+1. **Differential Evolution (DE) for Global Search**: DE is highly effective at navigating non-convex landscapes with many local minima. I will use a quadratic penalty method to handle constraints during DE, allowing it to explore configurations that may temporarily violate bounds but are penalized heavily, guiding the population toward feasible high-sum regions.
+2. **SLSQP Local Refinement**: Once DE identifies promising candidate solutions, I will pass them to SLSQP with exact inequality constraints. SLSQP excels at polishing solutions to high precision when started from feasible points.
+3. **Adaptive Perturbation Search**: To escape shallow local minima, I will run a scheduled perturbation phase around the best found solution, gradually reducing the perturbation magnitude to simulate simulated annealing behavior.
+4. **Robust Initialization & Scaling**: The penalty weight is tuned to 1500, which is large enough to enforce feasibility but not so large as to cause numerical instability in the optimizer. Bounds for radii during DE are set to `[0.01, 0.5]` to prevent collapse to zero-radius solutions, while SLSQP uses `[0.0, 0.5]` for final accuracy.
+
+This pipeline systematically explores the solution space, refines the best finds, and aggressively polishes the configuration to push the sum of radii beyond 2.636.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def penalty_objective(v, weight):
+    """Objective for Differential Evolution with quadratic penalty for constraints."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    obj = -np.sum(r)
+    
+    # Boundary violations: r <= x <= 1-r, r <= y <= 1-r
+    v1 = np.minimum(0.0, x - r)
+    v2 = np.minimum(0.0, 1.0 - x - r)
+    v3 = np.minimum(0.0, y - r)
+    v4 = np.minimum(0.0, 1.0 - y - r)
+    p_bound = np.sum(v1**2 + v2**2 + v3**2 + v4**2)
+    
+    # Pairwise separation violations: dist >= r_i + r_j
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    r_sum = r[:, None] + r[None, :]
+    v_pair = np.minimum(0.0, dist - r_sum)
+    p_pair = np.sum(v_pair[I_IDX, J_IDX]**2)
+    
+    return obj + weight * (p_bound + p_pair)
+
+def constraints_slsqp(v):
+    """Exact inequality constraints for SLSQP: g(v) >= 0."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = []
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    c.append(dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2)
+    
+    return np.concatenate(c)
+
+def objective_slsqp(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def run_de_search(seed, weight):
+    """Runs Differential Evolution to find a high-quality starting configuration."""
+    bounds = []
+    for _ in range(N):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.01, 0.5)])
+        
+    res = differential_evolution(
+        func=penalty_objective,
+        bounds=bounds,
+        args=(weight,),
+        popsize=40,
+        maxiter=200,
+        mutation=(0.5, 1.0),
+        recombination=0.9,
+        seed=seed,
+        tol=1e-7,
+        polish=False
+    )
+    return res.x
+
+def run_packing():
+    best_sum = -np.inf
+    best_v = None
+    cons = {'type': 'ineq', 'fun': constraints_slsqp}
+    bounds_slsqp = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    
+    # Phase 1: Differential Evolution Global Search
+    # Multiple seeds ensure diverse exploration of the configuration space
+    seeds = [42, 123, 456, 789, 1024]
+    for seed in seeds:
+        try:
+            v0 = run_de_search(seed, weight=1500.0)
+            res = minimize(objective_slsqp, v0, method='SLSQP', bounds=bounds_slsqp,
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+            if res.success and np.min(constraints_slsqp(res.x)) >= -1e-8:
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Adaptive Perturbation Search to escape local minima
+    if best_v is not None:
+        for k in range(60):
+            v_pert = best_v.copy()
+            # Gradually decrease perturbation scale to simulate annealing
+            scale = 0.008 * (1.0 - k / 80.0)
+            v_pert += np.random.randn(3 * N) * scale
+            v_pert[0::3] = np.clip(v_pert[0::3], 0.01, 0.99)
+            v_pert[1::3] = np.clip(v_pert[1::3], 0.01, 0.99)
+            v_pert[2::3] = np.clip(v_pert[2::3], 0.001, 0.49)
+            
+            try:
+                res = minimize(objective_slsqp, v_pert, method='SLSQP', bounds=bounds_slsqp,
+                               constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+                if res.success and np.min(constraints_slsqp(res.x)) >= -1e-8:
+                    s = -res.fun
+                    if s > best_sum:
+                        best_sum = s
+                        best_v = res.x.copy()
+            except Exception:
+                continue
+                
+    # Phase 3: High-Precision Final Polish
+    if best_v is not None:
+        try:
+            res = minimize(objective_slsqp, best_v, method='SLSQP', bounds=bounds_slsqp,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if res.success and np.min(constraints_slsqp(res.x)) >= -1e-9:
+                best_v = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+            
+    centers = np.column_stack((best_v[0::3], best_v[1::3]))
+    radii = np.maximum(best_v[2::3], 0.0)
+    return centers, radii, float(best_sum)
+```

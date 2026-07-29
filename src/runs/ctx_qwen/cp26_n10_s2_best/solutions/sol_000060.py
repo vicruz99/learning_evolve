@@ -1,0 +1,177 @@
+# sol_000060 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000020 (state fea4b3d4) state=cfc1d9c4 sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(v):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*N_CIRCLES:])
+
+def constraints(v):
+    """Vectorized inequality constraints: boundaries and non-overlap."""
+    centers = v[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = v[2*N_CIRCLES:]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c_bound = np.concatenate([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ])
+    
+    # Pairwise non-overlap: dist >= r_i + r_j
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    c_overlap = dists[TRIU_IDX] - r_sum[TRIU_IDX]
+    return np.concatenate([c_bound, c_overlap])
+
+def get_min_dist(centers):
+    """Compute minimum distance between any two centers."""
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    # Exclude diagonal
+    np.fill_diagonal(dists, np.inf)
+    return np.min(dists)
+
+def run_packing():
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # 1. Generate diverse initial configurations
+    np.random.seed(42)
+    init_configs = []
+    
+    # Hexagonal lattice
+    r_h = 0.09
+    pts_h = []
+    y = r_h
+    row = 0
+    while len(pts_h) < n:
+        x_start = r_h if row % 2 == 0 else 2 * r_h
+        x = x_start
+        while x <= 1.0 - r_h:
+            pts_h.append([x, y])
+            x += 2 * r_h
+        y += r_h * np.sqrt(3)
+        row += 1
+    init_configs.append(np.array(pts_h[:n]))
+    
+    # Perturbed grids
+    gs = np.linspace(0.12, 0.88, 6)
+    grid = np.array([[x, y] for y in gs for x in gs])
+    for _ in range(6):
+        idx = np.random.choice(len(grid), n, replace=False)
+        jitter = np.random.uniform(-0.025, 0.025, size=(n, 2))
+        init_configs.append(np.clip(grid[idx] + jitter, 0.05, 0.95))
+        
+    # Pure random
+    for _ in range(6):
+        init_configs.append(np.random.uniform(0.1, 0.9, size=(n, 2)))
+        
+    # Concentric / polar
+    pts_p = [[0.5, 0.5]]
+    for k in range(6):
+        a = k * np.pi / 3
+        pts_p.append([0.5 + 0.25*np.cos(a), 0.5 + 0.25*np.sin(a)])
+    for k in range(12):
+        a = k * np.pi / 6
+        pts_p.append([0.5 + 0.45*np.cos(a), 0.5 + 0.45*np.sin(a)])
+    while len(pts_p) < n:
+        pts_p.append(np.random.uniform(0.1, 0.9, 2))
+    init_configs.append(np.array(pts_p[:n]))
+
+    # 2. First pass: Optimize from each configuration
+    for cfg in init_configs:
+        # Set initial radii to a safe fraction of the closest approach
+        min_d = get_min_dist(cfg)
+        r_init = np.full(n, min_d * 0.35)
+        v0 = np.concatenate([cfg.flatten(), r_init])
+        
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            
+            if np.all(constraints(res.x) >= -1e-8):
+                cur_sum = -res.fun
+                if cur_sum > best_sum:
+                    best_sum = cur_sum
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # 3. Second pass: Perturb and refine the best solution found
+    if best_v is not None:
+        for _ in range(8):
+            v_pert = best_v.copy()
+            # Randomize positions slightly
+            v_pert[:2*n] += np.random.uniform(-0.015, 0.015, size=2*n)
+            # Clamp positions to bounds
+            v_pert[:2*n] = np.clip(v_pert[:2*n], 0.02, 0.98)
+            # Slightly reduce radii to ensure feasibility after perturbation
+            v_pert[2*n:] *= 0.98
+            
+            try:
+                res = minimize(objective, v_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+                if np.all(constraints(res.x) >= -1e-8):
+                    cur_sum = -res.fun
+                    if cur_sum > best_sum:
+                        best_sum = cur_sum
+                        best_v = res.x.copy()
+            except Exception:
+                continue
+
+    if best_v is None:
+        # Fallback (should not trigger with robust initialization)
+        centers = np.array([[0.1 + 0.07*i, 0.1 + 0.07*(i//6)] for i in range(26)])
+        radii = np.full(26, 0.035)
+        return centers, radii, np.sum(radii)
+
+    centers = best_v[:2*n].reshape(n, 2)
+    radii = best_v[2*n:]
+    
+    # 4. Strict post-processing to guarantee validator compliance
+    margin = 1e-9
+    for _ in range(200):
+        changed = False
+        # Enforce boundaries
+        max_r_bound = np.minimum(
+            np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+            np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+        ) - margin
+        mask = radii > max_r_bound
+        if np.any(mask):
+            radii[mask] = max_r_bound[mask]
+            changed = True
+            
+        # Enforce non-overlap
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                max_sum = d - margin
+                if radii[i] + radii[j] > max_sum:
+                    shrink = (radii[i] + radii[j] - max_sum) / 2.0
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    # Ensure non-negativity
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))

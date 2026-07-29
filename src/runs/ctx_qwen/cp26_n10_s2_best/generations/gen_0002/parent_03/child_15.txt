@@ -1,0 +1,255 @@
+
+
+Looking at the past solutions, they all cluster around sum of radii ≈ 2.628-2.630. To break through to 2.636, I need a fundamentally different optimization strategy that better escapes local minima.
+
+<strategy>
+1. **Constraint formulation**: Use squared distance constraints for numerical stability, which is already in the current code.
+
+2. **Diverse initialization**: Generate hexagonal lattices with multiple radii, rotations, and shifts. Also try grid-based, corner-exploiting, and random configurations.
+
+3. **Aggressive multi-start**: Run SLSQP from dozens of diverse starting points.
+
+4. **Iterative perturbation refinement**: After finding the best solution, repeatedly perturb it with decreasing noise and re-optimize to escape shallow local minima.
+
+5. **Multiple optimization methods**: Try SLSQP and also COBYLA (derivative-free) which might find different local optima.
+
+6. **Two-phase approach**: First find good configurations with SLSQP, then use a local search with tiny perturbations to fine-tune.
+
+7. **Strict post-processing**: Enforce all constraints with safety margins to guarantee validator compliance.
+
+Key insight: The current best (2.628) vs target (2.636) is only a 0.3% gap. This suggests the global optimum is near the current best, but SLSQP is getting stuck in local minima. The solution is to try MANY more starting points and use more aggressive perturbation strategies.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+
+def objective(v, N):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2 * N :])
+
+
+def constraints(v, N, pair_i, pair_j):
+    """Inequality constraints: boundaries and pairwise non-overlap (squared)."""
+    x = v[:N]
+    y = v[N : 2 * N]
+    r = v[2 * N :]
+
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+
+    dx = x[pair_i] - x[pair_j]
+    dy = y[pair_i] - y[pair_j]
+    r_sum = r[pair_i] + r[pair_j]
+
+    c = np.concatenate([c, dx ** 2 + dy ** 2 - r_sum ** 2])
+    return c
+
+
+def make_hex_centers(N, r0, angle=0.0, shift_x=0.0, shift_y=0.0):
+    """Create hexagonal lattice centers."""
+    centers = []
+    y = r0 + shift_y
+    row = 0
+    while len(centers) < N + 15:
+        x_start = r0 + (row % 2) * r0
+        x = x_start + shift_x
+        while x <= 1 - r0 and len(centers) < N + 15:
+            centers.append([x, y])
+            x += 2 * r0
+        y += r0 * np.sqrt(3)
+        row += 1
+
+    centers = np.array(centers[:N])
+
+    if angle != 0.0:
+        ca, sa = np.cos(angle), np.sin(angle)
+        c = centers - 0.5
+        centers = c @ np.array([[ca, -sa], [sa, ca]]) + 0.5
+        centers = np.clip(centers, 0.01, 0.99)
+
+    return centers
+
+
+def make_grid_centers(N, n_rows, n_cols):
+    """Create grid-based centers."""
+    centers = []
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if len(centers) >= N:
+                break
+            x = (j + 0.5) / n_cols
+            y = (i + 0.5) / n_rows
+            centers.append([x, y])
+        if len(centers) >= N:
+            break
+    return np.array(centers[:N])
+
+
+def make_corner_centers(N, seed):
+    """Create corner-exploiting centers with larger corner circles."""
+    np.random.seed(seed)
+    centers = np.zeros((N, 2))
+    corners = [[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.87]]
+    for i, c in enumerate(corners):
+        centers[i] = c
+    centers[4:] = np.random.uniform(0.15, 0.85, (N - 4, 2))
+    return centers
+
+
+def run_packing():
+    N = 26
+    pair_i, pair_j = np.triu_indices(N, k=1)
+
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons = {"type": "ineq", "fun": constraints, "args": (N, pair_i, pair_j)}
+
+    best_sum = -1.0
+    best_v = None
+
+    starts = []
+
+    # Hexagonal lattices with varied parameters
+    for r0 in np.arange(0.075, 0.115, 0.005):
+        for angle in [0.0, 0.05, -0.05, 0.1, -0.1, 0.15, -0.15, 0.2]:
+            centers = make_hex_centers(N, r0, angle)
+            r_init = np.full(N, r0 * 0.85)
+            starts.append(np.concatenate([centers[:, 0], centers[:, 1], r_init]))
+
+    # Shifted hexagonal lattices
+    for r0 in [0.09, 0.095, 0.10, 0.105]:
+        for sx in [-0.02, 0.0, 0.02]:
+            for sy in [-0.02, 0.0, 0.02]:
+                centers = make_hex_centers(N, r0, shift_x=sx, shift_y=sy)
+                r_init = np.full(N, r0 * 0.85)
+                starts.append(np.concatenate([centers[:, 0], centers[:, 1], r_init]))
+
+    # Grid configurations
+    for n_r in range(4, 7):
+        for n_c in range(5, 8):
+            if n_r * n_c >= N:
+                centers = make_grid_centers(N, n_r, n_c)
+                r_init = np.full(N, 0.04)
+                starts.append(np.concatenate([centers[:, 0], centers[:, 1], r_init]))
+
+    # Random starts
+    for seed in range(60):
+        np.random.seed(seed)
+        centers = np.random.uniform(0.05, 0.95, (N, 2))
+        r_init = np.full(N, 0.035)
+        starts.append(np.concatenate([centers[:, 0], centers[:, 1], r_init]))
+
+    # Corner-exploiting starts
+    for seed in range(40):
+        centers = make_corner_centers(N, 1000 + seed)
+        r_init = np.zeros(N)
+        r_init[:4] = 0.10
+        r_init[4:] = 0.05
+        starts.append(np.concatenate([centers[:, 0], centers[:, 1], r_init]))
+
+    # Phase 1: Initial optimization from all starts
+    for v0 in starts:
+        try:
+            res = minimize(
+                objective,
+                v0,
+                method="SLSQP",
+                args=(N,),
+                bounds=bounds,
+                constraints=cons,
+                options={"maxiter": 25000, "ftol": 1e-14, "disp": False},
+            )
+            if -res.fun > best_sum:
+                c_val = constraints(res.x, N, pair_i, pair_j)
+                if np.min(c_val) >= -1e-5:
+                    best_sum = -res.fun
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Aggressive perturbation refinement
+    if best_v is not None:
+        for iteration in range(15):
+            noise_scale = 0.006 / (iteration + 1)
+            for trial in range(50):
+                np.random.seed(trial + 5000 + iteration * 200)
+                v_pert = best_v.copy()
+                v_pert[: 2 * N] += np.random.uniform(-noise_scale, noise_scale, 2 * N)
+                v_pert[: 2 * N] = np.clip(v_pert[: 2 * N], 0.005, 0.995)
+                v_pert[2 * N :] *= 0.94 - iteration * 0.008
+
+                try:
+                    res = minimize(
+                        objective,
+                        v_pert,
+                        method="SLSQP",
+                        args=(N,),
+                        bounds=bounds,
+                        constraints=cons,
+                        options={"maxiter": 15000, "ftol": 1e-14, "disp": False},
+                    )
+                    if -res.fun > best_sum:
+                        c_val = constraints(res.x, N, pair_i, pair_j)
+                        if np.min(c_val) >= -1e-5:
+                            best_sum = -res.fun
+                            best_v = res.x.copy()
+                except Exception:
+                    pass
+
+    # Phase 3: COBYLA optimization for different local minima
+    if best_v is not None:
+        for iteration in range(10):
+            noise_scale = 0.004 / (iteration + 1)
+            for trial in range(30):
+                np.random.seed(trial + 8000 + iteration * 100)
+                v_pert = best_v.copy()
+                v_pert[: 2 * N] += np.random.uniform(-noise_scale, noise_scale, 2 * N)
+                v_pert[: 2 * N] = np.clip(v_pert[: 2 * N], 0.01, 0.99)
+                v_pert[2 * N :] *= 0.95
+
+                try:
+                    res = minimize(
+                        objective,
+                        v_pert,
+                        method="COBYLA",
+                        args=(N,),
+                        bounds=bounds,
+                        constraints=cons,
+                        options={"maxiter": 20000, "rhobeg": 1e-4, "catol": 1e-7, "disp": False},
+                    )
+                    if -res.fun > best_sum:
+                        c_val = constraints(res.x, N, pair_i, pair_j)
+                        if np.min(c_val) >= -1e-5:
+                            best_sum = -res.fun
+                            best_v = res.x.copy()
+                except Exception:
+                    pass
+
+    # Extract final configuration
+    if best_v is not None:
+        centers = np.column_stack((best_v[:N], best_v[N : 2 * N]))
+        radii = best_v[2 * N :].copy()
+    else:
+        centers = np.random.uniform(0.1, 0.9, (N, 2))
+        radii = np.full(N, 0.04)
+
+    # Strict constraint enforcement
+    for i in range(N):
+        radii[i] = min(radii[i], centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        radii[i] = max(0.0, radii[i])
+
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if radii[i] + radii[j] > d - 1e-12:
+                    ov = (radii[i] + radii[j] - d) / 2.0 + 1e-11
+                    radii[i] = max(0.0, radii[i] - ov)
+                    radii[j] = max(0.0, radii[j] - ov)
+                    changed = True
+        if not changed:
+            break
+
+    return centers, radii, float(np.sum(radii))
+```

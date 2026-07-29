@@ -1,0 +1,165 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square, I will employ a hybrid optimization strategy that combines physical intuition with rigorous numerical optimization:
+
+1. **Force-Directed Initialization**: Instead of relying solely on static grids or random points, I will simulate a physical expansion process. Circles start small in the center and gradually grow while repelling each other and pushing against the walls. This naturally drives the configuration towards dense, boundary-hugging layouts that are highly feasible and close to local optima.
+2. **Joint Optimization with SLSQP**: Using the force-initiated configurations, I will run `scipy.optimize.minimize` with the SLSQP method. SLSQP is ideal here because it handles non-linear inequality constraints (non-overlap and boundary conditions) natively while optimizing both centers and radii simultaneously.
+3. **Multi-Restart & Perturbation Search**: Packing problems have many local minima. I will run the optimization from 15 diverse force-initiated seeds. Furthermore, I will implement a perturbation loop on the best-found configuration: adding controlled noise to centers, recomputing a safe feasible radius baseline, and re-optimizing. This helps escape shallow local optima that stall standard gradient-based methods.
+4. **Strict Numerical Repair**: Optimization solvers often return solutions that are feasible within their internal tolerances but might slightly violate the strict `1e-12` validator tolerance. A dedicated repair pass will shrink overlapping radii and clamp boundary violations to guarantee the final output passes validation without losing meaningful objective value.
+5. **Code Structure**: All helper functions will be defined at the top level with no closures or lambda functions, adhering strictly to the prompt's rules. Vectorized numpy operations will be used where possible to keep the inner loops efficient.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_constraints(v):
+    """Computes boundary and non-overlap constraints. Must be >= 0."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = []
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    # Overlap constraints: dist(i,j) - (r_i + r_j) >= 0
+    idx = np.triu_indices(N, 1)
+    d = np.linalg.norm(c[idx[0]] - c[idx[1]], axis=1)
+    con.append(d - (r[idx[0]] + r[idx[1]]))
+    return np.concatenate(con)
+
+def obj_func(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def force_init(n, seed, iters=1200):
+    """Generates a feasible initial configuration using force-directed expansion."""
+    rng = np.random.default_rng(seed)
+    c = rng.uniform(0.25, 0.75, (n, 2))
+    r = np.full(n, 0.02)
+    
+    for _ in range(iters):
+        # Gradually grow radii to simulate expansion
+        r *= 1.0006
+        
+        forces = np.zeros_like(c)
+        
+        # Wall repulsion
+        for i in range(n):
+            for dim in range(2):
+                if c[i, dim] < r[i]: 
+                    forces[i, dim] += (r[i] - c[i, dim]) * 20.0
+                if c[i, dim] > 1.0 - r[i]: 
+                    forces[i, dim] -= (c[i, dim] - (1.0 - r[i])) * 20.0
+                    
+        # Inter-circle repulsion
+        diffs = c[:, None, :] - c[None, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        np.fill_diagonal(dists, np.inf)
+        sum_r = r[:, None] + r[None, :]
+        
+        overlap = np.maximum(0.0, sum_r - dists)
+        safe_dists = np.where(dists > 1e-9, dists, 1.0)
+        force_mag = overlap * 10.0 / safe_dists
+        
+        # Accumulate forces
+        for i in range(n):
+            dir_vecs = c[i] - c
+            forces[i] += np.sum(force_mag[i, :, np.newaxis] * dir_vecs, axis=0)
+            
+        # Update positions
+        c += forces * 0.0003
+        c = np.clip(c, 1e-6, 1.0 - 1e-6)
+        
+    return c, r
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    bounds_opt = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    # Phase 1: Force-directed initialization + SLSQP
+    for seed in range(15):
+        c0, r0 = force_init(N, seed)
+        v0 = np.concatenate([c0.flatten(), r0])
+        
+        try:
+            res = minimize(obj_func, v0, method='SLSQP', bounds=bounds_opt,
+                          constraints=cons, options={'maxiter': 4000, 'ftol': 1e-14})
+            s = np.sum(res.x[2*N:])
+            if s > best_sum:
+                best_sum = s
+                best_c = res.x[:2*N].reshape(N, 2).copy()
+                best_r = res.x[2*N:].copy()
+        except Exception:
+            pass
+
+    if best_c is None:
+        best_c = rng.uniform(0.1, 0.9, (N, 2))
+        best_r = np.full(N, 0.05)
+        best_sum = np.sum(best_r)
+
+    # Phase 2: Perturbation Local Search
+    for step in range(30):
+        noise = 0.005 * (0.85 ** (step // 5))
+        c_pert = best_c.copy() + rng.normal(0, noise, best_c.shape)
+        c_pert = np.clip(c_pert, 0.01, 0.99)
+        
+        # Compute safe initial radii for perturbed centers
+        rb = np.minimum(np.minimum(c_pert[:, 0], 1.0 - c_pert[:, 0]), 
+                        np.minimum(c_pert[:, 1], 1.0 - c_pert[:, 1]))
+        dists = np.linalg.norm(c_pert[:, None, :] - c_pert[None, :, :], axis=2)
+        np.fill_diagonal(dists, np.inf)
+        rp = 0.5 * np.min(dists, axis=1)
+        r_pert = np.minimum(rb, rp) * 0.85
+        
+        v_curr = np.concatenate([c_pert.flatten(), r_pert])
+        
+        try:
+            res = minimize(obj_func, v_curr, method='SLSQP', bounds=bounds_opt,
+                          constraints=cons, options={'maxiter': 2500, 'ftol': 1e-14})
+            s = np.sum(res.x[2*N:])
+            if s > best_sum:
+                best_sum = s
+                best_c = res.x[:2*N].reshape(N, 2).copy()
+                best_r = res.x[2*N:].copy()
+        except Exception:
+            continue
+
+    # Phase 3: Final strict repair
+    radii = best_r.copy()
+    centers = best_c.copy()
+    
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            max_r = min(x, 1.0-x, y, 1.0-y)
+            if r > max_r + 1e-12:
+                radii[i] = max_r
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    
+    return centers, radii, final_sum
+```

@@ -1,0 +1,855 @@
+
+
+<strategy>
+To pack 26 circles in a unit square to maximize the sum of radii, I'll use a multi-stage optimization approach:
+
+1. **Initial Configuration**: Start with a hexagonal-like pattern which provides better packing density than square grid. The hexagonal packing naturally leaves gaps that can be filled.
+
+2. **Optimization Formulation**: 
+   - Variables: centers (x_i, y_i) and radii (r_i) for each of 26 circles
+   - Objective: maximize sum of radii (minimize negative sum)
+   - Constraints: boundary conditions (circles inside square) and non-overlap conditions
+
+3. **Optimization Strategy**:
+   - Use scipy's SLSQP optimizer which handles inequality constraints
+   - Provide careful constraint formulation
+   - Run multiple optimization stages to escape local optima
+   - Use penalty method as backup
+
+4. **Key considerations**:
+   - The target sum of radii is ~2.636, meaning average radius ~0.101
+   - Hexagonal packing is more efficient than square grid
+   - Need to handle the non-convex nature of the problem carefully
+
+Let me implement a robust optimization that tries multiple initial configurations and refinement stages.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def generate_hexagonal_initial(n, shift_x=0.0, shift_y=0.0):
+    """Generate a hexagonal pattern initial configuration for n circles."""
+    centers = np.zeros((n, 2))
+    
+    # Determine number of rows needed
+    n_rows = int(np.ceil(np.sqrt(n * 2.0 / np.sqrt(3))))
+    
+    row_height = 1.0 / (n_rows + 1)
+    spacing = row_height * np.sqrt(3)
+    
+    idx = 0
+    for row in range(n_rows):
+        y = (row + 1) * row_height + shift_y * row_height
+        if row % 2 == 0:
+            n_cols = int(np.ceil(np.sqrt(n)))
+            x_spacing = 1.0 / (n_cols + 1)
+        else:
+            n_cols = int(np.ceil(np.sqrt(n)))
+            x_spacing = 1.0 / (n_cols + 1)
+            offset = x_spacing / 2
+        else:
+            n_cols = int(np.ceil(np.sqrt(n)))
+            x_spacing = 1.0 / (n_cols + 1)
+            offset = 0
+        
+        for col in range(n_cols):
+            if idx >= n:
+                break
+            x = (col + 1) * x_spacing + offset + shift_x * x_spacing
+            x = np.clip(x, 0.05, 0.95)
+            y = np.clip(y, 0.05, 0.95)
+            centers[idx] = [x, y]
+            idx += 1
+    
+    r_init = min(x_spacing, row_height) / 3
+    radii = np.ones(n) * r_init
+    return centers, radii
+
+
+def generate_grid_initial(n):
+    """Generate a grid pattern initial configuration."""
+    centers = np.zeros((n, 2))
+    grid_size = int(np.ceil(np.sqrt(n)))
+    spacing = 1.0 / (grid_size + 1)
+    
+    idx = 0
+    for i in range(grid_size):
+        for j in range(grid_size):
+            if idx >= n:
+                break
+            centers[idx] = [(i + 1) * spacing, (j + 1) * spacing]
+            idx += 1
+    
+    radii = np.ones(n) * spacing / 4
+    return centers, radii
+
+
+def build_optimization_params(centers, radii, n):
+    """Combine centers and radii into optimization vector."""
+    params = np.concatenate([centers[:, 0], centers[:, 1], radii])
+    return params
+
+
+def extract_solution(params, n):
+    """Extract centers and radii from optimization vector."""
+    centers = np.column_stack([params[:n], params[n:2*n]])
+    radii = params[2*n:]
+    return centers, radii
+
+
+def penalty_objective(params, n, penalty_weight=1e6):
+    """Objective with penalty for constraint violations."""
+    centers, radii = extract_solution(params, n)
+    
+    # Objective: negative sum of radii
+    obj = -np.sum(radii)
+    
+    # Penalty for boundary violations
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        # Left boundary
+        violation = max(0, r - x)
+        obj += penalty_weight * violation ** 2
+        # Right boundary
+        violation = max(0, x + r - 1)
+        obj += penalty_weight * violation ** 2
+        # Bottom boundary
+        violation = max(0, r - y)
+        obj += penalty_weight * violation ** 2
+        # Top boundary
+        violation = max(0, y + r - 1)
+        obj += penalty_weight * violation ** 2
+        # Negative radius
+        violation = max(0, -r)
+        obj += penalty_weight * violation ** 2
+    
+    # Penalty for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            r_sum = radii[i] + radii[j]
+            violation = max(0, r_sum - dist)
+            obj += penalty_weight * violation ** 2
+    
+    return obj
+
+
+def objective(params, n):
+    """Pure objective: negative sum of radii."""
+    return -np.sum(params[2*n:])
+
+
+def boundary_x_lower(params, n, i):
+    return params[i] - params[2*n+i]
+
+def boundary_x_upper(params, n, i):
+    return 1 - params[i] - params[2*n+i]
+
+def boundary_y_lower(params, n, i):
+    return params[n+i] - params[2*n+i]
+
+def boundary_y_upper(params, n, i):
+    return 1 - params[n+i] - params[2*n+i]
+
+def non_overlap(params, n, i, j):
+    dx = params[i] - params[j]
+    dy = params[n+i] - params[n+j]
+    r_sum = params[2*n+i] + params[2*n+j]
+    return dx*dx + dy*dy - r_sum*r_sum
+
+def radius_nonneg(params, n, i):
+    return params[2*n+i]
+
+
+def optimize_with_slsqp(centers, radii, n):
+    """Run SLSQP optimization."""
+    x0 = build_optimization_params(centers, radii, n)
+    
+    constraints = []
+    for i in range(n):
+        constraints.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_x_lower(p, n, i)})
+        constraints.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_x_upper(p, n, i)})
+        constraints.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_y_lower(p, n, i)})
+        constraints.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_y_upper(p, n, i)})
+        constraints.append({'type': 'ineq', 'fun': lambda p, i=i: radius_nonneg(p, n, i)})
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            constraints.append({'type': 'ineq', 'fun': lambda p, i=i, j=j: non_overlap(p, n, i, j)})
+    
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    
+    try:
+        result = minimize(
+            objective,
+            x0,
+            args=(n,),
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'maxiter': 2000, 'ftol': 1e-15, 'disp': False}
+        )
+        return extract_solution(result.x, n), -result.fun
+    except Exception:
+        return centers, np.sum(radii)
+
+
+def optimize_with_penalty(centers, radii, n, penalty_weight=1e6):
+    """Run penalty-based optimization."""
+    x0 = build_optimization_params(centers, radii, n)
+    
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    
+    try:
+        result = minimize(
+            penalty_objective,
+            x0,
+            args=(n, penalty_weight),
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 3000, 'ftol': 1e-15}
+        )
+        centers_opt, radii_opt = extract_solution(result.x, n)
+        return centers_opt, radii_opt, -np.sum(radii_opt)
+    except Exception:
+        return centers, radii, np.sum(radii)
+
+
+def perturb_and_optimize(centers, radii, n, num_perturbations=5, perturbation_scale=0.02):
+    """Try multiple perturbations and keep best result."""
+    best_sum = np.sum(radii)
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    for _ in range(num_perturbations):
+        # Random perturbation
+        perturbed_centers = centers.copy()
+        perturbed_radii = radii.copy()
+        
+        for i in range(n):
+            perturbed_centers[i, 0] += np.random.uniform(-perturbation_scale, perturbation_scale)
+            perturbed_centers[i, 1] += np.random.uniform(-perturbation_scale, perturbation_scale)
+            perturbed_radii[i] *= np.random.uniform(0.8, 1.2)
+        
+        # Clip to valid range
+        perturbed_centers = np.clip(perturbed_centers, 0.01, 0.99)
+        perturbed_radii = np.maximum(perturbed_radii, 0.001)
+        
+        # Optimize
+        opt_centers, opt_radii, opt_sum = optimize_with_penalty(
+            perturbed_centers, perturbed_radii, n, penalty_weight=1e6
+        )
+        
+        if opt_sum > best_sum:
+            best_sum = opt_sum
+            best_centers = opt_centers
+            best_radii = opt_radii
+    
+    return best_centers, best_radii, best_sum
+
+
+def refine_radii(centers, n):
+    """Refine radii given fixed centers by computing maximum possible radius for each circle."""
+    radii = np.zeros(n)
+    
+    for i in range(n):
+        x, y = centers[i]
+        # Max radius from boundaries
+        max_r = min(x, 1-x, y, 1-y)
+        
+        # Reduce based on nearest neighbors
+        for j in range(n):
+            if i != j:
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist > 0:
+                    max_r = min(max_r, dist - radii[j] - 1e-10)
+        
+        radii[i] = max(0, max_r - 1e-10)
+    
+    return radii
+
+
+def run_packing():
+    """Main function to pack 26 circles in unit square."""
+    n = 26
+    
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Try multiple initial configurations
+    best_sum = 0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Hexagonal initial with SLSQP
+    centers1, radii1 = generate_grid_initial(n)
+    opt_c1, sum1 = optimize_with_slsqp(centers1, radii1, n)
+    if sum1 > best_sum:
+        best_sum = sum1
+        best_centers = opt_c1
+        best_radii = best_radii
+    
+    # Strategy 2: Grid initial with penalty method
+    centers2, radii2 = generate_grid_initial(n)
+    opt_c2, opt_r2, sum2 = optimize_with_penalty(centers2, radii2, n, penalty_weight=1e6)
+    if sum2 > best_sum:
+        best_sum = sum2
+        best_centers = opt_c2
+        best_radii = opt_r2
+    
+    # Strategy 3: Perturbation approach
+    if best_centers is not None:
+        opt_c3, opt_r3, sum3 = perturb_and_optimize(
+            best_centers, best_radii, n, 
+            num_perturbations=10, perturbation_scale=0.01
+        )
+        if sum3 > best_sum:
+            best_sum = sum3
+            best_centers = opt_c3
+            best_radii = opt_r3
+    
+    # Strategy 4: Multiple restart with different seeds
+    for seed in [123, 456, 789, 101112]:
+        np.random.seed(seed)
+        centers_r, radii_r = generate_grid_initial(n)
+        opt_c_r, opt_r_r, sum_r = optimize_with_penalty(
+            centers_r, radii_r, n, penalty_weight=1e6
+        )
+        if sum_r > best_sum:
+            best_sum = sum_r
+            best_centers = opt_c_r
+            best_radii = opt_r_r
+        
+        # Also try perturbation from this starting point
+        opt_c_p, opt_r_p, sum_p = perturb_and_optimize(
+            opt_c_r, opt_r_p, n,
+            num_perturbations=5, perturbation_scale=0.005
+        )
+        if sum_p > best_sum:
+            best_sum = sum_p
+            best_centers = opt_c_p
+            best_radii = opt_r_p
+    
+    # Final refinement: iteratively adjust radii
+    if best_centers is not None:
+        # Run one more round of SLSQP for fine-tuning
+        opt_c_final, sum_final = optimize_with_slsqp(best_centers, best_radii, n)
+        if sum_final > best_sum:
+            best_sum = sum_final
+            best_centers = opt_c_final
+            best_radii = best_radii
+    
+    # Ensure valid output
+    if best_centers is None:
+        best_centers, best_radii = generate_grid_initial(n)
+        best_sum = np.sum(best_radii)
+    
+    # Clip radii to be valid
+    best_radii = np.maximum(best_radii, 0)
+    best_centers = np.clip(best_centers, 0, 1)
+    
+    return best_centers, best_radii, best_sum
+```
+
+Wait, I see several issues in my code. Let me fix them:
+
+1. The hexagonal generation function has syntax errors
+2. The comparison updates for best_radii are incorrect
+3. Need to ensure the code is clean and working
+
+Let me rewrite more carefully:
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def generate_grid_initial(n):
+    """Generate a grid pattern initial configuration for n circles."""
+    centers = np.zeros((n, 2))
+    grid_size = int(np.ceil(np.sqrt(n)))
+    spacing = 1.0 / (grid_size + 1)
+    
+    idx = 0
+    for i in range(grid_size):
+        for j in range(grid_size):
+            if idx >= n:
+                break
+            centers[idx] = [(i + 1) * spacing, (j + 1) * spacing]
+            idx += 1
+    
+    radii = np.ones(n) * spacing / 4
+    return centers, radii
+
+
+def generate_hexagonal_initial(n):
+    """Generate a hexagonal pattern initial configuration for n circles."""
+    centers = np.zeros((n, 2))
+    
+    # Determine approximate grid size
+    n_rows = int(np.ceil(np.sqrt(n)))
+    n_cols = int(np.ceil(n / n_rows))
+    
+    row_height = 1.0 / (n_rows + 1)
+    col_width = 1.0 / (n_cols + 1)
+    
+    idx = 0
+    for row in range(n_rows):
+        y = (row + 1) * row_height
+        offset = (col_width / 2) if row % 2 == 1 else 0
+        
+        for col in range(n_cols):
+            if idx >= n:
+                break
+            x = (col + 1) * col_width + offset
+            x = np.clip(x, 0.02, 0.98)
+            y = np.clip(y, 0.02, 0.98)
+            centers[idx] = [x, y]
+            idx += 1
+    
+    r_init = min(col_width, row_height) / 4
+    radii = np.ones(n) * r_init
+    return centers, radii
+
+
+def build_params(centers, radii, n):
+    """Combine centers and radii into optimization vector."""
+    return np.concatenate([centers[:, 0], centers[:, 1], radii])
+
+
+def extract_solution(params, n):
+    """Extract centers and radii from optimization vector."""
+    centers = np.column_stack([params[:n], params[n:2*n]])
+    radii = params[2*n:]
+    return centers, radii
+
+
+def boundary_x_lower(params, n, i):
+    return params[i] - params[2*n+i]
+
+def boundary_x_upper(params, n, i):
+    return 1 - params[i] - params[2*n+i]
+
+def boundary_y_lower(params, n, i):
+    return params[n+i] - params[2*n+i]
+
+def boundary_y_upper(params, n, i):
+    return 1 - params[n+i] - params[2*n+i]
+
+def non_overlap_constraint(params, n, i, j):
+    dx = params[i] - params[j]
+    dy = params[n+i] - params[n+j]
+    r_sum = params[2*n+i] + params[2*n+j]
+    return dx*dx + dy*dy - r_sum*r_sum
+
+def radius_nonneg(params, n, i):
+    return params[2*n+i]
+
+
+def objective(params, n):
+    """Negative sum of radii."""
+    return -np.sum(params[2*n:])
+
+
+def penalty_objective(params, n, pw=1e6):
+    """Penalty-based objective."""
+    centers, radii = extract_solution(params, n)
+    obj = -np.sum(radii)
+    
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        obj += pw * max(0, r - x)**2
+        obj += pw * max(0, x + r - 1)**2
+        obj += pw * max(0, r - y)**2
+        obj += pw * max(0, y + r - 1)**2
+        obj += pw * max(0, -r)**2
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            rs = radii[i] + radii[j]
+            obj += pw * max(0, rs - dist)**2
+    
+    return obj
+
+
+def optimize_slsqp(centers, radii, n):
+    """Optimize using SLSQP."""
+    x0 = build_params(centers, radii, n)
+    
+    cons = []
+    for i in range(n):
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_x_lower(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_x_upper(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_y_lower(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_y_upper(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: radius_nonneg(p, n, i)})
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            cons.append({'type': 'ineq', 'fun': lambda p, i=i, j=j: non_overlap_constraint(p, n, i, j)})
+    
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    
+    try:
+        result = minimize(
+            objective, x0, args=(n,),
+            method='SLSQP', bounds=bounds, constraints=cons,
+            options={'maxiter': 3000, 'ftol': 1e-14}
+        )
+        c, r = extract_solution(result.x, n)
+        return c, r, -result.fun
+    except Exception:
+        return centers, radii, np.sum(radii)
+
+
+def optimize_penalty(centers, radii, n, pw=1e6):
+    """Optimize using penalty method with L-BFGS-B."""
+    x0 = build_params(centers, radii, n)
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    
+    try:
+        result = minimize(
+            penalty_objective, x0, args=(n, pw),
+            method='L-BFGS-B', bounds=bounds,
+            options={'maxiter': 5000, 'ftol': 1e-14}
+        )
+        c, r = extract_solution(result.x, n)
+        return c, r, np.sum(r)
+    except Exception:
+        return centers, radii, np.sum(radii)
+
+
+def perturb_optimize(centers, radii, n, num_trials=8, scale=0.01):
+    """Perturb and optimize multiple times."""
+    best_sum = np.sum(radii)
+    best_c = centers.copy()
+    best_r = radii.copy()
+    
+    for _ in range(num_trials):
+        pc = centers + np.random.uniform(-scale, scale, (n, 2))
+        pr = radii * np.random.uniform(0.85, 1.15, n)
+        pc = np.clip(pc, 0.01, 0.99)
+        pr = np.maximum(pr, 0.005)
+        
+        oc, or_, os = optimize_penalty(pc, pr, n, pw=1e6)
+        if os > best_sum:
+            best_sum = os
+            best_c = oc
+            best_r = or_
+    
+    return best_c, best_r, best_sum
+
+
+def run_packing():
+    """Pack 26 circles in unit square to maximize sum of radii."""
+    n = 26
+    
+    np.random.seed(42)
+    
+    best_sum = -1
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple initial configurations
+    for init_func in [generate_grid_initial, generate_hexagonal_initial]:
+        c, r = init_func(n)
+        
+        # SLSQP optimization
+        oc, or_, os = optimize_slsqp(c, r, n)
+        if os > best_sum:
+            best_sum = os
+            best_centers = oc
+            best_radii = or_
+        
+        # Penalty optimization
+        oc2, or2, os2 = optimize_penalty(c, r, n, pw=1e6)
+        if os2 > best_sum:
+            best_sum = os2
+            best_centers = oc2
+            best_radii = or2
+    
+    # Perturbation search from best so far
+    if best_centers is not None:
+        for seed in [1, 2, 3, 5, 7]:
+            np.random.seed(seed)
+            pc, pr, ps = perturb_optimize(best_centers, best_radii, n, num_trials=5, scale=0.008)
+            if ps > best_sum:
+                best_sum = ps
+                best_centers = pc
+                best_radii = pr
+    
+    # Final SLSQP refinement
+    if best_centers is not None:
+        oc, or_, os = optimize_slsqp(best_centers, best_radii, n)
+        if os > best_sum:
+            best_sum = os
+            best_centers = oc
+            best_radii = or_
+    
+    # Fallback
+    if best_centers is None:
+        best_centers, best_radii = generate_grid_initial(n)
+        best_sum = np.sum(best_radii)
+    
+    best_radii = np.maximum(best_radii, 0)
+    best_centers = np.clip(best_centers, 0, 1)
+    
+    return best_centers, best_radii, best_sum
+```
+
+I still have issues with the code structure. Let me clean it up completely and ensure it works:
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def generate_grid_initial(n):
+    """Generate a grid pattern initial configuration for n circles."""
+    centers = np.zeros((n, 2))
+    grid_size = int(np.ceil(np.sqrt(n)))
+    spacing = 1.0 / (grid_size + 1)
+    
+    idx = 0
+    for i in range(grid_size):
+        for j in range(grid_size):
+            if idx >= n:
+                break
+            centers[idx] = [(i + 1) * spacing, (j + 1) * spacing]
+            idx += 1
+    
+    radii = np.ones(n) * spacing / 5
+    return centers, radii
+
+
+def generate_hexagonal_initial(n):
+    """Generate a hexagonal pattern initial configuration for n circles."""
+    centers = np.zeros((n, 2))
+    
+    n_rows = int(np.ceil(np.sqrt(n)))
+    n_cols = int(np.ceil(n / n_rows))
+    
+    row_height = 1.0 / (n_rows + 1)
+    col_width = 1.0 / (n_cols + 1)
+    
+    idx = 0
+    for row in range(n_rows):
+        y = (row + 1) * row_height
+        offset = (col_width / 2) if row % 2 == 1 else 0
+        
+        for col in range(n_cols):
+            if idx >= n:
+                break
+            x = (col + 1) * col_width + offset
+            x = np.clip(x, 0.02, 0.98)
+            y = np.clip(y, 0.02, 0.98)
+            centers[idx] = [x, y]
+            idx += 1
+    
+    r_init = min(col_width, row_height) / 5
+    radii = np.ones(n) * r_init
+    return centers, radii
+
+
+def build_params(centers, radii, n):
+    """Combine centers and radii into optimization vector."""
+    return np.concatenate([centers[:, 0], centers[:, 1], radii])
+
+
+def extract_solution(params, n):
+    """Extract centers and radii from optimization vector."""
+    centers = np.column_stack([params[:n], params[n:2*n]])
+    radii = params[2*n:]
+    return centers, radii
+
+
+def boundary_x_lower(params, n, i):
+    return params[i] - params[2*n+i]
+
+
+def boundary_x_upper(params, n, i):
+    return 1 - params[i] - params[2*n+i]
+
+
+def boundary_y_lower(params, n, i):
+    return params[n+i] - params[2*n+i]
+
+
+def boundary_y_upper(params, n, i):
+    return 1 - params[n+i] - params[2*n+i]
+
+
+def non_overlap_constraint(params, n, i, j):
+    dx = params[i] - params[j]
+    dy = params[n+i] - params[n+j]
+    r_sum = params[2*n+i] + params[2*n+j]
+    return dx*dx + dy*dy - r_sum*r_sum
+
+
+def radius_nonneg(params, n, i):
+    return params[2*n+i]
+
+
+def objective(params, n):
+    """Negative sum of radii."""
+    return -np.sum(params[2*n:])
+
+
+def penalty_objective(params, n, pw):
+    """Penalty-based objective."""
+    centers, radii = extract_solution(params, n)
+    obj = -np.sum(radii)
+    
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        obj += pw * max(0, r - x)**2
+        obj += pw * max(0, x + r - 1)**2
+        obj += pw * max(0, r - y)**2
+        obj += pw * max(0, y + r - 1)**2
+        obj += pw * max(0, -r)**2
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            rs = radii[i] + radii[j]
+            obj += pw * max(0, rs - dist)**2
+    
+    return obj
+
+
+def optimize_slsqp(centers, radii, n):
+    """Optimize using SLSQP."""
+    x0 = build_params(centers, radii, n)
+    
+    cons = []
+    for i in range(n):
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_x_lower(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_x_upper(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_y_lower(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: boundary_y_upper(p, n, i)})
+        cons.append({'type': 'ineq', 'fun': lambda p, i=i: radius_nonneg(p, n, i)})
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            cons.append({'type': 'ineq', 'fun': lambda p, i=i, j=j: non_overlap_constraint(p, n, i, j)})
+    
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    
+    try:
+        result = minimize(
+            objective, x0, args=(n,),
+            method='SLSQP', bounds=bounds, constraints=cons,
+            options={'maxiter': 3000, 'ftol': 1e-14}
+        )
+        c, r = extract_solution(result.x, n)
+        return c, r, -result.fun
+    except Exception:
+        return centers, radii, np.sum(radii)
+
+
+def optimize_penalty(centers, radii, n, pw):
+    """Optimize using penalty method with L-BFGS-B."""
+    x0 = build_params(centers, radii, n)
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    
+    try:
+        result = minimize(
+            penalty_objective, x0, args=(n, pw),
+            method='L-BFGS-B', bounds=bounds,
+            options={'maxiter': 5000, 'ftol': 1e-14}
+        )
+        c, r = extract_solution(result.x, n)
+        return c, r, np.sum(r)
+    except Exception:
+        return centers, radii, np.sum(radii)
+
+
+def perturb_optimize(centers, radii, n, num_trials, scale):
+    """Perturb and optimize multiple times."""
+    best_sum = np.sum(radii)
+    best_c = centers.copy()
+    best_r = radii.copy()
+    
+    for _ in range(num_trials):
+        pc = centers + np.random.uniform(-scale, scale, (n, 2))
+        pr = radii * np.random.uniform(0.85, 1.15, n)
+        pc = np.clip(pc, 0.01, 0.99)
+        pr = np.maximum(pr, 0.005)
+        
+        oc, or_, os = optimize_penalty(pc, pr, n, 1e6)
+        if os > best_sum:
+            best_sum = os
+            best_c = oc
+            best_r = or_
+    
+    return best_c, best_r, best_sum
+
+
+def run_packing():
+    """Pack 26 circles in unit square to maximize sum of radii."""
+    n = 26
+    
+    np.random.seed(42)
+    
+    best_sum = -1
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple initial configurations
+    for init_func in [generate_grid_initial, generate_hexagonal_initial]:
+        c, r = init_func(n)
+        
+        # SLSQP optimization
+        oc, or_, os = optimize_slsqp(c, r, n)
+        if os > best_sum:
+            best_sum = os
+            best_centers = oc
+            best_radii = or_
+        
+        # Penalty optimization
+        oc2, or2, os2 = optimize_penalty(c, r, n, 1e6)
+        if os2 > best_sum:
+            best_sum = os2
+            best_centers = oc2
+            best_radii = or2
+    
+    # Perturbation search from best so far
+    if best_centers is not None:
+        for seed in [1, 2, 3, 5, 7]:
+            np.random.seed(seed)
+            pc, pr, ps = perturb_optimize(best_centers, best_radii, n, num_trials=5, scale=0.008)
+            if ps > best_sum:
+                best_sum = ps
+                best_centers = pc
+                best_radii = pr
+    
+    # Final SLSQP refinement
+    if best_centers is not None:
+        oc, or_, os = optimize_slsqp(best_centers, best_radii, n)
+        if os > best_sum:
+            best_sum = os
+            best_centers = oc
+            best_radii = or_
+    
+    # Fallback
+    if best_centers is None:
+        best_centers, best_radii = generate_grid_initial(n)
+        best_sum = np.sum(best_radii)
+    
+    best_radii = np.maximum(best_radii, 0)
+    best_centers = np.clip(best_centers, 0, 1)
+    
+    return best_centers, best_radii, best_sum
+```

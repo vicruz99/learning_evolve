@@ -1,0 +1,140 @@
+# sol_000291 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1e8a963c) state=df140781 sum of radii=2.599689 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimize packing of 26 circles in a unit square to maximize sum of radii.
+    """
+    n = 26
+    dim = 2
+    
+    # --- 1. Generate Initial Configuration ---
+    # Hexagonal packing arrangement to start with high density
+    centers = np.zeros((n, dim))
+    radii = np.ones(n) * 0.1 # Initial guess
+    
+    rows_counts = [6, 5, 6, 5, 4] # Sum = 26
+    row_idx = 0
+    current_x = 0.1
+    current_y = 0.1
+    shift = 0.1 # Horizontal shift for hexagonal packing
+    
+    # Initialize centers based on a rough hexagonal layout
+    for r_idx, count in enumerate(rows_counts):
+        y = current_y + r_idx * 0.17 # Vertical spacing approx
+        for c in range(count):
+            if r_idx % 2 == 1:
+                x = current_x + shift + c * 0.2
+            else:
+                x = current_x + c * 0.2
+            
+            # Clamp to ensure valid initial position
+            centers[row_idx, 0] = max(0.1, min(0.9, x))
+            centers[row_idx, 1] = max(0.1, min(0.9, y))
+            row_idx += 1
+            
+    # --- 2. Define Optimization Problem ---
+    # We want to maximize sum(radii), so we minimize negative sum(radii)
+    # Variables: [x0, y0, r0, x1, y1, r1, ...]
+    # Total variables = n * 3
+    
+    def objective(params):
+        # params: [x0, y0, r0, x1, y1, r1, ...]
+        r = params[2::3]
+        return -np.sum(r)
+
+    def constraints(params):
+        c_list = []
+        x = params[0::3]
+        y = params[1::3]
+        r = params[2::3]
+        
+        # Boundary constraints: 0 <= x - r AND x + r <= 1, same for y
+        # x - r >= 0
+        c_list.append(('boundary_x_min', lambda p: p[0::3] - p[2::3]))
+        # 1 - (x + r) >= 0 => x + r <= 1
+        c_list.append(('boundary_x_max', lambda p: 1.0 - (p[0::3] + p[2::3])))
+        c_list.append(('boundary_y_min', lambda p: p[1::3] - p[2::3]))
+        c_list.append(('boundary_y_max', lambda p: 1.0 - (p[1::3] + p[2::3])))
+        
+        # Non-negative radii
+        c_list.append(('radii_pos', lambda p: p[2::3]))
+        
+        # Non-overlap: dist(i, j) >= r_i + r_j
+        # dist^2 >= (r_i + r_j)^2
+        # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        def make_overlap(i, j):
+            def constr(p):
+                xi, yi, ri = p[0::3][i], p[1::3][i], p[2::3][i]
+                xj, yj, rj = p[0::3][j], p[1::3][j], p[2::3][j]
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                r_sum = ri + rj
+                return dist_sq - r_sum**2
+            return constr
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                c_list.append(('overlap_{}_{}'.format(i, j), make_overlap(i, j)))
+        
+        return c_list
+
+    # Prepare initial guess
+    initial_params = np.zeros(n * 3)
+    initial_params[0::3] = centers[:, 0]
+    initial_params[1::3] = centers[:, 1]
+    initial_params[2::3] = radii
+    
+    # Setup constraints for scipy
+    constraints_list = []
+    for name, func in constraints(initial_params):
+        constraints_list.append(opt.NonlinearConstraint(func, 0, np.inf))
+
+    # --- 3. Run Optimization ---
+    # Using SLSQP for constrained optimization
+    best_params = initial_params
+    best_score = -np.sum(radii)
+    
+    # We run a few iterations/restarts to improve
+    for _ in range(3):
+        try:
+            res = opt.minimize(objective, 
+                               initial_params, 
+                               method='SLSQP', 
+                               constraints=constraints_list,
+                               options={'maxiter': 500, 'ftol': 1e-12})
+            if -res.fun > best_score:
+                best_score = -res.fun
+                best_params = res.x
+        except Exception:
+            continue
+            
+        # Perturb best params to try escaping local minima
+        initial_params = best_params + np.random.normal(0, 0.005, n*3)
+        
+        # Re-apply constraints roughly to keep it valid-ish for next step
+        # (Not strictly necessary as SLSQP handles constraints, but helps stability)
+
+    # --- 4. Extract and Format Results ---
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    final_centers[:, 0] = best_params[0::3]
+    final_centers[:, 1] = best_params[1::3]
+    final_radii = best_params[2::3]
+    
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii
+
+# Verification block (optional, for local testing)
+if __name__ == "__main__":
+    centers, radii, s_r = run_packing()
+    print(f"Sum of radii: {s_r}")
+    print(f"Valid: {validate_packing(centers, radii)}")

@@ -1,0 +1,149 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond the current ~2.628, we move away from standard SLSQP constraint handling which can struggle with the highly non-linear contact manifolds in dense packings. Instead, we employ a **smooth penalty method** combined with L-BFGS-B. 
+
+Key improvements:
+1. **Penalty Formulation**: Convert inequality constraints (boundary & non-overlap) into a differentiable penalty term added to the negative sum of radii. This allows the optimizer to naturally "push" circles apart and expand radii without getting trapped by constraint Jacobian singularities that plague SLSQP.
+2. **Homotopy/Annealing Schedule**: Start with a small penalty weight `μ` to allow free exploration and initial expansion, then gradually increase `μ` to enforce strict feasibility. This mimics a physical "expanding circles" process and helps escape shallow local minima.
+3. **Diverse Initializations**: Use multiple hexagonal lattice shifts, grid patterns, and random seeds to sample different basins of attraction before applying the penalty annealing.
+4. **Strict Post-Processing**: After optimization, enforce boundary and non-overlap constraints analytically with a tiny safety margin to guarantee the validator passes without relying on floating-point luck.
+5. **Top-Level Design**: All helpers are defined at module level with explicit globals to satisfy the no-closure rule, ensuring clean and robust execution.
+
+This approach typically yields denser packings for sum-of-radii objectives because it treats constraints as soft repulsive forces during the search, allowing the optimizer to find configurations where circles are tightly interlocked but maximally expanded.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+# Constants for the problem
+N_CIRCLES = 26
+TRI_MASK = np.triu(np.ones((N_CIRCLES, N_CIRCLES), dtype=bool), k=1)
+BOUNDS = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+
+def penalty_objective(v, mu):
+    """
+    Computes the objective: negative sum of radii + penalty for constraint violations.
+    Using a squared penalty allows L-BFGS-B to smoothly navigate the landscape.
+    """
+    x = v[:N_CIRCLES]
+    y = v[N_CIRCLES:2*N_CIRCLES]
+    r = v[2*N_CIRCLES:]
+    
+    # Primary objective: maximize sum of radii
+    val = -np.sum(r)
+    
+    # Boundary penalties: circle must stay inside [0,1]x[0,1]
+    val += mu * np.sum(np.maximum(0.0, r - x)**2)
+    val += mu * np.sum(np.maximum(0.0, r - (1.0 - x))**2)
+    val += mu * np.sum(np.maximum(0.0, r - y)**2)
+    val += mu * np.sum(np.maximum(0.0, r - (1.0 - y))**2)
+    
+    # Overlap penalties: dist >= r_i + r_j
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    # Add small epsilon to avoid exact zero distance during optimization
+    dist = np.sqrt(dx**2 + dy**2 + 1e-12)
+    r_sum = r[:, None] + r[None, :]
+    
+    overlaps = np.maximum(0.0, r_sum - dist)
+    val += mu * np.sum(overlaps[TRI_MASK]**2)
+    
+    return val
+
+def generate_initial_configs():
+    """Generates a diverse set of initial center coordinates."""
+    inits = []
+    
+    # 1. Hexagonal lattice variations
+    for shift in [0.0, 0.02, -0.02, 0.04, 0.01, -0.01]:
+        r0 = 0.10
+        y_pos = r0 + shift
+        row = 0
+        pts = []
+        while len(pts) < N_CIRCLES:
+            x_start = r0 if row % 2 == 0 else 2 * r0
+            x = x_start
+            while x <= 1 - r0 and len(pts) < N_CIRCLES:
+                pts.append([x, y_pos])
+                x += 2 * r0
+            y_pos += np.sqrt(3) * r0
+            row += 1
+        inits.append(np.array(pts[:N_CIRCLES]))
+        
+    # 2. Uniform square grid
+    pts_grid = []
+    for i in range(6):
+        for j in range(5):
+            pts_grid.append([0.1 + i * 0.15, 0.1 + j * 0.2])
+    inits.append(np.array(pts_grid[:N_CIRCLES]))
+    
+    # 3. Random scatter
+    for seed in range(5):
+        np.random.seed(seed + 100)
+        inits.append(np.random.uniform(0.05, 0.95, (N_CIRCLES, 2)))
+        
+    return inits
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_sum = -1.0
+    best_v = None
+    inits = generate_initial_configs()
+    
+    for base_pts in inits:
+        # Initialize with small feasible radii
+        v0 = np.concatenate([base_pts[:, 0], base_pts[:, 1], np.full(N_CIRCLES, 0.035)])
+        curr_v = v0.copy()
+        
+        # Penalty annealing: gradually increase strictness
+        for mu in [20, 100, 500, 2000, 10000, 50000]:
+            # Inject tiny noise to escape local minima between mu steps
+            np.random.seed(None)
+            noise = np.random.uniform(-1e-4, 1e-4, size=len(curr_v))
+            noise[2*N_CIRCLES:] *= 0.1
+            curr_v = np.clip(curr_v + noise, 0.0, 1.0)
+            curr_v[2*N_CIRCLES:] = np.clip(curr_v[2*N_CIRCLES:], 0.0, 0.5)
+            
+            res = minimize(penalty_objective, curr_v, args=(mu,), method='L-BFGS-B', 
+                           bounds=BOUNDS, options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            curr_v = res.x.copy()
+            
+        # Extract and strictly enforce constraints for validator compliance
+        centers = curr_v[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+        radii = curr_v[2*N_CIRCLES:].copy()
+        
+        # 1. Strict boundary enforcement
+        for i in range(N_CIRCLES):
+            max_r_bound = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            radii[i] = min(radii[i], max_r_bound)
+            
+        # 2. Strict non-overlap enforcement with iterative shrinkage
+        for _ in range(15):
+            changed = False
+            for i in range(N_CIRCLES):
+                for j in range(i + 1, N_CIRCLES):
+                    d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                    if radii[i] + radii[j] > d:
+                        shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                        radii[i] = max(0.0, radii[i] - shrink)
+                        radii[j] = max(0.0, radii[j] - shrink)
+                        changed = True
+            if not changed:
+                break
+                
+        curr_sum = float(np.sum(radii))
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_v = np.concatenate([centers.flatten(), radii])
+            
+    # Fallback safety (should not be triggered)
+    if best_v is None:
+        centers = np.random.rand(N_CIRCLES, 2) * 0.8 + 0.1
+        radii = np.full(N_CIRCLES, 0.05)
+        return centers, radii, float(np.sum(radii))
+        
+    centers = best_v[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = best_v[2*N_CIRCLES:]
+    return centers, radii, float(np.sum(radii))
+```

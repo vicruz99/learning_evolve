@@ -1,0 +1,122 @@
+# sol_000341 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 6a87b209) state=0287d686 sum of radii=2.614006 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    
+    for i in range(n):
+        if radii[i] < 0: return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+def get_initial_params(n):
+    """Generate an initial hexagonal-like packing for n circles."""
+    params = np.zeros(n * 3)
+    # Start with a small radius to ensure initial feasibility
+    current_r = 0.08
+    row_len = 6
+    idx = 0
+    
+    r = 0.08
+    for row_idx in range(6):
+        y = r + row_idx * (r * np.sqrt(3))
+        x_start = r
+        if row_idx % 2 == 1:
+            x_start += r
+        for col_idx in range(row_len):
+            x = x_start + col_idx * 2 * r
+            if x + r > 1.0 or idx >= n:
+                break
+            params[3*idx] = x
+            params[3*idx+1] = y
+            params[3*idx+2] = r
+            idx += 1
+    return params, current_r
+
+def run_packing():
+    n = 26
+    best_sum = 0.0
+    best_state = None
+
+    # Function to reshape and extract centers/radii
+    def to_cir_state(p):
+        return p[:n*2].reshape((n, 2)), p[n*2:n*3]
+
+    # Objective function: Maximize sum of radii (Minimize negative sum)
+    def objective(p):
+        _, radii = to_cir_state(p)
+        return -np.sum(radii)
+
+    # Inequality constraints: c(x) >= 0
+    def boundary_constraints(p):
+        centers, radii = to_cir_state(p)
+        return np.concatenate([
+            centers[:, 0] - radii,  # x - r >= 0
+            1.0 - centers[:, 0] - radii,  # 1 - (x + r) >= 0
+            centers[:, 1] - radii,  # y - r >= 0
+            1.0 - centers[:, 1] - radii,  # 1 - (y + r) >= 0
+            radii  # r >= 0
+        ])
+
+    # Non-overlap constraints
+    def non_overlap_constraints(p):
+        centers, radii = to_cir_state(p)
+        dists = np.linalg.norm(centers[:, np.newaxis, :] - centers[np.newaxis, :, :], axis=2)
+        rad_sums = radii[:, np.newaxis] + radii[np.newaxis, :]
+        return dists[np.triu_indices(n, k=1)] - rad_sums[np.triu_indices(n, k=1)]
+
+    # Setup constraint dictionary
+    constraints = []
+    constraints.append({'type': 'ineq', 'fun': boundary_constraints})
+    constraints.append({'type': 'ineq', 'fun': non_overlap_constraints})
+
+    # Bounds for all variables
+    bounds = [(0, 1)] * (2 * n) + [(1e-5, 0.5)] * n
+
+    # Run optimization with multiple restarts to find a high-quality solution
+    for trial in range(5):
+        initial_p, _ = get_initial_params(n)
+        if trial > 0:
+            # Add random noise for restarts
+            noise = np.random.uniform(-0.02, 0.02, n * 3)
+            initial_p = np.clip(initial_p + noise, 1e-5, 0.99)
+        
+        try:
+            res = minimize(objective, initial_p, method='SLSQP', bounds=bounds, 
+                           constraints=constraints, options={'ftol': 1e-9, 'maxiter': 1000})
+            if res.success and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_state = res.x
+        except Exception as e:
+            continue
+
+    # Final extraction and validation
+    if best_state is not None:
+        centers = best_state[:n*2].reshape((n, 2))
+        radii = best_state[n*2:n*3]
+        if validate_packing(centers, radii):
+            return centers, radii, np.sum(radii)
+
+    # Fallback to initial state if optimization fails
+    fallback_p, _ = get_initial_params(n)
+    return fallback_p[:n*2].reshape((n, 2)), fallback_p[n*2:n*3], np.sum(fallback_p[n*2:n*3])

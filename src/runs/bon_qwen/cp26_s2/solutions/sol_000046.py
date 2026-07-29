@@ -1,0 +1,117 @@
+# sol_000046 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 256846a1) state=0b58b535 sum of radii=2.617835 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_func(x, n):
+    """Minimize negative sum of radii (equivalent to maximizing sum)"""
+    return -np.sum(x[2::3])
+
+def constraint_func(x, n):
+    """
+    Compute all inequality constraints:
+    - Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r
+    - Pairwise: distance(i,j) >= r_i + r_j
+    Returns a 1D numpy array of constraint values. Positive values indicate satisfaction.
+    """
+    xs = x[0::3]
+    ys = x[1::3]
+    rs = x[2::3]
+
+    # Boundary constraints
+    c_boundary = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+
+    # Pairwise distance constraints
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dists = np.sqrt(dx*dx + dy*dy)
+    r_sums = rs[:, None] + rs[None, :]
+
+    # Extract lower triangle (excluding diagonal) to avoid duplicates and self-pairs
+    idx = np.tril_indices(n, k=-1)
+    c_pairs = dists[idx] - r_sums[idx]
+
+    return np.concatenate([c_boundary, c_pairs])
+
+def get_initial_guess(n, strategy='grid', seed=None):
+    """Generate initial configuration for centers and radii"""
+    x = np.zeros(3 * n)
+    
+    if seed is not None:
+        np.random.seed(seed)
+
+    if strategy == 'random':
+        x[0::3] = np.random.rand(n)
+        x[1::3] = np.random.rand(n)
+    elif strategy == 'grid':
+        # Hexagonal-like packing initialization
+        rows = 6
+        cols = 5
+        idx = 0
+        for r in range(rows):
+            for c in range(cols):
+                if idx >= n:
+                    break
+                offset = 0.5 if r % 2 else 0
+                x[3 * idx] = (c + 0.5 + offset) / (cols + 0.5)
+                x[3 * idx + 1] = (r + 0.5) / rows
+                idx += 1
+            if idx >= n:
+                break
+
+    # Set small initial radii to guarantee initial feasibility
+    x[2::3] = 0.02
+    return x
+
+def run_packing():
+    n = 26
+    best_val = -np.inf
+    best_centers = None
+    best_radii = None
+
+    # Define optimization components
+    constraints = {'type': 'ineq', 'fun': constraint_func, 'args': (n,)}
+    bounds = [(0, 1) if i % 3 != 2 else (0, 0.5) for i in range(3 * n)]
+
+    # Multiple restarts with different strategies to escape local optima
+    starts = [
+        ('grid', None),
+        ('grid', None),
+        ('random', 42),
+        ('random', 123),
+        ('random', 456)
+    ]
+
+    for strat, seed in starts:
+        x0 = get_initial_guess(n, strat, seed)
+        res = minimize(objective_func, x0, args=(n,), method='SLSQP',
+                       bounds=bounds, constraints=constraints,
+                       options={'maxiter': 2000, 'ftol': 1e-10})
+
+        if res.success:
+            val = -res.fun
+            if val > best_val:
+                best_val = val
+                best_centers = np.column_stack((res.x[0::3], res.x[1::3]))
+                best_radii = res.x[2::3]
+
+    # Fallback if optimization fails for all starts
+    if best_centers is None:
+        x0 = get_initial_guess(n, 'grid')
+        best_centers = np.column_stack((x0[0::3], x0[1::3]))
+        best_radii = np.full(n, 0.01)
+        best_val = np.sum(best_radii)
+
+    # Numerical safety: ensure non-negative radii
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, float(np.sum(best_radii))

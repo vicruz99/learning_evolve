@@ -1,0 +1,171 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat the radii as variables subject to the packing constraints. For fixed circle centers, finding the optimal radii is a Linear Programming (LP) problem:
+Maximize $\sum r_i$
+Subject to:
+1.  $0 \le r_i$
+2.  $r_i \le x_i, r_i \le 1-x_i, r_i \le y_i, r_i \le 1-y_i$ (Boundary constraints)
+3.  $r_i + r_j \le \sqrt{(x_i-x_j)^2 + (y_i-y_j)^2}$ for all pairs (Non-overlap constraints)
+
+Because the objective is concave and the constraints are linear, the solution is highly sensitive to the distances between centers. To find the global optimum, we use a gradient ascent method:
+1.  **Initialize**: Place 26 centers in a randomized hexagonal pattern to ensure a high initial packing density.
+2.  **LP Solver**: For a given set of centers, use `scipy.optimize.linprog` to find the maximum sum of radii and the corresponding dual variables (Lagrange multipliers).
+3.  **Gradient Calculation**: Using the dual variables from the LP, compute the gradient of the total radius sum with respect to each center's coordinates. Dual variables act as "pressures": active wall constraints push circles toward the center, and active neighbor constraints push circles apart.
+4.  **Iterative Optimization**: Update center positions based on the gradient, using an adaptive learning rate (Adam optimizer style) for stability.
+5.  **Restart**: Run multiple restarts to avoid local optima, which are common in packing landscapes.
+6.  **Final Validation**: Solve the LP one last time to extract the exact optimal radii for the final center positions and return the valid packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the placement of 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26)
+        sum_radii: float
+    """
+    N = 26
+    best_sum_r = 0.0
+    best_centers = None
+    best_radii = None
+
+    # Helper to solve the radii LP for fixed centers
+    def solve_lp(centers):
+        n = centers.shape[0]
+        c_obj = np.ones(n) * -1.0  # Maximize sum(r) -> Minimize -sum(r)
+        
+        # Constraints: A_ub @ r <= b_ub
+        # Walls: 4 per circle (Left, Right, Bottom, Top)
+        # Pairs: 1 per pair (i, j)
+        
+        num_wall = 4 * n
+        num_pairs = n * (n - 1) // 2
+        A_ub = np.zeros((num_wall + num_pairs, n))
+        b_ub = np.zeros(num_wall + num_pairs)
+        
+        idx = 0
+        
+        # Wall constraints
+        for i in range(n):
+            x, y = centers[i]
+            # Left: r_i <= x
+            A_ub[idx, i] = 1.0; b_ub[idx] = x; idx += 1
+            # Right: r_i <= 1 - x
+            A_ub[idx, i] = 1.0; b_ub[idx] = 1.0 - x; idx += 1
+            # Bottom: r_i <= y
+            A_ub[idx, i] = 1.0; b_ub[idx] = y; idx += 1
+            # Top: r_i <= 1 - y
+            A_ub[idx, i] = 1.0; b_ub[idx] = 1.0 - y; idx += 1
+            
+        # Pair constraints: r_i + r_j <= dist
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                A_ub[idx, i] = 1.0
+                A_ub[idx, j] = 1.0
+                b_ub[idx] = dist
+                idx += 1
+                
+        bounds = [(0, None)] * n
+        
+        # Use HiGHS solver for efficiency
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success:
+            # Marginals for inequality constraints (dual variables)
+            # Order corresponds to A_ub rows
+            duals = res.marginals.ineqlin
+            return res.fun * -1, res.x, duals
+        return 0, None, None
+
+    # Helper to compute gradient of the LP objective w.r.t centers
+    def compute_gradient(centers, duals):
+        n = centers.shape[0]
+        grad = np.zeros_like(centers)
+        
+        # Wall gradients
+        # Left duals at indices 4i, Right at 4i+1, etc.
+        # Left: r_i <= x_i -> dual pushes x_i + (increase x allows larger r)
+        # Right: r_i <= 1-x_i -> dual pushes x_i - (increase x restricts r)
+        for i in range(n):
+            l, r, b, t = duals[4*i], duals[4*i+1], duals[4*i+2], duals[4*i+3]
+            grad[i, 0] += l - r
+            grad[i, 1] += b - t
+            
+        # Pair gradients
+        # Pair (i, j) corresponds to constraint r_i + r_j <= dist
+        # Dual lambda_ij contributes to gradient of x_i: lambda_ij * (x_i - x_j) / dist
+        pair_idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                lambda_val = duals[4*n + pair_idx]
+                if lambda_val > 1e-9: # Only process active constraints
+                    diff = centers[i] - centers[j]
+                    dist = np.linalg.norm(diff)
+                    if dist > 1e-9:
+                        force = lambda_val * diff / dist
+                        grad[i] += force
+                        grad[j] -= force
+                pair_idx += 1
+                
+        return grad
+
+    # Adam Optimizer State
+    def adam_step(centers, grad, m, v, t, lr=0.1, beta1=0.9, beta2=0.999, eps=1e-8):
+        m = beta1 * m + (1 - beta1) * grad
+        v = beta2 * v + (1 - beta2) * (grad ** 2)
+        m_hat = m / (1 - beta1**t)
+        v_hat = v / (1 - beta2**t)
+        centers = centers + lr * m_hat / (np.sqrt(v_hat) + eps)
+        return np.clip(centers, 1e-6, 1 - 1e-6), m, v, t + 1
+
+    # Optimization Loop with Multiple Restarts
+    for restart in range(5):
+        # Initialize centers in a hexagonal-like random pattern
+        np.random.seed(42 + restart)
+        centers = np.random.rand(N, 2) * 0.8 + 0.1
+        
+        # Optimization parameters
+        lr = 0.05
+        m = np.zeros_like(centers)
+        v = np.zeros_like(centers)
+        t = 1
+        
+        current_sum = 0
+        
+        # Run gradient ascent
+        for iteration in range(300):
+            obj_val, radii, duals = solve_lp(centers)
+            
+            if obj_val <= current_sum + 1e-7:
+                # If objective stalled, maybe perturbation or just continue
+                pass
+            
+            current_sum = obj_val
+            grad = compute_gradient(centers, duals)
+            
+            # Update centers
+            centers, m, v, t = adam_step(centers, grad, m, v, t, lr=lr)
+            
+            # Decay learning rate slightly
+            lr *= 0.995
+
+        if current_sum > best_sum_r:
+            best_sum_r = current_sum
+            best_centers = centers.copy()
+            
+            # Final solve for radii at best centers
+            _, best_radii, _ = solve_lp(best_centers)
+
+    # If radii not found (should not happen), fallback
+    if best_radii is None:
+        _, best_radii, _ = solve_lp(best_centers)
+
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

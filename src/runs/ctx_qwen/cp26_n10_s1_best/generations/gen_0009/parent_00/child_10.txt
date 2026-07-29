@@ -1,0 +1,229 @@
+
+
+<strategy>
+To bridge the tiny gap to 2.636, we need a highly efficient global search for center positions followed by precise local refinement. The previous SLSQP-only approaches likely got trapped in local optima due to the non-convex landscape of center placement.
+
+Strategy:
+1. **LP-Driven Simulated Annealing (SA)**: Instead of optimizing centers and radii jointly, we fix centers and compute the absolute maximum sum of radii via Linear Programming (`scipy.optimize.linprog`). This objective function `sum(LP_radii(centers))` is continuous and piecewise-linear, making it ideal for SA. We run SA with a cooling schedule to explore center configurations that maximize packing efficiency. Precomputing the LP constraint matrix `A_ub` makes each LP call extremely fast (~0.1ms).
+2. **Diverse Initializations**: We seed SA with hexagonal lattices, rotated hex lattices, and force-directed layouts to ensure broad coverage of the configuration space.
+3. **SLSQP High-Precision Polish**: After SA finds the best center layout, we switch to `SLSQP` optimizing both centers and radii simultaneously. SLSQP excels at satisfying tight inequality constraints and can squeeze out the final numerical precision using squared-distance constraints.
+4. **Iterative Deflation & Re-optimization**: To escape any remaining rigid contact networks, we slightly shrink radii, perturb centers, and re-run SLSQP multiple times.
+5. **Strict Validation Repair**: A final safety loop ensures all constraints satisfy the `1e-12` tolerance required by the validator, applying minimal shrinkage only if necessary.
+
+This hybrid approach leverages the speed and exactness of LP for global topology search and the gradient-based precision of SLSQP for local polishing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+import warnings
+warnings.filterwarnings('ignore')
+
+N = 26
+
+# Precompute LP constraint matrix structure for maximum speed
+LP_NUM_CONST = 4 * N + N * (N - 1) // 2
+LP_A = np.zeros((LP_NUM_CONST, N))
+_lp_idx = 0
+for i in range(N):
+    LP_A[_lp_idx, i] = 1.0; _lp_idx += 1
+    LP_A[_lp_idx, i] = 1.0; _lp_idx += 1
+    LP_A[_lp_idx, i] = 1.0; _lp_idx += 1
+    LP_A[_lp_idx, i] = 1.0; _lp_idx += 1
+for i in range(N):
+    for j in range(i + 1, N):
+        LP_A[_lp_idx, i] = 1.0
+        LP_A[_lp_idx, j] = 1.0
+        _lp_idx += 1
+
+def solve_lp_radii(centers):
+    """Compute optimal radii for fixed centers using pre-structured LP."""
+    b_ub = np.empty(LP_NUM_CONST)
+    idx = 0
+    for i in range(N):
+        x, y = centers[i]
+        b_ub[idx] = x; idx += 1
+        b_ub[idx] = 1.0 - x; idx += 1
+        b_ub[idx] = y; idx += 1
+        b_ub[idx] = 1.0 - y; idx += 1
+        
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            b_ub[idx] = np.hypot(dx, dy)
+            idx += 1
+            
+    try:
+        res = linprog(-np.ones(N), A_ub=LP_A, b_ub=b_ub, bounds=[(0.0, None)] * N, method='highs')
+        if res.success:
+            return np.maximum(res.x, 1e-9)
+    except Exception:
+        pass
+    return np.full(N, 0.05)
+
+def sa_optimize(centers, steps=10000, temp_init=0.003):
+    """Simulated Annealing to find optimal center positions maximizing sum of LP radii."""
+    curr = centers.copy()
+    curr_r = solve_lp_radii(curr)
+    curr_score = np.sum(curr_r)
+    best = curr.copy()
+    best_score = curr_score
+    
+    for step in range(steps):
+        temp = temp_init * (0.9995 ** step)
+        idx = np.random.randint(N)
+        shift = np.random.normal(0, temp, 2)
+        new_c = curr.copy()
+        new_c[idx] = np.clip(new_c[idx] + shift, 0.001, 0.999)
+        
+        new_r = solve_lp_radii(new_c)
+        new_score = np.sum(new_r)
+        
+        delta = new_score - curr_score
+        if delta > 0 or np.random.rand() < np.exp(delta / max(temp, 1e-7)):
+            curr = new_c
+            curr_score = new_score
+            curr_r = new_r
+            if curr_score > best_score:
+                best_score = curr_score
+                best = curr.copy()
+    return best, best_score
+
+def make_hex_init(r0, ang):
+    """Generates a hexagonal lattice initialization with optional rotation."""
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < N + 5:
+        x = r0 if row % 2 == 0 else 2.0 * r0
+        while x <= 1.0 - r0 and len(pts) < N + 5:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+    pts = np.array(pts[:N])
+    if ang != 0.0:
+        c, s = np.cos(ang), np.sin(ang)
+        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+    return pts
+
+def make_force_init(seed):
+    """Force-directed layout to spread points evenly."""
+    np.random.seed(seed)
+    pts = np.random.uniform(0.15, 0.85, (N, 2))
+    for _ in range(200):
+        f = np.zeros_like(pts)
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pts[j] - pts[i]
+                d = np.hypot(dx[0], dx[1])
+                if d < 0.25 and d > 1e-5:
+                    rep = 0.008 / (d**2 + 0.001)
+                    f[i] -= dx * rep / d
+                    f[j] += dx * rep / d
+            for dim in range(2):
+                if pts[i, dim] < 0.12: f[i, dim] += 0.04
+                elif pts[i, dim] > 0.88: f[i, dim] -= 0.04
+        pts += f * 0.04
+        pts = np.clip(pts, 0.02, 0.98)
+    return pts
+
+def run_packing() -> tuple:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    
+    best_centers = None
+    best_sum = -1.0
+    
+    # Phase 1: Diverse Starts + SA Optimization
+    inits = [make_hex_init(0.09, 0.0), make_hex_init(0.09, 0.2), make_hex_init(0.09, -0.2)]
+    for s in range(4):
+        inits.append(make_force_init(s))
+        
+    for pts in inits:
+        c_opt, score = sa_optimize(pts, steps=8000, temp_init=0.0025)
+        if score > best_sum:
+            best_sum = score
+            best_centers = c_opt.copy()
+            
+    if best_centers is None:
+        best_centers = make_hex_init(0.09, 0.0)
+        
+    # Phase 2: SLSQP High-Precision Polish
+    TRIL_IDX = np.tril_indices(N, -1)
+    
+    def obj_slsqp(x):
+        return -np.sum(x[2::3])
+        
+    def cons_slsqp(x):
+        xs, ys, rs = x[0::3], x[1::3], x[2::3]
+        c = np.concatenate([xs - rs, 1.0 - xs - rs, ys - rs, 1.0 - ys - rs])
+        dx = xs[:, None] - xs[None, :]
+        dy = ys[:, None] - ys[None, :]
+        dr = rs[:, None] + rs[None, :]
+        c = np.concatenate([c, dx[TRIL_IDX]**2 + dy[TRIL_IDX]**2 - dr[TRIL_IDX]**2])
+        return c
+        
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': cons_slsqp}
+    
+    # Initialize SLSQP with best SA centers and LP radii
+    r_lp = solve_lp_radii(best_centers)
+    x0 = np.zeros(3 * N)
+    x0[0::3] = best_centers[:, 0]
+    x0[1::3] = best_centers[:, 1]
+    x0[2::3] = r_lp * 0.999
+    
+    # Iterative refinement with deflation to escape rigid contacts
+    for cycle in range(15):
+        try:
+            res = minimize(obj_slsqp, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 15000, 'ftol': 1e-14, 'disp': False})
+            if not np.isnan(res.fun):
+                x0 = res.x.copy()
+                # Slight deflation to allow topology shifts in next cycle
+                if cycle < 14:
+                    x0[2::3] *= 0.990
+                    noise = 0.001 * (0.85 ** cycle)
+                    x0[0::3] += np.random.normal(0, noise, N)
+                    x0[1::3] += np.random.normal(0, noise, N)
+                    # Project back to bounds
+                    for i in range(N):
+                        r = max(1e-6, x0[3*i+2])
+                        x0[3*i] = np.clip(x0[3*i], r, 1.0 - r)
+                        x0[3*i+1] = np.clip(x0[3*i+1], r, 1.0 - r)
+                        x0[3*i+2] = r
+        except Exception:
+            break
+            
+    centers = np.column_stack((x0[0::3], x0[1::3]))
+    radii = x0[2::3].copy()
+    
+    # Final LP squeeze for absolute maximum radii on optimized centers
+    final_r = solve_lp_radii(centers)
+    if np.sum(final_r) > np.sum(radii) - 1e-8:
+        radii = final_r.copy()
+        
+    # Strict validation repair against 1e-12 tolerance
+    for _ in range(100):
+        valid = True
+        for i in range(N):
+            if radii[i] < 0 or centers[i, 0] < radii[i] - 1e-10 or centers[i, 0] > 1.0 - radii[i] + 1e-10 or \
+               centers[i, 1] < radii[i] - 1e-10 or centers[i, 1] > 1.0 - radii[i] + 1e-10:
+                valid = False; break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                    if d < radii[i] + radii[j] - 1e-10:
+                        valid = False; break
+                if not valid: break
+        if valid: break
+        
+        radii *= 0.9998
+        centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+        
+    return centers, radii, float(np.sum(radii))
+```

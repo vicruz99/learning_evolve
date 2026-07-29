@@ -1,0 +1,214 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.628, we need a more robust and efficient optimization pipeline. The main bottlenecks in previous attempts were:
+1. **Slow constraint evaluation**: Loop-based constraint construction is $O(N^2)$ and slow in Python. Vectorizing distance and radius-sum computations dramatically speeds up gradient estimates.
+2. **Local minima trapping**: SLSQP is sensitive to initial conditions. We need diverse, structured initializations (rotated/shifted hexagonal lattices) followed by aggressive local perturbation search.
+3. **Suboptimal center-radius coupling**: While SLSQP optimizes both jointly, the LP (Linear Programming) polishing step guarantees optimal radii for fixed centers. We use SLSQP to find good center configurations, then apply LP to squeeze out the final radius sum.
+4. **Numerical stability**: Strict boundary enforcement and iterative overlap resolution prevent validation failures from floating-point drift.
+
+The improved strategy:
+- Vectorize all constraint computations.
+- Generate hexagonal lattice initializations with random rotations, shifts, and spacings to cover the configuration space.
+- Run SLSQP with high iteration limits and tight tolerances.
+- Perform a dedicated local perturbation phase around the best solution found.
+- Polish radii using LP, which solves the linear relaxation exactly for fixed centers.
+- Apply strict numerical safety fixes before returning.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def objective(x):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Vectorized inequality constraints g(x) >= 0."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    # Preallocate constraint array
+    n_cons = 4 * N + N * (N - 1) // 2
+    c = np.empty(n_cons)
+    
+    # Boundary constraints
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    # Pairwise non-overlap constraints: dist(i,j) >= r_i + r_j
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist = np.hypot(dx, dy)
+    r_sum = r[:, None] + r[None, :]
+    
+    idx = np.triu_indices(N, k=1)
+    c[4*N:] = dist[idx] - r_sum[idx]
+    return c
+
+def get_optimal_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii subject to constraints."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    n_pairs = n * (n - 1) // 2
+    A_ub = np.zeros((n_pairs, n))
+    b_ub = np.zeros(n_pairs)
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = d + 1e-12  # Tiny tolerance for numerical safety
+            idx += 1
+            
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        mx = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(0.0, mx)))
+        
+    for method in ['highs', 'interior-point', 'revised simplex']:
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method=method)
+            if res.success and np.all(res.x >= -1e-9):
+                return np.maximum(res.x, 0.0)
+        except Exception:
+            continue
+    return np.full(n, 0.02)
+
+def generate_initializations(num_seeds):
+    """Generate diverse hexagonal lattice initializations."""
+    inits = []
+    rng = np.random.RandomState(42)
+    
+    for seed in range(num_seeds):
+        s = 0.15 + rng.uniform(0, 0.04)
+        rot = rng.uniform(-0.08, 0.08)
+        shift_x = rng.uniform(0, s)
+        shift_y = rng.uniform(0, s * np.sqrt(3) / 2)
+        
+        pts = []
+        for row in range(15):
+            for col in range(15):
+                x = col * s + (row % 2) * s / 2.0
+                y = row * s * np.sqrt(3) / 2.0
+                xr = x * np.cos(rot) - y * np.sin(rot) + shift_x
+                yr = x * np.sin(rot) + y * np.cos(rot) + shift_y
+                if 0.06 <= xr <= 0.94 and 0.06 <= yr <= 0.94:
+                    pts.append([xr, yr])
+                if len(pts) >= N:
+                    break
+            if len(pts) >= N:
+                break
+                
+        if len(pts) < N:
+            while len(pts) < N:
+                pts.append([rng.uniform(0.15, 0.85), rng.uniform(0.15, 0.85)])
+                
+        pts = np.array(pts[:N])
+        pts += rng.normal(0, 0.002, pts.shape)
+        pts = np.clip(pts, 0.06, 0.94)
+        inits.append(pts)
+    return inits
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Optimizes the packing of 26 circles in a unit square to maximize sum of radii."""
+    n = N
+    bounds_opt = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    cons_opt = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Stage 1: Broad search from structured initializations
+    inits = generate_initializations(25)
+    
+    for base_pts in inits:
+        # Small safe initial radius ensures strict feasibility
+        r0 = 0.025
+        x0 = np.zeros(3 * n)
+        for i in range(n):
+            x0[3*i] = base_pts[i, 0]
+            x0[3*i+1] = base_pts[i, 1]
+            x0[3*i+2] = r0
+            
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds_opt,
+                           constraints=cons_opt,
+                           options={'maxiter': 20000, 'ftol': 1e-14, 'disp': False})
+            
+            if res.success or -res.fun > best_sum:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_x is None:
+        best_x = np.zeros(3*n)
+        best_x[0::3] = np.random.uniform(0.2, 0.8, n)
+        best_x[1::3] = np.random.uniform(0.2, 0.8, n)
+        best_x[2::3] = 0.02
+        best_sum = -np.sum(best_x[2::3])
+        
+    # Stage 2: Local perturbation search to escape shallow local minima
+    rng = np.random.RandomState(123)
+    for _ in range(35):
+        x_pert = best_x.copy()
+        x_pert[0::3] += rng.normal(0, 0.0025, n)
+        x_pert[1::3] += rng.normal(0, 0.0025, n)
+        x_pert[2::3] += rng.normal(0, 0.0008, n)
+        
+        x_pert[0::3] = np.clip(x_pert[0::3], 0.0, 1.0)
+        x_pert[1::3] = np.clip(x_pert[1::3], 0.0, 1.0)
+        x_pert[2::3] = np.clip(x_pert[2::3], 0.0, 0.5)
+        
+        try:
+            res = minimize(objective, x_pert, method='SLSQP', bounds=bounds_opt,
+                           constraints=cons_opt,
+                           options={'maxiter': 15000, 'ftol': 1e-14, 'disp': False})
+            
+            if res.success:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+
+    # Stage 3: LP Polishing for optimal radii given fixed centers
+    c_final = np.column_stack((best_x[0::3], best_x[1::3]))
+    r_final = get_optimal_radii(c_final)
+    
+    # Stage 4: Numerical safety and strict validity enforcement
+    for i in range(n):
+        x, y = c_final[i]
+        r_final[i] = min(r_final[i], x, 1.0 - x, y, 1.0 - y, 0.5)
+        r_final[i] = max(0.0, r_final[i])
+        
+    for _ in range(15):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(c_final[i, 0] - c_final[j, 0], c_final[i, 1] - c_final[j, 1])
+                if d < r_final[i] + r_final[j] - 1e-12:
+                    exc = r_final[i] + r_final[j] - d
+                    r_final[i] -= exc * 0.5
+                    r_final[j] -= exc * 0.5
+                    r_final[i] = max(0.0, r_final[i])
+                    r_final[j] = max(0.0, r_final[j])
+                    changed = True
+        if not changed:
+            break
+            
+    return c_final, r_final, float(np.sum(r_final))
+```

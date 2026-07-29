@@ -1,0 +1,266 @@
+# sol_000008 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1907b6e7) state=7b43d752 sum of radii=0.773419 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square to maximize sum of radii.
+    """
+    n = 26
+    np.random.seed(42) # For reproducibility
+    
+    # --- Initialization ---
+    # Start with a grid-like distribution to ensure good coverage
+    # 5x5 grid has 25 circles. We need 26.
+    # Let's place 25 in a 5x5 grid and 1 in the center or a gap, 
+    # but perturbed to allow optimization.
+    
+    centers = np.zeros((n, 2))
+    radii = np.full(n, 0.01) # Start small
+    
+    # Grid positions
+    count = 0
+    # 5 rows, 5 cols
+    for r in range(5):
+        for c in range(5):
+            if count < n:
+                x = 0.1 + c * 0.2 + np.random.uniform(-0.01, 0.01)
+                y = 0.1 + r * 0.2 + np.random.uniform(-0.01, 0.01)
+                # Clamp to valid range initially
+                centers[count] = np.clip([x, y], 0.05, 0.95)
+                count += 1
+                
+    # If we didn't fill all (should have), fill remaining randomly
+    while count < n:
+        centers[count] = np.random.uniform(0.1, 0.9, 2)
+        count += 1
+        
+    # --- Optimization Loop ---
+    # We will use a simple iterative expansion and relaxation method.
+    # 1. Increase radii.
+    # 2. Resolve collisions by moving centers.
+    # 3. Repeat.
+    
+    # Parameters
+    steps = 5000
+    growth_rate = 1.001 # Multiply radii by this factor or add small amount
+    move_step = 0.01 # Step size for moving centers
+    decay = 0.9995 # Decay for move step to converge
+    
+    # We want to maximize sum of radii. 
+    # Heuristic: Try to make radii equal and large.
+    # But we can allow variation.
+    
+    # Let's define a force function
+    # If dist < r1 + r2, push apart.
+    # If center near boundary and circle large, push inside.
+    
+    for step in range(steps):
+        current_sum_r = np.sum(radii)
+        
+        # 1. Try to grow radii
+        # We can't just grow them all, we must check constraints.
+        # Instead, let's use a penalty-based gradient ascent or simple adjustment.
+        # Or simpler: compute max possible radius for each circle given current others,
+        # and move radii towards that.
+        
+        # Update radii based on current positions
+        for i in range(n):
+            # Boundary limits
+            max_r = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+            
+            # Neighbor limits
+            for j in range(n):
+                if i == j: continue
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                # Constraint: r_i + r_j <= dist => r_i <= dist - r_j
+                limit = dist - radii[j]
+                if limit < max_r:
+                    max_r = limit
+            
+            # Update radius: move towards max_r
+            # To avoid instability, move gradually
+            if radii[i] < max_r:
+                radii[i] = radii[i] * 0.9 + max_r * 0.1
+            else:
+                # If radius is too big (shouldn't happen if we only grow), shrink
+                radii[i] = max_r
+
+        # 2. Move centers to resolve tightness and improve space
+        # Calculate forces
+        forces = np.zeros((n, 2))
+        
+        for i in range(n):
+            # Boundary forces: push away from walls
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Push from left wall
+            if x - r < 0:
+                forces[i, 0] += (0 - (x - r)) * 10.0
+            # Push from right wall
+            elif x + r > 1:
+                forces[i, 0] -= ((x + r) - 1) * 10.0
+            
+            # Push from bottom wall
+            if y - r < 0:
+                forces[i, 1] += (0 - (y - r)) * 10.0
+            # Push from top wall
+            elif y + r > 1:
+                forces[i, 1] -= ((y + r) - 1) * 10.0
+            
+            # Repulsion forces from other circles
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.sqrt(np.sum(diff**2))
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist:
+                    # Overlap: strong repulsion
+                    # Force magnitude proportional to overlap amount
+                    overlap = min_dist - dist
+                    if dist > 1e-6:
+                        force_vec = (diff / dist) * overlap * 5.0
+                        forces[i] += force_vec
+                        forces[j] -= force_vec
+                else:
+                    # If very close, apply weak repulsion to spread out (prevent jamming)
+                    # This helps in finding better local optima
+                    if dist < min_dist * 1.1:
+                        force_vec = (diff / dist) * (min_dist * 1.1 - dist) * 0.5
+                        forces[i] += force_vec
+                        forces[j] -= force_vec
+
+        # Update centers
+        current_move_step = move_step * (decay ** (step / 100.0))
+        centers += forces * current_move_step
+        
+        # Clamp centers to [0,1] loosely to prevent explosion, 
+        # but allow slight overshoot for force resolution (handled by next step)
+        # Actually, strict clamping is safer
+        centers = np.clip(centers, 1e-4, 1-1e-4)
+
+    # --- Final Adjustment & Validation ---
+    # After optimization, ensure strict validity.
+    # We might have slight numerical violations.
+    # We can perform a final shrink if necessary.
+    
+    # Check and fix overlaps by shrinking radii slightly if needed
+    # This is a last resort, optimization should have handled it.
+    
+    # Let's do a final pass to maximize radii given final positions
+    # Solve for optimal radii for fixed centers (Linear Programming-like update)
+    # Since N is small, we can iterate.
+    for _ in range(100):
+        for i in range(n):
+            max_r = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+            for j in range(n):
+                if i == j: continue
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                max_r = min(max_r, dist - radii[j])
+            # Ensure non-negative
+            max_r = max(0.0, max_r)
+            radii[i] = max_r # Set to max possible
+
+    # Ensure strict non-overlap with tolerance
+    # If any overlap, shrink the smaller circle
+    for _ in range(50):
+        overlap_found = False
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                sum_r = radii[i] + radii[j]
+                if sum_r > dist + 1e-9:
+                    overlap = (sum_r - dist) / 2
+                    # Shrink both slightly or just the smaller one
+                    # To preserve sum, shrink proportional to radius?
+                    # Just clamp sum_r to dist
+                    # Distribute reduction
+                    if radii[i] > radii[j]:
+                        radii[i] -= overlap
+                    else:
+                        radii[j] -= overlap
+                    # Ensure non-negative
+                    radii[i] = max(0, radii[i])
+                    radii[j] = max(0, radii[j])
+                    overlap_found = True
+        if not overlap_found:
+            break
+            
+    # Check boundaries and clamp radii
+    for i in range(n):
+        max_r = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+        if radii[i] > max_r + 1e-9:
+            radii[i] = max_r
+        radii[i] = max(0.0, radii[i])
+
+    # Final validation check (internal)
+    # if not validate_packing(centers, radii):
+    #     print("Warning: Final packing failed validation, adjusting...")
+    #     # Emergency shrink
+    #     min_r = np.min(radii)
+    #     radii -= min_r * 0.1 # Shrink all a bit
+    #     radii = np.maximum(radii, 0)
+
+    sum_radii = np.sum(radii)
+    
+    # Clean up centers and radii for output
+    centers = centers.astype(np.float64)
+    radii = radii.astype(np.float64)
+    
+    return centers, radii, float(sum_radii)
+
+# Helper to run and print stats if executed directly (though not required by prompt format)
+if __name__ == "__main__":
+    centers, radii, total = run_packing()
+    print(f"Sum of radii: {total}")
+    print(f"Min radius: {np.min(radii)}")
+    print(f"Max radius: {np.max(radii)}")
+    print(f"Valid: {validate_packing(centers, radii)}")

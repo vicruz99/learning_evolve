@@ -1,0 +1,826 @@
+
+
+<strategy>
+To solve the problem of packing 26 circles in a unit square to maximize the sum of radii, I will employ a multi-stage strategy.
+
+1.  **Initial Configuration**: A key challenge in packing problems is the landscape of local minima. A random initialization often fails. I will use a structured initialization based on a hexagonal lattice, which is the densest packing configuration for equal circles. I will generate points on a hexagonal grid scaled to fit the unit square and then prune or adjust them to have exactly 26 circles. This provides a strong starting point close to the global optimum.
+
+2.  **Objective Function**: I will define a penalty-based objective function. For a fixed radius $r$, the goal is to minimize the overlap between circles and the violation of boundary constraints. The cost function will be the sum of squared overlaps and boundary penalties.
+    *   Overlap penalty between circle $i$ and $j$: $\max(0, 2r - \|c_i - c_j\|)^2$.
+    *   Boundary penalty for circle $i$: $\max(0, r - x_i)^2 + \max(0, x_i - (1-r))^2 + \dots$ for $y$.
+
+3.  **Optimization Algorithm**:
+    *   **Binary Search for Radius**: Since the sum of radii is $26 \times r$ (assuming equal radii is near optimal for maximizing sum), I will binary search for the maximum feasible radius $r$. The search range will be roughly $[0.08, 0.12]$.
+    *   **Local Search (Gradient Descent)**: For each candidate radius $r$ in the binary search, I will attempt to find a valid configuration of centers using `scipy.optimize.minimize`. I will use the 'L-BFGS-B' method, which supports bound constraints ($0 \le x, y \le 1$).
+    *   **Multiple Restarts**: To mitigate the risk of getting stuck in local minima during the local search, I will run the optimizer from multiple initial configurations (the hexagonal grid, a random configuration, and a grid configuration). If any run finds a valid packing (cost $\approx 0$), the radius is considered feasible.
+
+4.  **Refinement**: Once a feasible packing for a high radius is found, I will use that configuration as the seed for slightly higher radii, allowing the optimizer to "grow" the circles gradually. This homotopy-like approach helps escape local traps.
+
+5.  **Output**: The final valid configuration (centers and radii) will be returned. I will ensure all constraints are satisfied within a small tolerance.
+</strategy>
+
+```python
+import numpy as np
+import scipy.optimize as opt
+import math
+
+# Constants
+N_CIRCLES = 26
+TOLERANCE = 1e-8
+BINARY_SEARCH_ITERATIONS = 20
+OPTIMIZATION_ITERATIONS = 1000
+
+def get_hexagonal_initial_centers(n):
+    """
+    Generates an initial configuration of centers based on a hexagonal lattice.
+    This is often a good starting point for dense packing problems.
+    """
+    centers = []
+    # We try to fit points into the square. 
+    # Hexagonal packing has vertical spacing sqrt(3)/2 * diameter and horizontal spacing diameter.
+    # Let's assume a tentative radius to layout, say 0.1, then scale positions.
+    # Actually, we just need distinct points in [0,1].
+    # We can generate a lattice and select the best n points that are within [0,1].
+    
+    # Let's try to fill rows
+    y = 0.1
+    row = 0
+    while len(centers) < n:
+        x_start = 0.1 if row % 2 == 0 else 0.2 # Offset for hexagonal
+        step = 0.2
+        while x_start < 0.95: # Leave some margin
+            centers.append([x_start, y])
+            x_start += step
+            if len(centers) >= n:
+                break
+        y += 0.1732 # approx 0.1 * sqrt(3)
+        row += 1
+        
+    # If we didn't get enough (unlikely with these params), fill with random
+    while len(centers) < n:
+        centers.append([np.random.rand(), np.random.rand()])
+        
+    return np.array(centers[:n])
+
+def get_grid_initial_centers(n):
+    """
+    Generates an initial configuration based on a square grid.
+    """
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    
+    # Spacing to fit in [0,1] with some padding
+    padding = 0.05
+    width = 1 - 2 * padding
+    height = 1 - 2 * padding
+    
+    centers = []
+    for r in range(rows):
+        for c in range(cols):
+            if len(centers) < n:
+                x = padding + c * (width / (cols - 1)) if cols > 1 else 0.5
+                y = padding + r * (height / (rows - 1)) if rows > 1 else 0.5
+                centers.append([x, y])
+    
+    return np.array(centers)
+
+def get_random_initial_centers(n):
+    """
+    Generates random initial centers.
+    """
+    return np.random.rand(n, 2)
+
+def calculate_violation(centers, r):
+    """
+    Calculates the total violation of constraints for a given configuration and radius.
+    Violation includes circle-circle overlaps and boundary intersections.
+    """
+    n = centers.shape[0]
+    violation = 0.0
+    
+    # Circle-Circle overlaps
+    # Vectorized computation for efficiency
+    # dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    # This creates a full matrix, might be memory heavy for large N, but N=26 is tiny.
+    # Let's use loops for clarity and safety, or optimized numpy.
+    
+    # Using numpy broadcasting
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Mask out diagonal (distance to self)
+    np.fill_diagonal(dists, np.inf)
+    
+    # Overlap: dist < 2r
+    overlaps = 2 * r - dists
+    overlaps = np.maximum(0, overlaps)
+    violation += np.sum(overlaps**2)
+    
+    # Boundary violations
+    # x - r < 0  => r - x > 0
+    # x + r > 1  => x - (1-r) > 0
+    # Same for y
+    
+    # x boundaries
+    violation += np.sum(np.maximum(0, r - centers[:, 0])**2)
+    violation += np.sum(np.maximum(0, centers[:, 0] - (1 - r))**2)
+    
+    # y boundaries
+    violation += np.sum(np.maximum(0, r - centers[:, 1])**2)
+    violation += np.sum(np.maximum(0, centers[:, 1] - (1 - r))**2)
+    
+    return violation
+
+def objective_function(centers_flat, r):
+    """
+    Objective function for scipy.optimize.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    return calculate_violation(centers, r)
+
+def try_pack(r, init_centers_list):
+    """
+    Tries to find a valid packing for radius r using multiple initial configurations.
+    Returns (success, best_centers)
+    """
+    bounds = [(0.0, 1.0)] * (N_CIRCLES * 2)
+    best_violation = float('inf')
+    best_centers = None
+    
+    # We try multiple initial configurations
+    for init_centers in init_centers_list:
+        x0 = init_centers.flatten()
+        
+        # Use L-BFGS-B which handles bounds
+        try:
+            res = opt.minimize(
+                objective_function, 
+                x0, 
+                args=(r,), 
+                method='L-BFGS-B', 
+                bounds=bounds,
+                options={'maxiter': OPTIMIZATION_ITERATIONS, 'ftol': 1e-12}
+            )
+            
+            if res.fun < best_violation:
+                best_violation = res.fun
+                best_centers = res.x.reshape(-1, 2)
+                
+                # If we found a perfect packing, return immediately
+                if res.fun < TOLERANCE:
+                    return True, best_centers
+                    
+        except Exception:
+            continue
+            
+    # Check if we found a valid packing within tolerance
+    # Allow a slightly higher tolerance for numerical noise
+    if best_violation < 1e-6:
+        return True, best_centers
+    
+    return False, best_centers
+
+def run_packing():
+    """
+    Main function to solve the circle packing problem.
+    """
+    # 1. Prepare initial configurations
+    # We want to try different layouts to avoid local minima
+    inits = []
+    
+    # Hexagonal layout
+    try:
+        inits.append(get_hexagonal_initial_centers(N_CIRCLES))
+    except:
+        pass
+        
+    # Grid layout
+    try:
+        inits.append(get_grid_initial_centers(N_CIRCLES))
+    except:
+        pass
+        
+    # Random layouts (a few)
+    for _ in range(5):
+        inits.append(get_random_initial_centers(N_CIRCLES))
+        
+    # 2. Binary search for the optimal radius
+    low = 0.05
+    high = 0.15 # Upper bound estimate (r=0.1 is baseline for 25 circles)
+    best_r = low
+    best_centers = inits[0] # Default fallback
+    
+    # First, find a feasible radius to get a baseline configuration
+    # Start with a small radius to ensure feasibility
+    current_r = 0.02
+    # Find a valid config for small r to use as seed
+    # Actually, any config works for small r, but let's just pick one
+    best_centers = inits[0] 
+    
+    # We can refine best_centers at low r
+    # But binary search will handle finding feasibility
+    
+    for i in range(BINARY_SEARCH_ITERATIONS):
+        mid = (low + high) / 2.0
+        
+        # Try to pack circles of radius 'mid'
+        # We use the best_centers found so far as one of the inits to help convergence
+        # (Continuation method)
+        current_inits = list(inits)
+        if best_centers is not None:
+            current_inits.append(best_centers)
+            
+        success, centers = try_pack(mid, current_inits)
+        
+        if success:
+            best_r = mid
+            best_centers = centers
+            low = mid + 1e-4 # Increase lower bound
+        else:
+            high = mid - 1e-4 # Decrease upper bound
+            
+        # Narrow the search range if it's too wide, though binary search does this naturally
+        if high - low < 1e-5:
+            break
+            
+    # 3. Final refinement
+    # Once we found a good radius, try to optimize radii individually?
+    # The problem asks to maximize sum of radii. 
+    # Assuming equal radii is a strong heuristic. 
+    # However, we can try to slightly increase radii if possible.
+    # But since we binary searched for the max feasible 'r' where ALL circles have radius 'r',
+    # this sum is 26 * r.
+    
+    # Let's verify the result
+    centers = best_centers
+    radii = np.full(N_CIRCLES, best_r)
+    
+    # Check validity one last time
+    # The validator allows 1e-12 error. 
+    # Our tolerance was 1e-6 or 1e-8.
+    # If the optimizer didn't converge perfectly, we might need to shrink radii slightly.
+    violation = calculate_violation(centers, best_r)
+    if violation > 1e-7:
+        # Scale down radii slightly to ensure validity
+        # The violation is sum of squares of overlaps. 
+        # We can estimate required shrinkage.
+        # A simple heuristic: reduce r by a small factor or fixed amount.
+        # Since we want to maximize sum, we want minimal reduction.
+        # Let's just subtract a small epsilon based on max overlap?
+        # Or re-run optimizer with fixed r slightly smaller?
+        # Actually, if violation > 0, it's invalid.
+        # Let's reduce r until valid.
+        step = 0.001
+        while calculate_violation(centers, best_r) > 1e-8:
+            best_r -= step
+            step *= 0.9 # Decrease step size
+            if best_r < 0: break
+    
+    radii = np.full(N_CIRCLES, best_r)
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+
+# Function to be called by the system
+def run_packing():
+    # Re-defining to match the required signature and logic
+    # The logic above is inside this function in the final code block
+    pass 
+```
+
+Wait, I should combine the logic properly. The previous block had `run_packing` defined twice. I will provide the complete clean code.
+
+One detail: `get_hexagonal_initial_centers` and others are helper functions. They should be top-level.
+The `run_packing` function is the entry point.
+
+Let's refine the binary search logic.
+If `try_pack` returns success, we store `best_centers` and try larger `r`.
+If it fails, we try smaller `r`.
+However, `try_pack` might fail for a feasible `r` if the initial points are bad.
+To mitigate this, we include the previous `best_centers` in the list of initial configurations for the next step. This acts as a continuation method.
+
+Also, I should ensure that the returned `centers` and `radii` are strictly valid.
+The `calculate_violation` function uses squared penalties.
+If `violation` is small, it's likely valid.
+But to be safe, I will do a final check and shrink radii if needed.
+
+One optimization: The problem allows different radii.
+Is it possible to get a higher sum?
+Maybe. But finding the optimal variable radii configuration is significantly harder (non-convex, more variables).
+Given the constraints and the likely target (2.636), equal radii packing is the standard approach.
+Target sum 2.636 for 26 circles implies average radius ~0.1014.
+My estimate for 26 equal circles is around 0.101-0.102.
+So this strategy should hit the target.
+
+One potential issue: `scipy.optimize` might be slow if called many times.
+20 iterations * ~7 restarts = 140 optimizations.
+Each optimization on 52 variables.
+This should be well within time limits (usually few seconds).
+
+Let's double check the initial centers generation.
+`get_hexagonal_initial_centers`:
+Row 0: y=0.1. x=0.1, 0.3, 0.5, 0.7, 0.9 (5 points).
+Row 1: y=0.2732. x=0.2, 0.4, 0.6, 0.8 (4 points).
+Row 2: y=0.4464. x=0.1, 0.3, 0.5, 0.7, 0.9 (5 points).
+Row 3: y=0.6196. x=0.2, 0.4, 0.6, 0.8 (4 points).
+Row 4: y=0.7928. x=0.1, 0.3, 0.5, 0.7, 0.9 (5 points).
+Total: 5+4+5+4+5 = 23 points.
+Need 26.
+The code appends random points if needed.
+This is a decent seed.
+
+Let's refine `get_hexagonal_initial_centers` to try to fill more efficiently.
+Or just rely on random seeds too.
+
+Final check on `calculate_violation`.
+`np.maximum(0, overlaps)**2` is correct.
+Boundary checks: `r - centers[:, 0]` is positive if $x < r$. Correct.
+`centers[:, 0] - (1 - r)` is positive if $x > 1-r$. Correct.
+
+One small thing: The validation function checks `x - r < -1e-12`.
+So if `x - r` is -1e-13, it's valid.
+My check `r - x > 0` detects violation.
+If `x = r`, `r-x = 0`, no violation.
+If `x = r - 1e-12`, `r-x = 1e-12`, violation > 0.
+So the penalty function aligns with the validator.
+
+I will write the final code now.
+
+```python
+import numpy as np
+import scipy.optimize as opt
+import math
+
+# Constants
+N_CIRCLES = 26
+TOLERANCE = 1e-9
+BINARY_SEARCH_ITERATIONS = 25
+OPTIMIZATION_ITERATIONS = 2000
+
+def get_hexagonal_initial_centers(n):
+    """
+    Generates an initial configuration of centers based on a hexagonal lattice.
+    """
+    centers = []
+    # Heuristic parameters for layout
+    y = 0.1
+    row = 0
+    # Try to fill rows. 5 circles width requires 0.1 start, 0.2 step -> 0.1, 0.3, 0.5, 0.7, 0.9
+    # 4 circles width requires 0.2 start, 0.2 step -> 0.2, 0.4, 0.6, 0.8
+    
+    while len(centers) < n and y < 0.95:
+        if row % 2 == 0:
+            x_start = 0.1
+            count = 5
+        else:
+            x_start = 0.2
+            count = 4
+            
+        for k in range(count):
+            if len(centers) < n:
+                x = x_start + k * 0.2
+                if x <= 0.95: # Ensure within bounds roughly
+                     centers.append([x, y])
+        
+        y += 0.1732 # sqrt(3)/2 * 0.2 approx
+        row += 1
+        
+    # Fill remaining with random if needed
+    while len(centers) < n:
+        centers.append([np.random.rand(), np.random.rand()])
+        
+    return np.array(centers[:n])
+
+def get_grid_initial_centers(n):
+    """
+    Generates an initial configuration based on a square grid.
+    """
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    
+    padding = 0.05
+    width = 1 - 2 * padding
+    height = 1 - 2 * padding
+    
+    centers = []
+    for r in range(rows):
+        for c in range(cols):
+            if len(centers) < n:
+                # Spread evenly
+                if cols > 1:
+                    x = padding + c * (width / (cols - 1))
+                else:
+                    x = 0.5
+                if rows > 1:
+                    y = padding + r * (height / (rows - 1))
+                else:
+                    y = 0.5
+                centers.append([x, y])
+    
+    return np.array(centers)
+
+def get_random_initial_centers(n):
+    """
+    Generates random initial centers.
+    """
+    # Random points in [0.1, 0.9] to be safe initially
+    return np.random.uniform(0.1, 0.9, (n, 2))
+
+def calculate_violation(centers, r):
+    """
+    Calculates the total violation of constraints.
+    """
+    n = centers.shape[0]
+    violation = 0.0
+    
+    # Circle-Circle overlaps
+    # Compute all pairwise distances
+    # Using broadcasting
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Distance to self is 0, we ignore it. 
+    # Overlap occurs if dist < 2r.
+    # We only care about upper triangle to avoid double counting, 
+    # but summing all is fine for minimization (just scales gradient).
+    
+    overlaps = 2 * r - dists
+    overlaps = np.maximum(0, overlaps)
+    violation += np.sum(overlaps**2)
+    
+    # Boundary violations
+    # x < r  => r - x > 0
+    violation += np.sum(np.maximum(0, r - centers[:, 0])**2)
+    # x > 1 - r => x - (1-r) > 0
+    violation += np.sum(np.maximum(0, centers[:, 0] - (1 - r))**2)
+    # y < r
+    violation += np.sum(np.maximum(0, r - centers[:, 1])**2)
+    # y > 1 - r
+    violation += np.sum(np.maximum(0, centers[:, 1] - (1 - r))**2)
+    
+    return violation
+
+def objective_function(centers_flat, r):
+    """
+    Objective function for scipy.optimize.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    return calculate_violation(centers, r)
+
+def try_pack(r, init_centers_list):
+    """
+    Tries to find a valid packing for radius r.
+    """
+    bounds = [(0.0, 1.0)] * (N_CIRCLES * 2)
+    best_violation = float('inf')
+    best_centers = None
+    
+    # Try multiple starts
+    for init_centers in init_centers_list:
+        x0 = init_centers.flatten()
+        
+        try:
+            res = opt.minimize(
+                objective_function, 
+                x0, 
+                args=(r,), 
+                method='L-BFGS-B', 
+                bounds=bounds,
+                options={'maxiter': OPTIMIZATION_ITERATIONS, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            
+            if res.fun < best_violation:
+                best_violation = res.fun
+                best_centers = res.x.reshape(-1, 2)
+                if res.fun < TOLERANCE:
+                    return True, best_centers
+        except Exception:
+            continue
+            
+    # If best violation is very small, consider it success
+    if best_violation < 1e-6:
+        return True, best_centers
+    
+    return False, best_centers
+
+def run_packing():
+    """
+    Main function to solve the circle packing problem.
+    """
+    # Prepare initial configurations
+    inits = []
+    inits.append(get_hexagonal_initial_centers(N_CIRCLES))
+    inits.append(get_grid_initial_centers(N_CIRCLES))
+    for _ in range(5):
+        inits.append(get_random_initial_centers(N_CIRCLES))
+        
+    low = 0.08
+    high = 0.12 # Start range
+    best_r = low
+    best_centers = inits[0]
+    
+    # Initial check to establish a baseline
+    # Find a valid r to start
+    test_r = 0.05
+    success, _ = try_pack(test_r, inits)
+    if success:
+        low = 0.05
+    else:
+        # If even 0.05 fails, something is wrong, but unlikely.
+        # Just proceed.
+        pass
+
+    # Binary Search
+    for i in range(BINARY_SEARCH_ITERATIONS):
+        mid = (low + high) / 2.0
+        
+        # Include best_centers found so far as a seed
+        current_inits = list(inits)
+        if best_centers is not None:
+            current_inits.append(best_centers)
+            
+        success, centers = try_pack(mid, current_inits)
+        
+        if success:
+            best_r = mid
+            best_centers = centers
+            low = mid + 1e-5 # Try larger
+        else:
+            high = mid - 1e-5 # Try smaller
+            
+        if high - low < 1e-5:
+            break
+            
+    # Final refinement: Ensure strict validity
+    centers = best_centers
+    r_final = best_r
+    
+    # Check violation
+    violation = calculate_violation(centers, r_final)
+    
+    # If violation is too high, shrink radius
+    # This is a safety measure
+    if violation > 1e-7:
+        # Simple bisection to find max valid r for this fixed configuration
+        # Actually, we can just decrease r until violation is small
+        # Since violation is sum of squares of (2r - dist), 
+        # reducing r reduces overlap linearly (approx).
+        
+        r_low = 0.0
+        r_high = r_final
+        for _ in range(50):
+            r_mid = (r_low + r_high) / 2
+            if calculate_violation(centers, r_mid) < 1e-9:
+                r_low = r_mid
+            else:
+                r_high = r_mid
+        r_final = r_low
+
+    radii = np.full(N_CIRCLES, r_final)
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+```
+The logic seems sound. The binary search with multiple restarts and continuation should find a good packing. The final radius check ensures validity.
+
+One detail: `best_centers` might be None if initial packs fail? Unlikely with small r.
+Added a check `if best_centers is not None`.
+
+Double check target: 2.636.
+My code maximizes sum of radii.
+If `r_final` is around 0.101, sum is 2.626.
+Wait, 26 * 0.101 = 2.626.
+Target 2.636 implies r ~ 0.1014.
+My range [0.08, 0.12] covers this.
+The optimization should push r up to the limit.
+
+I'll output the code now.
+
+
+```python
+import numpy as np
+import scipy.optimize as opt
+import math
+
+# Constants
+N_CIRCLES = 26
+TOLERANCE = 1e-9
+BINARY_SEARCH_ITERATIONS = 25
+OPTIMIZATION_ITERATIONS = 2000
+
+def get_hexagonal_initial_centers(n):
+    """
+    Generates an initial configuration of centers based on a hexagonal lattice.
+    This provides a structured, dense starting point.
+    """
+    centers = []
+    # Parameters for layout: trying to fit circles with approximate diameter 0.2
+    y = 0.1
+    row = 0
+    
+    while len(centers) < n and y < 0.95:
+        # Alternate row starts for hexagonal packing
+        if row % 2 == 0:
+            x_start = 0.1
+            count = 5 # Fit 5 circles in width 1 (0.1 to 0.9 step 0.2)
+        else:
+            x_start = 0.2
+            count = 4 # Fit 4 circles in shifted row
+            
+        for k in range(count):
+            if len(centers) < n:
+                x = x_start + k * 0.2
+                if x <= 0.95: 
+                     centers.append([x, y])
+        
+        y += 0.1732 # Vertical spacing for hexagonal packing (sqrt(3)/2 * 0.2)
+        row += 1
+        
+    # Fill remaining with random points if we didn't get enough
+    while len(centers) < n:
+        centers.append([np.random.rand(), np.random.rand()])
+        
+    return np.array(centers[:n])
+
+def get_grid_initial_centers(n):
+    """
+    Generates an initial configuration based on a square grid.
+    """
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    
+    padding = 0.05
+    width = 1 - 2 * padding
+    height = 1 - 2 * padding
+    
+    centers = []
+    for r in range(rows):
+        for c in range(cols):
+            if len(centers) < n:
+                if cols > 1:
+                    x = padding + c * (width / (cols - 1))
+                else:
+                    x = 0.5
+                if rows > 1:
+                    y = padding + r * (height / (rows - 1))
+                else:
+                    y = 0.5
+                centers.append([x, y])
+    
+    return np.array(centers)
+
+def get_random_initial_centers(n):
+    """
+    Generates random initial centers within a safe margin.
+    """
+    return np.random.uniform(0.1, 0.9, (n, 2))
+
+def calculate_violation(centers, r):
+    """
+    Calculates the total violation of constraints (overlaps and boundary breaches).
+    """
+    n = centers.shape[0]
+    violation = 0.0
+    
+    # Circle-Circle overlaps
+    # Compute pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Overlap occurs if distance < 2r
+    overlaps = 2 * r - dists
+    overlaps = np.maximum(0, overlaps)
+    violation += np.sum(overlaps**2)
+    
+    # Boundary violations
+    # x < r  => r - x > 0
+    violation += np.sum(np.maximum(0, r - centers[:, 0])**2)
+    # x > 1 - r => x - (1-r) > 0
+    violation += np.sum(np.maximum(0, centers[:, 0] - (1 - r))**2)
+    # y < r
+    violation += np.sum(np.maximum(0, r - centers[:, 1])**2)
+    # y > 1 - r
+    violation += np.sum(np.maximum(0, centers[:, 1] - (1 - r))**2)
+    
+    return violation
+
+def objective_function(centers_flat, r):
+    """
+    Objective function wrapper for scipy.optimize.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    return calculate_violation(centers, r)
+
+def try_pack(r, init_centers_list):
+    """
+    Attempts to find a valid packing for a given radius r using multiple initial seeds.
+    Returns (success, best_centers).
+    """
+    bounds = [(0.0, 1.0)] * (N_CIRCLES * 2)
+    best_violation = float('inf')
+    best_centers = None
+    
+    for init_centers in init_centers_list:
+        x0 = init_centers.flatten()
+        
+        try:
+            res = opt.minimize(
+                objective_function, 
+                x0, 
+                args=(r,), 
+                method='L-BFGS-B', 
+                bounds=bounds,
+                options={'maxiter': OPTIMIZATION_ITERATIONS, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            
+            if res.fun < best_violation:
+                best_violation = res.fun
+                best_centers = res.x.reshape(-1, 2)
+                
+                # If we found a nearly perfect packing, return immediately
+                if res.fun < TOLERANCE:
+                    return True, best_centers
+                    
+        except Exception:
+            continue
+            
+    # Check if the best found solution is within a reasonable tolerance
+    if best_violation < 1e-6:
+        return True, best_centers
+    
+    return False, best_centers
+
+def run_packing():
+    """
+    Main function to solve the circle packing problem by maximizing the sum of radii.
+    Uses binary search on the radius combined with local optimization.
+    """
+    # 1. Prepare initial configurations for diversity
+    inits = []
+    inits.append(get_hexagonal_initial_centers(N_CIRCLES))
+    inits.append(get_grid_initial_centers(N_CIRCLES))
+    for _ in range(5):
+        inits.append(get_random_initial_centers(N_CIRCLES))
+        
+    low = 0.08
+    high = 0.12 # Upper bound estimate
+    best_r = low
+    best_centers = inits[0]
+    
+    # Establish a baseline valid configuration with a small radius
+    # This ensures we have a starting point for the continuation method
+    test_r = 0.02
+    success, temp_centers = try_pack(test_r, inits)
+    if success:
+        best_centers = temp_centers
+        best_r = test_r
+    else:
+        # Fallback if initial small pack fails (unlikely)
+        pass
+
+    # 2. Binary Search for the optimal radius
+    for i in range(BINARY_SEARCH_ITERATIONS):
+        mid = (low + high) / 2.0
+        
+        # Include the best configuration found so far as a seed (Continuation Method)
+        current_inits = list(inits)
+        if best_centers is not None:
+            current_inits.append(best_centers)
+            
+        success, centers = try_pack(mid, current_inits)
+        
+        if success:
+            best_r = mid
+            best_centers = centers
+            low = mid + 1e-5 # Try larger radius
+        else:
+            high = mid - 1e-5 # Radius too large, try smaller
+            
+        if high - low < 1e-5:
+            break
+            
+    # 3. Final Validation and Adjustment
+    centers = best_centers
+    r_final = best_r
+    
+    # Calculate violation for the best found radius
+    violation = calculate_violation(centers, r_final)
+    
+    # If violation is significant, shrink radius to ensure strict validity
+    if violation > 1e-8:
+        # Find the largest r <= r_final that is valid for this specific center configuration
+        r_low = 0.0
+        r_high = r_final
+        for _ in range(50):
+            r_mid = (r_low + r_high) / 2
+            if calculate_violation(centers, r_mid) < 1e-9:
+                r_low = r_mid
+            else:
+                r_high = r_mid
+        r_final = r_low
+
+    radii = np.full(N_CIRCLES, r_final)
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+```

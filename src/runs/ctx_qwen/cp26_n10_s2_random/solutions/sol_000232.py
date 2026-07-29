@@ -1,0 +1,227 @@
+# sol_000232 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000224 (state 70cd4a3b) state=4c300815 sum of radii=2.242800 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+
+def solve_lp_and_grad(centers):
+    """
+    Solves LP to maximize sum of radii for fixed centers.
+    Returns (radii, sum_radii, gradient_wrt_centers).
+    """
+    n = centers.shape[0]
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    num_pairs = n * (n - 1) // 2
+    num_bound = 4 * n
+    A_ub = np.zeros((num_pairs + num_bound, n))
+    b_ub = np.zeros(num_pairs + num_bound)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    for i in range(n):
+        b_ub[idx] = centers[i, 0]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        b_ub[idx] = centers[i, 1]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    c_obj = -np.ones(n)
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)] * n, method='highs')
+    
+    if not res.success:
+        return None, None, None
+        
+    radii = res.x
+    s_sum = np.sum(radii)
+    
+    # Robust dual extraction across SciPy versions
+    duals = np.zeros(num_pairs + num_bound)
+    if hasattr(res, 'marginals') and res.marginals is not None:
+        if hasattr(res.marginals, 'ineqlin'):
+            duals = res.marginals.ineqlin
+        elif hasattr(res, 'ineqlin') and res.ineqlin is not None:
+            duals = res.ineqlin.marginals
+    elif hasattr(res, 'ineqlin') and res.ineqlin is not None:
+        duals = res.ineqlin.marginals
+        
+    # Compute gradient w.r.t centers using dual variables (Envelope Theorem)
+    grad = np.zeros_like(centers)
+    
+    # Pairwise distance constraints: r_i + r_j <= ||c_i - c_j||
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            lam = duals[idx]
+            if lam > 1e-9:
+                d = dists[i, j]
+                if d > 1e-9:
+                    vec = (centers[i] - centers[j]) / d
+                    grad[i] += lam * vec
+                    grad[j] -= lam * vec
+            idx += 1
+            
+    # Boundary constraints: r_i <= x_i, 1-x_i, y_i, 1-y_i
+    for i in range(n):
+        base = num_pairs + 4 * i
+        mu_L = duals[base]
+        mu_R = duals[base + 1]
+        mu_B = duals[base + 2]
+        mu_T = duals[base + 3]
+        grad[i, 0] += mu_L - mu_R
+        grad[i, 1] += mu_B - mu_T
+        
+    return radii, s_sum, grad
+
+def lbfgs_obj_grad(x_flat):
+    """Objective and gradient callback for L-BFGS-B."""
+    c = x_flat.reshape(N, 2)
+    # Keep centers slightly inside boundaries to ensure LP feasibility and stability
+    c = np.clip(c, 1e-5, 1.0 - 1e-5)
+    radii, s_sum, grad = solve_lp_and_grad(c)
+    if s_sum is None:
+        return 0.0, np.zeros_like(x_flat)
+    # We maximize sum of radii => minimize negative sum
+    return -s_sum, -grad.flatten()
+
+def generate_inits(rng):
+    """Generates diverse initial center configurations."""
+    inits = []
+    
+    # Hexagonal lattice patterns with varying row counts and densities
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 4, 6, 6, 5],
+        [7, 6, 6, 7], [6, 7, 7, 6], [5, 5, 6, 5, 5], [4, 5, 6, 5, 6]
+    ]
+    for pat in patterns:
+        for r_est in [0.095, 0.100, 0.105]:
+            c = []
+            y = r_est
+            for r_idx, cnt in enumerate(pat):
+                shift = r_est if r_idx % 2 == 1 else 0.0
+                x = r_est + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r_est
+                y += r_est * np.sqrt(3.0)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+            inits.append(c)
+            
+    # Force-directed repulsion starts
+    for s in range(10):
+        c = rng.uniform(0.2, 0.8, (N, 2))
+        for _ in range(800):
+            f = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i+1, N):
+                    d_vec = c[i] - c[j]
+                    d = np.linalg.norm(d_vec)
+                    if d < 0.2 and d > 1e-5:
+                        push = (0.2 - d) * 0.05
+                        f[i] += d_vec / d * push
+                        f[j] -= d_vec / d * push
+            c += f * 0.1
+            c = np.clip(c, 0.1, 0.9)
+        inits.append(c)
+        
+    # Uniform random starts
+    for _ in range(10):
+        inits.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    # Corner-biased starts (circles in corners can grow larger)
+    for _ in range(5):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        corners = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        for k in range(4):
+            c[k] = corners[k] + rng.normal(0, 0.02, 2)
+        inits.append(c)
+        
+    return inits
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_sum = -1.0
+    
+    inits = generate_inits(rng)
+    bounds = [(0.0, 1.0)] * (2 * N)
+    
+    # Phase 1: L-BFGS-B optimization from diverse starts
+    for c0 in inits:
+        try:
+            res = minimize(lbfgs_obj_grad, c0.flatten(), method='L-BFGS-B',
+                           jac=True, bounds=bounds,
+                           options={'maxiter': 3000, 'ftol': 1e-15, 'gtol': 1e-12})
+            s_val = -res.fun
+            if s_val > best_sum:
+                best_sum = s_val
+                best_c = res.x.reshape(N, 2).copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Basin-hopping perturbations to escape local minima
+    if best_c is not None:
+        for step in range(40):
+            noise = 0.015 * (0.9 ** (step / 10.0))
+            c_pert = best_c + rng.normal(0, noise, best_c.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            try:
+                res = minimize(lbfgs_obj_grad, c_pert.flatten(), method='L-BFGS-B',
+                               jac=True, bounds=bounds,
+                               options={'maxiter': 1500, 'ftol': 1e-15})
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_c = res.x.reshape(N, 2).copy()
+            except Exception:
+                pass
+                
+    # Final exact LP solve for radii
+    radii, final_sum, _ = solve_lp_and_grad(best_c)
+    if radii is not None and final_sum > best_sum:
+        best_sum = final_sum
+        
+    # Strict Numerical Repair to guarantee validation compliance
+    radii = radii.copy()
+    centers = best_c.copy()
+    for _ in range(200):
+        changed = False
+        # Fix pairwise overlaps
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        # Fix boundary violations
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            if r > max_r + 1e-12:
+                radii[i] = max_r
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    return centers, radii, final_sum

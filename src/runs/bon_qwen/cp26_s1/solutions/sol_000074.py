@@ -1,111 +1,206 @@
 # sol_000074 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state dfef56bb) state=0aa3c968 sum of radii=2.577772 correctness=1.0
+# generation=0 parent=seed (state ed1177e6) state=8974d275 sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 
-def compute_penalty(centers, radii, alpha):
-    """Compute boundary and overlap penalties for the packing configuration."""
-    n = len(radii)
-    pen = 0.0
-    
-    # Boundary penalties: circles must stay within [0, 1]
-    pen += alpha * np.sum(np.maximum(0, radii - centers[:, 0])**2)
-    pen += alpha * np.sum(np.maximum(0, radii - (1 - centers[:, 0]))**2)
-    pen += alpha * np.sum(np.maximum(0, radii - centers[:, 1])**2)
-    pen += alpha * np.sum(np.maximum(0, radii - (1 - centers[:, 1]))**2)
-    
-    # Overlap penalties: circles must not intersect
-    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diff**2, axis=2))
-    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
-    
-    overlap = np.maximum(0, r_sum - dists)
-    # Only count each pair once (upper triangle)
-    overlap = np.triu(overlap, k=1)
-    pen += alpha * np.sum(overlap**2)
-    
-    return pen
-
-def objective_function(vars, n, alpha):
-    """Objective to minimize: -sum(radii) + penalty."""
-    centers = vars[:2*n].reshape(n, 2)
-    radii = vars[2*n:]
-    return -np.sum(radii) + compute_penalty(centers, radii, alpha)
-
-def run_packing():
-    """Pack 26 circles in a unit square to maximize the sum of radii."""
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     n = 26
-    np.random.seed(42)  # Deterministic initialization
-    
-    # 1. Hexagonal lattice initialization for dense starting configuration
     centers = np.zeros((n, 2))
-    radii = np.full(n, 0.04)
     
-    idx = 0
-    row, col = 0, 0
-    spacing = 0.22
-    while idx < n:
-        x = col * spacing + (0.5 * spacing if row % 2 == 1 else 0) + spacing/2
-        y = row * spacing * np.sqrt(3)/2 + spacing/2
-        centers[idx] = [x, y]
-        idx += 1
-        col += 1
-        if col > 5:
-            col = 0
-            row += 1
-            
-    # Scale to fit comfortably inside the square and add small jitter
-    cmin, cmax = centers.min(axis=0), centers.max(axis=0)
-    centers = (centers - cmin) / (cmax - cmin) * 0.7 + 0.15
-    centers += np.random.uniform(-0.01, 0.01, centers.shape)
+    # 1. Initialize on a Hexagonal Lattice
+    # Hexagonal packing is denser. We try to fit rows.
+    # Estimation: r ~ 0.1. Vertical spacing ~ sqrt(3)*r ~ 0.173.
+    # Height 1.0 fits about 6-7 rows.
+    # We distribute points in a staggered grid pattern.
     
-    # Flatten parameters for optimizer: [x1, y1, ..., x26, y26, r1, ..., r26]
-    x0 = np.concatenate([centers.flatten(), radii])
-    bounds = [(0.0, 1.0)]*(2*n) + [(0.0, 0.5)]*n
+    # Heuristic initialization:
+    # Try to place points in a grid that approximates hexagonal packing.
+    # Number of rows approx sqrt(N * sqrt(3)) ~ 6-7.
+    num_rows = 7
+    row_counts = [4, 5, 4, 5, 4, 5, 4] # Sum = 27? 4+5+4+5+4+5+4 = 31. Too many.
+    # Let's try fewer rows or fewer per row.
+    # N=26. 
+    # Pattern 5, 4, 5, 4, 5, 4, 3? Sum = 30.
+    # Pattern 5, 4, 5, 4, 5, 3? Sum = 26. (6 rows)
     
-    # 2. Homotopy continuation: gradually increase penalty weight
-    alphas = [100.0, 1000.0, 5000.0, 20000.0]
-    curr_vars = x0.copy()
+    rows_pattern = [5, 4, 5, 4, 5, 3]
+    current_idx = 0
     
-    for alpha in alphas:
-        res = minimize(objective_function, curr_vars, args=(n, alpha), method='L-BFGS-B', 
-                       bounds=bounds, options={'maxiter': 5000, 'ftol': 1e-12, 'gtol': 1e-8})
-        curr_vars = res.x
+    # Vertical spacing estimate
+    y_spacing = 1.0 / (len(rows_pattern) + 1) * 1.5 # Rough guess to spread them
+    
+    # Better initialization: Random or structured?
+    # Let's use a structured hex-like grid.
+    # We will refine this with optimization anyway.
+    
+    # Let's place them in a distorted grid first
+    # 6 rows
+    y_coords = np.linspace(0.1, 0.9, len(rows_pattern))
+    
+    k = 0
+    for i, count in enumerate(rows_pattern):
+        y = y_coords[i]
+        # x coordinates centered
+        # width available ~ 0.8. 
+        # spacing ~ 0.8 / (count + 1) ?
+        # Just spread them evenly
+        x_coords = np.linspace(0.1, 0.9, count)
         
-    final_centers = curr_vars[:2*n].reshape(n, 2)
-    final_radii = curr_vars[2*n:]
+        # Stagger odd rows?
+        if i % 2 == 1:
+            x_coords = x_coords + (0.9 - 0.1) / (2 * count)
+        
+        for j in range(count):
+            if k < n:
+                centers[k] = [x_coords[j], y]
+                k += 1
+                
+    # Fill remaining if any (should be exact 26)
+    if k < n:
+        # Fallback random placement for any leftovers
+        np.random.seed(42)
+        while k < n:
+            centers[k] = [np.random.uniform(0.05, 0.95), np.random.uniform(0.05, 0.95)]
+            k += 1
+
+    # 2. Optimization Loop (Repulsive Forces)
+    # We want to maximize the minimum distance between circles and boundaries.
+    # This is equivalent to minimizing energy E = sum(1/dist^2) + sum(1/dist_wall^2)
     
-    # 3. Deterministic constraint satisfaction post-processing
-    for _ in range(30):
-        changed = False
-        # Enforce boundary constraints
+    # Initial step size
+    step_size = 0.05
+    decay = 0.995
+    max_iter = 2000
+    
+    # To avoid division by zero, add small epsilon to distances
+    eps = 1e-6
+    
+    for _ in range(max_iter):
+        forces = np.zeros_like(centers)
+        
+        # Inter-circle repulsion
+        # O(N^2) is fine for N=26
         for i in range(n):
-            x, y = final_centers[i]
-            r = final_radii[i]
-            for b in [x, 1-x, y, 1-y]:
-                if r > b - 1e-9:
-                    final_radii[i] = max(0, b - 1e-9)
-                    changed = True
-                    
-        # Enforce non-overlap constraints
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                if dist < eps:
+                    dist = eps
+                    # Random nudge
+                    diff = np.random.rand(2) - 0.5
+                    dist = np.linalg.norm(diff)
+                
+                # Force magnitude ~ 1/dist^2 (Coulombic)
+                # Direction: push apart
+                force_mag = 1.0 / (dist * dist)
+                force_vec = (diff / dist) * force_mag
+                
+                forces[i] += force_vec
+                forces[j] -= force_vec
+        
+        # Boundary repulsion
+        # Push away from x=0, x=1, y=0, y=1
         for i in range(n):
-            for j in range(i+1, n):
-                dist = np.hypot(final_centers[i,0]-final_centers[j,0], 
-                                final_centers[i,1]-final_centers[j,1])
-                if dist < final_radii[i] + final_radii[j] - 1e-9:
-                    excess = final_radii[i] + final_radii[j] - dist
-                    final_radii[i] -= excess/2
-                    final_radii[j] -= excess/2
-                    changed = True
-                    
-        if not changed:
-            break
+            x, y = centers[i]
             
-    # Ensure strictly positive radii
-    final_radii = np.maximum(final_radii, 1e-9)
+            # Distance to walls
+            dx_left = x
+            dx_right = 1.0 - x
+            dy_bottom = y
+            dy_top = 1.0 - y
+            
+            # Force from left wall (pushes right)
+            if dx_left < 0.5: # Only if close? No, 1/x^2 works everywhere but strong near 0
+                # Actually 1/x^2 is strong near 0, weak far. 
+                # We want to keep them inside. 
+                # Potential 1/x pushes away from 0.
+                force_x = 1.0 / (dx_left * dx_left + eps)
+            else:
+                force_x = 0 # Already safe from left? 
+                # But we want to balance. 
+                # Better: Force = 1/d^2 always, but directed outwards.
+            
+            # Refined Boundary Force:
+            # F = 1/d^2 directed away from wall.
+            
+            # Left wall
+            if x < 0.5:
+                forces[i, 0] += 1.0 / (x * x + eps)
+            # Right wall
+            if x > 0.5:
+                forces[i, 0] -= 1.0 / ((1-x)*(1-x) + eps)
+            # Bottom wall
+            if y < 0.5:
+                forces[i, 1] += 1.0 / (y * y + eps)
+            # Top wall
+            if y > 0.5:
+                forces[i, 1] -= 1.0 / ((1-y)*(1-y) + eps)
+
+        # Update positions
+        centers += forces * step_size
+        
+        # Clamp to bounds (safety)
+        centers = np.clip(centers, 1e-4, 1.0 - 1e-4)
+        
+        step_size *= decay
+        
+        if step_size < 1e-7:
+            break
+
+    # 3. Calculate Radius
+    # r is limited by min distance between centers / 2 and min distance to wall
+    min_dist = 1.0
     
-    return final_centers, final_radii, np.sum(final_radii)
+    # Center-to-center
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            if d < min_dist:
+                min_dist = d
+    
+    r = min_dist / 2.0
+    
+    # Center-to-wall
+    for i in range(n):
+        x, y = centers[i]
+        dist_wall = min(x, 1-x, y, 1-y)
+        if dist_wall < r:
+            r = dist_wall
+            
+    # 4. Adjust Centers to maximize r if possible
+    # If r is determined by wall distance, we might be able to shift centers inwards.
+    # However, the force simulation should have balanced this.
+    # Just to be safe, if r is very small, we might have converged to a bad local min.
+    # But with repulsive forces, it usually finds a good spread.
+    
+    # Scale centers to fit radius r exactly against the tightest constraint?
+    # Actually, if we just output r calculated from positions, it is valid.
+    # But we might be able to increase r slightly by shifting?
+    # The simulation pushes them apart, so they are likely touching.
+    
+    # Let's ensure r is not larger than wall distance
+    # Recompute r strictly
+    r_calc = 1.0
+    # Check pairs
+    dists = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            dists.append(np.linalg.norm(centers[i] - centers[j]))
+    r_calc = min(r_calc, min(dists)/2.0) if dists else 1.0
+    
+    # Check walls
+    for i in range(n):
+        dist_w = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+        r_calc = min(r_calc, dist_w)
+        
+    # It's possible the simulation pushed them to boundaries where r is limited by wall.
+    # If so, r_calc is correct.
+    
+    radii = np.full(n, r_calc)
+    
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

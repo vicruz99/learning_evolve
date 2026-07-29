@@ -1,0 +1,187 @@
+
+
+<strategy>
+The current parameterization `x = r + u*(1-2r)`, `y = r + v*(1-2r)` elegantly handles boundary constraints by mapping `u, v ∈ [0,1]` to the valid region for each circle's center. This reduces the constraint set to only pairwise non-overlap conditions, which significantly improves SLSQP performance.
+
+To push the sum of radii from ~2.625 to >2.636, we need:
+1. **More Diverse High-Quality Initializations**: Hexagonal and grid patterns are good, but adding controlled random perturbations and scaling radii to be strictly feasible initially helps SLSQP start from valid regions.
+2. **Extended Optimization Budgets**: Increase `maxiter` and tighten `ftol` to allow deeper convergence into narrow feasible valleys.
+3. **Multi-Stage Refinement**: After finding the best global candidate, perform a "shake-and-optimize" phase where the best solution is slightly perturbed and re-optimized multiple times. This escapes shallow local minima that trap the optimizer near the boundary of feasibility.
+4. **Precomputed Indices**: Extract triangular indices once to speed up constraint evaluation during the thousands of iterations.
+5. **Robust Clipping**: Ensure all intermediate variables stay strictly within bounds to prevent solver divergence.
+
+The improved implementation incorporates these strategies while maintaining the elegant boundary-free parameterization.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute indices for pairwise constraints to speed up evaluation
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(vars_vec):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Constraints: pairwise non-overlap.
+    Boundary constraints are handled automatically by the parameterization.
+    """
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is strictly inside [0,1]^2
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum_sq = (r[:, np.newaxis] + r[np.newaxis, :])**2
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[I_IDX, J_IDX] - r_sum_sq[I_IDX, J_IDX]
+
+def get_init_vars(n, seed, pattern):
+    """Generates a strictly feasible initial configuration."""
+    np.random.seed(seed)
+    centers = np.zeros((n, 2))
+    
+    if pattern == 'hex':
+        r_est = 0.09
+        y_pos = r_est
+        row = 0
+        idx = 0
+        while y_pos <= 1.0 - r_est and idx < n:
+            x_pos = r_est + (row % 2) * r_est
+            while x_pos <= 1.0 - r_est and idx < n:
+                centers[idx] = [x_pos, y_pos]
+                idx += 1
+                x_pos += 2.0 * r_est
+            y_pos += np.sqrt(3.0) * r_est
+            row += 1
+    elif pattern == 'grid':
+        idx = 0
+        for i in range(5):
+            for j in range(6):
+                if idx < n:
+                    centers[idx] = [0.08 + j*0.17, 0.08 + i*0.17]
+                    idx += 1
+    else:  # rand
+        centers = np.random.rand(n, 2) * 0.8 + 0.1
+        
+    # Add controlled jitter
+    centers += np.random.uniform(-0.025, 0.025, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    # Compute strictly feasible radii based on distances
+    r = np.zeros(n)
+    for i in range(n):
+        d_wall = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        d_min = 1.0
+        for j in range(n):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i]-centers[j])**2))
+                if d < d_min:
+                    d_min = d
+        # Scale down to ensure strict feasibility for SLSQP start
+        r[i] = 0.38 * min(d_wall, d_min/2.0)
+        
+    r = np.maximum(r, 1e-4)
+    r = np.minimum(r, 0.49)  # Keep denominator positive
+    
+    # Convert to normalized u, v coordinates
+    denom = 1.0 - 2.0 * r
+    u = (centers[:, 0] - r) / denom
+    v = (centers[:, 1] - r) / denom
+    u = np.clip(u, 0.0, 1.0)
+    v = np.clip(v, 0.0, 1.0)
+    
+    vars0 = np.empty(n * 3)
+    vars0[0::3] = r
+    vars0[1::3] = u
+    vars0[2::3] = v
+    return vars0
+
+def run_packing():
+    n = N
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_vars = None
+    best_sum = -np.inf
+    
+    # Phase 1: Broad search from structured and randomized initializations
+    patterns = ['hex', 'grid', 'rand']
+    for seed in range(35):
+        pat = patterns[seed % 3]
+        x0 = get_init_vars(n, seed, pat)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14})
+            # Verify constraint satisfaction within numerical tolerance
+            if np.min(constraint_func(res.x)) >= -1e-7:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local refinement via iterative perturbation ("shake & optimize")
+    if best_vars is not None:
+        for k in range(25):
+            # Create a slightly perturbed copy
+            x0_pert = best_vars.copy()
+            x0_pert += np.random.randn(len(x0_pert)) * 0.0025
+            
+            # Strictly enforce bounds to prevent solver issues
+            x0_pert[0::3] = np.clip(x0_pert[0::3], 1e-6, 0.499)
+            x0_pert[1::3] = np.clip(x0_pert[1::3], 0.0, 1.0)
+            x0_pert[2::3] = np.clip(x0_pert[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, x0_pert, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+                if np.min(constraint_func(res.x)) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # Final high-precision polish on the absolute best found
+    if best_vars is not None:
+        try:
+            res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                                 constraints=cons, options={'maxiter': 10000, 'ftol': 1e-15})
+            if np.min(constraint_func(res_final.x)) >= -1e-7 and -res_final.fun > best_sum:
+                best_vars = res_final.x
+        except Exception:
+            pass
+            
+    # Fallback if optimization completely fails (highly unlikely)
+    if best_vars is None:
+        best_vars = get_init_vars(n, 0, 'hex')
+        
+    # Reconstruct centers from optimized parameters
+    r_opt = best_vars[0::3]
+    u_opt = best_vars[1::3]
+    v_opt = best_vars[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    
+    # Ensure non-negative radii against any numerical drift
+    r_opt = np.maximum(r_opt, 0.0)
+    
+    return centers, r_opt, float(np.sum(r_opt))
+```

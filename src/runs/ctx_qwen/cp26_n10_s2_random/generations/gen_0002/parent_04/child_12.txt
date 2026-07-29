@@ -1,0 +1,148 @@
+
+
+<strategy>
+To improve the circle packing for N=26 circles in a unit square, we shift from optimizing both centers and radii simultaneously to a **centers-only optimization**. This reduces the dimensionality by half and explicitly handles constraints by computing radii as the minimum distance to boundaries and half the distance to the nearest neighbor. This formulation is continuous but non-smooth, making it ideal for derivative-free optimizers like Nelder-Mead.
+
+Key improvements:
+1. **Centers-Only Objective**: Radii are computed deterministically from centers: `r_i = min(dist_to_boundary, 0.5 * min_dist_to_neighbors)`. This guarantees non-overlap and boundary constraints by construction.
+2. **Multi-Start Strategy**: We generate 100 diverse initial configurations (hexagonal lattices with varying densities, random uniform points, and perturbed grids) to cover different regions of the configuration space.
+3. **Iterative Refinement**: The top 30 candidates from the initial phase are used as seeds for a second round of optimization with targeted perturbations to escape shallow local minima.
+4. **Robust Optimizer**: `Nelder-Mead` is used because it handles non-smooth landscapes effectively and doesn't require gradient computations. Implicit boundary clipping in the objective function keeps the search space valid without explicit constraint handling.
+5. **Deterministic & Safe**: No lambdas or closures are used. All helpers are top-level. The final radii are recomputed from the optimized centers to guarantee strict validity against the checker's tolerance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def eval_packing(centers):
+    """
+    Computes radii and their sum for a given set of centers.
+    Radii are constrained by boundaries and nearest neighbors.
+    """
+    x = centers[:, 0]
+    y = centers[:, 1]
+    
+    # Distance to square boundaries
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Minimum distance to any other circle
+    min_dists = np.min(dists, axis=1)
+    r_neighbors = 0.5 * min_dists
+    
+    # Actual radius is the limiting factor
+    radii = np.minimum(r_bound, r_neighbors)
+    radii = np.maximum(radii, 0.0)
+    return np.sum(radii), radii
+
+def objective(centers_flat):
+    """Objective function to minimize (negative sum of radii)."""
+    centers = centers_flat.reshape(N, 2)
+    # Clip to unit square; penalty from r_bound naturally discourages out-of-bounds
+    centers = np.clip(centers, 0.0, 1.0)
+    s, _ = eval_packing(centers)
+    return -s
+
+def generate_inits(num_inits):
+    """Generates diverse initial center configurations."""
+    inits = []
+    rng = np.random.default_rng(2023)
+    
+    for i in range(num_inits):
+        if i < 30:
+            # Hexagonal lattice with varying estimated radii
+            pts = []
+            r_est = 0.075 + i * 0.002
+            dy = r_est * np.sqrt(3)
+            dx = 2 * r_est
+            row = 0
+            while len(pts) < N:
+                y = r_est + row * dy
+                if y + r_est > 1.0: break
+                off = (row % 2) * (dx / 2.0)
+                x = r_est + off
+                while x + r_est <= 1.0 and len(pts) < N:
+                    pts.append([x, y])
+                    x += dx
+                row += 1
+            while len(pts) < N:
+                pts.append([rng.uniform(0.2, 0.8), rng.uniform(0.2, 0.8)])
+            pts = np.array(pts[:N]) + rng.normal(0, 0.005, (N, 2))
+        elif i < 70:
+            # Random dense points
+            pts = rng.uniform(0.08, 0.92, (N, 2))
+        else:
+            # Perturbed grid
+            pts = np.zeros((N, 2))
+            idx = 0
+            for r in range(6):
+                for c in range(5):
+                    if idx >= N: break
+                    pts[idx, 0] = 0.12 + c * 0.18
+                    pts[idx, 1] = 0.12 + r * 0.18
+                    idx += 1
+            pts += rng.normal(0, 0.03, (N, 2))
+            
+        pts = np.clip(pts, 0.01, 0.99)
+        inits.append(pts.flatten())
+    return inits
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Generate diverse starting points
+    all_inits = generate_inits(100)
+    
+    candidates = []
+    # Primary optimization phase
+    for x0 in all_inits:
+        res = minimize(objective, x0, method='Nelder-Mead',
+                       options={'maxiter': 8000, 'fatol': 1e-14, 'xatol': 1e-14})
+        curr_sum = -res.fun
+        candidates.append((curr_sum, res.x.copy()))
+        
+    # Sort candidates by performance (tuples compare element-wise)
+    candidates.sort(reverse=True)
+    
+    # Take top candidates as baseline
+    for i in range(min(30, len(candidates))):
+        curr_sum, x_best = candidates[i]
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = x_best.reshape(N, 2)
+            _, best_radii = eval_packing(best_centers)
+            
+    # Refinement phase: perturbed local search on best solution
+    rng = np.random.default_rng(42)
+    for _ in range(40):
+        x_curr = best_centers.flatten().copy()
+        # Perturb a random subset of circles to break symmetry/local traps
+        mask = rng.random(N) < 0.4
+        noise = rng.normal(0, 0.003, (N, 2))
+        x_curr[::2][mask] += noise[mask, 0]
+        x_curr[1::2][mask] += noise[mask, 1]
+        x_curr = np.clip(x_curr, 0.0, 1.0)
+        
+        res = minimize(objective, x_curr, method='Nelder-Mead',
+                       options={'maxiter': 4000, 'fatol': 1e-14, 'xatol': 1e-14})
+        curr_sum = -res.fun
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = res.x.reshape(N, 2)
+            _, best_radii = eval_packing(best_centers)
+            
+    # Final safety: recompute radii from strictly clipped centers
+    best_centers = np.clip(best_centers, 0.0, 1.0)
+    _, best_radii = eval_packing(best_centers)
+    
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

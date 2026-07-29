@@ -1,300 +1,176 @@
 
 
 <strategy>
-To pack 26 circles in a unit square maximizing the sum of radii, we use a physics-based optimization approach (gradient ascent on the sum of radii).
-
-1.  **Initialization**: Place 26 centers in a hexagonal-like grid pattern to provide a well-distributed starting configuration.
-2.  **Radius Calculation**: For any configuration of centers, the maximum possible radius for each circle is determined by its distance to the square boundaries and half the distance to its nearest neighbor. This ensures no overlaps or boundary violations.
-3.  **Gradient Ascent**: We compute the gradient of the sum of radii with respect to each center's position.
-    *   If a circle is limited by a wall, the gradient points away from that wall.
-    *   If limited by a neighbor, the gradient points away from that neighbor (repulsion).
-    *   If multiple constraints are active (e.g., equidistant to two neighbors), we average their gradients.
-4.  **Iterative Refinement**: We move centers along these gradients with a decaying step size. This allows circles to "push" each other apart into gaps, increasing the available space (and thus radii) for the entire system.
-5.  **Final Validation**: After optimization, we recompute the exact maximum radii and return the valid packing.
+To maximize the sum of radii for 26 circles in a unit square, we treat the problem as a nested optimization. For any fixed configuration of circle centers, the maximum possible radii can be determined by solving a Linear Programming (LP) problem. The LP maximizes $\sum r_i$ subject to boundary constraints ($r_i \le x_i, 1-x_i, y_i, 1-y_i$) and non-overlap constraints ($r_i + r_j \le \|c_i - c_j\|$). We then use Differential Evolution (DE), a robust global optimizer, to search the 52-dimensional space of circle centers to maximize the optimal value of this LP. To ensure a high-quality result, we initialize the DE with multiple diverse starting populations, including a perturbed grid and a hexagonal lattice, and utilize the 'highs' solver for fast LP resolution.
 </strategy>
 
 ```python
 import numpy as np
-import math
-
-def validate_packing(centers, radii):
-    """
-    Validate that circles don't overlap and are inside the unit square
-    """
-    n = centers.shape[0]
-    if np.isnan(centers).any() or np.isnan(radii).any():
-        return False
-    
-    for i in range(n):
-        if radii[i] < 0:
-            return False
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
-            return False
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-12:
-                return False
-    return True
+from scipy.optimize import linprog, differential_evolution
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    n_circles = 26
-    
-    # 1. Initialize centers in a hexagonal grid pattern
-    centers = []
-    # We want to fit 26 circles. 
-    # A rough hexagonal layout: rows of 5, 6, 5, 6, 4 circles? 
-    # Or just a dense grid and we let the optimizer sort it out.
-    # Let's try a 6x5 grid (30 points) and pick 26 well-spaced ones.
-    # Actually, a specific pattern might help convergence.
-    # Let's generate points on a hex lattice scaled to fit [0,1]^2.
-    
-    # Approximate density: 26 circles in area 1.
-    # Let's try to place them in 5 rows.
-    rows = 5
-    # Distribution of circles per row to sum to 26: 5, 6, 5, 6, 4
-    cols_per_row = [5, 6, 5, 6, 4]
-    
-    # Vertical spacing for 5 rows
-    # We want to leave margin.
-    # Let's map indices to coordinates
-    y_coords = np.linspace(0.1, 0.9, rows) # Just a starting spread
-    
-    for r_idx, row_y in enumerate(y_coords):
-        count = cols_per_row[r_idx]
-        # Horizontal spacing
-        # For hex packing, odd rows are offset
-        offset = 0.1 if r_idx % 2 == 1 else 0.0
-        # We want to distribute 'count' circles in [offset, 1-offset] roughly
-        # Or just uniform distribution [0,1]
+    n = 26
+
+    def get_max_sum_radii(centers_flat: np.ndarray) -> tuple[float, np.ndarray]:
+        """
+        For a given set of centers, solve the LP to find maximum radii.
+        Returns (sum_radii, radii).
+        """
+        centers = centers_flat.reshape(n, 2)
         
-        # Let's try uniform distribution for x, shifted
-        # To maximize space, centers should be somewhat uniform.
-        # Using linspace
-        if count > 0:
-            x_coords = np.linspace(0.1 + offset, 0.9 + offset, count)
-            # Ensure within bounds
-            x_coords = np.clip(x_coords, 0, 1)
-            for x in x_coords:
-                centers.append([x, row_y])
-                
-    centers = np.array(centers[:n_circles])
-    
-    # If we have fewer or more, adjust. 
-    # The logic above generates 5+6+5+6+4 = 26 exactly.
-    
-    # 2. Optimization Loop (Gradient Ascent on Sum of Radii)
-    # We treat the centers as variables and move them to maximize the sum of valid radii.
-    
-    step_size = 0.02
-    decay = 0.995
-    
-    # Run for a fixed number of iterations
-    for iteration in range(3000):
-        gradients = np.zeros((n_circles, 2))
-        current_radii = np.zeros(n_circles)
+        # Maximize sum(r_i) is equivalent to minimizing -sum(r_i)
+        c_obj = -np.ones(n)
         
-        # Compute radii and gradients for each circle
-        for i in range(n_circles):
-            c_i = centers[i]
-            x, y = c_i
+        A_ub = []
+        b_ub = []
+        
+        # Boundary constraints: r_i <= dist to boundaries
+        # x, y, 1-x, 1-y
+        for i in range(n):
+            x, y = centers[i]
+            row = np.zeros(n)
+            row[i] = 1.0
             
-            # Calculate distances to boundaries
-            d_left = x
-            d_right = 1.0 - x
-            d_bottom = y
-            d_top = 1.0 - y
+            # r_i <= x
+            A_ub.append(row)
+            b_ub.append(x)
+            # r_i <= 1 - x
+            A_ub.append(row)
+            b_ub.append(1.0 - x)
+            # r_i <= y
+            A_ub.append(row)
+            b_ub.append(y)
+            # r_i <= 1 - y
+            A_ub.append(row)
+            b_ub.append(1.0 - y)
             
-            # Calculate distances to other centers
-            # We need min distance to any other circle j
-            # dist_ij / 2 is the constraint
-            
-            min_dist = np.inf
-            active_grads = []
-            
-            # Check walls
-            # Gradient for radius wrt position is direction away from wall
-            if d_left < min_dist:
-                min_dist = d_left
-                active_grads = [(1.0, 0.0)]
-            elif abs(d_left - min_dist) < 1e-9:
-                active_grads.append((1.0, 0.0))
+        # Pairwise constraints: r_i + r_j <= distance(i, j)
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
                 
-            if d_right < min_dist:
-                min_dist = d_right
-                active_grads = [(-1.0, 0.0)]
-            elif abs(d_right - min_dist) < 1e-9:
-                active_grads.append((-1.0, 0.0))
-                
-            if d_bottom < min_dist:
-                min_dist = d_bottom
-                active_grads = [(0.0, 1.0)]
-            elif abs(d_bottom - min_dist) < 1e-9:
-                active_grads.append((0.0, 1.0))
-                
-            if d_top < min_dist:
-                min_dist = d_top
-                active_grads = [(0.0, -1.0)]
-            elif abs(d_top - min_dist) < 1e-9:
-                active_grads.append((0.0, -1.0))
-            
-            # Check neighbors
-            # Vectorized distance calculation could be faster, but N=26 is small
-            # We need to find neighbors that are closest
-            diffs = centers - c_i
-            dists = np.linalg.norm(diffs, axis=1)
-            dists[i] = np.inf # Ignore self
-            
-            # We are looking for min(dists[j] / 2)
-            # But we also need to compare with wall distances
-            # So we check if any neighbor is closer than current min_dist * 2
-            # Actually min_dist is the radius limit.
-            # Constraint is r <= dist_ij / 2 => 2r <= dist_ij.
-            # If min_dist (radius) is limited by neighbor j, then min_dist = dist_ij / 2.
-            
-            # Let's find indices of neighbors that are "close"
-            # A neighbor j limits radius i if dist_ij / 2 <= min_dist
-            # Actually, strictly, we want the minimum over all constraints.
-            # So if dist_ij / 2 < min_dist, then neighbor j is the new limiting factor.
-            
-            half_dists = dists / 2.0
-            
-            # Find neighbors that are limiting
-            # Since we already checked walls, min_dist holds the current min radius from walls.
-            # If a neighbor is closer, it becomes the limit.
-            
-            # Identify all neighbors that are effectively at the minimum distance
-            # Tolerance for "active" constraints
-            tol = 1e-7
-            
-            # Update min_dist with neighbors
-            # We iterate to find the true min
-            # Optimization: only check neighbors if dists[i] < 2 * min_dist ?
-            # No, just compute all.
-            
-            # To avoid O(N^2) inside loop too much, but N=26 is fine.
-            # Let's find the index of the closest neighbor
-            # But there might be multiple closest neighbors.
-            
-            # Find min half_dist
-            min_half_dist = np.min(half_dists)
-            
-            if min_half_dist < min_dist:
-                min_dist = min_half_dist
-                active_grads = [] # Reset, walls are no longer limiting
-                
-            elif abs(min_half_dist - min_dist) < tol:
-                # Tie between walls and neighbors or neighbors
-                pass 
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(dist)
+        
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        bounds = [(0, 1.0)] * n
+        
+        # Use 'highs' solver for speed
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                return -res.fun, res.x
             else:
-                # Walls are strictly limiting, neighbors don't add gradient (derivative 0)
-                # Wait, if neighbor is further, derivative of r w.r.t c_i due to neighbor is 0.
-                # So we only care about active constraints.
-                pass
-            
-            # If neighbors are limiting (or tied), add their gradients
-            if min_half_dist <= min_dist + tol:
-                # Find all neighbors that are at the min distance
-                limiting_indices = np.where(half_dists <= min_dist + tol)[0]
-                
-                for j in limiting_indices:
-                    if j == i: continue
-                    # Gradient of r_i w.r.t c_i due to neighbor j
-                    # r_i = 0.5 * ||c_i - c_j||
-                    # grad = 0.5 * (c_i - c_j) / ||c_i - c_j||
-                    diff = c_i - centers[j]
-                    d = np.linalg.norm(diff)
-                    if d > 1e-9:
-                        grad = 0.5 * diff / d
-                        active_grads.append(grad)
-            
-            current_radii[i] = max(0.0, min_dist)
-            
-            # Compute average gradient for active constraints
-            if active_grads:
-                avg_grad = np.mean(active_grads, axis=0)
-                # Normalize? 
-                # The magnitude of wall gradients is 1.
-                # The magnitude of neighbor gradients is 0.5.
-                # To balance forces, maybe scale neighbor grads by 2? 
-                # Or just keep as is. 
-                # Actually, wall constraint r = x, dr/dx = 1.
-                # Neighbor constraint r = d/2, dr/dx = 0.5 * cos(theta). Max 0.5.
-                # So walls are "stronger" in gradient terms.
-                # We might want to scale neighbor gradients by 2 to balance sensitivity.
-                # Let's try scaling neighbor gradients by 2.
-                # But active_grads might contain mixed types.
-                # Let's distinguish.
-                
-                scaled_grads = []
-                for g in active_grads:
-                    # Heuristic: if gradient is exactly (1,0), (-1,0), (0,1), (0,-1), it's a wall.
-                    # Check if it's a unit vector aligned with axes.
-                    is_wall = False
-                    if abs(g[0]) > 0.9 or abs(g[1]) > 0.9:
-                         if abs(g[0]) + abs(g[1]) == 1.0:
-                             is_wall = True
-                    
-                    # Better check: check original logic? 
-                    # We can't easily tag them here.
-                    # But neighbor gradients have magnitude 0.5. Wall gradients have magnitude 1.
-                    mag = np.linalg.norm(g)
-                    if mag < 0.9: # Likely neighbor
-                        scaled_grads.append(g * 2.0)
-                    else:
-                        scaled_grads.append(g)
-                
-                gradients[i] = np.mean(scaled_grads, axis=0)
-            else:
-                gradients[i] = np.array([0.0, 0.0])
+                # Fallback or error handling
+                return 0.0, np.zeros(n)
+        except Exception:
+            return 0.0, np.zeros(n)
 
-        # Update centers
-        # Gradient ascent: move in direction of gradient
-        centers += step_size * gradients
-        
-        # Clip to bounds
-        centers = np.clip(centers, 0.0, 1.0)
-        
-        # Decay step size
-        step_size *= decay
-        
-        # Add small jitter to escape local minima if stuck?
-        # Not necessary if step size decay is good.
+    def objective(centers_flat: np.ndarray) -> float:
+        s, _ = get_max_sum_radii(centers_flat)
+        # DE minimizes, so we return negative sum
+        return -s
 
-    # 3. Final Radius Computation
-    # Recompute radii strictly to ensure validity
-    final_radii = np.zeros(n_circles)
-    for i in range(n_circles):
-        c_i = centers[i]
-        x, y = c_i
-        
-        # Walls
-        r = min(x, 1-x, y, 1-y)
-        
-        # Neighbors
-        diffs = centers - c_i
-        dists = np.linalg.norm(diffs, axis=1)
-        dists[i] = np.inf
-        min_d = np.min(dists)
-        r = min(r, min_d / 2.0)
-        
-        final_radii[i] = r
-
-    sum_radii = np.sum(final_radii)
+    bounds_centers = [(0, 1)] * (2 * n)
     
-    # Final validation check (debug)
-    # if not validate_packing(centers, final_radii):
-    #     raise Exception("Packing invalid")
+    # Generate diverse initial populations
+    # 1. Random
+    pop1 = np.random.uniform(0, 1, (10, 2 * n))
+    
+    # 2. Grid-like structure (5x5 + 1) perturbed
+    grid_pop = []
+    base_coords = [0.1, 0.3, 0.5, 0.7, 0.9]
+    points = []
+    for x in base_coords:
+        for y in base_coords:
+            points.append([x, y])
+    # Add 26th point in a gap
+    points.append([0.2, 0.2])
+    pts_arr = np.array(points).flatten()
+    
+    for _ in range(5):
+        noise = np.random.uniform(-0.05, 0.05, 2 * n)
+        perturbed = np.clip(pts_arr + noise, 0, 1)
+        grid_pop.append(perturbed)
+    pop2 = np.array(grid_pop)
+    
+    # 3. Hexagonal-like structure
+    hex_pop = []
+    pts_hex = []
+    y_row = 0.1
+    while y_row < 0.9:
+        x_col = 0.1
+        row_points = []
+        while x_col < 0.9:
+            pts_hex.append([x_col, y_row])
+            x_col += 0.2
+        y_row += 0.1732 # sqrt(3)/2 * 0.2
+    # Fill up to 26
+    while len(pts_hex) < 26:
+        pts_hex.append([0.5, 0.5])
+    pts_hex = np.array(pts_hex[:26]).flatten()
+    
+    for _ in range(5):
+        noise = np.random.uniform(-0.05, 0.05, 2 * n)
+        perturbed = np.clip(pts_hex + noise, 0, 1)
+        hex_pop.append(perturbed)
+    pop3 = np.array(hex_pop)
+    
+    # Combine populations
+    all_pops = np.vstack([pop1, pop2, pop3])
+    
+    # Run Differential Evolution
+    result = differential_evolution(
+        objective, 
+        bounds_centers, 
+        seed=42, 
+        maxiter=300, 
+        popsize=all_pops, 
+        tol=1e-8, 
+        mutation=(0.5, 1.5),
+        recombination=0.7,
+        polish=False # Manual refinement if needed, but DE with polish can be slow
+    )
+    
+    best_centers = result.x.reshape(n, 2)
+    
+    # Get final radii for the best centers
+    _, radii = get_max_sum_radii(best_centers)
+    sum_radii = np.sum(radii)
+    
+    # Optional: Run a quick local refinement (Nelder-Mead) if time permits, 
+    # but for 52D it might be risky. DE with polish is usually sufficient.
+    # Given the complexity, we rely on the robust DE result.
+    
+    return best_centers, radii, sum_radii
 
-    return centers, final_radii, sum_radii
-
-# Run the function to verify
 if __name__ == "__main__":
-    c, r, s = run_packing()
-    print(f"Sum of radii: {s}")
-    # print(centers)
-    # print(radii)
+    centers, radii, total_r = run_packing()
+    print(f"Optimal Sum of Radii: {total_r:.6f}")
+    # Validation check
+    import numpy as np
+    def validate_packing(centers, radii):
+        n = centers.shape[0]
+        if np.isnan(centers).any() or np.isnan(radii).any(): return False
+        for i in range(n):
+            if radii[i] < 0: return False
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                return False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist < radii[i] + radii[j] - 1e-12:
+                    return False
+        return True
+    
+    print(f"Valid: {validate_packing(centers, radii)}")
 ```

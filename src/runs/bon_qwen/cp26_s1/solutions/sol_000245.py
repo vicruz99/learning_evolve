@@ -1,0 +1,176 @@
+# sol_000245 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state a213d118) state=db1466be sum of radii=2.607748 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        tuple: (centers, radii, sum_radii)
+    """
+    n_circles = 26
+    best_sum_radii = 0
+    best_centers = None
+    best_radii = None
+    
+    # Function to generate a valid hexagonal grid initialization
+    def generate_hex_grid(n, r_init=0.08, seed=0):
+        rng = np.random.RandomState(seed)
+        centers = []
+        radii = []
+        
+        r = r_init
+        # Hexagonal grid parameters
+        dx = 2 * r
+        dy = np.sqrt(3) * r
+        
+        # Grid bounds padding
+        margin = r
+        
+        # Generate points until we have enough
+        x, y = margin, margin
+        while len(centers) < n:
+            # Add points in the current row
+            row_x = x
+            while row_x <= 1 - margin and len(centers) < n:
+                centers.append([row_x, y])
+                radii.append(r)
+                row_x += dx
+                if len(centers) >= n: break
+            
+            # Move to next row
+            y += dy
+            if y > 1 - margin:
+                break
+            
+            # Shift x for hexagonal staggering
+            x = x + r
+        
+        # If grid didn't produce enough (unlikely with r=0.08), fill remaining randomly
+        while len(centers) < n:
+            centers.append([0.5 + rng.uniform(-0.2, 0.2), 0.5 + rng.uniform(-0.2, 0.2)])
+            radii.append(r)
+            
+        return np.array(centers), np.array(radii)
+
+    # Objective function: Minimize negative sum of radii
+    def objective(z):
+        r = z[2::3]
+        return -np.sum(r)
+
+    # Constraint: Boundary (x - r >= 0)
+    def boundary_x_left(z):
+        x = z[0::3]
+        r = z[2::3]
+        return x - r - 1e-5
+
+    # Constraint: Boundary (1 - x - r >= 0)
+    def boundary_x_right(z):
+        x = z[0::3]
+        r = z[2::3]
+        return 1 - x - r - 1e-5
+
+    # Constraint: Boundary (y - r >= 0)
+    def boundary_y_bottom(z):
+        y = z[1::3]
+        r = z[2::3]
+        return y - r - 1e-5
+
+    # Constraint: Boundary (1 - y - r >= 0)
+    def boundary_y_top(z):
+        y = z[1::3]
+        r = z[2::3]
+        return 1 - y - r - 1e-5
+
+    # Constraint: Pairwise non-overlap
+    # dist - (r_i + r_j) >= 0
+    def non_overlap_constraints(z):
+        x = z[0::3]
+        y = z[1::3]
+        r = z[2::3]
+        
+        # Calculate squared distances efficiently using broadcasting
+        # This returns a matrix of squared distances
+        diff_x = x[:, np.newaxis] - x[np.newaxis, :]
+        diff_y = y[:, np.newaxis] - y[np.newaxis, :]
+        dist_sq = diff_x**2 + diff_y**2
+        
+        # Calculate sum of radii
+        r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+        
+        # Extract upper triangle to avoid duplicates and self-comparison
+        mask = np.triu(np.ones((n_circles, n_circles), dtype=bool), k=1)
+        dists = np.sqrt(dist_sq[mask])
+        r_sums = r_sum[mask]
+        
+        return dists - r_sums - 1e-5
+
+    # Define constraints dictionary
+    constraints = [
+        {'type': 'ineq', 'fun': boundary_x_left},
+        {'type': 'ineq', 'fun': boundary_x_right},
+        {'type': 'ineq', 'fun': boundary_y_bottom},
+        {'type': 'ineq', 'fun': boundary_y_top},
+        {'type': 'ineq', 'fun': non_overlap_constraints}
+    ]
+
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n_circles):
+        bounds.extend([(0, 1), (0, 1), (0, 0.5)])
+
+    # Run multiple restarts to find the global optimum
+    num_restarts = 10
+    for i in range(num_restarts):
+        # Generate initial configuration
+        init_centers, init_radii = generate_hex_grid(n_circles, r_init=0.08, seed=i)
+        
+        # Small perturbation to avoid getting stuck in the exact same spot
+        if i > 0:
+            noise = np.random.normal(0, 0.01, init_centers.shape).astype(float)
+            init_centers += noise
+            # Clip to ensure valid start
+            init_centers = np.clip(init_centers, 0.02, 0.98)
+            init_radii = np.ones(n_circles) * 0.05
+
+        # Flatten initial state into vector z
+        z0 = np.zeros(3 * n_circles)
+        z0[0::3] = init_centers[:, 0]
+        z0[1::3] = init_centers[:, 1]
+        z0[2::3] = init_radii
+
+        # Run optimization
+        try:
+            res = minimize(
+                objective,
+                z0,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 500, 'ftol': 1e-9}
+            )
+            
+            if res.success or res.fun < -best_sum_radii:
+                current_sum = -res.fun
+                if current_sum > best_sum_radii:
+                    best_sum_radii = current_sum
+                    best_centers = res.x.reshape(-1, 3)[:, :2]
+                    best_radii = res.x.reshape(-1, 3)[:, 2]
+        except Exception as e:
+            print(f"Optimization failed on restart {i}: {e}")
+            continue
+
+    # Ensure we have a valid result
+    if best_centers is None:
+        # Fallback to simple grid if optimization fails
+        best_centers, best_radii = generate_hex_grid(n_circles, r_init=0.08, seed=0)
+        best_sum_radii = np.sum(best_radii)
+
+    return best_centers, best_radii, float(best_sum_radii)

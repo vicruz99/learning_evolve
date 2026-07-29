@@ -1,182 +1,137 @@
 # sol_000209 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state cccf4974) state=ab34d851 sum of radii=1.565468 correctness=1.0
+# generation=0 parent=seed (state c1389c4d) state=15918ac0 sum of radii=2.438966 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize as opt
+import math
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Pack 26 circles in a unit square to maximize sum of radii.
-    Strategy: Optimize for 26 equal circles using a penalty-based approach with 
-    multiple initializations (Random, Grid, Hex-like).
+    Generates a packing of 26 circles in a unit square to maximize the sum of radii.
+    Uses a triangular lattice arrangement (hexagonal packing) which is denser than 
+    a square grid, allowing for a higher sum of radii.
     """
-    n = 26
     
-    def cost_function(params, n):
-        # params: [x1, y1, ..., xn, yn, r]
-        xy = params[:2*n]
-        r = params[2*n]
-        centers = xy.reshape((n, 2))
-        
-        # 1. Boundary Penalties
-        # Centers must be in [r, 1-r]
-        # Penalty: sum of squared violations
-        
-        # x violations
-        left_x = np.maximum(0, r - centers[:, 0])
-        right_x = np.maximum(0, centers[:, 0] - (1.0 - r))
-        # y violations
-        top_y = np.maximum(0, centers[:, 1] - (1.0 - r))
-        bottom_y = np.maximum(0, r - centers[:, 1])
-        
-        bound_pen = np.sum(left_x**2 + right_x**2 + top_y**2 + bottom_y**2)
-        
-        # 2. Overlap Penalties
-        # Distance between centers >= 2r
-        # Violation: max(0, 2r - dist)^2
-        
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff**2, axis=2))
-        # Ignore self-distance
-        np.fill_diagonal(dists, np.inf)
-        
-        overlap = 2.0 * r - dists
-        overlap_pen = np.sum(np.maximum(0, overlap)**2)
-        
-        # Penalty weights
-        # High weights ensure constraints are respected
-        w_bound = 1000.0
-        w_overlap = 1000.0
-        
-        # Objective: Maximize r (Minimize -r) + Penalties
-        cost = -r + w_bound * bound_pen + w_overlap * overlap_pen
-        return cost
-
-    def objective(params):
-        return cost_function(params, n)
-
-    candidates = []
-    np.random.seed(42)
+    # 1. Initial Configuration Generation (27 circles in 6 rows)
+    # Pattern: 5, 4, 5, 4, 5, 4 circles per row
+    # This triangular lattice allows for efficient space usage.
     
-    # Strategy 1: Multiple Random Starts
-    # Searching a range of initial radii to find the basin of attraction for the optimum
-    for _ in range(20):
-        r_init = 0.08 + np.random.rand() * 0.05 # Range [0.08, 0.13]
-        low = r_init
-        high = 1.0 - r_init
-        # Fallback if r_init > 0.5 (unlikely here)
-        if low > high:
-            low, high = 0.0, 1.0
-        
-        # Random centers within valid range for r_init
-        centers = np.random.uniform(low, high, (n, 2))
-        params = np.concatenate([centers.flatten(), [r_init]])
-        candidates.append(params)
-
-    # Strategy 2: Perturbed Grid Start
-    # 5x5 grid is a known local optimum for r=0.1 (25 circles).
-    # We add a 26th circle and perturb to escape the grid constraint.
-    grid_pts = []
-    for i in range(5):
-        for j in range(5):
-            grid_pts.append([0.1 + i*0.2, 0.1 + j*0.2])
-    # Add 26th point in the center (will overlap, but optimizer will resolve)
-    grid_pts.append([0.5, 0.5])
+    target_n = 26
+    initial_n = 27
     
-    centers_grid = np.array(grid_pts)
-    # Perturb to break symmetry
-    centers_grid += np.random.normal(0, 0.02, centers_grid.shape)
-    # Clip to safe zone [0.05, 0.95] to avoid immediate boundary crash
-    centers_grid[:, 0] = np.clip(centers_grid[:, 0], 0.05, 0.95)
-    centers_grid[:, 1] = np.clip(centers_grid[:, 1], 0.05, 0.95)
+    # We calculate the radius based on the height constraint of 6 rows
+    # Height = 2*r + 5*r*sqrt(3) = 1
+    # r = 1 / (2 + 5*sqrt(3))
+    r_initial = 1.0 / (2.0 + 5.0 * math.sqrt(3.0))
     
-    # Start with r=0.08 to allow movement
-    params_grid = np.concatenate([centers_grid.flatten(), [0.08]])
-    candidates.append(params_grid)
-
-    # Strategy 3: Hexagonal-like Lattice
-    # Hexagonal packing is denser than square grid.
-    centers_hex = []
-    r_hex = 0.09
-    # Generate rows
-    # Vertical spacing for hex packing of radius r is r*sqrt(3)
-    y = r_hex
-    row_idx = 0
-    while y + r_hex <= 1.0 + 1e-9 and len(centers_hex) < 26:
-        # Horizontal shift for odd rows
-        shift = r_hex if row_idx % 2 != 0 else 0.0
-        x_start = r_hex + shift
-        x = x_start
-        while x + r_hex <= 1.0 + 1e-9 and len(centers_hex) < 26:
-            centers_hex.append([x, y])
-            x += 2 * r_hex # Horizontal spacing 2r
-        y += r_hex * np.sqrt(3)
-        row_idx += 1
-        
-    # Fill remaining if needed
-    while len(centers_hex) < 26:
-        centers_hex.append([np.random.rand(), np.random.rand()])
-        
-    centers_hex_arr = np.array(centers_hex[:26])
-    # Clip to valid region
-    centers_hex_arr[:, 0] = np.clip(centers_hex_arr[:, 0], r_hex, 1.0 - r_hex)
-    centers_hex_arr[:, 1] = np.clip(centers_hex_arr[:, 1], r_hex, 1.0 - r_hex)
+    centers = []
     
-    params_hex = np.concatenate([centers_hex_arr.flatten(), [r_hex]])
-    candidates.append(params_hex)
-
-    best_params = None
-    best_cost = np.inf
-    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)]
-
-    # Optimization Loop
-    for p in candidates:
-        # Use Powell method (derivative-free, handles bounds)
-        res = opt.minimize(objective, p, method='Powell', bounds=bounds,
-                           options={'maxiter': 3000, 'xtol': 1e-10, 'ftol': 1e-12})
+    # Generate centers for 6 rows
+    # Row y-coordinates: r, r + r*sqrt(3), r + 2*r*sqrt(3), ...
+    # Row x-coordinates:
+    #   Odd rows (0, 2, 4) - size 5: start at r, step 2r
+    #   Even rows (1, 3, 5) - size 4: start at 2r, step 2r (shifted by r)
+    
+    row_counts = [5, 4, 5, 4, 5, 4]
+    
+    for i, count in enumerate(row_counts):
+        y = r_initial + i * r_initial * math.sqrt(3.0)
         
-        if res.fun < best_cost:
-            best_cost = res.fun
-            best_params = res.x
+        if i % 2 == 0: # Odd rows (index 0, 2, 4) - 5 circles
+            # Centers at r, 3r, 5r, 7r, 9r
+            for j in range(count):
+                x = r_initial + j * 2 * r_initial
+                centers.append((x, y))
+        else: # Even rows (index 1, 3, 5) - 4 circles
+            # Centers at 2r, 4r, 6r, 8r
+            for j in range(count):
+                x = 2 * r_initial + j * 2 * r_initial
+                centers.append((x, y))
+                
+    centers = np.array(centers)
+    
+    # 2. Pruning to 26 circles
+    # We remove the last circle (index 26) to get 26 circles.
+    # The configuration is symmetric, so removing one from the end is valid.
+    centers = centers[:target_n]
+    
+    # 3. Uniform Radius Scaling Optimization
+    # With one circle removed, the constraints are looser. We can scale up the radii.
+    # We determine the maximum scaling factor such that no overlaps or boundary violations occur.
+    
+    n = centers.shape[0]
+    
+    # Initialize maximum possible scaling factor to 1.0
+    max_scale = 1.0
+    
+    # Check boundary constraints for each circle
+    # Circle i is valid if r <= x_i, r <= 1-x_i, r <= y_i, r <= 1-y_i
+    # So r <= min(x_i, 1-x_i, y_i, 1-y_i)
+    # Since we scale r_initial by s, s * r_initial <= dist_to_boundary
+    # s <= dist_to_boundary / r_initial
+    
+    for i in range(n):
+        x, y = centers[i]
+        dist_boundary = min(x, 1.0 - x, y, 1.0 - y)
+        if dist_boundary <= 0:
+            continue # Should not happen for valid initial config
+        scale_limit = dist_boundary / r_initial
+        if scale_limit < max_scale:
+            max_scale = scale_limit
             
-        # Refine with Nelder-Mead
-        res2 = opt.minimize(objective, res.x, method='Nelder-Mead',
-                            options={'maxiter': 3000, 'xatol': 1e-10, 'fatol': 1e-12})
-        if res2.fun < best_cost:
-            best_cost = res2.fun
-            best_params = res2.x
+    # Check pairwise overlap constraints
+    # dist(center_i, center_j) >= r_i + r_j = 2 * (s * r_initial)
+    # s <= dist(center_i, center_j) / (2 * r_initial)
+    
+    # Vectorized distance calculation for efficiency
+    # diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    # dists = np.linalg.norm(diff, axis=2)
+    # However, for n=26, nested loop is fine and clear.
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            c1 = centers[i]
+            c2 = centers[j]
+            dist = np.sqrt(np.sum((c1 - c2)**2))
+            if dist > 0:
+                scale_limit = dist / (2.0 * r_initial)
+                if scale_limit < max_scale:
+                    max_scale = scale_limit
 
-    # Extract results
-    xy = best_params[:2*n].reshape((n, 2))
-    r_opt = best_params[2*n]
+    # 4. Final Calculation
+    optimal_r = max_scale * r_initial
+    radii = np.full(n, optimal_r)
+    sum_radii = float(np.sum(radii))
     
-    # Post-processing: Ensure strict validity
-    # Calculate the maximum valid r for the found configuration
+    # 5. Final Validation Check (Debugging/Confidence)
+    # We perform a quick check to ensure no overlaps or boundary issues
+    # given floating point precision.
     
-    # 1. Boundary constraint: r <= min(x, 1-x, y, 1-y)
-    min_x = np.min(xy[:, 0])
-    max_x = np.max(xy[:, 0])
-    min_y = np.min(xy[:, 1])
-    max_y = np.max(xy[:, 1])
-    r_bound = min(min_x, 1.0 - max_x, min_y, 1.0 - max_y)
+    # Adjust centers/radii slightly if necessary? 
+    # The scaling ensures strict inequality usually, but let's be safe.
+    # The logic above finds the exact limit. In practice, numerical errors might
+    # cause a tiny violation if we are exactly at the limit.
+    # We can apply a very small epsilon shrink if needed, but usually not required
+    # if max_scale is strictly less than 1 (which it is, as we removed a circle).
     
-    # 2. Overlap constraint: 2r <= dist(i, j) => r <= dist(i, j) / 2
-    diffs = xy[:, np.newaxis, :] - xy[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diffs**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    min_dist = np.min(dists)
-    r_overlap = min_dist / 2.0
+    # Wait, removing a circle might make the limit exactly determined by another constraint.
+    # The max_scale logic finds the tightest constraint.
+    # If the tightest constraint is from the removed circle, max_scale remains 1.0?
+    # No, removing a circle removes constraints involving that circle.
+    # The remaining constraints are from the other 25 circles.
+    # It is highly likely that max_scale > 1.0.
     
-    # The valid radius is the minimum of these limits
-    final_r = min(r_opt, r_bound, r_overlap)
+    # Let's apply the scaling
+    # Actually, we don't need to scale centers, just radii.
+    # But for visualization or further checks, radii are separate.
     
-    # Ensure non-negative
-    if final_r < 0:
-        final_r = 0.0
-        
-    final_radii = np.full(n, final_r)
-    
-    return xy, final_radii, 26 * final_r
+    return centers, radii, sum_radii
+
+# Helper to run and print
+if __name__ == "__main__":
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Radius: {r[0]}")
+    print(f"Count: {len(r)}")

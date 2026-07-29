@@ -1,0 +1,196 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.628 and target 2.636, we need a more robust optimization pipeline that avoids getting trapped in local minima while precisely handling geometric constraints. The previous approaches using direct SLSQP on all variables sometimes struggle with the non-smooth nature of circle boundaries and pairwise contacts. 
+
+My strategy employs a two-stage hybrid optimization:
+1. **Centers-Only Global/Local Search**: First, optimize only the center coordinates using a non-smooth objective that implicitly handles constraints via `r_i = min(boundary_dists, 0.5 * neighbor_dists)`. This formulation is highly effective because it directly maximizes the achievable sum of radii without explicit inequality constraints, making it friendly to derivative-free methods like `Powell` and `Nelder-Mead`. We use multiple diverse initial configurations (hexagonal lattices with varying densities + random perturbations) to explore the landscape broadly.
+2. **Full Constrained Refinement**: Take the best center layouts found and initialize a full SLSQP optimization on both centers and radii. Here, we use explicit inequality constraints (`dist >= r_i + r_j` and boundary conditions). SLSQP excels at fine-tuning solutions near the optimum where constraint boundaries are active and trade-offs between moving centers and growing radii are delicate.
+3. **Strict Repair & Validation**: After optimization, apply a deterministic repair routine that clamps radii to boundary limits and proportionally shrinks overlapping circles to guarantee the validation function passes within numerical tolerance, while preserving as much radius sum as possible.
+
+This pipeline combines the exploratory strength of derivative-free methods with the precision of gradient-based constrained optimization, typically pushing packing densities past standard local minima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def get_max_radii(centers):
+    """Computes the maximum valid radius for each circle given fixed centers."""
+    n = centers.shape[0]
+    x = centers[:, 0]
+    y = centers[:, 1]
+    
+    # Distance to boundaries: min(x, 1-x, y, 1-y)
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    
+    # Ignore self-distances
+    np.fill_diagonal(dist, np.inf)
+    min_dist = np.min(dist, axis=1)
+    
+    # Radius constrained by half the minimum distance to avoid overlap
+    return np.minimum(r_bound, 0.5 * min_dist)
+
+def obj_centers(centers_flat):
+    """Objective for centers-only optimization: minimize negative sum of radii."""
+    centers = centers_flat.reshape(-1, 2)
+    return -np.sum(get_max_radii(centers))
+
+def obj_full(vars_flat):
+    """Objective for full optimization: minimize negative sum of radii."""
+    return -np.sum(vars_flat[2::3])
+
+def con_full(vars_flat):
+    """Computes all boundary and non-overlap constraints (must be >= 0)."""
+    cx = vars_flat[0::3]
+    cy = vars_flat[1::3]
+    cr = vars_flat[2::3]
+    
+    con = []
+    # Boundary constraints
+    con.append(cx - cr)
+    con.append(1.0 - cx - cr)
+    con.append(cy - cr)
+    con.append(1.0 - cy - cr)
+    
+    # Pairwise non-overlap: dist(i,j) >= r_i + r_j
+    dx = cx[:, np.newaxis] - cx[np.newaxis, :]
+    dy = cy[:, np.newaxis] - cy[np.newaxis, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    sr = cr[:, np.newaxis] + cr[np.newaxis, :]
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    con.append(dist[mask] - sr[mask])
+    
+    return np.concatenate(con)
+
+def get_bounds():
+    """Returns variable bounds for x, y in [0,1] and r in [0, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Uses a two-stage approach: centers-only search followed by full constrained refinement.
+    """
+    np.random.seed(42)
+    best_sum = -1.0
+    best_full_vars = None
+    bounds = get_bounds()
+    constraints = {'type': 'ineq', 'fun': con_full}
+    
+    # Generate diverse initial center configurations
+    configs = []
+    
+    # 1. Hexagonal lattice variations
+    for r in [0.095, 0.100, 0.105, 0.110]:
+        pts = []
+        y = r
+        row = 0
+        while len(pts) < N:
+            x = r if row % 2 == 0 else 2 * r
+            while x < 1.0 - r and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r
+            y += np.sqrt(3.0) * r
+            row += 1
+        configs.append(np.array(pts[:N]))
+        
+    # 2. Structured grid variations
+    for spacing in [0.18, 0.19, 0.20]:
+        pts = []
+        y = spacing
+        while y < 1.0 - spacing and len(pts) < N:
+            x = spacing
+            while x < 1.0 - spacing and len(pts) < N:
+                pts.append([x, y])
+                x += spacing
+            y += spacing
+        configs.append(np.array(pts[:N]))
+        
+    # 3. Random configurations
+    for _ in range(15):
+        configs.append(np.random.rand(N, 2) * 0.8 + 0.1)
+
+    # Stage 1: Optimize centers only using derivative-free methods
+    for cfg in configs:
+        # Add tiny deterministic noise to break symmetry
+        cfg_perturbed = cfg + np.random.normal(0, 1e-4, cfg.shape)
+        cfg_perturbed = np.clip(cfg_perturbed, 1e-5, 1.0 - 1e-5)
+        
+        try:
+            res_c = minimize(obj_centers, cfg_perturbed.flatten(), method='Powell',
+                             options={'maxiter': 4000, 'ftol': 1e-10, 'xatol': 1e-10})
+            centers_opt = res_c.x.reshape(-1, 2)
+        except Exception:
+            centers_opt = cfg_perturbed
+            
+        # Stage 2: Refine with full constrained optimization
+        radii_init = get_max_radii(centers_opt) * 0.99
+        vars_init = np.zeros(3 * N)
+        vars_init[0::3] = centers_opt[:, 0]
+        vars_init[1::3] = centers_opt[:, 1]
+        vars_init[2::3] = radii_init
+        
+        try:
+            res_full = minimize(obj_full, vars_init, method='SLSQP',
+                                bounds=bounds, constraints=constraints,
+                                options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            
+            # Check feasibility and update best
+            cons_val = con_full(res_full.x)
+            if np.all(cons_val >= -1e-6):
+                curr_sum = -np.sum(res_full.x[2::3])
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_full_vars = res_full.x.copy()
+        except Exception:
+            pass
+
+    # Fallback if optimization fails
+    if best_full_vars is None:
+        best_full_vars = np.zeros(3 * N)
+        best_full_vars[0::3] = configs[0][:, 0]
+        best_full_vars[1::3] = configs[0][:, 1]
+        best_full_vars[2::3] = 0.05
+        
+    centers = np.column_stack((best_full_vars[0::3], best_full_vars[1::3]))
+    radii = best_full_vars[2::3].copy()
+    
+    # Stage 3: Strict repair to guarantee validation passes
+    # Clamp to boundaries
+    for i in range(N):
+        cx, cy = centers[i]
+        r = radii[i]
+        mx = min(cx, 1.0 - cx, cy, 1.0 - cy)
+        if r > mx + 1e-9:
+            radii[i] = mx
+            
+    # Resolve overlaps by shrinking radii
+    for _ in range(30):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 1e-9)
+    final_sum = float(np.sum(radii))
+    
+    return centers, radii, final_sum
+```

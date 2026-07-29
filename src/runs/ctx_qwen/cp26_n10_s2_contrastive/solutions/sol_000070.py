@@ -1,0 +1,163 @@
+# sol_000070 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000025 (state 808bce88) state=c7a814b4 sum of radii=1.718447 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+I_IDX, J_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(params):
+    """Negative sum of radii to be minimized."""
+    return -np.sum(params[2 * N_CIRCLES:])
+
+def constraints(params):
+    """Boundary and non-overlap constraints (must be >= 0)."""
+    cx = params[:N_CIRCLES]
+    cy = params[N_CIRCLES:2 * N_CIRCLES]
+    r = params[2 * N_CIRCLES:]
+    
+    c = np.empty(4 * N_CIRCLES + N_CIRCLES * (N_CIRCLES - 1) // 2)
+    c[:N_CIRCLES] = cx - r
+    c[N_CIRCLES:2 * N_CIRCLES] = 1.0 - cx - r
+    c[2 * N_CIRCLES:3 * N_CIRCLES] = cy - r
+    c[3 * N_CIRCLES:4 * N_CIRCLES] = 1.0 - cy - r
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dists = np.hypot(dx, dy)
+    c[4 * N_CIRCLES:] = dists[I_IDX, J_IDX] - (r[I_IDX] + r[J_IDX])
+    return c
+
+def solve_radii_lp(centers):
+    """Given fixed centers, solve LP to maximize sum of radii exactly."""
+    n = centers.shape[0]
+    dx = centers[:, None, 0] - centers[None, :, 0]
+    dy = centers[:, None, 1] - centers[None, :, 1]
+    dists_mat = np.hypot(dx, dy)
+    dists = dists_mat[I_IDX, J_IDX]
+
+    A_ub = np.zeros((len(dists), n))
+    A_ub[np.arange(len(dists)), I_IDX] = 1.0
+    A_ub[np.arange(len(dists)), J_IDX] = 1.0
+    b_ub = dists
+
+    bounds_r = []
+    for i in range(n):
+        mx = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        bounds_r.append((0.0, max(0.0, mx)))
+
+    for method in ['highs', 'interior-point']:
+        try:
+            res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method=method)
+            if res.success:
+                return res.x, -res.fun
+        except Exception:
+            continue
+    return np.zeros(n), 0.0
+
+def generate_init(seed, p_type):
+    """Create diverse starting points for optimization."""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N_CIRCLES, 2))
+    
+    if p_type == 'hex':
+        patterns = [
+            [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [7, 6, 5, 4, 4], 
+            [4, 6, 5, 6, 5], [8, 5, 5, 5, 3], [6, 6, 5, 5, 4]
+        ]
+        pat = patterns[seed % len(patterns)]
+        y = 0.07
+        dy = 0.162 + (seed % 5) * 0.003
+        idx = 0
+        for r_idx, cnt in enumerate(pat):
+            shift = 0.0 if r_idx % 2 == 0 else 0.085
+            x = 0.07 + shift
+            for k in range(cnt):
+                if idx < N_CIRCLES:
+                    centers[idx] = [x + rng.uniform(-0.015, 0.015), y + rng.uniform(-0.01, 0.01)]
+                    x += 0.155 + (seed % 4) * 0.002
+                idx += 1
+            y += dy
+    else:
+        centers = rng.uniform(0.12, 0.88, (N_CIRCLES, 2))
+        
+    centers = np.clip(centers, 0.05, 0.95)
+    r_init = np.full(N_CIRCLES, 0.065)
+    return np.concatenate([centers.ravel(), r_init])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraints}
+
+    # Phase 1: Broad search with diverse initializations
+    for seed in range(50):
+        x0 = generate_init(seed, 'hex' if seed % 2 == 0 else 'rand')
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-13})
+            c_temp = res.x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+            r_lp, s_lp = solve_radii_lp(c_temp)
+            if s_lp > best_sum:
+                best_sum = s_lp
+                best_c = c_temp.copy()
+                best_r = r_lp.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Local basin-hopping refinement
+    if best_c is not None:
+        for it in range(40):
+            rng = np.random.RandomState(it * 17 + 5)
+            c_p = best_c + rng.randn(N_CIRCLES, 2) * 0.005
+            c_p = np.clip(c_p, 0.03, 0.97)
+            r_lp, _ = solve_radii_lp(c_p)
+            x0 = np.concatenate([c_p.ravel(), r_lp * 0.99])
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 4000, 'ftol': 1e-14})
+                c_temp = res.x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+                r_lp2, s_lp2 = solve_radii_lp(c_temp)
+                if s_lp2 > best_sum:
+                    best_sum = s_lp2
+                    best_c = c_temp.copy()
+                    best_r = r_lp2.copy()
+            except Exception:
+                continue
+
+    # Fallback safety net
+    if best_c is None:
+        best_c = np.tile([0.5, 0.5], (N_CIRCLES, 1))
+        best_r = np.full(N_CIRCLES, 0.02)
+        best_sum = np.sum(best_r)
+
+    # Strict validity enforcement
+    centers = best_c.copy()
+    radii = best_r.copy()
+
+    for i in range(N_CIRCLES):
+        mx = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        if radii[i] > mx:
+            radii[i] = max(0.0, mx - 1e-9)
+
+    for _ in range(50):
+        changed = False
+        for i in range(N_CIRCLES):
+            for j in range(i + 1, N_CIRCLES):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    exc = radii[i] + radii[j] - d
+                    radii[i] -= exc / 2.0
+                    radii[j] -= exc / 2.0
+                    changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))

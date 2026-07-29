@@ -1,0 +1,326 @@
+# sol_000050 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state bd759b5e) state=2c3104ff sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    # Initial configuration: Hexagonal lattice
+    # We try to fit rows of circles. 
+    # Approximate optimal radius r ~ 0.101. Diameter d ~ 0.202.
+    # Hexagonal packing vertical spacing: d * sqrt(3)/2 ~ 0.175.
+    # 5 rows would need height ~ 4 * 0.175 + d ~ 0.7 + 0.2 = 0.9. Fits.
+    
+    # Let's try a configuration: 5 rows.
+    # Row lengths: 5, 6, 5, 6, 4? Sum = 26.
+    # Or 6, 5, 6, 5, 4?
+    # Let's try to center them.
+    
+    # Better approach: Start with a dense random or grid and optimize.
+    # But a structured start is better.
+    # Let's use a grid of 6x5 = 30 points, remove 4, or just place 26 in hex pattern.
+    
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Hexagonal packing generation
+    # Row 0: 5 circles
+    # Row 1: 6 circles (shifted)
+    # Row 2: 5 circles
+    # Row 3: 6 circles
+    # Row 4: 4 circles
+    # Total 26.
+    
+    # Let's adjust counts to fit width 1.
+    # If we have 6 circles, width needed ~ 5*d + d = 6d? No, centers at 0.5d, 1.5d...
+    # 6 circles need width roughly 5*d + d = 6d? 
+    # Actually centers at x = r + k*2r. 
+    # Max x = r + 5*2r = 11r. 
+    # 11r <= 1 => r <= 1/11 ~ 0.09.
+    # 5 circles: r + 4*2r = 9r <= 1 => r <= 1/9 ~ 0.11.
+    # So rows with 6 circles restrict radius more.
+    
+    # Let's try rows: 6, 5, 6, 5, 4?
+    # 6 circles restrict r to ~0.09.
+    # Sum would be 26 * 0.09 = 2.34. Too low.
+    # We need rows with fewer circles to allow larger r.
+    # Maybe 5, 6, 5, 5, 5? (26)
+    # The 6-circle row will be the bottleneck.
+    
+    # Maybe we don't need equal radii.
+    # But let's first find a good equal radius packing.
+    # If we use a 5x5 grid (25 circles), r=0.1.
+    # We need to add 1 circle.
+    # In the center of the grid? Or in a gap.
+    # Gap size in 5x5 grid (spacing 0.2) is small.
+    # Distance to 4 neighbors is 0.2/sqrt(2) ~ 0.1414.
+    # Max r for gap circle = 0.1414 - 0.1 = 0.0414.
+    # Sum = 2.5 + 0.0414 = 2.54.
+    
+    # We need to improve the base packing.
+    # Maybe a perturbed hexagonal packing allows larger r.
+    
+    # Let's try a general optimization from a random start or grid.
+    
+    # Initialize centers in a perturbed grid
+    # 6 columns, 5 rows? 30 positions. Pick 26.
+    # Or just 5x5 grid plus 1.
+    
+    # Let's try a "best effort" optimization.
+    
+    # 1. Initialize centers randomly in [0.1, 0.9]
+    # 2. Set radii to a small value
+    # 3. Expand radii and push centers
+    
+    # Better initialization: Hexagonal grid
+    # Let's construct a hexagonal grid that fits 26 circles well.
+    # Try 6 rows of varying size.
+    
+    # Configuration:
+    # Row 0: 5 circles
+    # Row 1: 5 circles
+    # Row 2: 6 circles
+    # Row 3: 5 circles
+    # Row 4: 5 circles
+    # Total 26.
+    
+    # Let's place them.
+    # We need to determine r and positions.
+    # Let's assume a target r and place centers.
+    
+    # Since we will optimize, let's just start with a reasonable dense packing.
+    # 5x5 grid is a good start.
+    
+    idx = 0
+    # 5x5 grid centers
+    for i in range(5):
+        for j in range(5):
+            centers[idx] = [0.1 + i * 0.2, 0.1 + j * 0.2]
+            idx += 1
+    # 26th circle
+    centers[idx] = [0.5, 0.5] # Center
+    
+    # Initial radii
+    radii = np.full(n, 0.01)
+    
+    # Optimization loop
+    # We will try to maximize sum of radii.
+    # Use a simple iterative repulsion method.
+    
+    lr = 0.01 # learning rate
+    decay = 0.995
+    
+    for step in range(5000):
+        # Calculate forces
+        forces = np.zeros_like(centers)
+        
+        # Calculate current max possible radii based on distances
+        # This is a bit complex. Instead, let's just push centers apart 
+        # when they are too close for current radii.
+        # And try to increase radii.
+        
+        # Strategy: 
+        # 1. For each circle, compute distance to nearest neighbor and wall.
+        # 2. Limit radius to min(dist_to_neighbor/2, dist_to_wall).
+        # 3. If we want to maximize sum, we should push centers apart to increase these distances.
+        
+        # Let's compute a "pressure" on each circle.
+        # Pressure from neighbors: if dist < r_i + r_j, push apart.
+        # Pressure from walls: if dist_to_wall < r_i, push inward.
+        
+        # Actually, let's update radii first to be feasible given current centers.
+        # Then adjust centers to allow larger radii.
+        
+        # Update radii to be the maximum feasible given current centers
+        # This is a linear programming problem, but we can approximate greedily or solve LP.
+        # Given n=26, LP is fast. But let's use a simpler heuristic.
+        # r_i = min(wall_dist, min_j (dist_ij - r_j)) ? No, coupled.
+        
+        # Let's use the LP approach for fixed centers?
+        # Max sum r_i s.t. r_i + r_j <= d_ij, r_i <= w_i.
+        # This is equivalent to finding max weight independent set on some graph?
+        # Actually, it's just an LP.
+        # We can use scipy.optimize.linprog.
+        
+        # But doing this every step might be slow.
+        # Let's stick to a gradient-like approach.
+        
+        # Repulsion forces
+        for i in range(n):
+            # Wall constraints
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Wall forces (push away from boundary if close)
+            # Target radius is not fixed, we want to increase it.
+            # If we hit wall, we are constrained.
+            
+            # Check overlaps
+            for j in range(i + 1, n):
+                dx = centers[i][0] - centers[j][0]
+                dy = centers[i][1] - centers[j][1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist:
+                    # Overlap
+                    overlap = min_dist - dist
+                    # Repulsion force proportional to overlap
+                    # Direction: i away from j
+                    if dist > 1e-9:
+                        fx = (dx / dist) * overlap
+                        fy = (dy / dist) * overlap
+                        forces[i] += [fx, fy]
+                        forces[j] -= [fx, fy]
+                    else:
+                        # Same position, push randomly
+                        forces[i] += [0.1, 0.1]
+                        forces[j] -= [0.1, 0.1]
+            
+            # Wall repulsion (if radius is close to wall distance)
+            # We want radius to grow.
+            # If radius is limited by wall, we can't grow it by moving center towards wall.
+            # We should move center away from wall to allow larger radius?
+            # No, moving away from wall increases dist to that wall, but decreases to opposite.
+            # Optimal center for a single circle is center of square.
+            # But with neighbors, it's a balance.
+            
+            # Let's just apply a force to keep centers in [r, 1-r].
+            # If center[i] < r[i], push right.
+            # But r[i] is variable.
+            
+            # Let's update radii based on current constraints.
+            # A safe lower bound for r_i is min(wall_dist, min_j dist_ij / 2).
+            # But this assumes equal neighbors.
+            
+            # Let's compute a feasible radius vector.
+            # We can solve the LP: max sum r s.t. r_i + r_j <= d_ij, r_i <= w_i.
+            # Using a simple iterative solver for this LP:
+            # r_i = min(w_i, min_j (d_ij - r_j)) ? No.
+            # But we can relax.
+            
+            pass
+
+        # Let's try a different approach.
+        # Fix radii to a target value and check feasibility?
+        # Or just optimize positions for fixed radii?
+        
+        # Let's try to increase radii globally.
+        # If we increase all radii by dr, and fix positions, overlaps occur.
+        # Then we resolve overlaps by moving positions.
+        
+        # Global growth step
+        growth_rate = 1e-4
+        radii += growth_rate
+        
+        # Now resolve overlaps
+        # Apply repulsion
+        centers += lr * forces
+        
+        # Clip centers to [0, 1]
+        centers = np.clip(centers, 0, 1)
+        
+        # Re-normalize radii?
+        # Actually, the repulsion moves centers to satisfy r_i + r_j <= d_ij.
+        # But we just increased radii, so overlaps are likely.
+        # The forces push centers apart.
+        
+        # Decay learning rate
+        lr *= decay
+        
+    # After heuristic optimization, we might have a valid packing but radii might be smaller than max possible.
+    # We should compute the exact max radii for the final centers.
+    # Solve LP: max sum r_i s.t. r_i + r_j <= ||c_i - c_j||, r_i <= dist_to_wall(c_i).
+    
+    # Let's implement a simple LP solver for this specific problem.
+    # Variables: r_0 ... r_25.
+    # Objective: max sum r_i.
+    # Constraints:
+    # r_i >= 0
+    # r_i + r_j <= d_ij
+    # r_i <= x_i
+    # r_i <= 1-x_i
+    # r_i <= y_i
+    # r_i <= 1-y_i
+    
+    # Since n=26 is small, we can use scipy.optimize.linprog.
+    
+    from scipy.optimize import linprog
+    
+    # Compute distances
+    d = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            d[i, j] = dist
+            d[j, i] = dist
+            
+    # Wall distances
+    w = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        w[i] = min(x, 1-x, y, 1-y)
+        
+    # LP formulation
+    # c = -1 (minimize -sum r)
+    c = np.ones(n)
+    
+    # A_ub * r <= b_ub
+    # Constraints: r_i + r_j <= d_ij
+    # r_i <= w_i
+    
+    # Number of constraints:
+    # n wall constraints
+    # n*(n-1)/2 distance constraints
+    
+    # Build A_ub
+    # This might be large but n=26 is small.
+    # 26 + 325 = 351 constraints.
+    
+    A_ub = []
+    b_ub = []
+    
+    # Wall constraints
+    for i in range(n):
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(w[i])
+        
+    # Distance constraints
+    for i in range(n):
+        for j in range(i+1, n):
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(d[i, j])
+            
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    # Bounds for r_i: (0, None)
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        radii = res.x
+        sum_radii = np.sum(radii)
+        return centers, radii, sum_radii
+    else:
+        # Fallback to heuristic radii
+        # Estimate radii from distances
+        est_radii = np.full(n, 0.1) # placeholder
+        # Recompute safely
+        # Just return current radii if LP fails (unlikely)
+        return centers, radii, np.sum(radii)

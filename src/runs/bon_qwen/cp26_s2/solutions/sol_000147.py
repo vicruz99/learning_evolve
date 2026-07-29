@@ -1,0 +1,227 @@
+# sol_000147 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 6c47fa47) state=7a4ae8a9 sum of radii=2.102474 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+
+    # Helper to generate hexagonal-ish initialization
+    def get_init_centers(seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+        
+        # Try to place points in a hexagonal pattern
+        centers = np.zeros((n, 2))
+        
+        # We can try to fit rows. 
+        # A simple heuristic is to place them on a grid and perturb, 
+        # or just use a dense hexagonal grid subset.
+        
+        # Let's try a randomized grid approach first for diversity
+        # Or a specific hexagonal layout.
+        
+        # Hexagonal layout parameters
+        # We want to cover [0,1]x[0,1].
+        # Let's create a list of candidate points from a dense hex grid and pick n
+        points = []
+        # Spacing for hex grid
+        # Let's estimate spacing. Area ~ 1/26. r ~ 0.1. diameter 0.2.
+        # Hex spacing dx ~ 0.2, dy ~ 0.1732
+        
+        dx = 0.2
+        dy = dx * np.sqrt(3) / 2
+        
+        # Generate grid
+        y = 0.1
+        while y <= 0.9:
+            x = 0.1
+            # Check if this row should be shifted
+            row_idx = int(round((y - 0.1) / dy))
+            offset = (dx / 2) if (row_idx % 2 == 1) else 0.0
+            
+            while x <= 0.9:
+                points.append([x + offset, y])
+                x += dx
+            y += dy
+            
+        # If we don't have enough points in strict hex grid, fill with random
+        if len(points) < n:
+            # Fill remaining
+            while len(points) < n:
+                pts = np.random.rand(10, 2) * 0.8 + 0.1
+                for p in pts:
+                    if len(points) >= n: break
+                    # Simple distance check to avoid duplicates
+                    is_new = True
+                    for existing in points:
+                        if np.linalg.norm(np.array(p) - np.array(existing)) < 0.05:
+                            is_new = False
+                            break
+                    if is_new:
+                        points.append(p)
+        
+        # If we have more, select n randomly
+        if len(points) > n:
+            indices = np.random.choice(len(points), n, replace=False)
+            selected = [points[i] for i in indices]
+        else:
+            selected = points
+            
+        return np.array(selected)
+
+    def solve_lp(centers):
+        # Variables: r_0, r_1, ..., r_25
+        # Maximize sum(r_i) => Minimize -sum(r_i)
+        c_obj = -np.ones(n)
+        
+        A_ub = []
+        b_ub = []
+        
+        # Constraints: r_i + r_j <= dist(i, j)
+        # And boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+        
+        # Precompute distances
+        dists = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                dists[i, j] = d
+                dists[j, i] = d
+                
+        # Pairwise constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(dists[i, j])
+                
+        # Boundary constraints
+        for i in range(n):
+            x, y = centers[i]
+            # r_i <= x
+            row = np.zeros(n); row[i] = 1.0
+            A_ub.append(row); b_ub.append(x)
+            # r_i <= 1-x
+            row = np.zeros(n); row[i] = 1.0
+            A_ub.append(row); b_ub.append(1.0 - x)
+            # r_i <= y
+            row = np.zeros(n); row[i] = 1.0
+            A_ub.append(row); b_ub.append(y)
+            # r_i <= 1-y
+            row = np.zeros(n); row[i] = 1.0
+            A_ub.append(row); b_ub.append(1.0 - y)
+            
+        # Bounds: r_i >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success:
+            return res.x, -res.fun
+        else:
+            return None, 0.0
+
+    def optimize_step(centers):
+        radii, current_sum = solve_lp(centers)
+        if radii is None:
+            return centers, 0.0
+        
+        # Calculate forces to push centers apart if circles are touching
+        # Force on i: sum over j of (c_i - c_j) if r_i + r_j == d_ij
+        # We use a small tolerance
+        forces = np.zeros_like(centers)
+        tol = 1e-6
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                if d < 1e-9: d = 1e-9 # avoid div by zero
+                
+                if abs(radii[i] + radii[j] - d) < tol:
+                    # Tight constraint
+                    # Unit vector from j to i
+                    u = (centers[i] - centers[j]) / d
+                    # Push i away from j, j away from i
+                    # Strength could be proportional to radius?
+                    forces[i] += u
+                    forces[j] -= u
+        
+        # Boundary repulsion?
+        # If r_i is limited by wall, maybe move away?
+        # But wall limits are hard. Just ensure we don't go out.
+        
+        # Update centers
+        # Step size needs to be small
+        step_size = 0.01
+        new_centers = centers + step_size * forces
+        
+        # Clip to [0, 1] with some margin? 
+        # Actually centers can be anywhere in [0,1], radii will adjust.
+        # But radii >= 0 requires centers in [0,1].
+        new_centers = np.clip(new_centers, 0, 1)
+        
+        return new_centers, current_sum
+
+    # Run multiple restarts
+    best_config = None
+    
+    # Try a few seeds
+    seeds = [42, 123, 456, 789, 101, 202, 303, 0, 1, 2]
+    
+    for seed in seeds:
+        curr_centers = get_init_centers(seed)
+        # Perturb slightly
+        curr_centers += np.random.randn(n, 2) * 0.02
+        curr_centers = np.clip(curr_centers, 0.05, 0.95) # Keep away from edges initially? 
+        # Actually edges are good for circles. Let's keep full range but clip.
+        curr_centers = np.clip(curr_centers, 0, 1)
+        
+        # Optimization loop
+        for _ in range(50): # Number of iterations
+            curr_centers, curr_sum = optimize_step(curr_centers)
+            # Decay step size?
+            # For now fixed.
+            
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                # Re-solve LP to get exact radii for best centers
+                r, s = solve_lp(curr_centers)
+                if r is not None:
+                    best_centers = curr_centers.copy()
+                    best_radii = r
+                # If LP failed (unlikely if centers valid), keep old best
+
+    # Final refinement on best centers
+    # Run a few more steps on the best found
+    if best_centers is not None:
+        for _ in range(20):
+            best_centers, _ = optimize_step(best_centers)
+        # Final LP
+        r, s = solve_lp(best_centers)
+        if r is not None:
+            best_radii = r
+            best_sum = s
+            best_centers = best_centers
+            
+    # Validation check (internal)
+    if best_centers is not None:
+        # Just to be safe, clip radii to be non-negative
+        best_radii = np.maximum(best_radii, 0)
+        
+    return best_centers, best_radii, best_sum

@@ -1,0 +1,159 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat this as a non-linear optimization problem with quadratic constraints. The key challenges are avoiding local minima and ensuring the solver respects the non-overlap and boundary conditions efficiently.
+
+1. **Constraint Formulation**: We use squared distance constraints $(x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 \ge 0$. This avoids square roots, makes gradients polynomial, and improves solver stability while preserving the feasible region (since distances and radius sums are non-negative).
+2. **Initialization Diversity**: We generate multiple valid starting configurations:
+   - **Hexagonal Lattice**: A 6-5-6-5-4 row pattern closely mimics optimal dense packings.
+   - **Grid Pattern**: A 5x5 grid with an extra circle in a gap provides a different topology.
+   - **Random**: Helps escape biases from structured starts.
+3. **Multi-Stage Optimization**: 
+   - **Phase 1**: Run SLSQP from ~40 diverse starts to find promising basins of attraction.
+   - **Phase 2**: Take the best result and run ~20 highly refined local optimizations with tiny perturbations to squeeze out the last bits of precision.
+4. **Numerical Robustness**: Precompute index arrays for pairwise constraints to speed up evaluations. Use tight tolerances (`ftol=1e-12` to `1e-14`) and sufficient iterations. Ensure radii remain non-negative and centers stay within `[0,1]` via bounds and clipping.
+5. **Validation Compatibility**: The solver respects bounds directly, and we clamp radii to `≥0` post-optimization. The tolerance in the validation function (`1e-12`) aligns with our solver precision.
+
+This approach balances exploration (many starts) and exploitation (refinement), which is standard for high-precision circle packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+BOUNDS = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+
+def objective(x):
+    """Objective function: maximize sum of radii (minimize negative sum)"""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """
+    Inequality constraints:
+    - Circle boundaries within [0,1]x[0,1]
+    - Squared pairwise distance >= squared sum of radii
+    Returns array of constraint values (must be >= 0)
+    """
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+    
+    # Pairwise non-overlap constraints (squared form for smoothness)
+    dx = cx[I_IDX] - cx[J_IDX]
+    dy = cy[I_IDX] - cy[J_IDX]
+    r_sum = r[I_IDX] + r[J_IDX]
+    c = np.concatenate([c, dx**2 + dy**2 - r_sum**2])
+    return c
+
+def make_hex_init(seed):
+    """Hexagonal lattice initialization: 6-5-6-5-4 pattern"""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, 0.075)
+    
+    row_counts = [6, 5, 6, 5, 4]
+    y = 0.075
+    idx = 0
+    for r_idx, count in enumerate(row_counts):
+        x_start = 0.075 if r_idx % 2 == 0 else 0.15
+        for col in range(count):
+            centers[idx, 0] = x_start + col * 0.15
+            centers[idx, 1] = y
+            idx += 1
+        y += 0.13
+        
+    centers += rng.uniform(-0.005, 0.005, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    return np.concatenate([centers.ravel(), radii])
+
+def make_grid_init(seed):
+    """Grid initialization: 5x5 + 1 extra circle"""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, 0.08)
+    
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            centers[idx, 0] = 0.1 + j * 0.2
+            centers[idx, 1] = 0.1 + i * 0.2
+            idx += 1
+            
+    centers[25] = [0.2, 0.2]
+    centers += rng.uniform(-0.005, 0.005, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    return np.concatenate([centers.ravel(), radii])
+
+def make_random_init(seed):
+    """Random initialization in inner region"""
+    rng = np.random.RandomState(seed)
+    cx = rng.uniform(0.15, 0.85, N)
+    cy = rng.uniform(0.15, 0.85, N)
+    r = np.full(N, 0.06)
+    return np.concatenate([cx, cy, r])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes circle packing in a unit square to maximize sum of radii.
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    best_sum = 0.0
+    best_x = None
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    # Phase 1: Broad exploration with multiple structured starts
+    for trial in range(40):
+        if trial < 15:
+            x0 = make_hex_init(trial)
+        elif trial < 25:
+            x0 = make_grid_init(trial)
+        else:
+            x0 = make_random_init(trial)
+            
+        try:
+            res = minimize(
+                objective, x0, method='SLSQP', bounds=BOUNDS,
+                constraints=cons, 
+                options={'maxiter': 4000, 'ftol': 1e-12, 'disp': False}
+            )
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_x = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Local refinement to escape shallow local optima
+    if best_x is not None:
+        for _ in range(20):
+            noise = np.random.randn(3 * N) * 0.001
+            x0 = best_x + noise
+            x0 = np.clip(x0, [b[0] for b in BOUNDS], [b[1] for b in BOUNDS])
+            
+            try:
+                res = minimize(
+                    objective, x0, method='SLSQP', bounds=BOUNDS,
+                    constraints=cons, 
+                    options={'maxiter': 6000, 'ftol': 1e-14, 'disp': False}
+                )
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_x = res.x.copy()
+            except Exception:
+                pass
+
+    # Fallback (should rarely be used)
+    if best_x is None:
+        best_x = make_hex_init(0)
+        
+    centers = best_x[:2*N].reshape(N, 2)
+    radii = np.maximum(best_x[2*N:], 0.0)
+    return centers, radii, float(np.sum(radii))
+```

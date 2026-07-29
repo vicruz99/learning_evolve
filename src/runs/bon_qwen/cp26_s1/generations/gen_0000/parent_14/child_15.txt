@@ -1,129 +1,102 @@
 
 
 <strategy>
-To solve the problem of packing 26 circles in a unit square to maximize the sum of radii, we will formulate it as a nonlinear constrained optimization problem. The objective is to maximize $\sum r_i$, which is equivalent to minimizing $-\sum r_i$. The constraints ensure that all circles remain within the unit square $[0,1]^2$ and do not overlap.
+To pack 26 circles in a unit square maximizing the sum of radii, I will use a joint optimization approach for both centers and radii. The problem is non-convex, so I will initialize with a hexagonal lattice configuration (known to be near-optimal for circle packing) and then refine using `scipy.optimize.minimize` with the SLSQP algorithm. 
 
-**Optimization Formulation:**
-- **Variables:** $3N$ variables for $N=26$ circles: $(x_i, y_i, r_i)$ for $i=1,\dots,26$.
-- **Objective:** Minimize $f(p) = -\sum_{i=1}^{26} r_i$.
-- **Constraints:**
-  1. Boundary: $r_i \le x_i \le 1-r_i$ and $r_i \le y_i \le 1-r_i$.
-  2. Non-overlap: $(x_i - x_j)^2 + (y_i - y_j)^2 \ge (r_i + r_j)^2$ for all $1 \le i < j \le 26$.
-- **Bounds:** $0 \le x_i, y_i \le 1$ and $0 \le r_i \le 0.5$.
-
-**Strategy for Robustness:**
-1. **Initialization:** We use a hexagonal lattice pattern to initialize circle centers, which is known to be dense and effective for packing problems. We perturb the positions slightly and start with small radii to ensure the initial configuration is feasible.
-2. **Solver:** We employ `scipy.optimize.minimize` with the `SLSQP` algorithm, which handles nonlinear constraints efficiently. We wrap the constraints in a `NonlinearConstraint` object.
-3. **Multi-start Search:** To avoid local minima, we run the optimizer 10 times with different random seeds and perturbations, keeping the best result.
-4. **Polishing:** After the multi-start phase, we perform a final high-precision optimization run from the best found configuration to refine the solution.
-5. **Vectorization:** Constraint evaluations are vectorized using NumPy operations for speed, which is crucial given the $\binom{26}{2}=325$ pairwise constraints.
-
-This approach balances computational efficiency with thorough exploration of the solution space, typically yielding a high-quality packing configuration.
+Key steps:
+1. **Initialization**: Place 26 circles in a staggered hexagonal grid with initial radius ~0.09. This ensures a valid starting point with good density.
+2. **Optimization**: Formulate as a constrained optimization problem. Variables are flattened `[x1, y1, r1, x2, y2, r2, ...]`. Objective is to minimize `-sum(r)`. Constraints enforce boundary adherence (`r <= x <= 1-r`, etc.) and non-overlap (`dist^2 >= (r_i+r_j)^2`).
+3. **Vectorization**: Compute constraints using NumPy broadcasting for efficiency, avoiding slow Python loops during the optimization iterations.
+4. **Post-processing**: Apply a safety scaling/clamping step to guarantee strict feasibility within the validation tolerance, correcting any minor numerical violations from the optimizer.
+5. **Structure Compliance**: All helper functions are defined at the top level with no closures or lambdas, strictly following the rules.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize, NonlinearConstraint
-import math
+from scipy.optimize import minimize
 
-def obj_func(p):
-    """Objective function: minimize negative sum of radii."""
-    return -np.sum(p[2::3])
+N_CIRCLES = 26
 
-def con_func(p):
-    """Constraint function: boundary and non-overlap constraints."""
-    n = 26
-    x = p[0::3]
-    y = p[1::3]
-    r = p[2::3]
+def objective_func(v):
+    """Objective: maximize sum of radii (minimize negative sum)"""
+    return -np.sum(v[2::3])
+
+def constraints_func(v):
+    """Returns array of inequality constraints >= 0"""
+    n = N_CIRCLES
+    c = v[:2*n].reshape(n, 2)
+    r = v[2*n:]
     
-    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
-    c_boundary = np.concatenate([
-        x - r,
-        1.0 - x - r,
-        y - r,
-        1.0 - y - r
-    ])
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    cons = [
+        c[:, 0] - r,          # x - r >= 0
+        1.0 - c[:, 0] - r,    # 1 - x - r >= 0
+        c[:, 1] - r,          # y - r >= 0
+        1.0 - c[:, 1] - r     # 1 - y - r >= 0
+    ]
     
-    # Overlap constraints: (x_i - x_j)^2 + (y_i - y_j)^2 >= (r_i + r_j)^2
-    ii, jj = np.triu_indices(n, k=1)
-    dx = x[ii] - x[jj]
-    dy = y[ii] - y[jj]
-    dr = r[ii] + r[jj]
-    c_overlap = dx**2 + dy**2 - dr**2
+    # Pairwise non-overlap constraints: dist^2 - (r_i + r_j)^2 >= 0
+    diff = c[:, None, :] - c[None, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    r_sum_sq = (r[:, None] + r[None, :])**2
     
-    return np.concatenate([c_boundary, c_overlap])
+    idx = np.triu_indices(n, k=1)
+    cons.append(dist_sq[idx] - r_sum_sq[idx])
+    
+    return np.concatenate(cons)
 
 def run_packing():
-    n = 26
-    cons = NonlinearConstraint(con_func, 0, np.inf)
-    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    n = N_CIRCLES
+    r_init = 0.09
+    centers = []
+    # Hexagonal arrangement counts to get exactly 26 circles
+    row_counts = [5, 4, 5, 4, 5, 3]
     
-    best_p = None
-    best_val = -np.inf
+    for row, count in enumerate(row_counts):
+        y = r_init + row * r_init * np.sqrt(3)
+        for col in range(count):
+            x = r_init + col * 2 * r_init + (row % 2) * r_init
+            centers.append([x, y])
+            
+    centers = np.array(centers)
+    radii = np.full(n, r_init)
     
-    # Multi-start optimization
-    for seed in range(10):
-        np.random.seed(seed)
+    # Flatten initial guess: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
         
-        # Hexagonal lattice initialization
-        pts = []
-        step = 0.22
-        y = step * 0.5
-        row = 0
-        while y < 1.0 - step * 0.5:
-            x = step * 0.5
-            offset = (step * math.sqrt(3) / 2) if row % 2 else 0
-            while x < 1.0 - step * 0.5:
-                pts.append((x + offset, y))
-                x += step * math.sqrt(3)
-            y += step * 0.5 * math.sqrt(3)
-            row += 1
-            if len(pts) >= n:
-                break
-        
-        # Fill remaining points randomly if needed
-        while len(pts) < n:
-            pts.append((np.random.rand() * 0.6 + 0.2, np.random.rand() * 0.6 + 0.2))
-        pts = pts[:n]
-        
-        p0 = np.zeros(3 * n)
-        p0[0::3] = [p[0] for p in pts]
-        p0[1::3] = [p[1] for p in pts]
-        p0[2::3] = np.full(n, 0.04)
-        
-        # Add small random perturbations to break symmetry
-        p0[0::3] += np.random.uniform(-0.02, 0.02, n)
-        p0[1::3] += np.random.uniform(-0.02, 0.02, n)
-        p0[0::3] = np.clip(p0[0::3], 0.05, 0.95)
-        p0[1::3] = np.clip(p0[1::3], 0.05, 0.95)
-        
-        try:
-            res = minimize(obj_func, p0, method='SLSQP', bounds=bounds, constraints=[cons],
-                           options={'ftol': 1e-10, 'maxiter': 2000, 'disp': False})
-            val = -res.fun
-            if val > best_val:
-                best_val = val
-                best_p = res.x.copy()
-        except Exception:
-            continue
-
-    if best_p is None:
-        best_p = p0.copy()
-        best_val = -obj_func(p0)
-        
-    # Polishing phase to refine the best solution found
-    try:
-        res2 = minimize(obj_func, best_p, method='SLSQP', bounds=bounds, constraints=[cons],
-                        options={'ftol': 1e-12, 'maxiter': 3000, 'disp': False})
-        if -res2.fun > best_val:
-            best_val = -res2.fun
-            best_p = res2.x.copy()
-    except Exception:
-        pass
-
-    centers = np.column_stack((best_p[0::3], best_p[1::3]))
-    radii = best_p[2::3]
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 1.0)] * n
+    cons_dict = {'type': 'ineq', 'fun': constraints_func}
     
-    return centers, radii, best_val
+    # Run optimization
+    res = minimize(objective_func, x0, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                   options={'ftol': 1e-14, 'maxiter': 5000, 'disp': False})
+                   
+    c_opt = res.x[:2*n].reshape(n, 2)
+    r_opt = res.x[2*n:]
+    r_opt = np.maximum(r_opt, 1e-9)
+    
+    # Robust post-processing to guarantee strict feasibility
+    alpha = 1.0
+    for i in range(n):
+        x, y, r = c_opt[i, 0], c_opt[i, 1], r_opt[i]
+        if r > 1e-12:
+            alpha = min(alpha, x/r, (1.0-x)/r, y/r, (1.0-y)/r)
+            
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.sqrt((c_opt[i,0]-c_opt[j,0])**2 + (c_opt[i,1]-c_opt[j,1])**2)
+            rs = r_opt[i] + r_opt[j]
+            if rs > 1e-12:
+                alpha = min(alpha, d / rs)
+                
+    if alpha < 1.0:
+        r_opt *= alpha
+        for i in range(n):
+            r_opt[i] = min(r_opt[i], c_opt[i,0], 1.0-c_opt[i,0], c_opt[i,1], 1.0-c_opt[i,1])
+            
+    return c_opt, r_opt, np.sum(r_opt)
 ```

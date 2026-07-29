@@ -1,0 +1,187 @@
+# sol_000074 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 05693c56) state=e423f046 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+import math
+
+def get_optimal_radii_and_marginals(centers):
+    """
+    Solves the LP to find max radii for fixed centers and returns radii + dual variables (marginals).
+    """
+    n = centers.shape[0]
+    
+    # Objective: maximize sum(r) => minimize -sum(r)
+    c_obj = -np.ones(n)
+    
+    # Constraints construction
+    # 1. Pairwise non-overlap: r_i + r_j <= dist(i, j)
+    # 2. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    
+    n_pairs = n * (n - 1) // 2
+    n_bounds = 4 * n
+    total_constraints = n_pairs + n_bounds
+    
+    A_ub = np.zeros((total_constraints, n))
+    b_ub = np.zeros(total_constraints)
+    
+    idx = 0
+    # Pairwise constraints
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = d
+            idx += 1
+            
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        # r_i <= x
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = x
+        idx += 1
+        # r_i <= 1 - x
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = 1.0 - x
+        idx += 1
+        # r_i <= y
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = y
+        idx += 1
+        # r_i <= 1 - y
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = 1.0 - y
+        idx += 1
+        
+    bounds = [(0, None)] * n
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            radii = res.x
+            # Extract marginals (dual variables)
+            # In scipy optimize, marginals for inequality constraints are in res.marginals.ineqlin
+            # Note: marginals are non-negative for standard form min c^Tx s.t. Ax <= b
+            marginals = res.marginals.ineqlin
+            return radii, marginals, True
+        else:
+            return np.zeros(n), np.zeros(total_constraints), False
+    except Exception:
+        return np.zeros(n), np.zeros(total_constraints), False
+
+def compute_gradient(centers, marginals):
+    """
+    Computes the gradient of the sum of radii with respect to center positions
+    using the dual variables (marginals) from the LP solution.
+    """
+    n = centers.shape[0]
+    gradients = np.zeros_like(centers)
+    
+    n_pairs = n * (n - 1) // 2
+    
+    # Process pairwise constraints
+    pair_idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            mu = marginals[pair_idx]
+            if mu > 1e-10: # Only consider active constraints
+                d = np.linalg.norm(centers[i] - centers[j])
+                if d > 1e-10:
+                    # Direction from j to i
+                    vec = (centers[i] - centers[j]) / d
+                    # Force pushes i away from j, j away from i
+                    gradients[i] += mu * vec
+                    gradients[j] -= mu * vec
+            pair_idx += 1
+            
+    # Process boundary constraints
+    # Order in marginals: pairs, then for each i: x, 1-x, y, 1-y
+    for i in range(n):
+        base_idx = n_pairs + i * 4
+        
+        # mu_x corresponds to r_i <= x. Increasing x relaxes constraint (allows larger r).
+        # Gradient wrt x is +mu_x
+        mu_x = marginals[base_idx]
+        
+        # mu_1x corresponds to r_i <= 1-x. Increasing x tightens constraint.
+        # Gradient wrt x is -mu_1x
+        mu_1x = marginals[base_idx + 1]
+        
+        # mu_y corresponds to r_i <= y. Increasing y relaxes.
+        # Gradient wrt y is +mu_y
+        mu_y = marginals[base_idx + 2]
+        
+        # mu_1y corresponds to r_i <= 1-y. Increasing y tightens.
+        # Gradient wrt y is -mu_1y
+        mu_1y = marginals[base_idx + 3]
+        
+        gradients[i, 0] += mu_x - mu_1x
+        gradients[i, 1] += mu_y - mu_1y
+        
+    return gradients
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum_radii = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple random initializations to avoid local minima
+    num_tries = 10
+    
+    for _ in range(num_tries):
+        # Initialize centers randomly
+        # Avoiding extreme corners initially helps
+        centers = np.random.uniform(0.05, 0.95, size=(n, 2))
+        
+        # Optimization parameters
+        lr_start = 0.05
+        lr_end = 0.0001
+        num_steps = 300
+        
+        for step in range(num_steps):
+            # Learning rate decay
+            lr = lr_start * (lr_end / lr_start) ** (step / num_steps)
+            
+            # 1. Solve LP for radii
+            radii, marginals, success = get_optimal_radii_and_marginals(centers)
+            
+            if not success:
+                # Fallback if LP fails (rare), just break or continue
+                break
+                
+            # 2. Compute gradient for center positions
+            grad = compute_gradient(centers, marginals)
+            
+            # 3. Update centers
+            centers += lr * grad
+            
+            # 4. Enforce boundary constraints on centers (hard clip)
+            # Note: The LP handles radius vs boundary, but centers must stay in [0,1]
+            # Actually, if center goes outside [0,1], the LP constraints r <= x etc become negative/invalid?
+            # LP bounds are r >= 0. If x < 0, r <= x implies r <= negative, so r=0.
+            # It's safer to keep centers inside [0,1].
+            centers = np.clip(centers, 0.0, 1.0)
+            
+        # Final calculation of radii for this trial
+        final_radii, _, _ = get_optimal_radii_and_marginals(centers)
+        current_sum = np.sum(final_radii)
+        
+        if current_sum > best_sum_radii:
+            best_sum_radii = current_sum
+            best_centers = centers.copy()
+            best_radii = final_radii.copy()
+
+    # Return the best found packing
+    # Ensure types are correct
+    return best_centers, best_radii, float(best_sum_radii)
+
+if __name__ == "__main__":
+    # Quick test logic if run directly, though run_packing is the entry point
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")

@@ -1,0 +1,238 @@
+
+
+<strategy>
+To improve the current packing sum of radii from 2.635983 to surpass 2.636, we need a more robust optimization strategy that escapes shallow local minima common in circle packing problems. The past solutions relied heavily on `SLSQP`, which works well but can stall near the optimum due to its quasi-Newton approach and constraint handling.
+
+Key improvements in this strategy:
+1. **Dual Optimizer Approach**: We will use `trust-constr` as the primary optimizer. It handles large sets of non-linear inequality constraints more robustly than `SLSQP` and often converges to deeper local minima for geometric packing. We keep `SLSQP` as a fallback/refinement to catch cases where `trust-constr` struggles.
+2. **Enhanced Initialization**: We generate diverse starting configurations including rotated hexagonal lattices, staggered grids, and force-relaxed random scatter. This covers the configuration space more thoroughly.
+3. **Adaptive Perturbation Schedule**: After finding a good local optimum, we perform iterative perturbations with decaying noise. This simulates a simulated annealing effect without temperature scheduling, helping circles rearrange to fill microscopic gaps.
+4. **Strict Feasibility Management**: Initial radii are computed conservatively (80-85% of geometric limits) to guarantee strict feasibility for the optimizers, preventing early termination due to constraint violations.
+5. **Robust Post-Processing**: A deterministic, iterative shrink-and-adjust routine guarantees the final output strictly satisfies the validator's tolerance thresholds, eliminating numerical edge-case failures.
+
+These changes target the microscopic inefficiencies in boundary interactions and inter-circle spacing that typically cap the sum of radii just below theoretical limits.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, NonlinearConstraint
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+NUM_PAIRS = len(PAIR_I)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraint_ineq(v):
+    """Compute inequality constraints: boundaries and squared non-overlap distances."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c = np.empty(4*N + NUM_PAIRS)
+    
+    # Boundary constraints
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    # Pairwise non-overlap constraints (squared for smooth gradients)
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    
+    return c
+
+def get_feasible_radii(centers, shrink=0.85):
+    """Compute strictly feasible initial radii based on local geometry."""
+    # Distance to square boundaries
+    r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    # Distance to other centers
+    dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+    r = np.minimum(r, np.min(dists, axis=1) / 2.0)
+    
+    return np.clip(r * shrink, 1e-5, 0.5)
+
+def force_relax(centers, steps=300):
+    """Relax configuration using repulsive forces to find dense local packing."""
+    pts = centers.copy()
+    for _ in range(steps):
+        forces = np.zeros_like(pts)
+        for i in range(N):
+            for j in range(i + 1, N):
+                diff = pts[i] - pts[j]
+                d = np.hypot(diff[0], diff[1])
+                if d < 0.25 and d > 1e-6:
+                    f = (0.25 - d) / d * 0.5
+                    forces[i] += f * diff
+                    forces[j] -= f * diff
+        pts += forces * 0.05
+        pts = np.clip(pts, 0.05, 0.95)
+    return pts
+
+def generate_inits():
+    """Generate diverse initial configurations."""
+    inits = []
+    
+    # 1. Hexagonal lattices with various rotations and densities
+    for r0 in np.linspace(0.075, 0.105, 7):
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N + 10:
+            xs = r0 if row % 2 == 0 else 2.0 * r0
+            x = xs
+            while x <= 1.0 - r0 and len(pts) < N + 10:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+            row += 1
+        c = np.array(pts[:N])
+        for ang in [0.0, 0.05, -0.05, 0.1, -0.1]:
+            ca, sa = np.cos(ang), np.sin(ang)
+            rot = c - 0.5
+            rot = rot @ np.array([[ca, -sa], [sa, ca]]) + 0.5
+            if np.all(rot >= 0.02) and np.all(rot <= 0.98):
+                inits.append(rot)
+                
+    # 2. Perturbed grids
+    for s in np.linspace(0.17, 0.21, 5):
+        c = np.array([[i*s + 0.05, j*s + 0.05] for i in range(6) for j in range(5)])[:N]
+        c += np.random.uniform(-0.005, 0.005, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        inits.append(c)
+        
+    # 3. Force-relaxed random configurations
+    for seed in range(12):
+        np.random.seed(seed)
+        c = np.random.uniform(0.15, 0.85, (N, 2))
+        c = force_relax(c)
+        inits.append(c)
+        
+    return inits
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    
+    # Define constraint object for trust-constr
+    cons_obj = NonlinearConstraint(constraint_ineq, 0, np.inf)
+    
+    best_sum = -1.0
+    best_v = None
+    
+    inits = generate_inits()
+    
+    # Phase 1: Multi-start optimization
+    for c_init in inits:
+        r_init = get_feasible_radii(c_init, shrink=0.75)
+        v0 = np.concatenate([c_init[:, 0], c_init[:, 1], r_init])
+        
+        # Try trust-constr (robust for complex constraints)
+        try:
+            res = minimize(objective, v0, method='trust-constr', bounds=bounds,
+                           constraints=cons_obj, options={'maxiter': 2500, 'verbose': 0})
+            if -res.fun > best_sum:
+                if np.min(constraint_ineq(res.x)) >= -1e-7:
+                    best_sum = -res.fun
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+        # Fallback/Refinement with SLSQP
+        try:
+            res2 = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                            constraints={'type': 'ineq', 'fun': constraint_ineq},
+                            options={'maxiter': 4000, 'ftol': 1e-13})
+            if -res2.fun > best_sum:
+                if np.min(constraint_ineq(res2.x)) >= -1e-7:
+                    best_sum = -res2.fun
+                    best_v = res2.x.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Iterative perturbation & refinement to escape local minima
+    if best_v is not None:
+        current_v = best_v.copy()
+        for step in range(35):
+            np.random.seed(step + 2000)
+            v_pert = current_v.copy()
+            
+            # Decaying noise schedule
+            noise_scale = 0.006 * (1.0 - step / 35.0)
+            v_pert[:2*N] += np.random.uniform(-noise_scale, noise_scale, 2*N)
+            v_pert[:2*N] = np.clip(v_pert[:2*N], 0.02, 0.98)
+            
+            # Shrink radii to create breathing room, then re-feasibilize
+            c_pts = v_pert[:2*N].reshape(N, 2)
+            v_pert[2*N:] = get_feasible_radii(c_pts, shrink=0.82)
+            
+            # Try trust-constr for refinement
+            try:
+                res = minimize(objective, v_pert, method='trust-constr', bounds=bounds,
+                               constraints=cons_obj, options={'maxiter': 1500})
+                if -res.fun > best_sum and np.min(constraint_ineq(res.x)) >= -1e-7:
+                    best_sum = -res.fun
+                    best_v = res.x.copy()
+                    current_v = best_v.copy()
+            except Exception:
+                pass
+            
+            # Try SLSQP if trust-constr didn't improve
+            if -res.fun <= best_sum:
+                try:
+                    res2 = minimize(objective, v_pert, method='SLSQP', bounds=bounds,
+                                    constraints={'type': 'ineq', 'fun': constraint_ineq},
+                                    options={'maxiter': 2000, 'ftol': 1e-13})
+                    if -res2.fun > best_sum and np.min(constraint_ineq(res2.x)) >= -1e-7:
+                        best_sum = -res2.fun
+                        best_v = res2.x.copy()
+                        current_v = best_v.copy()
+                except Exception:
+                    pass
+
+    # Fallback in case all optimizations fail
+    if best_v is None:
+        c_fallback = inits[0]
+        r_fallback = get_feasible_radii(c_fallback)
+        best_v = np.concatenate([c_fallback[:, 0], c_fallback[:, 1], r_fallback])
+        
+    # Extract final configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Phase 3: Strict Post-Processing to guarantee validator compliance
+    # 1. Enforce boundary constraints strictly
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    cr = np.maximum(cr, 0.0)
+    
+    # 2. Enforce non-overlap constraints iteratively with minimal shrinkage
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                sum_r = cr[i] + cr[j]
+                # Validator allows: dist >= r1 + r2 - 1e-12
+                if sum_r > d + 1e-11:
+                    shrink = (sum_r - d - 1e-11) / 2.0
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    return centers, cr, float(np.sum(cr))
+```

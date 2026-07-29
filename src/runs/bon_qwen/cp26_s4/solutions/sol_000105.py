@@ -1,0 +1,179 @@
+# sol_000105 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 80fa60f2) state=bffcedb0 sum of radii=2.613222 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize sum of radii.
+    """
+    n = 26
+    
+    # --- Initialization: Hexagonal Lattice ---
+    # We try to fit 26 circles in a hexagonal pattern.
+    # A 5-4-5-4-5-3 pattern or similar.
+    # Let's try to generate centers for a hexagonal grid and scale them to fit.
+    
+    # Approximate radius for 26 circles in unit square (area density ~0.9)
+    # 26 * pi * r^2 ~ 0.9 => r ~ 0.105
+    # But boundary effects reduce this. Let's start with r=0.1
+    r_init = 0.1
+    
+    centers = []
+    
+    # Rows configuration to sum to 26
+    # 5, 5, 5, 5, 4, 2? No, let's stick to dense hexagonal.
+    # 5, 4, 5, 4, 5, 3 -> 26
+    rows = [5, 4, 5, 4, 5, 3]
+    
+    # Vertical spacing for hexagonal packing: sqrt(3)/2 * (2r) = r*sqrt(3)
+    # Horizontal spacing: 2r
+    # But we need to fit in [0,1].
+    # Let's generate relative positions and then scale/center.
+    
+    y_offset = 0
+    for i, count in enumerate(rows):
+        x_start = 0
+        if i % 2 == 1:
+            # Shift odd rows by r horizontally (half step of 2r)
+            x_start = r_init 
+        
+        for j in range(count):
+            x = x_start + j * (2 * r_init)
+            y = y_offset
+            centers.append([x, y])
+        
+        y_offset += r_init * np.sqrt(3)
+    
+    centers = np.array(centers)
+    
+    # Center the configuration in the square
+    # Find min and max coordinates
+    min_c = centers.min(axis=0)
+    max_c = centers.max(axis=0)
+    
+    # Current bounding box size
+    width = max_c[0] - min_c[0]
+    height = max_c[1] - min_c[1]
+    
+    # Scale to fit inside [0, 1] with some margin for radii?
+    # Actually, the optimizer will handle scaling. 
+    # Let's just translate to center.
+    centers = centers - 0.5 * (min_c + max_c) + 0.5
+    
+    # Initialize radii
+    radii = np.full(n, r_init)
+    
+    # --- Optimization ---
+    # Variables: [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+    # Total 3 * n variables.
+    
+    def objective(vars):
+        # vars is shape (3*n,)
+        # Extract radii and sum them (negative for minimization)
+        # radii are at indices 2, 5, 8, ...
+        r = vars[2::3]
+        return -np.sum(r)
+    
+    def constraints(vars):
+        cons = []
+        
+        # Unpack
+        # x = vars[0::3], y = vars[1::3], r = vars[2::3]
+        # But accessing slices in loop is slow? n=26 is small.
+        x = vars[0::3]
+        y = vars[1::3]
+        r = vars[2::3]
+        
+        # 1. Boundary constraints: r <= x, 1-x, y, 1-y
+        # x - r >= 0  => r - x <= 0 (Standard form g(x) <= 0)
+        # 1 - x - r >= 0 => x + r - 1 <= 0
+        # y - r >= 0
+        # 1 - y - r >= 0
+        
+        # We use scipy's constraint format: {'type': 'ineq', 'fun': lambda v: ...} returning value >= 0
+        # Or 'type': 'ineq', 'fun' returns vector where each element >= 0.
+        
+        # Let's collect all inequality constraints (value >= 0)
+        ineqs = []
+        
+        # Boundary
+        ineqs.extend(x - r)            # x >= r
+        ineqs.extend(1 - x - r)        # 1-x >= r
+        ineqs.extend(y - r)            # y >= r
+        ineqs.extend(1 - y - r)        # 1-y >= r
+        
+        # Non-overlap: dist >= r_i + r_j
+        # (x_i - x_j)^2 + (y_i - y_j)^2 >= (r_i + r_j)^2
+        # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                dist_sq = dx*dx + dy*dy
+                sum_r = r[i] + r[j]
+                # Constraint: dist_sq - sum_r^2 >= 0
+                # Note: dist_sq is >= 0. sum_r^2 >= 0.
+                # This is a valid constraint.
+                val = dist_sq - sum_r**2
+                ineqs.append(val)
+                
+        return np.array(ineqs)
+
+    # Initial guess
+    x0 = np.zeros(3 * n)
+    x0[0::3] = centers[:, 0]
+    x0[1::3] = centers[:, 1]
+    x0[2::3] = radii
+    
+    # Bounds for variables
+    # x, y in [0, 1]
+    # r in [0, 0.5] (max possible radius is 0.5)
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+    
+    # Define constraint object for SLSQP
+    # SLSQP supports vector constraints
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    # Run optimization
+    # We might need multiple restarts or a robust method.
+    # SLSQP is good.
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                       options={'ftol': 1e-9, 'maxiter': 1000})
+        
+        # Extract results
+        opt_centers = np.zeros((n, 2))
+        opt_radii = np.zeros(n)
+        
+        opt_centers[:, 0] = res.x[0::3]
+        opt_centers[:, 1] = res.x[1::3]
+        opt_radii = res.x[2::3]
+        
+        # Verify validity (optional but good practice)
+        # The validation function checks strict inequalities with tolerance.
+        # Our optimizer might be on the boundary.
+        # We should clamp radii slightly if needed, but optimizer should handle it.
+        
+    except Exception as e:
+        # Fallback to initial guess if optimization fails
+        print(f"Optimization failed: {e}")
+        opt_centers = centers
+        opt_radii = radii
+
+    sum_radii = np.sum(opt_radii)
+    
+    # Final validation check (debugging)
+    # We assume the validation function will be run separately.
+    
+    return opt_centers, opt_radii, sum_radii

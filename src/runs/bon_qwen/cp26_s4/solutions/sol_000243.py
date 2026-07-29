@@ -1,0 +1,145 @@
+# sol_000243 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state e7c70ed6) state=1bb5b298 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Runs a force-directed simulation with radius inflation to pack 26 circles
+    in a unit square, maximizing the sum of radii.
+    """
+    np.random.seed(42)  # For reproducibility
+    n_circles = 26
+    n_iters = 5000
+    lr = 0.01  # Learning rate for position updates
+    growth_rate = 1e-4  # Rate at which radii increase
+    force_scale = 10.0  # Scaling factor for repulsion forces
+
+    # Initialize centers randomly in the middle of the square to avoid immediate wall collisions
+    centers = np.random.rand(n_circles, 2) * 0.6 + 0.2
+    radii = np.full(n_circles, 0.02)
+
+    for _ in range(n_iters):
+        # 1. Calculate repulsion forces between circles
+        # Compute pairwise difference vectors
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]  # Shape: (N, N, 2)
+        # Compute pairwise distances
+        dists = np.linalg.norm(diff, axis=2)  # Shape: (N, N)
+        
+        # Avoid division by zero for i == j
+        dists = np.where(dists == 0, 1e-9, dists)
+        
+        # Calculate overlap: positive if r_i + r_j > dist
+        radii_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlap = radii_sum - dists
+        
+        # Only consider overlaps
+        overlap = np.maximum(0, overlap)
+        
+        # Calculate force direction (unit vector from j to i)
+        # diff / dists gives direction i -> j? No, diff is i - j. 
+        # We want force on i to be away from j, so direction is (i - j) / dist.
+        direction = diff / dists[:, :, np.newaxis]
+        
+        # Force on circle i from j is proportional to overlap
+        force_contribution = overlap[:, :, np.newaxis] * direction
+        forces = np.sum(force_contribution, axis=1)  # Shape: (N, 2)
+
+        # 2. Calculate repulsion forces from walls
+        # Left wall (x=0)
+        overlap_left = radii - centers[:, 0]
+        overlap_left = np.maximum(0, overlap_left)
+        forces[:, 0] += force_scale * overlap_left
+
+        # Right wall (x=1)
+        overlap_right = centers[:, 0] - (1 - radii)
+        overlap_right = np.maximum(0, overlap_right)
+        forces[:, 0] -= force_scale * overlap_right
+
+        # Bottom wall (y=0)
+        overlap_bottom = radii - centers[:, 1]
+        overlap_bottom = np.maximum(0, overlap_bottom)
+        forces[:, 1] += force_scale * overlap_bottom
+
+        # Top wall (y=1)
+        overlap_top = centers[:, 1] - (1 - radii)
+        overlap_top = np.maximum(0, overlap_top)
+        forces[:, 1] -= force_scale * overlap_top
+
+        # 3. Update positions
+        centers += lr * forces / force_scale  # Normalize force by scale to keep lr intuitive
+
+        # 4. Grow radii
+        radii += growth_rate
+
+        # 5. Enforce boundaries strictly to prevent invalid states
+        # Although forces push away, numerical steps might overshoot.
+        # We clamp positions to be valid for current radii.
+        centers[:, 0] = np.clip(centers[:, 0], radii, 1 - radii)
+        centers[:, 1] = np.clip(centers[:, 1], radii, 1 - radii)
+
+    # Final cleanup: Recalculate radii based on current tightest constraints
+    # This ensures the radii are as large as possible for the final positions
+    # without violating constraints. We do a simple relaxation pass.
+    
+    # Compute max possible radius for each circle given neighbors and walls
+    # This is a simplified version of the LP solution, iterating a few times
+    for _ in range(50):
+        # Update radii based on neighbors
+        new_radii = np.copy(radii)
+        for i in range(n_circles):
+            r_i = radii[i]
+            # Check walls
+            max_r = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            
+            # Check neighbors
+            for j in range(n_circles):
+                if i != j:
+                    d = np.linalg.norm(centers[i] - centers[j])
+                    r_j = radii[j]
+                    # Constraint: r_i + r_j <= d  =>  r_i <= d - r_j
+                    limit = d - r_j
+                    if limit < max_r:
+                        max_r = limit
+            
+            # Update radius to the max valid, but keep it from shrinking too much if not needed
+            # Actually, to maximize sum, we want r_i as large as possible.
+            # However, we must respect current neighbors.
+            # If we just set r_i = max_r, we might violate constraints with other neighbors
+            # if those neighbors were also updated. 
+            # A conservative update: r_i = min(r_i + epsilon, max_r) ?
+            # Or just enforce constraint: if r_i + r_j > d, reduce r_i.
+            pass
+        
+        # Let's just enforce constraints by reducing radii if they violate
+        valid_radii = np.copy(radii)
+        for i in range(n_circles):
+            # Wall constraints
+            r = valid_radii[i]
+            if r > centers[i, 0]: valid_radii[i] = centers[i, 0]
+            if r > 1 - centers[i, 0]: valid_radii[i] = 1 - centers[i, 0]
+            if r > centers[i, 1]: valid_radii[i] = centers[i, 1]
+            if r > 1 - centers[i, 1]: valid_radii[i] = 1 - centers[i, 1]
+            
+            # Neighbor constraints
+            for j in range(n_circles):
+                if i != j:
+                    d = np.linalg.norm(centers[i] - centers[j])
+                    r_sum = valid_radii[i] + radii[j] # Use current radii[j] or updated?
+                    # To be safe, use valid_radii[i] + radii[j] (current iteration)
+                    # But radii[j] might have been reduced already in this loop?
+                    # Let's use a conservative approach: reduce if overlap
+                    if valid_radii[i] + radii[j] > d:
+                        valid_radii[i] = max(0, d - radii[j])
+        
+        radii = valid_radii
+
+    # Ensure non-negative
+    radii = np.maximum(radii, 0)
+
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

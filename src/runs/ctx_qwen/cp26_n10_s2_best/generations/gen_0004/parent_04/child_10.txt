@@ -1,0 +1,195 @@
+
+
+<strategy>
+To improve the circle packing sum of radii beyond the current ~2.631, I will focus on three main areas:
+1. **Diverse & Structured Initial Configurations**: Instead of purely random or basic hex grids, I'll generate multiple hexagonal lattice patterns with different row distributions (e.g., [6,5,6,5,4], [5,6,5,6,4], etc.) combined with systematic rotations and translations. This covers more of the configuration space near known optimal packings.
+2. **Force-Relaxed Random Starts**: I'll include a vectorized repulsion-based relaxation to generate well-spaced random configurations that naturally respect boundaries, providing good baselines for the optimizer.
+3. **Adaptive Perturbation & Swap Strategy**: Local minima are the biggest hurdle. I'll implement a refinement loop that gradually reduces perturbation noise, randomly swaps pairs of circles (positions + radii) to break symmetries, and shrinks radii slightly before re-optimizing to allow centers to find new equilibria.
+4. **Robust Constraint Handling & Post-Processing**: I'll use squared distance constraints for smoother gradients during optimization, and apply a strict iterative shrinkage phase at the end to guarantee validator compliance without unnecessarily sacrificing radius sum.
+
+The optimizer will be SLSQP with increased iteration limits and tight tolerances. Multi-start exploration followed by iterative local refinement typically yields the best results for this problem size.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Compute inequality constraints: boundaries and squared non-overlap distances."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    return c
+
+def compute_initial_radii(centers, shrink=0.88):
+    """Compute strictly feasible initial radii based on local geometry."""
+    r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+    r = np.minimum(r, np.min(dists, axis=1) / 2.0)
+    return np.clip(r * shrink, 1e-4, 0.25)
+
+def generate_hex_configs():
+    """Generate hexagonal lattice configurations with varied row distributions and transformations."""
+    configs = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,6,5,5], [6,6,5,5,4],
+        [7,5,5,5,4], [5,5,6,6,4], [6,5,5,6,4], [5,6,6,4,5],
+        [6,4,6,6,4], [4,6,5,6,5], [6,6,4,5,5]
+    ]
+    for pat in patterns:
+        if sum(pat) < N: 
+            continue
+        r0 = 0.10
+        pts = []
+        y = r0
+        row_idx = 0
+        for count in pat:
+            x_start = r0 if row_idx % 2 == 0 else 2.0 * r0
+            for k in range(count):
+                if len(pts) >= N: 
+                    break
+                x = x_start + k * 2.0 * r0
+                pts.append([x, y])
+            y += r0 * np.sqrt(3.0)
+            row_idx += 1
+        pts = np.array(pts[:N])
+        
+        for ang in [0.0, 0.05, -0.05, 0.1, -0.1, 0.15, -0.15]:
+            for sx in [-0.02, 0.0, 0.02, 0.04]:
+                for sy in [-0.02, 0.0, 0.02, 0.04]:
+                    p = pts.copy()
+                    if ang != 0.0:
+                        c, s = np.cos(ang), np.sin(ang)
+                        p = (p - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+                    p += [sx, sy]
+                    p = np.clip(p, 0.01, 0.99)
+                    r = compute_initial_radii(p, 0.88)
+                    configs.append(np.concatenate([p[:,0], p[:,1], r]))
+    return configs
+
+def force_relaxed_init(seed):
+    """Generate a well-spread initial configuration using vectorized repulsion forces."""
+    np.random.seed(seed)
+    pts = np.random.uniform(0.1, 0.9, (N, 2))
+    lr = 0.04
+    for _ in range(500):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+        mask = (dists < 0.25) & ~np.eye(N, dtype=bool)
+        forces = np.zeros_like(pts)
+        f_mag = np.zeros_like(dists)
+        f_mag[mask] = (0.25 - dists[mask]) * 0.5
+        f_vec = diff * f_mag[:, :, None] / dists[:, :, None]
+        forces = np.sum(f_vec, axis=1)
+        pts += forces * lr
+        pts = np.clip(pts, 0.02, 0.98)
+        lr *= 0.998
+    r = compute_initial_radii(pts, 0.85)
+    return np.concatenate([pts[:,0], pts[:,1], r])
+
+def run_packing():
+    """Optimizes packing of 26 circles in a unit square to maximize sum of radii."""
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-5, 0.3)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    inits = generate_hex_configs()
+    for s in range(25):
+        inits.append(force_relaxed_init(s))
+        
+    # Phase 1: Multi-start exploration
+    for v0 in inits:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 15000, 'ftol': 1e-12, 'disp': False})
+            s_val = -res.fun
+            if s_val > best_sum and np.min(constraints(res.x)) >= -1e-6:
+                best_sum = s_val
+                best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        best_v = inits[0]
+        
+    # Phase 2: Adaptive refinement & escape from local minima
+    curr = best_v.copy()
+    for step in range(40):
+        np.random.seed(step + 2000)
+        pert = curr.copy()
+        
+        # Adaptive noise schedule
+        noise = 0.006 * max(0.2, 1.0 - step/40.0)
+        pert[:2*N] += np.random.uniform(-noise, noise, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        
+        # Random swap to break symmetries
+        if np.random.rand() < 0.4:
+            i, j = np.random.choice(N, 2, replace=False)
+            idx_pair = np.array([i, j])
+            pert[idx_pair] = pert[[j, i]]
+            pert[N + idx_pair] = pert[N + [j, i]]
+            pert[2*N + idx_pair] = pert[2*N + [j, i]]
+            
+        # Shrink radii to guarantee feasibility after perturbation
+        centers_p = pert[:2*N].reshape(N, 2)
+        pert[2*N:] = compute_initial_radii(centers_p, 0.90)
+        
+        try:
+            res = minimize(objective, pert, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 10000, 'ftol': 1e-12, 'disp': False})
+            s_val = -res.fun
+            if s_val > best_sum and np.min(constraints(res.x)) >= -1e-6:
+                best_sum = s_val
+                best_v = res.x.copy()
+                curr = best_v.copy()
+        except Exception:
+            pass
+            
+    # Extract final configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    
+    # Phase 3: Strict post-processing for validator compliance
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    cr = np.maximum(cr, 0.0)
+    
+    # Iterative non-overlap enforcement with minimal safety margin
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(cx[i]-cx[j], cy[i]-cy[j])
+                if cr[i] + cr[j] > d - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    centers = np.column_stack((cx, cy))
+    return centers, cr, float(np.sum(cr))
+```

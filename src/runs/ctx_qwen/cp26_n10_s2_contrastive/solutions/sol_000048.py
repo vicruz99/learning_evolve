@@ -1,0 +1,250 @@
+# sol_000048 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000024 (state 7d29769f) state=67bc1eb3 sum of radii=2.598537 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+TRIU_IDX = np.triu_indices(N, k=1)
+
+def objective_func(x):
+    """Minimize negative sum of radii to maximize it."""
+    return -np.sum(x[2::3])
+
+def constraint_func(x):
+    """Vectorized inequality constraints g(x) >= 0."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    # Preallocate constraint array
+    n_cons = 4 * N + N * (N - 1) // 2
+    c = np.empty(n_cons)
+    idx = 0
+    
+    # Boundary constraints
+    c[idx:idx+N] = cx - r; idx += N
+    c[idx:idx+N] = 1.0 - cx - r; idx += N
+    c[idx:idx+N] = cy - r; idx += N
+    c[idx:idx+N] = 1.0 - cy - r; idx += N
+    
+    # Vectorized pairwise squared distance constraints
+    # dist^2 >= (r_i + r_j)^2  <==>  dist^2 - (r_i + r_j)^2 >= 0
+    cx_diff = cx[:, None] - cx[None, :]
+    cy_diff = cy[:, None] - cy[None, :]
+    r_sum = r[:, None] + r[None, :]
+    
+    diff = cx_diff**2 + cy_diff**2 - r_sum**2
+    c[idx:] = diff[TRIU_IDX]
+    
+    return c
+
+def solve_radii_lp(centers):
+    """Given fixed centers, solve LP to maximize sum(radii) subject to constraints."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    n_pairs = n * (n - 1) // 2
+    A_ub = np.zeros((n_pairs, n))
+    b_ub = np.zeros(n_pairs)
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = d
+            idx += 1
+            
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        ub = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(0.0, ub)))
+        
+    for method in ['highs', 'interior-point']:
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method=method)
+            if res.success and np.all(res.x >= -1e-9):
+                return np.maximum(res.x, 0.0)
+        except Exception:
+            continue
+            
+    return np.full(n, 0.01)
+
+def generate_init(seed):
+    """Generate diverse initial center configurations."""
+    rng = np.random.RandomState(seed)
+    c = np.zeros((N, 2))
+    init_type = seed % 3
+    idx = 0
+    
+    if init_type == 0:
+        # Hexagonal lattice with varying density
+        density = 0.6 + (seed % 10) * 0.08
+        r_est = 0.06 * density
+        dy = r_est * np.sqrt(3)
+        dx = 2.0 * r_est
+        y = r_est + 0.01
+        row = 0
+        while idx < N and y < 1.0 - r_est:
+            x_start = r_est + 0.01 + (row % 2) * (dx / 2.0)
+            col = 0
+            while x_start + col * dx < 1.0 - r_est and idx < N:
+                c[idx, 0] = x_start + col * dx + rng.uniform(-0.015, 0.015)
+                c[idx, 1] = y + rng.uniform(-0.015, 0.015)
+                idx += 1
+                col += 1
+            y += dy
+            row += 1
+    elif init_type == 1:
+        # Structured grid
+        step = 0.16
+        y = 0.08
+        row = 0
+        while idx < N and y < 0.92:
+            x = 0.08 + (row % 2) * (step / 2.0)
+            while x < 0.92 and idx < N:
+                c[idx, 0] = x + rng.uniform(-0.01, 0.01)
+                c[idx, 1] = y + rng.uniform(-0.01, 0.01)
+                idx += 1
+                x += step
+            y += step * 0.866
+            row += 1
+    else:
+        # Dense random placement
+        c = rng.uniform(0.05, 0.95, (N, 2))
+        idx = N
+        
+    # Fill remaining if any
+    while idx < N:
+        c[idx, 0] = rng.uniform(0.2, 0.8)
+        c[idx, 1] = rng.uniform(0.2, 0.8)
+        idx += 1
+        
+    return np.clip(c, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    bounds_opt = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons_opt = {'type': 'ineq', 'fun': constraint_func}
+    
+    # Phase 1: Broad search with diverse initializations
+    for seed in range(60):
+        c_init = generate_init(seed)
+        r_init = np.full(N, 0.035)
+        
+        x0 = np.zeros(3 * N)
+        x0[0::3] = c_init[:, 0]
+        x0[1::3] = c_init[:, 1]
+        x0[2::3] = r_init
+        
+        try:
+            res = minimize(
+                objective_func, x0,
+                method='SLSQP',
+                bounds=bounds_opt,
+                constraints=cons_opt,
+                options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False}
+            )
+            
+            if res.success or -res.fun > best_sum:
+                curr_c = np.column_stack((res.x[0::3], res.x[1::3]))
+                curr_r = solve_radii_lp(curr_c)
+                curr_s = np.sum(curr_r)
+                
+                if curr_s > best_sum:
+                    best_sum = curr_s
+                    best_c = curr_c.copy()
+                    best_r = curr_r.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Local refinement with perturbations
+    if best_c is not None:
+        for iteration in range(40):
+            rng = np.random.RandomState(iteration * 31 + 7)
+            noise_scale = 0.004 * (1.0 - iteration / 45.0)
+            
+            c_pert = best_c + rng.normal(0, noise_scale, best_c.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            r_pert = best_r * 0.995
+            
+            x0 = np.zeros(3 * N)
+            x0[0::3] = c_pert[:, 0]
+            x0[1::3] = c_pert[:, 1]
+            x0[2::3] = r_pert
+            
+            try:
+                res = minimize(
+                    objective_func, x0,
+                    method='SLSQP',
+                    bounds=bounds_opt,
+                    constraints=cons_opt,
+                    options={'maxiter': 2000, 'ftol': 1e-13, 'disp': False}
+                )
+                
+                if res.success:
+                    curr_c = np.column_stack((res.x[0::3], res.x[1::3]))
+                    curr_r = solve_radii_lp(curr_c)
+                    curr_s = np.sum(curr_r)
+                    
+                    if curr_s > best_sum:
+                        best_sum = curr_s
+                        best_c = curr_c.copy()
+                        best_r = curr_r.copy()
+            except Exception:
+                continue
+
+    # Fallback safety net
+    if best_c is None:
+        best_c = np.random.rand(N, 2) * 0.6 + 0.2
+        best_r = np.full(N, 0.02)
+        best_sum = np.sum(best_r)
+        
+    # Phase 3: Final validation and numerical strictness
+    c_final = best_c.copy()
+    r_final = best_r.copy()
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        x, y = c_final[i]
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        r_final[i] = min(r_final[i], max_r - 1e-11)
+        r_final[i] = max(0.0, r_final[i])
+        
+    # Iteratively resolve microscopic overlaps
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(c_final[i, 0] - c_final[j, 0], c_final[i, 1] - c_final[j, 1])
+                if d < r_final[i] + r_final[j] - 1e-12:
+                    excess = r_final[i] + r_final[j] - d
+                    # Distribute excess proportionally to larger radius to minimize loss
+                    total_r = r_final[i] + r_final[j]
+                    if total_r > 1e-12:
+                        r_final[i] -= excess * (r_final[i] / total_r)
+                        r_final[j] -= excess * (r_final[j] / total_r)
+                    else:
+                        r_final[i] -= excess * 0.5
+                        r_final[j] -= excess * 0.5
+                        
+                    r_final[i] = max(0.0, r_final[i])
+                    r_final[j] = max(0.0, r_final[j])
+                    changed = True
+        if not changed:
+            break
+            
+    final_sum = np.sum(r_final)
+    return c_final, r_final, float(final_sum)

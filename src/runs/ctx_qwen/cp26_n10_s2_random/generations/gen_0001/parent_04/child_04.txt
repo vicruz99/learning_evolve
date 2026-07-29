@@ -1,0 +1,132 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we formulate a constrained nonlinear optimization problem. The key challenges are the non-convexity of the overlap constraints and the high dimensionality (78 variables: 52 coordinates + 26 radii). 
+
+Strategy:
+1. **Constraint Formulation**: Use squared distance constraints `dist^2 >= (r_i + r_j)^2` instead of `dist >= r_i + r_j`. This removes the square root, making the constraint function smooth and differentiable almost everywhere, which significantly improves SLSQP performance.
+2. **Multi-Start Optimization**: Run `scipy.optimize.minimize` (SLSQP method) from many different initial configurations. SLSQP is excellent for constrained problems but can get stuck in local minima. Multiple restarts mitigate this.
+3. **Intelligent Initialization**: Start with a hexagonal lattice pattern (known for high packing density) scaled to fit comfortably inside the square, then add random noise. This provides a physically plausible starting geometry.
+4. **Adaptive Perturbation**: After each successful optimization, perturb the best-found configuration (centers + slightly shrunken radii) and re-optimize. This acts as a local escape mechanism from suboptimal basins.
+5. **Feasibility Verification**: After each optimization step, verify that all constraints are satisfied within a tight tolerance before accepting the solution.
+6. **Bounds Handling**: Explicitly bound coordinates to [0,1] and radii to [0, 0.5]. Start with small radii (0.03) to ensure initial feasibility, allowing the optimizer to grow them naturally.
+
+This approach systematically explores the configuration space, leverages gradient-based refinement, and enforces hard geometric constraints, consistently pushing past typical local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    def objective(v):
+        # Minimize negative sum of radii => Maximize sum of radii
+        return -np.sum(v[2*n:])
+        
+    def constraint_func(v):
+        C = v[:2*n].reshape(n, 2)
+        R = v[2*n:]
+        
+        # Boundary constraints: circle inside [0,1]^2
+        # x >= r, 1-x >= r, y >= r, 1-y >= r
+        con = np.concatenate([
+            C[:, 0] - R,
+            1.0 - C[:, 0] - R,
+            C[:, 1] - R,
+            1.0 - C[:, 1] - R
+        ])
+        
+        # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+        # Squared form is smoother and avoids sqrt singularities
+        diff = C[:, np.newaxis, :] - C[np.newaxis, :, :]
+        d2 = np.sum(diff**2, axis=2)
+        r_sum = R[:, np.newaxis] + R[np.newaxis, :]
+        pair_con = d2 - r_sum**2
+        
+        # Only upper triangle to avoid duplicates and self-comparison
+        idx = np.triu_indices(n, k=1)
+        con = np.concatenate([con, pair_con[idx]])
+        
+        return con
+
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    def get_initial_guess(seed):
+        np.random.seed(seed)
+        centers = []
+        y = 0.05
+        row = 0
+        while len(centers) < n:
+            x = 0.05 + (row % 2) * 0.04
+            while x <= 0.95 and len(centers) < n:
+                centers.append([x, y])
+                x += 0.09
+            y += 0.078
+            row += 1
+        centers = np.array(centers[:n])
+        
+        # Add noise and clip to safe interior region
+        noise = np.random.uniform(-0.02, 0.02, centers.shape)
+        centers = np.clip(centers + noise, 0.02, 0.98)
+        
+        v = np.zeros(3*n)
+        v[:2*n] = centers.flatten()
+        v[2*n:] = 0.03  # Small initial radius ensures feasibility
+        return v
+
+    # Multiple restarts with adaptive perturbation of the best solution
+    for seed in range(40):
+        x0 = get_initial_guess(seed)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                con_vals = constraint_func(res.x)
+                if np.all(con_vals >= -1e-7):
+                    best_sum = curr_sum
+                    best_centers = res.x[:2*n].reshape(n, 2).copy()
+                    best_radii = res.x[2*n:].copy()
+        except Exception:
+            pass
+            
+        # Perturb best solution found so far to escape local minima
+        if best_centers is not None:
+            pert = best_centers.copy()
+            pert += np.random.normal(0, 0.008, pert.shape)
+            pert = np.clip(pert, 0.01, 0.99)
+            # Slightly shrink radii to ensure feasible starting point for next optimization
+            x0_pert = np.concatenate([pert.flatten(), best_radii * 0.95])
+            try:
+                res2 = minimize(objective, x0_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                                options={'maxiter': 2000, 'ftol': 1e-13, 'disp': False})
+                curr_sum2 = -res2.fun
+                if curr_sum2 > best_sum:
+                    con_vals2 = constraint_func(res2.x)
+                    if np.all(con_vals2 >= -1e-7):
+                        best_sum = curr_sum2
+                        best_centers = res2.x[:2*n].reshape(n, 2).copy()
+                        best_radii = res2.x[2*n:].copy()
+            except Exception:
+                pass
+
+    # Fallback if optimization failed entirely
+    if best_centers is None:
+        x0 = get_initial_guess(0)
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                       options={'maxiter': 4000, 'disp': False})
+        best_centers = res.x[:2*n].reshape(n, 2)
+        best_radii = res.x[2*n:]
+        best_sum = -res.fun
+        
+    # Ensure radii are strictly non-negative
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    return best_centers, best_radii, float(best_sum)
+```

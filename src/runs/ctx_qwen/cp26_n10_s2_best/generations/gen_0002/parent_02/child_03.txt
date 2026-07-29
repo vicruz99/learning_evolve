@@ -1,0 +1,136 @@
+
+
+<strategy>
+The previous approaches used SLSQP to optimize centers and radii jointly, which frequently gets trapped in local minima due to the non-convex coupling of distance and radius constraints. To break through the ~2.628 plateau, we decouple the problem:
+
+1. **Decoupling via Linear Programming**: For any fixed set of circle centers, finding the maximum sum of radii is a Linear Programming problem. The constraints are linear: `r_i + r_j <= distance(i,j)` and `0 <= r_i <= min(x_i, 1-x_i, y_i, 1-y_i)`. This removes the non-convex radius-center coupling from the optimizer's perspective.
+2. **Global Center Optimization**: We use `scipy.optimize.differential_evolution` to search the 52-dimensional space of circle centers. The objective function evaluates the LP to get the exact maximum sum of radii for each center configuration. This creates a smoother optimization landscape focused purely on spatial arrangement.
+3. **Smart Initialization**: We seed the evolutionary algorithm with perturbed hexagonal lattices and dense grids, which are known to be near-optimal packings. This drastically reduces the search space.
+4. **Local Refinement**: After DE finds a promising basin, we run a derivative-free local optimizer (`Nelder-Mead`) to fine-tune the centers.
+5. **Strict Post-Processing**: An iterative shrinkage step guarantees that all constraints satisfy the validator's `1e-12` tolerance, compensating for any LP solver numerical drift.
+
+This strategy leverages the mathematical structure of the problem, avoiding the pitfalls of joint non-linear optimization while thoroughly exploring high-quality regions of the configuration space.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, differential_evolution, minimize
+
+N = 26
+PAIRS = np.triu_indices(N, k=1)
+
+def compute_lp_sum(centers):
+    """Solves LP to find maximum sum of radii for fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    # Boundary constraints: r_i <= distance to nearest wall
+    b = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    b = np.maximum(b, 1e-9)
+    
+    # Pairwise distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d = np.sqrt(dx**2 + dy**2)
+    
+    # Construct LP matrices: Maximize sum(r) -> Minimize -sum(r)
+    # Constraints: r_i <= b_i  AND  r_i + r_j <= d_ij
+    A1 = np.eye(N)
+    b1 = b.copy()
+    
+    m = len(PAIRS[0])
+    A2 = np.zeros((m, N))
+    A2[np.arange(m), PAIRS[0]] = 1.0
+    A2[np.arange(m), PAIRS[1]] = 1.0
+    b2 = d[PAIRS]
+    
+    A_ub = np.vstack([A1, A2])
+    b_ub = np.concatenate([b1, b2])
+    
+    res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=(0, None), method='highs')
+    return -res.fun, -res.x
+
+def objective_func(v):
+    """Objective for optimizer: maximize sum of radii -> minimize negative sum."""
+    centers = v.reshape(-1, 2)
+    val, _ = compute_lp_sum(centers)
+    return -val
+
+def run_packing():
+    bounds = [(0.02, 0.98)] * (2 * N)
+    
+    # Generate high-quality initial population
+    inits = []
+    r_hex = 0.095
+    base_pts = []
+    y = r_hex
+    row = 0
+    while len(base_pts) < N + 10:
+        x_start = r_hex if row % 2 == 0 else 2 * r_hex
+        x = x_start
+        while x <= 1.0 - r_hex:
+            base_pts.append([x, y])
+            x += 2 * r_hex
+        y += r_hex * np.sqrt(3)
+        row += 1
+    base_pts = np.array(base_pts[:N])
+    
+    np.random.seed(42)
+    for _ in range(10):
+        pts = base_pts + np.random.uniform(-0.025, 0.025, size=base_pts.shape)
+        pts = np.clip(pts, 0.02, 0.98)
+        inits.append(pts.flatten())
+        
+    # Add grid-based starts for diversity
+    grid = np.array([(i*0.18+0.1, j*0.18+0.1) for i in range(5) for j in range(5)] + [(0.5, 0.5)])
+    for _ in range(5):
+        pts = grid + np.random.uniform(-0.02, 0.02, size=grid.shape)
+        pts = np.clip(pts, 0.02, 0.98)
+        inits.append(pts.flatten())
+        
+    inits = np.array(inits)
+    
+    # Global search over center positions
+    try:
+        res_de = differential_evolution(objective_func, bounds, 
+                                        initial_guess=inits, popsize=15, maxiter=300, 
+                                        tol=1e-7, seed=42, workers=1, polish=False)
+        best_v = res_de.x
+    except Exception:
+        best_v = inits[0]
+        
+    # Local refinement to escape shallow basins
+    try:
+        res_local = minimize(objective_func, best_v, method='Nelder-Mead', 
+                             options={'maxiter': 5000, 'xatol': 1e-7, 'fatol': 1e-9})
+        if res_local.fun < objective_func(best_v):
+            best_v = res_local.x
+    except Exception:
+        pass
+        
+    centers = best_v.reshape(N, 2)
+    _, radii = compute_lp_sum(centers)
+    
+    # Strict post-processing to guarantee validator compliance
+    cr = radii.copy()
+    cx, cy = centers[:, 0], centers[:, 1]
+    
+    # Enforce boundary constraints strictly
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    
+    # Enforce non-overlap constraints iteratively with safety margin
+    for _ in range(5):
+        for i in range(N):
+            for j in range(i+1, N):
+                dist = np.hypot(cx[i]-cx[j], cy[i]-cy[j])
+                if dist < cr[i] + cr[j] - 1e-9:
+                    shrink = (cr[i] + cr[j] - dist) / 2.0 + 1e-7
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    
+    cr = np.maximum(cr, 0.0)
+    # Final boundary clamp
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    
+    return centers, cr, float(np.sum(cr))
+```

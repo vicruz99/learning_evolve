@@ -1,0 +1,453 @@
+# sol_000173 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 397104b2) state=a3c9a353 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+from scipy.spatial.distance import pdist, squareform
+import warnings
+
+def get_initial_hexagonal_centers(n, attempts=5):
+    """
+    Generates initial centers for n circles using a hexagonal lattice pattern.
+    Tries multiple scaling factors and rotations to find a valid initial placement.
+    """
+    best_centers = None
+    best_min_dist = -1
+
+    # Try a few variations of the hexagonal grid
+    # Estimate grid size based on area
+    # Area per circle approx 1/n. r ~ sqrt(1/(pi*n)). spacing ~ 2r.
+    # Roughly sqrt(n) circles per side.
+    
+    # We can just try placing points in a grid and jittering or scaling
+    # Let's try to fit a triangular grid.
+    
+    # Heuristic: try to pack points in a triangle shape or rectangle
+    # 26 points: 5 rows of ~5 points?
+    
+    for _ in range(attempts):
+        centers = np.zeros((n, 2))
+        
+        # Random perturbation for variety
+        # Or structured
+        # Let's try a structured hexagonal packing
+        # Estimate optimal radius r
+        # Packing density ~ 0.9. Area = n * pi * r^2 = 0.9 => r = sqrt(0.9/(n*pi))
+        r_est = np.sqrt(0.9 / (n * np.pi))
+        
+        # Spacing
+        h = r_est * np.sqrt(3) # vertical spacing
+        w = 2 * r_est          # horizontal spacing
+        
+        # Determine rows and cols
+        # Try to fit in square
+        # We can iterate over possible number of rows
+        found_valid = False
+        for num_rows in range(1, 10):
+            if num_rows == 0: continue
+            # Circles per row approx n/num_rows
+            # Alternating rows have floor/ceil
+            counts = []
+            rem = n
+            for i in range(num_rows):
+                c = n // num_rows
+                if i < n % num_rows:
+                    c += 1
+                counts.append(c)
+            
+            # Check if fits
+            # Max width required: max(counts) * w
+            # Height required: (num_rows - 1) * h + 2*r_est
+            
+            # We scale w and h to fit in [0,1]
+            # Actually, let's just place them and scale
+            pass
+        
+        # Simpler: Just place on a grid and optimize
+        # Random placement is also fine for optimizer to pick up
+        # But structured is better.
+        
+        # Let's generate a triangular grid
+        # y = k * h, x = j * w + (k%2)*w/2
+        k = int(np.ceil(np.sqrt(n * np.sqrt(3)/2))) # estimate rows
+        j_max = int(np.ceil(n / k))
+        
+        idx = 0
+        y = 0
+        while idx < n:
+            x = 0
+            shift = (y // h) * (w / 2) if (y // h) % 2 != 0 else 0 # roughly
+            # Better:
+            row_idx = int(y / h)
+            shift = (row_idx % 2) * (w / 2)
+            
+            while x < 1.5 and idx < n: # loop a bit more to be safe
+                centers[idx] = [x + shift, y]
+                idx += 1
+                x += w
+            y += h
+        
+        # Normalize to [0,1] roughly
+        if idx <= n:
+            # Center the points
+            if idx > 0:
+                min_x, min_y = centers[:idx].min(axis=0)
+                max_x, max_y = centers[:idx].max(axis=0)
+                range_x = max_x - min_x
+                range_y = max_y - min_y
+                
+                # Scale to fit in 0.8 to allow margin
+                scale = 0.8 / max(range_x, range_y) if max(range_x, range_y) > 0 else 1
+                centers[:idx] = (centers[:idx] - np.array([min_x, min_y])) * scale + 0.5
+                
+                # Clip and keep only n
+                centers = centers[:n].copy()
+                
+                # Compute min dist
+                if np.all(centers >= 0) and np.all(centers <= 1):
+                    dists = squareform(pdist(centers))
+                    min_d = np.min(dists[dists > 0]) # ignore 0
+                    if min_d > best_min_dist:
+                        best_min_dist = min_d
+                        best_centers = centers.copy()
+
+    if best_centers is None:
+        # Fallback to random
+        best_centers = np.random.rand(n, 2)
+        
+    return best_centers
+
+def objective_function(x_vars, n):
+    """
+    Objective for optimization.
+    We want to maximize r.
+    Variables: [x1, y1, ..., xn, yn, r]
+    Actually, minimizing -r.
+    But we handle constraints separately.
+    Here we return the negative of the feasible radius determined by centers.
+    Wait, if r is a variable, we just return -r.
+    But if we don't include r in variables, we compute max possible r.
+    
+    Let's stick to variables: centers (2n) and r (1).
+    But SLSQP handles constraints.
+    So objective is just -r.
+    """
+    r = x_vars[-1]
+    return -r
+
+def constraints_func(x_vars, n):
+    """
+    Generates constraint functions for SLSQP.
+    Variables: [x1, y1, ..., xn, yn, r]
+    """
+    centers = x_vars[:2*n].reshape(n, 2)
+    r = x_vars[-1]
+    
+    constraints = []
+    
+    # Boundary constraints
+    # x_i - r >= 0
+    # 1 - x_i - r >= 0
+    # y_i - r >= 0
+    # 1 - y_i - r >= 0
+    
+    for i in range(n):
+        xi, yi = centers[i]
+        # Lower bounds
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i, c=xi: v[2*i] - v[-1]}) # x - r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i, c=xi: 1 - v[2*i] - v[-1]}) # 1 - x - r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i, c=yi: v[2*i+1] - v[-1]}) # y - r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i, c=yi: 1 - v[2*i+1] - v[-1]}) # 1 - y - r
+        
+    # Pairwise distance constraints
+    # (xi - xj)^2 + (yi - yj)^2 >= (2r)^2
+    # This is quadratic, might be slow with many constraints (325).
+    # SLSQP might struggle.
+    # Alternative: linear constraints on distance? No.
+    # Maybe just optimize centers to maximize min distance, then set r.
+    
+    return constraints
+
+def maximize_equal_radius(n):
+    """
+    Optimizes centers to maximize the radius r of n equal circles.
+    """
+    best_r = 0
+    best_centers = None
+    
+    # Initial guess
+    init_centers = get_initial_hexagonal_centers(n)
+    
+    # Estimate initial r
+    min_dist = np.min(squareform(pdist(init_centers))[np.triu_indices_from(np.ones((n,n)), k=1)])
+    min_wall = np.min(np.array([np.min(init_centers), np.min(1-init_centers)]).T)
+    r_init = min(min_dist / 2, min_wall) * 0.9
+    
+    x0 = np.concatenate([init_centers.flatten(), [r_init]])
+    
+    # Bounds
+    # x, y in [0, 1]
+    # r in [0, 0.5]
+    bounds = [(0, 1)] * (2 * n) + [(0, 0.5)]
+    
+    # We will use a simpler approach: Maximize min distance between points
+    # effectively finding the packing.
+    # Let's use a custom objective that penalizes overlap.
+    
+    def obj_func(centers_flat):
+        centers = centers_flat.reshape(n, 2)
+        # We want to maximize the minimum distance to neighbors and walls
+        # But r is not fixed.
+        # Let's maximize a smooth approximation of min(r_possible)
+        # r_possible_i = min(dist(c_i, c_j)/2, dist(c_i, wall))
+        # We want to maximize min_i (r_possible_i) ?
+        # Actually we want to maximize min( min_ij(d_ij/2), min_i(dist_wall) )
+        
+        dists = squareform(pdist(centers))
+        # Extract upper triangle
+        idx = np.triu_indices(n, k=1)
+        pairwise_dists = dists[idx]
+        
+        wall_dists = np.array([
+            np.min(centers[:, 0]),
+            np.min(1 - centers[:, 0]),
+            np.min(centers[:, 1]),
+            np.min(1 - centers[:, 1])
+        ])
+        
+        min_pairwise = np.min(pairwise_dists)
+        min_wall = np.min(wall_dists)
+        
+        # The radius is limited by min_pairwise/2 and min_wall
+        r_val = min(min_pairwise / 2, min_wall)
+        
+        # We want to maximize r_val.
+        # To make it differentiable for gradient methods, we can use a smooth minimum?
+        # But Nelder-Mead or Powell doesn't need gradients.
+        return -r_val
+
+    # Use differential evolution or basinhopping?
+    # Given constraints, let's try local optimization from good start.
+    # SLSQP on the radius variable approach is hard due to quadratic constraints.
+    # Let's optimize centers directly.
+    
+    # Objective: maximize min distance.
+    # This is equivalent to maximizing r.
+    
+    # We can use 'trust-constr' or 'SLSQP' on the objective -r_val?
+    # But r_val is non-smooth.
+    
+    # Heuristic: Repulsion simulation.
+    # It's robust.
+    
+    centers = init_centers.copy()
+    
+    # Run repulsion simulation
+    # Potential energy U = sum 1/d^2 ?
+    # Force F = - grad U.
+    # Repulsive force between i and j: vector / d^3 * strength.
+    
+    learning_rate = 0.05
+    decay = 0.995
+    
+    for step in range(500):
+        forces = np.zeros_like(centers)
+        
+        # Inter-circle forces
+        # O(N^2)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                if dist > 1e-8:
+                    # Desired distance is unknown, but we want to push apart.
+                    # Force proportional to 1/dist^2?
+                    # If dist is small, force is huge.
+                    f_mag = 1.0 / (dist**2 + 1e-4)
+                    f_vec = diff / dist * f_mag
+                    forces[i] += f_vec
+                    forces[j] -= f_vec
+        
+        # Wall forces (repel from walls)
+        # We want centers to stay inside [0,1] but allow touching?
+        # Actually, for equal radius r, centers must be in [r, 1-r].
+        # But we don't know r.
+        # However, pushing away from walls helps distribute them.
+        # If a center is close to wall, push it in.
+        for i in range(n):
+            x, y = centers[i]
+            if x < 0.05: forces[i, 0] += 10.0 * (0.05 - x)
+            if x > 0.95: forces[i, 0] -= 10.0 * (x - 0.95)
+            if y < 0.05: forces[i, 1] += 10.0 * (0.05 - y)
+            if y > 0.95: forces[i, 1] -= 10.0 * (y - 0.95)
+            
+        # Update
+        centers += learning_rate * forces
+        
+        # Clip to [0,1] to ensure validity during sim
+        centers = np.clip(centers, 1e-6, 1 - 1e-6)
+        
+        learning_rate *= decay
+        
+    # After simulation, we have centers.
+    # Compute max possible equal radius r.
+    dists = squareform(pdist(centers))
+    idx = np.triu_indices(n, k=1)
+    pairwise_dists = dists[idx]
+    wall_dists = np.array([
+        np.min(centers[:, 0]),
+        np.min(1 - centers[:, 0]),
+        np.min(centers[:, 1]),
+        np.min(1 - centers[:, 1])
+    ])
+    r_equal = min(np.min(pairwise_dists) / 2, np.min(wall_dists))
+    
+    # Now, refine using scipy.optimize to maximize sum of radii?
+    # Or just use this r_equal for all circles.
+    # But we can do better with LP.
+    
+    # Let's try to optimize centers further using scipy to maximize the min distance.
+    # This is a standard "max-min distance" problem.
+    # We can minimize -min_distance.
+    # Since min is non-smooth, we can minimize sum of inv-distances?
+    # Or just use the result of simulation as a good start for a smoother objective.
+    
+    # Let's try to maximize a smooth objective: sum of distances?
+    # No, that pushes to corners.
+    # Maximize sum of log(distances)?
+    # This tends to spread points uniformly.
+    
+    def smooth_obj(centers_flat):
+        c = centers_flat.reshape(n, 2)
+        dists = pdist(c)
+        # Penalize small distances
+        # We want distances to be large.
+        # Use softmin or just sum of 1/dist?
+        # Minimize sum(1/d^2) + boundary penalties
+        penalty = 0
+        for d in dists:
+            if d < 0.2: # threshold
+                penalty += 100.0 / d**2
+        
+        # Boundary penalty
+        for i in range(n):
+            x, y = c[i]
+            if x < 0.05: penalty += 100 * (0.05 - x)**2
+            if x > 0.95: penalty += 100 * (x - 0.95)**2
+            if y < 0.05: penalty += 100 * (0.05 - y)**2
+            if y > 0.95: penalty += 100 * (y - 0.95)**2
+            
+        return penalty
+
+    # Minimize this penalty to spread points
+    # Use L-BFGS-B
+    res = opt.minimize(smooth_obj, centers.flatten(), method='L-BFGS-B', 
+                       bounds=[(0, 1)]*(2*n), options={'maxiter': 1000})
+    
+    final_centers = res.x.reshape(n, 2)
+    
+    return final_centers
+
+def solve_lp_radii(centers):
+    """
+    Given centers, solve LP to maximize sum of radii.
+    Maximize sum(r_i)
+    s.t. r_i + r_j <= dist(i,j) for all i<j
+         r_i <= dist(i, wall)
+         r_i >= 0
+    """
+    n = centers.shape[0]
+    
+    # Compute distances
+    dists_matrix = squareform(pdist(centers))
+    
+    # Compute wall distances
+    wall_dists = np.minimum(
+        np.minimum(centers, 1 - centers).min(axis=1), 
+        0.5 # r cannot be > 0.5 anyway
+    )
+    
+    # Setup LP
+    # Variables: r_1 ... r_n
+    # Obj: -sum(r)
+    c_obj = -np.ones(n)
+    
+    # Constraints: A_ub @ r <= b_ub
+    # r_i + r_j <= d_ij
+    # r_i <= w_i
+    
+    # This creates many constraints.
+    # Number of pair constraints: n*(n-1)/2
+    # Number of wall constraints: n
+    
+    A_ub = []
+    b_ub = []
+    
+    # Pairwise
+    for i in range(n):
+        for j in range(i + 1, n):
+            row = np.zeros(n)
+            row[i] = 1
+            row[j] = 1
+            A_ub.append(row)
+            b_ub.append(dists_matrix[i, j])
+            
+    # Wall
+    for i in range(n):
+        row = np.zeros(n)
+        row[i] = 1
+        A_ub.append(row)
+        b_ub.append(wall_dists[i])
+        
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    # Bounds for r_i: [0, 0.5]
+    bounds = [(0, 0.5) for _ in range(n)]
+    
+    from scipy.optimize import linprog
+    # linprog minimizes c^T x
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        radii = res.x
+        return radii
+    else:
+        # Fallback to equal radii based on min dist
+        min_d = np.min(dists_matrix[np.triu_indices(n, k=1)])
+        min_w = np.min(wall_dists)
+        r = min(min_d/2, min_w)
+        return np.full(n, r)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # 1. Optimize centers for equal radius packing
+    centers = maximize_equal_radius(n)
+    
+    # 2. Solve LP for unequal radii to maximize sum
+    radii = solve_lp_radii(centers)
+    
+    sum_radii = np.sum(radii)
+    
+    # Validation check (internal)
+    # Check overlaps
+    # dists = squareform(pdist(centers))
+    # overlaps = np.any(dists < radii[:, None] + radii[None, :] - 1e-9)
+    # Check bounds
+    # outside = np.any(centers < radii[:, None] - 1e-9) or np.any(centers > 1 - radii[:, None] + 1e-9)
+    
+    return centers, radii, float(sum_radii)
+
+# To be safe, let's ensure we import everything needed inside the function or at top level
+# The prompt says helper functions top level.
+# Imports are top level.
+
+if __name__ == "__main__":
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # print(c)
+    # print(r)

@@ -1,0 +1,293 @@
+# sol_000051 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 67b9141d) state=a273f283 sum of radii=2.400000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+
+N = 26
+
+
+def optimize_radii_given_centers(centers):
+    """Given fixed centers, solve LP to find maximum radii."""
+    n = N
+    c_obj = -np.ones(n)
+
+    A_ub_rows = []
+    b_ub_rows = []
+
+    for i in range(n):
+        max_r = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub_rows.append(row)
+        b_ub_rows.append(max_r)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub_rows.append(row)
+            b_ub_rows.append(dist)
+
+    A_ub = np.array(A_ub_rows)
+    b_ub = np.array(b_ub_rows)
+
+    bounds = [(0.0, None)] * n
+
+    result = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+
+    if result.success:
+        return result.x
+    else:
+        return np.ones(n) * 0.01
+
+
+def penalty_objective(x, radii):
+    """Penalty-based objective for center optimization."""
+    n = len(radii)
+    centers = x.reshape(n, 2)
+    obj = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            overlap = radii[i] + radii[j] - dist
+            if overlap > 0:
+                obj += overlap * overlap
+        x_i = centers[i, 0]
+        y_i = centers[i, 1]
+        r_i = radii[i]
+        if x_i - r_i < 0:
+            obj += (-(x_i - r_i)) ** 2
+        if x_i + r_i > 1:
+            obj += (x_i + r_i - 1) ** 2
+        if y_i - r_i < 0:
+            obj += (-(y_i - r_i)) ** 2
+        if y_i + r_i > 1:
+            obj += (y_i + r_i - 1) ** 2
+    return obj
+
+
+def penalty_gradient(x, radii):
+    """Gradient of penalty objective."""
+    n = len(radii)
+    centers = x.reshape(n, 2)
+    grad = np.zeros((n, 2))
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            overlap = radii[i] + radii[j] - dist
+            if overlap > 0 and dist > 1e-12:
+                factor = 2.0 * overlap / dist
+                grad[i, 0] += factor * dx
+                grad[i, 1] += factor * dy
+                grad[j, 0] -= factor * dx
+                grad[j, 1] -= factor * dy
+
+        x_i = centers[i, 0]
+        y_i = centers[i, 1]
+        r_i = radii[i]
+        if x_i - r_i < 0:
+            grad[i, 0] += -2.0 * (-(x_i - r_i)) * (-1.0)
+        if x_i + r_i > 1:
+            grad[i, 0] += 2.0 * (x_i + r_i - 1.0)
+        if y_i - r_i < 0:
+            grad[i, 1] += -2.0 * (-(y_i - r_i)) * (-1.0)
+        if y_i + r_i > 1:
+            grad[i, 1] += 2.0 * (y_i + r_i - 1.0)
+
+    return grad.flatten()
+
+
+def optimize_centers_given_radii(centers, radii):
+    """Optimize centers for fixed radii using scipy minimize."""
+    n = N
+    x0 = centers.flatten().copy()
+
+    bounds = [(0.0, 1.0)] * (2 * n)
+
+    def obj(x):
+        return penalty_objective(x, radii)
+
+    def grad(x):
+        return penalty_gradient(x, radii)
+
+    result = minimize(obj, x0, jac=grad, method='L-BFGS-B',
+                     bounds=bounds,
+                     options={'maxiter': 2000, 'ftol': 1e-15, 'gtol': 1e-10})
+
+    return result.x.reshape(n, 2)
+
+
+def make_grid_init(n_rows, n_cols, extra_positions=None):
+    """Create a grid initialization with optional extra positions."""
+    centers = np.zeros((N, 2))
+    idx = 0
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if idx < N:
+                centers[idx, 0] = (j + 0.5) / n_cols
+                centers[idx, 1] = (i + 0.5) / n_rows
+                idx += 1
+
+    if extra_positions is not None:
+        for pos in extra_positions:
+            if idx < N:
+                centers[idx] = pos
+                idx += 1
+
+    # Fill remaining with random positions
+    while idx < N:
+        centers[idx, 0] = 0.25 + 0.5 * np.random.random()
+        centers[idx, 1] = 0.25 + 0.5 * np.random.random()
+        idx += 1
+
+    return centers
+
+
+def make_hex_init():
+    """Create a hexagonal initialization."""
+    centers = np.zeros((N, 2))
+    idx = 0
+
+    # 6+5+6+5+4 = 26
+    row_counts = [6, 5, 6, 5, 4]
+    h = 0.12
+    v = h * np.sqrt(3.0) / 2.0
+
+    y_pos = 0.15
+    for row_i, nc in enumerate(row_counts):
+        x_start = 0.15 if row_i % 2 == 0 else 0.15 + h
+        for j in range(nc):
+            if idx < N:
+                centers[idx, 0] = x_start + j * 2 * h
+                centers[idx, 1] = y_pos
+                idx += 1
+        y_pos += v
+
+    while idx < N:
+        centers[idx, 0] = 0.5
+        centers[idx, 1] = 0.5
+        idx += 1
+
+    return centers
+
+
+def make_random_init():
+    """Create a random initialization."""
+    centers = np.zeros((N, 2))
+    for i in range(N):
+        centers[i, 0] = np.random.uniform(0.1, 0.9)
+        centers[i, 1] = np.random.uniform(0.1, 0.9)
+    return centers
+
+
+def alternating_optimize(centers_init, n_iterations=15):
+    """Run alternating optimization: radii LP -> centers nonlinear."""
+    centers = centers_init.copy()
+    radii = np.ones(N) * 0.03
+
+    for iteration in range(n_iterations):
+        radii = optimize_radii_given_centers(centers)
+        centers = optimize_centers_given_radii(centers, radii)
+
+    radii = optimize_radii_given_centers(centers)
+
+    return centers, radii, np.sum(radii)
+
+
+def clip_and_project(centers, radii):
+    """Ensure all circles are within bounds after optimization."""
+    for i in range(N):
+        centers[i, 0] = max(radii[i], min(1.0 - radii[i], centers[i, 0]))
+        centers[i, 1] = max(radii[i], min(1.0 - radii[i], centers[i, 1]))
+    return centers, radii
+
+
+def run_packing():
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+
+    # Try multiple initializations
+    initializations = [
+        make_grid_init(5, 5, extra_positions=[[0.5, 0.5]]),
+        make_grid_init(6, 5, extra_positions=None),
+        make_grid_init(5, 6, extra_positions=None),
+        make_hex_init(),
+        make_random_init(),
+    ]
+
+    for init_idx, centers_init in enumerate(initializations):
+        # Run alternating optimization
+        centers, radii, total = alternating_optimize(centers_init, n_iterations=12)
+        centers, radii = clip_and_project(centers, radii)
+        total = np.sum(radii)
+
+        if total > best_sum:
+            best_sum = total
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+
+        # Refinement: small perturbations
+        for _ in range(3):
+            centers_pert = best_centers.copy()
+            radii_pert = best_radii.copy()
+            for k in range(N):
+                centers_pert[k] += np.random.normal(0, 0.005, 2)
+            centers_pert, radii_pert, total_pert = alternating_optimize(
+                centers_pert, n_iterations=8
+            )
+            centers_pert, radii_pert = clip_and_project(centers_pert, radii_pert)
+            total_pert = np.sum(radii_pert)
+            if total_pert > best_sum:
+                best_sum = total_pert
+                best_centers = centers_pert.copy()
+                best_radii = radii_pert.copy()
+
+    # Final refinement with more iterations
+    best_centers, best_radii, best_sum = alternating_optimize(
+        best_centers, n_iterations=10
+    )
+    best_centers, best_radii = clip_and_project(best_centers, best_radii)
+    best_sum = np.sum(best_radii)
+
+    # Ensure non-negative radii
+    best_radii = np.maximum(best_radii, 0.0)
+
+    # Final validation pass - shrink slightly if needed
+    valid = True
+    for i in range(N):
+        if best_centers[i, 0] - best_radii[i] < 0 or best_centers[i, 0] + best_radii[i] > 1:
+            valid = False
+        if best_centers[i, 1] - best_radii[i] < 0 or best_centers[i, 1] + best_radii[i] > 1:
+            valid = False
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = best_centers[i, 0] - best_centers[j, 0]
+            dy = best_centers[i, 1] - best_centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            if dist < best_radii[i] + best_radii[j] - 1e-10:
+                valid = False
+
+    if not valid:
+        # Shrink all radii slightly
+        scale = 0.999
+        best_radii *= scale
+        best_centers = clip_and_project(best_centers, best_radii)
+        best_sum = np.sum(best_radii)
+
+    return best_centers, best_radii, best_sum

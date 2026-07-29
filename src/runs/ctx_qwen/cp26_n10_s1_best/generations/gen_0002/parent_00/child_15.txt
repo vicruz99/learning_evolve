@@ -1,0 +1,1619 @@
+
+
+<strategy>
+To improve the circle packing from 2.634292 towards 2.636, I need to focus on several key improvements:
+
+1. **Better force-directed initialization**: The current hex grid and grid initializations are good but not optimal. I'll implement a "growing circles" force simulation that naturally finds dense packings by gradually increasing radii while maintaining separation through repulsive forces. This tends to find better configurations than static grids.
+
+2. **Use actual distance constraints instead of squared**: Using `sqrt(dx²+dy²)` directly in constraints provides better gradient behavior near contact points compared to the squared form, helping the optimizer navigate the constraint boundary more precisely.
+
+3. **Multi-phase optimization with diverse strategies**:
+   - Force simulation for initialization (growing circles approach)
+   - Hexagonal lattice with various row patterns and angles
+   - Many random starts with small radii (to let optimizer grow them)
+   - Extensive perturbation and refinement phases
+
+4. **More aggressive perturbation**: The gap of 0.0017 requires escaping very shallow local minima. I'll use larger perturbations and more perturbation rounds.
+
+5. **Better convergence**: Using more iterations (50000+) and tighter tolerances (1e-14) to ensure full convergence.
+
+6. **Trust-constr as backup**: Using scipy's trust-constr method as an alternative optimizer that may find different local minima.
+
+The key insight is that for sum-of-radii optimization (not equal-circle packing), some circles can be larger than others, especially near corners where boundary constraints are less restrictive. The force simulation naturally exploits this by letting circles in favorable positions grow larger.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def obj(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def constraints(v):
+    """All inequality constraints g(v) >= 0."""
+    n = N
+    res = []
+    
+    # Boundary constraints
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    
+    # Overlap constraints using actual distance (better gradients)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            d = np.sqrt(dx*dx + dy*dy)
+            res.append(d - ri - rj)
+    
+    return np.array(res)
+
+def constraints_sq(v):
+    """Squared distance version for comparison."""
+    n = N
+    res = []
+    
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            res.append(dx*dx + dy*dy - (ri + rj)**2)
+    
+    return np.array(res)
+
+def force_simulate_grow(n, steps, seed):
+    """Force simulation that grows circles while maintaining separation."""
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.008)
+    
+    for step in range(steps):
+        forces = np.zeros((n, 2))
+        
+        for i in range(n):
+            r = radii[i]
+            # Wall repulsion
+            for axis in range(2):
+                if centers[i, axis] < r + 0.003:
+                    forces[i, axis] += 8 * (r + 0.003 - centers[i, axis])
+                elif centers[i, axis] > 1 - r - 0.003:
+                    forces[i, axis] -= 8 * (centers[i, axis] - (1 - r - 0.003))
+            
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                margin = radii[i] + radii[j] + 0.003
+                
+                if d < margin and d > 1e-10:
+                    f = 15 * (margin - d) / d
+                    forces[i, 0] -= f * dx
+                    forces[i, 1] -= f * dy
+                    forces[j, 0] += f * dx
+                    forces[j, 1] += f * dy
+        
+        # Cooling schedule
+        progress = step / steps
+        dt = 0.0015 * (0.2 + 0.8 * (1 - progress))
+        
+        centers += forces * dt
+        centers = np.clip(centers, 0.001, 0.999)
+        
+        # Grow radii
+        growth = 3e-5 * max(0.3, 1 - progress)
+        for i in range(n):
+            # Max radius from walls
+            max_r_wall = min(centers[i, 0], 1 - centers[i, 0], 
+                           centers[i, 1], 1 - centers[i, 1])
+            # Max radius from neighbors
+            max_r_neigh = np.inf
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    max_r_neigh = min(max_r_neigh, d - radii[j])
+            
+            max_r = min(max_r_wall, max_r_neigh) * 0.993
+            radii[i] = min(radii[i] + growth, max(max_r, 0.008))
+    
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def force_simulate_grow_fast(n, steps, seed):
+    """Faster force simulation using vectorized neighbor checks."""
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.008)
+    
+    for step in range(steps):
+        forces = np.zeros((n, 2))
+        
+        for i in range(n):
+            r = radii[i]
+            for axis in range(2):
+                if centers[i, axis] < r + 0.003:
+                    forces[i, axis] += 8 * (r + 0.003 - centers[i, axis])
+                elif centers[i, axis] > 1 - r - 0.003:
+                    forces[i, axis] -= 8 * (centers[i, axis] - (1 - r - 0.003))
+            
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d2 = dx*dx + dy*dy
+                margin2 = (radii[i] + radii[j] + 0.003)**2
+                
+                if d2 < margin2 and d2 > 1e-12:
+                    d = np.sqrt(d2)
+                    f = 15 * (np.sqrt(margin2) - d) / d
+                    forces[i, 0] -= f * dx
+                    forces[i, 1] -= f * dy
+                    forces[j, 0] += f * dx
+                    forces[j, 1] += f * dy
+        
+        progress = step / steps
+        dt = 0.0015 * (0.2 + 0.8 * (1 - progress))
+        
+        centers += forces * dt
+        centers = np.clip(centers, 0.001, 0.999)
+        
+        growth = 3e-5 * max(0.3, 1 - progress)
+        for i in range(n):
+            max_r_wall = min(centers[i, 0], 1 - centers[i, 0], 
+                           centers[i, 1], 1 - centers[i, 1])
+            max_r_neigh = np.inf
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    max_r_neigh = min(max_r_neigh, d - radii[j])
+            max_r = min(max_r_wall, max_r_neigh) * 0.993
+            radii[i] = min(radii[i] + growth, max(max_r, 0.008))
+    
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def hex_init(n, seed, r0=0.092):
+    """Hexagonal lattice initialization with perturbation."""
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    
+    # Trim or pad
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = centers[:n]
+    
+    # Add perturbation
+    centers = np.array(centers)
+    centers += np.random.uniform(-0.008, 0.008, centers.shape)
+    centers = np.clip(centers, r0 + 0.001, 1 - r0 - 0.001)
+    
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def hex_init_rotated(n, seed, angle, r0=0.09):
+    """Rotated hexagonal lattice."""
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    
+    # Rotate around center
+    cx, cy = 0.5, 0.5
+    ca, sa = np.cos(angle), np.sin(angle)
+    for i in range(n):
+        dx, dy = centers[i,0] - cx, centers[i,1] - cy
+        centers[i,0] = dx * ca - dy * sa + cx
+        centers[i,1] = dx * sa + dy * ca + cy
+    
+    # Clip to valid region
+    centers[:, 0] = np.clip(centers[:, 0], r0 + 0.001, 1 - r0 - 0.001)
+    centers[:, 1] = np.clip(centers[:, 1], r0 + 0.001, 1 - r0 - 0.001)
+    
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def random_init_small(n, seed):
+    """Random initialization with small radii."""
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.04)
+    
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def repair_feasibility(v, n):
+    """Ensure initial configuration is feasible for optimizer."""
+    for _ in range(500):
+        ok = True
+        # Ensure boundary feasibility
+        for i in range(n):
+            r = v[3*i + 2]
+            if r < 0.005:
+                v[3*i + 2] = 0.005
+                r = 0.005
+            v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+            v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+        
+        # Resolve overlaps
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = v[3*i] - v[3*j]
+                dy = v[3*i+1] - v[3*j+1]
+                d = np.sqrt(dx*dx + dy*dy)
+                r_sum = v[3*i+2] + v[3*j+2]
+                
+                if d < r_sum - 1e-9:
+                    ok = False
+                    if d > 1e-10:
+                        shift = (r_sum - d) * 0.5
+                        v[3*i] -= shift * dx / d
+                        v[3*i+1] -= shift * dy / d
+                        v[3*j] += shift * dx / d
+                        v[3*j+1] += shift * dy / d
+                    else:
+                        angle = np.random.uniform(0, 2*np.pi)
+                        sep = 0.01
+                        v[3*i] += sep * np.cos(angle)
+                        v[3*i+1] += sep * np.sin(angle)
+                        v[3*j] -= sep * np.cos(angle)
+                        v[3*j+1] -= sep * np.sin(angle)
+        
+        if ok:
+            break
+    
+    # Final projection to bounds
+    for i in range(n):
+        r = v[3*i + 2]
+        if r < 0.005:
+            v[3*i + 2] = 0.005
+            r = 0.005
+        v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+        v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+    
+    return v
+
+def try_optimize(v0, n, bounds, method='SLSQP', maxiter=40000):
+    """Try to optimize from initial guess, return (success, result, sum_radii)."""
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    try:
+        res = minimize(obj, v0, method=method, bounds=bounds, 
+                       constraints=cons,
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if not np.isnan(res.fun) and not np.isinf(res.fun):
+            return True, res.x.copy(), -res.fun
+    except Exception:
+        pass
+    return False, v0, 0.0
+
+def try_optimize_sq(v0, n, bounds):
+    """Try optimization with squared constraints."""
+    cons = {'type': 'ineq', 'fun': constraints_sq}
+    
+    try:
+        res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons,
+                       options={'maxiter': 40000, 'ftol': 1e-14, 'disp': False})
+        if not np.isnan(res.fun) and not np.isinf(res.fun):
+            return True, res.x.copy(), -res.fun
+    except Exception:
+        pass
+    return False, v0, 0.0
+
+def extract(v, n):
+    """Extract centers and radii from optimization vector."""
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i, 0] = v[3*i]
+        centers[i, 1] = v[3*i+1]
+        radii[i] = max(0.0, v[3*i+2])
+    return centers, radii
+
+def check_validity(centers, radii, n):
+    """Check if packing is valid."""
+    for i in range(n):
+        x, y, r = centers[i,0], centers[i,1], radii[i]
+        if r < -1e-12:
+            return False
+        if x < r - 1e-10 or x > 1 - r + 1e-10:
+            return False
+        if y < r - 1e-10 or y > 1 - r + 1e-10:
+            return False
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+            if d < radii[i] + radii[j] - 1e-10:
+                return False
+    return True
+
+def shrink_to_valid(centers, radii, n):
+    """Shrink radii minimally to ensure validity."""
+    for _ in range(200):
+        if check_validity(centers, radii, n):
+            break
+        radii *= 0.997
+        for i in range(n):
+            centers[i, 0] = np.clip(centers[i, 0], radii[i], 1 - radii[i])
+            centers[i, 1] = np.clip(centers[i, 1], radii[i], 1 - radii[i])
+    return centers, radii
+
+def run_packing():
+    n = N
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # ---- Phase 1: Force simulation initializations ----
+    print("Phase 1: Force simulation")
+    for seed in range(20):
+        v0 = force_simulate_grow(n, steps=80000, seed=seed)
+        v0 = repair_feasibility(v0, n)
+        ok, v, s = try_optimize(v0, n, bounds, maxiter=50000)
+        if ok and s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+            print(f"  Seed {seed}: sum = {s:.6f}")
+    
+    # ---- Phase 2: Hexagonal grids ----
+    print("Phase 2: Hexagonal grids")
+    for seed in range(25):
+        for r0 in [0.085, 0.09, 0.095, 0.1]:
+            v0 = hex_init(n, seed=seed, r0=r0)
+            v0 = repair_feasibility(v0, n)
+            ok, v, s = try_optimize(v0, n, bounds, maxiter=50000)
+            if ok and s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+                print(f"  Hex seed {seed} r0={r0}: sum = {s:.6f}")
+    
+    # ---- Phase 3: Rotated hexagonal grids ----
+    print("Phase 3: Rotated hexagonal grids")
+    for seed in range(15):
+        for angle in [0.05, 0.1, 0.15, -0.05, -0.1, 0.25, 0.35]:
+            v0 = hex_init_rotated(n, seed=seed, angle=angle, r0=0.09)
+            v0 = repair_feasibility(v0, n)
+            ok, v, s = try_optimize(v0, n, bounds, maxiter=50000)
+            if ok and s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+                print(f"  Rotated seed {seed} angle={angle}: sum = {s:.6f}")
+    
+    # ---- Phase 4: Random starts ----
+    print("Phase 4: Random starts")
+    for seed in range(30):
+        v0 = random_init_small(n, seed=seed)
+        v0 = repair_feasibility(v0, n)
+        ok, v, s = try_optimize(v0, n, bounds, maxiter=50000)
+        if ok and s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+            print(f"  Random seed {seed}: sum = {s:.6f}")
+    
+    # ---- Phase 5: Squared constraint optimization from best ----
+    print("Phase 5: Squared constraint optimization")
+    if best_v is not None:
+        ok, v, s = try_optimize_sq(best_v, n, bounds)
+        if ok and s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+            print(f"  Sq constraints: sum = {s:.6f}")
+    
+    # ---- Phase 6: Aggressive perturbation refinement ----
+    print("Phase 6: Perturbation refinement")
+    if best_v is not None:
+        for pert_size in [0.0003, 0.0005, 0.001, 0.002, 0.003]:
+            for _ in range(30):
+                v_pert = best_v + np.random.normal(0, pert_size, 3*n)
+                v_pert = repair_feasibility(v_pert, n)
+                
+                # Try both constraint formulations
+                ok1, v1, s1 = try_optimize(v_pert, n, bounds, maxiter=50000)
+                if ok1 and s1 > best_sum:
+                    best_sum = s1
+                    best_v = v1.copy()
+                    print(f"  Perturb {pert_size}: sum = {s1:.6f}")
+                    break  # Found improvement, try next perturbation size
+                
+                ok2, v2, s2 = try_optimize_sq(v_pert, n, bounds)
+                if ok2 and s2 > best_sum:
+                    best_sum = s2
+                    best_v = v2.copy()
+                    print(f"  Perturb {pert_size} (sq): sum = {s2:.6f}")
+                    break
+    
+    # ---- Phase 7: Sequential circle optimization ----
+    print("Phase 7: Sequential optimization")
+    if best_v is not None:
+        v_seq = best_v.copy()
+        for pass_num in range(5):
+            for i in range(n):
+                # Optimize circle i while fixing others
+                cons_i = []
+                for k in range(n):
+                    xk, yk, rk = v_seq[3*k], v_seq[3*k+1], v_seq[3*k+2]
+                    cons_i.append(xk - rk)
+                    cons_i.append(1.0 - xk - rk)
+                    cons_i.append(yk - rk)
+                    cons_i.append(1.0 - yk - rk)
+                for k in range(n):
+                    for l in range(k+1, n):
+                        if k == i or l == i:
+                            xk, yk, rk = v_seq[3*k], v_seq[3*k+1], v_seq[3*k+2] if k != i else (None, None, None)
+                            xl, yl, rl = v_seq[3*l], v_seq[3*l+1], v_seq[3*l+2] if l != i else (None, None, None)
+                        else:
+                            xk, yk, rk = v_seq[3*k], v_seq[3*k+1], v_seq[3*k+2]
+                            xl, yl, rl = v_seq[3*l], v_seq[3*l+1], v_seq[3*l+2]
+                            dx = xk - xl
+                            dy = yk - yl
+                            d = np.sqrt(dx*dx + dy*dy)
+                            cons_i.append(d - rk - rl)
+                
+                # This approach is too complex, skip sequential
+                break
+            break  # Skip sequential for now
+    
+    # ---- Phase 8: Very fine perturbation for final polish ----
+    print("Phase 8: Fine perturbation")
+    if best_v is not None:
+        for _ in range(50):
+            v_pert = best_v + np.random.normal(0, 1e-5, 3*n)
+            v_pert = repair_feasibility(v_pert, n)
+            ok, v, s = try_optimize(v_pert, n, bounds, maxiter=80000)
+            if ok and s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+                print(f"  Fine pert: sum = {s:.6f}")
+    
+    # ---- Extract and validate final result ----
+    if best_v is None:
+        # Fallback
+        v0 = hex_init(n, seed=42, r0=0.09)
+        best_v = v0
+        best_sum = np.sum(best_v[2::3])
+    
+    centers, radii = extract(best_v, n)
+    
+    # Ensure strict validity
+    if not check_validity(centers, radii, n):
+        centers, radii = shrink_to_valid(centers, radii, n)
+    
+    # Update sum
+    final_sum = np.sum(radii)
+    
+    print(f"Final sum of radii: {final_sum:.6f}")
+    
+    return centers, radii, float(final_sum)
+```
+
+Wait, I need to reconsider. The sequential optimization phase is getting too complicated. Let me simplify and focus on what matters most.
+
+Let me also reconsider the timing. The force simulation takes a long time. Let me make it more efficient or reduce the number of runs.
+
+Let me rewrite more carefully:
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def obj(v):
+    return -np.sum(v[2::3])
+
+def constraints(v):
+    n = N
+    res = []
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            d = np.sqrt(dx*dx + dy*dy)
+            res.append(d - ri - rj)
+    return np.array(res)
+
+def constraints_sq(v):
+    n = N
+    res = []
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            res.append(dx*dx + dy*dy - (ri + rj)**2)
+    return np.array(res)
+
+def force_simulate(n, steps, seed):
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.008)
+    
+    for step in range(steps):
+        forces = np.zeros((n, 2))
+        for i in range(n):
+            r = radii[i]
+            for axis in range(2):
+                if centers[i, axis] < r + 0.003:
+                    forces[i, axis] += 8 * (r + 0.003 - centers[i, axis])
+                elif centers[i, axis] > 1 - r - 0.003:
+                    forces[i, axis] -= 8 * (centers[i, axis] - (1 - r - 0.003))
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                margin = radii[i] + radii[j] + 0.003
+                if d < margin and d > 1e-10:
+                    f = 15 * (margin - d) / d
+                    forces[i, 0] -= f * dx
+                    forces[i, 1] -= f * dy
+                    forces[j, 0] += f * dx
+                    forces[j, 1] += f * dy
+        progress = step / steps
+        dt = 0.0015 * (0.2 + 0.8 * (1 - progress))
+        centers += forces * dt
+        centers = np.clip(centers, 0.001, 0.999)
+        growth = 3e-5 * max(0.3, 1 - progress)
+        for i in range(n):
+            max_r_wall = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            max_r_neigh = np.inf
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    max_r_neigh = min(max_r_neigh, d - radii[j])
+            max_r = min(max_r_wall, max_r_neigh) * 0.993
+            radii[i] = min(radii[i] + growth, max(max_r, 0.008))
+    
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def hex_init(n, seed, r0):
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    centers += np.random.uniform(-0.008, 0.008, centers.shape)
+    centers = np.clip(centers, r0 + 0.001, 1 - r0 - 0.001)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def hex_init_rotated(n, seed, angle, r0):
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    cx, cy = 0.5, 0.5
+    ca, sa = np.cos(angle), np.sin(angle)
+    for i in range(n):
+        dx, dy = centers[i,0] - cx, centers[i,1] - cy
+        centers[i,0] = dx * ca - dy * sa + cx
+        centers[i,1] = dx * sa + dy * ca + cy
+    centers[:, 0] = np.clip(centers[:, 0], r0 + 0.001, 1 - r0 - 0.001)
+    centers[:, 1] = np.clip(centers[:, 1], r0 + 0.001, 1 - r0 - 0.001)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def random_init(n, seed):
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.04)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def repair(v, n):
+    for _ in range(500):
+        ok = True
+        for i in range(n):
+            r = v[3*i + 2]
+            if r < 0.005:
+                v[3*i + 2] = 0.005
+                r = 0.005
+            v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+            v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = v[3*i] - v[3*j]
+                dy = v[3*i+1] - v[3*j+1]
+                d = np.sqrt(dx*dx + dy*dy)
+                r_sum = v[3*i+2] + v[3*j+2]
+                if d < r_sum - 1e-9:
+                    ok = False
+                    if d > 1e-10:
+                        shift = (r_sum - d) * 0.5
+                        v[3*i] -= shift * dx / d
+                        v[3*i+1] -= shift * dy / d
+                        v[3*j] += shift * dx / d
+                        v[3*j+1] += shift * dy / d
+                    else:
+                        angle = np.random.uniform(0, 2*np.pi)
+                        sep = 0.01
+                        v[3*i] += sep * np.cos(angle)
+                        v[3*i+1] += sep * np.sin(angle)
+                        v[3*j] -= sep * np.cos(angle)
+                        v[3*j+1] -= sep * np.sin(angle)
+        if ok:
+            break
+    for i in range(n):
+        r = v[3*i + 2]
+        if r < 0.005:
+            v[3*i + 2] = 0.005
+            r = 0.005
+        v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+        v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+    return v
+
+def optimize(v0, n, bounds, cons_func, maxiter=40000):
+    cons = {'type': 'ineq', 'fun': cons_func}
+    try:
+        res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons,
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if not np.isnan(res.fun) and not np.isinf(res.fun):
+            return res.x.copy(), -res.fun
+    except Exception:
+        pass
+    return v0, 0.0
+
+def check_valid(c, r, n):
+    for i in range(n):
+        if r[i] < -1e-12:
+            return False
+        if c[i,0] < r[i] - 1e-10 or c[i,0] > 1 - r[i] + 1e-10:
+            return False
+        if c[i,1] < r[i] - 1e-10 or c[i,1] > 1 - r[i] + 1e-10:
+            return False
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.sqrt((c[i,0]-c[j,0])**2 + (c[i,1]-c[j,1])**2)
+            if d < r[i] + r[j] - 1e-10:
+                return False
+    return True
+
+def shrink(c, r, n):
+    for _ in range(200):
+        if check_valid(c, r, n):
+            break
+        r *= 0.997
+        for i in range(n):
+            c[i, 0] = np.clip(c[i, 0], r[i], 1 - r[i])
+            c[i, 1] = np.clip(c[i, 1], r[i], 1 - r[i])
+    return c, r
+
+def extract(v, n):
+    c = np.zeros((n, 2))
+    r = np.zeros(n)
+    for i in range(n):
+        c[i, 0] = v[3*i]
+        c[i, 1] = v[3*i+1]
+        r[i] = max(0.0, v[3*i+2])
+    return c, r
+
+def run_packing():
+    n = N
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # Force simulation
+    for seed in range(15):
+        v0 = force_simulate(n, steps=60000, seed=seed)
+        v0 = repair(v0, n)
+        v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+        if s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+    
+    # Hexagonal grids
+    for seed in range(20):
+        for r0 in [0.088, 0.092, 0.096]:
+            v0 = hex_init(n, seed=seed, r0=r0)
+            v0 = repair(v0, n)
+            v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+            v2, s2 = optimize(v0, n, bounds, constraints_sq, maxiter=50000)
+            if s2 > best_sum:
+                best_sum = s2
+                best_v = v2.copy()
+    
+    # Rotated hexagonal
+    for seed in range(10):
+        for angle in [0.08, 0.15, -0.1, 0.2, -0.2]:
+            v0 = hex_init_rotated(n, seed=seed, angle=angle, r0=0.09)
+            v0 = repair(v0, n)
+            v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+    
+    # Random starts
+    for seed in range(25):
+        v0 = random_init(n, seed=seed)
+        v0 = repair(v0, n)
+        v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+        if s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+    
+    # Perturbation refinement
+    if best_v is not None:
+        for psize in [0.0005, 0.001, 0.002, 0.003, 0.005]:
+            for _ in range(25):
+                vp = best_v + np.random.normal(0, psize, 3*n)
+                vp = repair(vp, n)
+                v, s = optimize(vp, n, bounds, constraints, maxiter=50000)
+                if s > best_sum:
+                    best_sum = s
+                    best_v = v.copy()
+                v2, s2 = optimize(vp, n, bounds, constraints_sq, maxiter=50000)
+                if s2 > best_sum:
+                    best_sum = s2
+                    best_v = v2.copy()
+    
+    # Fine perturbation
+    if best_v is not None:
+        for _ in range(30):
+            vp = best_v + np.random.normal(0, 1e-5, 3*n)
+            vp = repair(vp, n)
+            v, s = optimize(vp, n, bounds, constraints, maxiter=80000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+    
+    if best_v is None:
+        best_v = hex_init(n, seed=42, r0=0.09)
+        best_sum = np.sum(best_v[2::3])
+    
+    centers, radii = extract(best_v, n)
+    if not check_valid(centers, radii, n):
+        centers, radii = shrink(centers, radii, n)
+    
+    return centers, radii, float(np.sum(radii))
+```
+
+This looks comprehensive. Let me review:
+
+1. Force simulation with 15 seeds - generates dense packings naturally
+2. Hexagonal grids with multiple r0 values and seeds
+3. Rotated hexagonal grids to break symmetry
+4. Random starts with small radii
+5. Extensive perturbation refinement with various sizes
+6. Uses both constraint formulations (distance and squared)
+7. Fine perturbation for final polish
+
+One thing I should add: the force simulation might take a while (60000 steps × 15 seeds). Let me reduce to maybe 40000 steps for some of them.
+
+Also, I should make sure I'm not running into time limits. Let me be more strategic about the number of runs.
+
+Actually, let me also add a "growing" optimization phase: start with the best solution, shrink radii slightly, grow them back while optimizing. This might escape local minima.
+
+Let me finalize:
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def obj(v):
+    return -np.sum(v[2::3])
+
+def constraints(v):
+    n = N
+    res = []
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            d = np.sqrt(dx*dx + dy*dy)
+            res.append(d - ri - rj)
+    return np.array(res)
+
+def constraints_sq(v):
+    n = N
+    res = []
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            res.append(dx*dx + dy*dy - (ri + rj)**2)
+    return np.array(res)
+
+def force_simulate(n, steps, seed):
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.008)
+    for step in range(steps):
+        forces = np.zeros((n, 2))
+        for i in range(n):
+            r = radii[i]
+            for axis in range(2):
+                if centers[i, axis] < r + 0.003:
+                    forces[i, axis] += 8 * (r + 0.003 - centers[i, axis])
+                elif centers[i, axis] > 1 - r - 0.003:
+                    forces[i, axis] -= 8 * (centers[i, axis] - (1 - r - 0.003))
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                margin = radii[i] + radii[j] + 0.003
+                if d < margin and d > 1e-10:
+                    f = 15 * (margin - d) / d
+                    forces[i, 0] -= f * dx
+                    forces[i, 1] -= f * dy
+                    forces[j, 0] += f * dx
+                    forces[j, 1] += f * dy
+        progress = step / steps
+        dt = 0.0015 * (0.2 + 0.8 * (1 - progress))
+        centers += forces * dt
+        centers = np.clip(centers, 0.001, 0.999)
+        growth = 3e-5 * max(0.3, 1 - progress)
+        for i in range(n):
+            max_r_wall = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            max_r_neigh = np.inf
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    max_r_neigh = min(max_r_neigh, d - radii[j])
+            max_r = min(max_r_wall, max_r_neigh) * 0.993
+            radii[i] = min(radii[i] + growth, max(max_r, 0.008))
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def hex_init(n, seed, r0):
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    centers += np.random.uniform(-0.008, 0.008, centers.shape)
+    centers = np.clip(centers, r0 + 0.001, 1 - r0 - 0.001)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def hex_init_rotated(n, seed, angle, r0):
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    cx, cy = 0.5, 0.5
+    ca, sa = np.cos(angle), np.sin(angle)
+    for i in range(n):
+        dx, dy = centers[i,0] - cx, centers[i,1] - cy
+        centers[i,0] = dx * ca - dy * sa + cx
+        centers[i,1] = dx * sa + dy * ca + cy
+    centers[:, 0] = np.clip(centers[:, 0], r0 + 0.001, 1 - r0 - 0.001)
+    centers[:, 1] = np.clip(centers[:, 1], r0 + 0.001, 1 - r0 - 0.001)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def random_init(n, seed):
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.04)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def repair(v, n):
+    for _ in range(500):
+        ok = True
+        for i in range(n):
+            r = v[3*i + 2]
+            if r < 0.005:
+                v[3*i + 2] = 0.005
+                r = 0.005
+            v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+            v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = v[3*i] - v[3*j]
+                dy = v[3*i+1] - v[3*j+1]
+                d = np.sqrt(dx*dx + dy*dy)
+                r_sum = v[3*i+2] + v[3*j+2]
+                if d < r_sum - 1e-9:
+                    ok = False
+                    if d > 1e-10:
+                        shift = (r_sum - d) * 0.5
+                        v[3*i] -= shift * dx / d
+                        v[3*i+1] -= shift * dy / d
+                        v[3*j] += shift * dx / d
+                        v[3*j+1] += shift * dy / d
+                    else:
+                        angle = np.random.uniform(0, 2*np.pi)
+                        sep = 0.01
+                        v[3*i] += sep * np.cos(angle)
+                        v[3*i+1] += sep * np.sin(angle)
+                        v[3*j] -= sep * np.cos(angle)
+                        v[3*j+1] -= sep * np.sin(angle)
+        if ok:
+            break
+    for i in range(n):
+        r = v[3*i + 2]
+        if r < 0.005:
+            v[3*i + 2] = 0.005
+            r = 0.005
+        v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+        v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+    return v
+
+def optimize(v0, n, bounds, cons_func, maxiter=40000):
+    cons = {'type': 'ineq', 'fun': cons_func}
+    try:
+        res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons,
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if not np.isnan(res.fun) and not np.isinf(res.fun):
+            return res.x.copy(), -res.fun
+    except Exception:
+        pass
+    return v0, 0.0
+
+def check_valid(c, r, n):
+    for i in range(n):
+        if r[i] < -1e-12:
+            return False
+        if c[i,0] < r[i] - 1e-10 or c[i,0] > 1 - r[i] + 1e-10:
+            return False
+        if c[i,1] < r[i] - 1e-10 or c[i,1] > 1 - r[i] + 1e-10:
+            return False
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.sqrt((c[i,0]-c[j,0])**2 + (c[i,1]-c[j,1])**2)
+            if d < r[i] + r[j] - 1e-10:
+                return False
+    return True
+
+def shrink(c, r, n):
+    for _ in range(200):
+        if check_valid(c, r, n):
+            break
+        r *= 0.997
+        for i in range(n):
+            c[i, 0] = np.clip(c[i, 0], r[i], 1 - r[i])
+            c[i, 1] = np.clip(c[i, 1], r[i], 1 - r[i])
+    return c, r
+
+def extract(v, n):
+    c = np.zeros((n, 2))
+    r = np.zeros(n)
+    for i in range(n):
+        c[i, 0] = v[3*i]
+        c[i, 1] = v[3*i+1]
+        r[i] = max(0.0, v[3*i+2])
+    return c, r
+
+def run_packing():
+    n = N
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # Force simulation
+    for seed in range(12):
+        v0 = force_simulate(n, steps=50000, seed=seed)
+        v0 = repair(v0, n)
+        v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+        if s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+    
+    # Hexagonal grids with multiple radii
+    for seed in range(18):
+        for r0 in [0.088, 0.092, 0.096]:
+            v0 = hex_init(n, seed=seed, r0=r0)
+            v0 = repair(v0, n)
+            v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+            v2, s2 = optimize(v0, n, bounds, constraints_sq, maxiter=50000)
+            if s2 > best_sum:
+                best_sum = s2
+                best_v = v2.copy()
+    
+    # Rotated hexagonal
+    for seed in range(8):
+        for angle in [0.08, 0.15, -0.1, 0.2, -0.2]:
+            v0 = hex_init_rotated(n, seed=seed, angle=angle, r0=0.09)
+            v0 = repair(v0, n)
+            v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+    
+    # Random starts
+    for seed in range(20):
+        v0 = random_init(n, seed=seed)
+        v0 = repair(v0, n)
+        v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+        if s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+    
+    # Perturbation refinement
+    if best_v is not None:
+        for psize in [0.0005, 0.001, 0.002, 0.003, 0.005, 0.01]:
+            for _ in range(20):
+                vp = best_v + np.random.normal(0, psize, 3*n)
+                vp = repair(vp, n)
+                v, s = optimize(vp, n, bounds, constraints, maxiter=50000)
+                if s > best_sum:
+                    best_sum = s
+                    best_v = v.copy()
+                v2, s2 = optimize(vp, n, bounds, constraints_sq, maxiter=50000)
+                if s2 > best_sum:
+                    best_sum = s2
+                    best_v = v2.copy()
+    
+    # Very fine perturbation
+    if best_v is not None:
+        for _ in range(30):
+            vp = best_v + np.random.normal(0, 1e-5, 3*n)
+            vp = repair(vp, n)
+            v, s = optimize(vp, n, bounds, constraints, maxiter=80000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+    
+    # Grow phase: shrink best, let optimizer regrow
+    if best_v is not None:
+        for shrink_factor in [0.97, 0.95, 0.93]:
+            vp = best_v.copy()
+            vp[2::3] *= shrink_factor
+            vp = repair(vp, n)
+            v, s = optimize(vp, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+            v2, s2 = optimize(vp, n, bounds, constraints_sq, maxiter=50000)
+            if s2 > best_sum:
+                best_sum = s2
+                best_v = v2.copy()
+    
+    if best_v is None:
+        best_v = hex_init(n, seed=42, r0=0.09)
+        best_sum = np.sum(best_v[2::3])
+    
+    centers, radii = extract(best_v, n)
+    if not check_valid(centers, radii, n):
+        centers, radii = shrink(centers, radii, n)
+    
+    return centers, radii, float(np.sum(radii))
+```
+
+I think this is good. Let me review one more time:
+
+1. Force simulation (12 runs × 50000 steps) - generates diverse dense packings
+2. Hexagonal grids (18 seeds × 3 r0 values) with both constraint formulations
+3. Rotated hexagonal (8 seeds × 5 angles)
+4. Random starts (20 seeds)
+5. Perturbation refinement (6 sizes × 20 runs each, both constraint types)
+6. Very fine perturbation (30 runs)
+7. Grow phase (shrink + regrow with 3 factors, both constraint types)
+
+This is thorough. The key improvement over previous solutions is:
+1. Force simulation for initialization (naturally finds good packings)
+2. Both constraint formulations (actual distance and squared) - might converge to different local minima
+3. "Grow" phase to escape local minima by temporarily shrinking and regrowing
+
+Let me make sure there are no issues with the code...
+
+One thing: I should make sure `repair` doesn't take too long. It's O(n²) per iteration with 500 iterations max. For n=26, that's 26*25/2 = 325 overlap checks per iteration, which is fast.
+
+Also, I should ensure the force simulation doesn't run too long. 50000 steps × 12 seeds should be manageable.
+
+Let me also think about whether the constraint function is correct:
+- Boundary: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0 ✓
+- Overlap: dist - ri - rj >= 0 ✓ (using actual distance)
+- Overlap sq: dx² + dy² - (ri+rj)² >= 0 ✓
+
+Looks correct. Let me finalize this solution.
+
+Wait, I realized I need to double-check: the problem says "Make all helper functions top level and have no closures from function nesting. Don't use any lambda functions."
+
+Let me check my code:
+- All functions are top-level ✓
+- No closures (no nested functions) ✓
+- No lambda functions ✓
+
+Good. Let me finalize.
+
+
+Looking at the current solution at 2.634292, I need to push past local minima to reach 2.636. The key improvements will be:
+
+1. **Force-directed "growing circles" initialization** - naturally finds dense packings by gradually expanding radii while maintaining separation
+2. **Both constraint formulations** (actual distance AND squared distance) - they converge to different local minima
+3. **"Grow" phase** - shrink best solution slightly, then let optimizer regrow, escaping local minima
+4. **Extensive perturbation strategy** with varied sizes
+5. **Rotated hexagonal grids** to break symmetries
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def obj(v):
+    return -np.sum(v[2::3])
+
+def constraints(v):
+    n = N
+    res = []
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            d = np.sqrt(dx*dx + dy*dy)
+            res.append(d - ri - rj)
+    return np.array(res)
+
+def constraints_sq(v):
+    n = N
+    res = []
+    for i in range(n):
+        x, y, r = v[3*i], v[3*i+1], v[3*i+2]
+        res.append(x - r)
+        res.append(1.0 - x - r)
+        res.append(y - r)
+        res.append(1.0 - y - r)
+    for i in range(n):
+        xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+        for j in range(i + 1, n):
+            xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+            dx = xi - xj
+            dy = yi - yj
+            res.append(dx*dx + dy*dy - (ri + rj)**2)
+    return np.array(res)
+
+def force_simulate(n, steps, seed):
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.008)
+    for step in range(steps):
+        forces = np.zeros((n, 2))
+        for i in range(n):
+            r = radii[i]
+            for axis in range(2):
+                if centers[i, axis] < r + 0.003:
+                    forces[i, axis] += 8 * (r + 0.003 - centers[i, axis])
+                elif centers[i, axis] > 1 - r - 0.003:
+                    forces[i, axis] -= 8 * (centers[i, axis] - (1 - r - 0.003))
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                margin = radii[i] + radii[j] + 0.003
+                if d < margin and d > 1e-10:
+                    f = 15 * (margin - d) / d
+                    forces[i, 0] -= f * dx
+                    forces[i, 1] -= f * dy
+                    forces[j, 0] += f * dx
+                    forces[j, 1] += f * dy
+        progress = step / steps
+        dt = 0.0015 * (0.2 + 0.8 * (1 - progress))
+        centers += forces * dt
+        centers = np.clip(centers, 0.001, 0.999)
+        growth = 3e-5 * max(0.3, 1 - progress)
+        for i in range(n):
+            max_r_wall = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            max_r_neigh = np.inf
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    max_r_neigh = min(max_r_neigh, d - radii[j])
+            max_r = min(max_r_wall, max_r_neigh) * 0.993
+            radii[i] = min(radii[i] + growth, max(max_r, 0.008))
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def hex_init(n, seed, r0):
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    centers += np.random.uniform(-0.008, 0.008, centers.shape)
+    centers = np.clip(centers, r0 + 0.001, 1 - r0 - 0.001)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def hex_init_rotated(n, seed, angle, r0):
+    np.random.seed(seed)
+    centers = []
+    y = r0
+    row = 0
+    while y + r0 <= 1.0:
+        x = r0 if row % 2 == 0 else 2*r0
+        while x + r0 <= 1.0:
+            centers.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    while len(centers) < n:
+        centers.append([np.random.uniform(0.15, 0.85), np.random.uniform(0.15, 0.85)])
+    centers = np.array(centers[:n])
+    cx, cy = 0.5, 0.5
+    ca, sa = np.cos(angle), np.sin(angle)
+    for i in range(n):
+        dx, dy = centers[i,0] - cx, centers[i,1] - cy
+        centers[i,0] = dx * ca - dy * sa + cx
+        centers[i,1] = dx * sa + dy * ca + cy
+    centers[:, 0] = np.clip(centers[:, 0], r0 + 0.001, 1 - r0 - 0.001)
+    centers[:, 1] = np.clip(centers[:, 1], r0 + 0.001, 1 - r0 - 0.001)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = np.full(n, r0)
+    return v
+
+def random_init(n, seed):
+    np.random.seed(seed)
+    centers = np.random.uniform(0.15, 0.85, (n, 2))
+    radii = np.full(n, 0.04)
+    v = np.zeros(3*n)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = radii
+    return v
+
+def repair(v, n):
+    for _ in range(500):
+        ok = True
+        for i in range(n):
+            r = v[3*i + 2]
+            if r < 0.005:
+                v[3*i + 2] = 0.005
+                r = 0.005
+            v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+            v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = v[3*i] - v[3*j]
+                dy = v[3*i+1] - v[3*j+1]
+                d = np.sqrt(dx*dx + dy*dy)
+                r_sum = v[3*i+2] + v[3*j+2]
+                if d < r_sum - 1e-9:
+                    ok = False
+                    if d > 1e-10:
+                        shift = (r_sum - d) * 0.5
+                        v[3*i] -= shift * dx / d
+                        v[3*i+1] -= shift * dy / d
+                        v[3*j] += shift * dx / d
+                        v[3*j+1] += shift * dy / d
+                    else:
+                        angle = np.random.uniform(0, 2*np.pi)
+                        sep = 0.01
+                        v[3*i] += sep * np.cos(angle)
+                        v[3*i+1] += sep * np.sin(angle)
+                        v[3*j] -= sep * np.cos(angle)
+                        v[3*j+1] -= sep * np.sin(angle)
+        if ok:
+            break
+    for i in range(n):
+        r = v[3*i + 2]
+        if r < 0.005:
+            v[3*i + 2] = 0.005
+            r = 0.005
+        v[3*i] = np.clip(v[3*i], r + 1e-8, 1 - r - 1e-8)
+        v[3*i + 1] = np.clip(v[3*i + 1], r + 1e-8, 1 - r - 1e-8)
+    return v
+
+def optimize(v0, n, bounds, cons_func, maxiter=40000):
+    cons = {'type': 'ineq', 'fun': cons_func}
+    try:
+        res = minimize(obj, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons,
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if not np.isnan(res.fun) and not np.isinf(res.fun):
+            return res.x.copy(), -res.fun
+    except Exception:
+        pass
+    return v0, 0.0
+
+def check_valid(c, r, n):
+    for i in range(n):
+        if r[i] < -1e-12:
+            return False
+        if c[i,0] < r[i] - 1e-10 or c[i,0] > 1 - r[i] + 1e-10:
+            return False
+        if c[i,1] < r[i] - 1e-10 or c[i,1] > 1 - r[i] + 1e-10:
+            return False
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.sqrt((c[i,0]-c[j,0])**2 + (c[i,1]-c[j,1])**2)
+            if d < r[i] + r[j] - 1e-10:
+                return False
+    return True
+
+def shrink(c, r, n):
+    for _ in range(200):
+        if check_valid(c, r, n):
+            break
+        r *= 0.997
+        for i in range(n):
+            c[i, 0] = np.clip(c[i, 0], r[i], 1 - r[i])
+            c[i, 1] = np.clip(c[i, 1], r[i], 1 - r[i])
+    return c, r
+
+def extract(v, n):
+    c = np.zeros((n, 2))
+    r = np.zeros(n)
+    for i in range(n):
+        c[i, 0] = v[3*i]
+        c[i, 1] = v[3*i+1]
+        r[i] = max(0.0, v[3*i+2])
+    return c, r
+
+def run_packing():
+    n = N
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # Phase 1: Force simulation - naturally finds dense packings
+    for seed in range(12):
+        v0 = force_simulate(n, steps=50000, seed=seed)
+        v0 = repair(v0, n)
+        v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+        if s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+    
+    # Phase 2: Hexagonal grids with multiple radii values
+    for seed in range(18):
+        for r0 in [0.088, 0.092, 0.096]:
+            v0 = hex_init(n, seed=seed, r0=r0)
+            v0 = repair(v0, n)
+            v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+            v2, s2 = optimize(v0, n, bounds, constraints_sq, maxiter=50000)
+            if s2 > best_sum:
+                best_sum = s2
+                best_v = v2.copy()
+    
+    # Phase 3: Rotated hexagonal grids - breaks symmetry
+    for seed in range(8):
+        for angle in [0.08, 0.15, -0.1, 0.2, -0.2]:
+            v0 = hex_init_rotated(n, seed=seed, angle=angle, r0=0.09)
+            v0 = repair(v0, n)
+            v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+    
+    # Phase 4: Random starts with small radii
+    for seed in range(20):
+        v0 = random_init(n, seed=seed)
+        v0 = repair(v0, n)
+        v, s = optimize(v0, n, bounds, constraints, maxiter=50000)
+        if s > best_sum:
+            best_sum = s
+            best_v = v.copy()
+    
+    # Phase 5: Aggressive perturbation refinement
+    if best_v is not None:
+        for psize in [0.0005, 0.001, 0.002, 0.003, 0.005, 0.01]:
+            for _ in range(20):
+                vp = best_v + np.random.normal(0, psize, 3*n)
+                vp = repair(vp, n)
+                v, s = optimize(vp, n, bounds, constraints, maxiter=50000)
+                if s > best_sum:
+                    best_sum = s
+                    best_v = v.copy()
+                v2, s2 = optimize(vp, n, bounds, constraints_sq, maxiter=50000)
+                if s2 > best_sum:
+                    best_sum = s2
+                    best_v = v2.copy()
+    
+    # Phase 6: Grow phase - shrink then regrow to escape local minima
+    if best_v is not None:
+        for shrink_factor in [0.97, 0.95, 0.93]:
+            vp = best_v.copy()
+            vp[2::3] *= shrink_factor
+            vp = repair(vp, n)
+            v, s = optimize(vp, n, bounds, constraints, maxiter=50000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+            v2, s2 = optimize(vp, n, bounds, constraints_sq, maxiter=50000)
+            if s2 > best_sum:
+                best_sum = s2
+                best_v = v2.copy()
+    
+    # Phase 7: Very fine perturbation for final polish
+    if best_v is not None:
+        for _ in range(30):
+            vp = best_v + np.random.normal(0, 1e-5, 3*n)
+            vp = repair(vp, n)
+            v, s = optimize(vp, n, bounds, constraints, maxiter=80000)
+            if s > best_sum:
+                best_sum = s
+                best_v = v.copy()
+    
+    # Fallback
+    if best_v is None:
+        best_v = hex_init(n, seed=42, r0=0.09)
+        best_sum = np.sum(best_v[2::3])
+    
+    centers, radii = extract(best_v, n)
+    if not check_valid(centers, radii, n):
+        centers, radii = shrink(centers, radii, n)
+    
+    return centers, radii, float(np.sum(radii))
+```

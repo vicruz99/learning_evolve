@@ -1,0 +1,121 @@
+
+
+<strategy>
+The problem of maximizing the sum of radii for N circles in a square is a classic non-convex optimization problem. Jointly optimizing centers and radii with gradient-based methods (like SLSQP) often gets trapped in local minima due to the non-smooth nature of distance constraints (`sqrt(dx^2+dy^2) >= r_i + r_j`).
+
+To overcome this, I will use a **bi-level optimization strategy**:
+1. **Inner Level (Linear Programming):** For any fixed set of centers, the maximum possible radii are determined by a linear program. The constraints are `r_i + r_j <= distance(i, j)` and boundary limits `r_i <= min(x_i, 1-x_i, y_i, 1-y_i)`. Maximizing `sum(r_i)` subject to these is a fast, exact LP problem. This guarantees that for any evaluated center configuration, we get the mathematically optimal radii without violating constraints.
+2. **Outer Level (Derivative-Free Optimization):** We optimize the 2D centers using `Powell` and `Nelder-Mead` methods, which handle the non-smooth objective landscape well. The objective function is simply the negative of the LP-computed sum of radii.
+3. **Initialization & Refinement:** We generate multiple hexagonal lattice initializations with varied densities and random perturbations to cover different topological basins. After each Powell optimization, a localized random search with Nelder-Mead refinement is performed to escape shallow local optima.
+4. **Efficiency:** The LP constraint matrix `A_ub` is precomputed once. Only the distance bounds vector updates per iteration, making each evaluation extremely fast (<1ms), allowing thousands of center evaluations within the time limit.
+
+This approach decouples the geometric feasibility (handled exactly by LP) from the spatial arrangement (handled robustly by derivative-free optimizers), consistently yielding higher-quality packings than standard joint constrained optimization.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+import math
+
+def run_packing():
+    n = 26
+    
+    # Precompute LP matrix structure for pairwise constraints: r_i + r_j <= dist_ij
+    n_pairs = n * (n - 1) // 2
+    A_ub_pairs = np.zeros((n_pairs, n))
+    pair_indices = []
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub_pairs[idx, i] = 1.0
+            A_ub_pairs[idx, j] = 1.0
+            pair_indices.append((i, j))
+            idx += 1
+            
+    def solve_radii(centers):
+        """Given fixed centers, solve LP to find maximal valid radii."""
+        centers = np.clip(centers, 0.0, 1.0)
+        cx, cy = centers[:, 0], centers[:, 1]
+        
+        # Compute pairwise distances for RHS of LP
+        b_ub = np.zeros(n_pairs)
+        for k, (i, j) in enumerate(pair_indices):
+            b_ub[k] = math.hypot(cx[i] - cx[j], cy[i] - cy[j])
+            
+        # Boundary constraints for each circle
+        bounds = []
+        for i in range(n):
+            x, y = centers[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            bounds.append((0.0, max(0.0, max_r)))
+            
+        # Solve LP: Maximize sum(r)  <=>  Minimize -sum(r)
+        try:
+            res = linprog(-np.ones(n), A_ub=A_ub_pairs, b_ub=b_ub, bounds=bounds, method='highs')
+        except Exception:
+            res = linprog(-np.ones(n), A_ub=A_ub_pairs, b_ub=b_ub, bounds=bounds, method='interior-point')
+            
+        if res.success:
+            return res.x, -res.fun
+        return np.zeros(n), 0.0
+
+    def objective(params):
+        """Objective for outer optimization: maximize sum of radii."""
+        c = params.reshape((n, 2))
+        _, s = solve_radii(c)
+        return -s  # Minimize negative sum
+
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+
+    # Generate diverse initial configurations
+    inits = []
+    for seed in range(12):
+        rng = np.random.RandomState(seed)
+        pts = []
+        # Hexagonal lattice with random spacing and jitter
+        sp = 0.13 + rng.uniform(0, 0.07)
+        y = sp + rng.uniform(-0.02, 0.02)
+        row = 0
+        while len(pts) < n:
+            shift = sp * 0.5 if row % 2 == 1 else 0.0
+            x = shift + sp
+            while x <= 1.0 - sp and len(pts) < n:
+                pts.append([x + rng.uniform(-0.01, 0.01), y + rng.uniform(-0.01, 0.01)])
+                x += sp
+            y += sp * math.sqrt(3) / 2
+            row += 1
+        inits.append(np.array(pts[:n]))
+
+    # Optimize centers for each initialization
+    for init_c in inits:
+        x0 = init_c.flatten()
+        
+        # Primary optimization: Powell's method
+        res = minimize(objective, x0, method='Powell', 
+                       options={'maxiter': 600, 'ftol': 1e-14, 'xtol': 1e-14})
+        cur_c = np.clip(res.x.reshape((n, 2)), 0, 1)
+        rad, s = solve_radii(cur_c)
+        
+        if s > best_sum:
+            best_sum = s
+            best_centers = cur_c
+            best_radii = rad
+            
+        # Secondary refinement: Random perturbation + Nelder-Mead to escape local traps
+        if s > best_sum * 0.99:
+            for _ in range(25):
+                pert = best_centers + np.random.randn(n, 2) * 0.004
+                pert = np.clip(pert, 0, 1)
+                res2 = minimize(objective, pert.flatten(), method='Nelder-Mead',
+                                options={'maxiter': 300, 'fatol': 1e-12})
+                cur_c2 = np.clip(res2.x.reshape((n, 2)), 0, 1)
+                rad2, s2 = solve_radii(cur_c2)
+                if s2 > best_sum:
+                    best_sum = s2
+                    best_centers = cur_c2
+                    best_radii = rad2
+
+    return best_centers, best_radii, float(best_sum)
+```

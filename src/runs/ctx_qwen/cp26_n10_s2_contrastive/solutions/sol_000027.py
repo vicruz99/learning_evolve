@@ -1,0 +1,163 @@
+# sol_000027 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000015 (state 9fd6082b) state=9b69c661 sum of radii=2.615282 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Uses vectorized constraints, linear-in-radii formulation, and a multi-phase search strategy.
+    """
+    n = 26
+    
+    def objective(params):
+        # params layout: [x_0..x_{n-1}, y_0..y_{n-1}, r_0..r_{n-1}]
+        # Minimize negative sum of radii
+        return -np.sum(params[2 * n :])
+
+    def constraints(params):
+        cx = params[:n]
+        cy = params[n : 2 * n]
+        r = params[2 * n :]
+
+        c = []
+
+        # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+        c.extend(cx - r)
+        c.extend(1.0 - cx - r)
+        c.extend(cy - r)
+        c.extend(1.0 - cy - r)
+
+        # Overlap constraints: dist(i, j) >= r_i + r_j
+        # Vectorized pairwise distance computation
+        cx_diff = cx[:, np.newaxis] - cx[np.newaxis, :]
+        cy_diff = cy[:, np.newaxis] - cy[np.newaxis, :]
+        dists = np.sqrt(cx_diff**2 + cy_diff**2)
+        r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+
+        # Extract upper triangle to avoid duplicates and self-constraints
+        i_idx, j_idx = np.triu_indices(n, k=1)
+        c.extend(dists[i_idx, j_idx] - r_sum[i_idx, j_idx])
+
+        return np.array(c)
+
+    # Variable bounds: centers in [0, 1], radii in [1e-9, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-9, 0.5)] * n
+    cons = {"type": "ineq", "fun": constraints}
+
+    best_sum = -1.0
+    best_params = None
+
+    def create_initial(pattern: str, seed: int, noise_scale: float) -> np.ndarray:
+        """Generate an initial configuration for the optimizer."""
+        rng = np.random.RandomState(seed)
+        cx = np.zeros(n)
+        cy = np.zeros(n)
+        r = np.full(n, 0.06)  # Conservative start radius to ensure feasibility
+
+        if pattern == "hex":
+            # 6-5-6-5-4 hexagonal arrangement
+            rows = [6, 5, 6, 5, 4]
+            y_curr = 0.13
+            dy = 0.17
+            idx = 0
+            for row_i, count in enumerate(rows):
+                x_start = 0.11 + (0.085 if row_i % 2 == 1 else 0.0)
+                for col in range(count):
+                    if idx < n:
+                        cx[idx] = x_start + col * 0.155
+                        cy[idx] = y_curr
+                        idx += 1
+                y_curr += dy
+        elif pattern == "rand":
+            cx = rng.uniform(0.2, 0.8, n)
+            cy = rng.uniform(0.2, 0.8, n)
+
+        if noise_scale > 0:
+            cx += rng.randn(n) * noise_scale
+            cy += rng.randn(n) * noise_scale
+            cx = np.clip(cx, 0.05, 0.95)
+            cy = np.clip(cy, 0.05, 0.95)
+
+        return np.concatenate([cx, cy, r])
+
+    # Phase 1: Broad exploration with multiple patterns and seeds
+    for pattern in ["hex", "rand"]:
+        for trial in range(8):
+            x0 = create_initial(pattern, seed=trial * 17 + 3, noise_scale=0.02 * trial)
+            try:
+                res = minimize(
+                    objective,
+                    x0,
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints=cons,
+                    options={"maxiter": 8000, "ftol": 1e-12, "disp": False},
+                )
+                if res.success and -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_params = res.x.copy()
+            except Exception:
+                continue
+
+    # Phase 2: Local refinement from best found configuration
+    if best_params is not None:
+        for trial in range(15):
+            rng = np.random.RandomState(1000 + trial)
+            # Perturb best solution slightly
+            x_curr = best_params.copy() + rng.randn(3 * n) * 0.004
+            # Project back to valid bounds
+            x_curr[: 2 * n] = np.clip(x_curr[: 2 * n], 1e-4, 1 - 1e-4)
+            x_curr[2 * n :] = np.clip(x_curr[2 * n :], 1e-9, 0.49)
+
+            try:
+                res = minimize(
+                    objective,
+                    x_curr,
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints=cons,
+                    options={"maxiter": 15000, "ftol": 1e-13, "disp": False},
+                )
+                if res.success and -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_params = res.x.copy()
+            except Exception:
+                continue
+
+    # Extract and strictly enforce validity
+    cx = best_params[:n]
+    cy = best_params[n : 2 * n]
+    r = best_params[2 * n :]
+
+    centers = np.column_stack((cx, cy))
+    radii = np.maximum(r, 1e-9)
+
+    # Enforce boundary constraints strictly
+    for i in range(n):
+        max_r = min(cx[i], 1.0 - cx[i], cy[i], 1.0 - cy[i])
+        if radii[i] > max_r:
+            radii[i] = max(0.0, max_r - 1e-9)
+
+    # Iteratively resolve any residual overlaps
+    for _ in range(10):
+        overlap_found = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                req_dist = radii[i] + radii[j]
+                if dist < req_dist - 1e-10:
+                    excess = req_dist - dist
+                    # Distribute reduction proportionally to radii
+                    total_r = radii[i] + radii[j]
+                    radii[i] -= excess * (radii[i] / total_r)
+                    radii[j] -= excess * (radii[j] / total_r)
+                    overlap_found = True
+        if not overlap_found:
+            break
+
+    return centers, radii, float(np.sum(radii))

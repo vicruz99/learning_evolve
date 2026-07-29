@@ -1,0 +1,244 @@
+
+
+Looking at the past solutions and the current best (2.626292), I need to find ways to squeeze out ~0.0097 more to reach 2.636.
+
+Key observations:
+1. The current approach uses `dist - r_i - r_j` constraints which have singular derivatives at dist=0
+2. Hexagonal packing patterns 5-6-5-6-4 and variants are promising for 26 circles
+3. The optimization landscape has many local minima
+4. Circles near corners/edges can be larger than interior circles
+
+My strategy:
+1. Use squared distance constraints for smoother optimization (better conditioning)
+2. Try multiple hexagonal row patterns with more diverse initial radii
+3. Position-dependent initial radii (larger near boundaries)
+4. Second-pass refinement from the best solution found
+5. More restarts with varied perturbation scales
+6. Aggressive post-processing to ensure strict validity
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+
+def objective(v, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2 * n:])
+
+
+def constraints(v, n):
+    """Compute all inequality constraints (must return >= 0)."""
+    centers = v[:2 * n].reshape(n, 2)
+    radii = v[2 * n:]
+
+    c = []
+    # Boundary constraints
+    c.append(centers[:, 0] - radii)
+    c.append(1 - centers[:, 0] - radii)
+    c.append(centers[:, 1] - radii)
+    c.append(1 - centers[:, 1] - radii)
+
+    # Pairwise non-overlap using squared distances for smoothness
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist_sq = np.sum(diff ** 2, axis=2)
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    c.append(dist_sq[mask] - r_sum[mask] ** 2)
+
+    return np.concatenate(c)
+
+
+def hex_init(rows, r0, seed=None):
+    """Generate hexagonal lattice initialization."""
+    if seed is not None:
+        np.random.seed(seed)
+
+    n = 26
+    pts = []
+    y = r0
+    for ri, cnt in enumerate(rows):
+        x0 = r0 if ri % 2 == 0 else 2 * r0
+        x = x0
+        for _ in range(cnt):
+            if len(pts) < n and x <= 1 - r0:
+                pts.append([x, y])
+                x += 2 * r0
+        if len(pts) >= n:
+            break
+        y += np.sqrt(3) * r0
+
+    if len(pts) < n:
+        return None, None
+    pts = np.array(pts[:n])
+
+    # Random perturbation to break symmetry
+    noise = np.random.uniform(-0.025, 0.025, pts.shape)
+    pts = np.clip(pts + noise, 0.04, 0.96)
+
+    # Position-dependent initial radii: larger near edges/corners
+    init_r = np.full(n, r0 * 0.25)
+    for i in range(n):
+        d_min = min(pts[i, 0], 1 - pts[i, 0], pts[i, 1], 1 - pts[i, 1])
+        # Circles closer to boundary can start larger
+        init_r[i] = r0 * 0.15 + r0 * 0.2 * (d_min / (r0 * 2))
+        init_r[i] = min(init_r[i], r0 * 0.45)
+
+    return pts, init_r
+
+
+def run_packing():
+    n = 26
+    bounds = [(0, 1)] * (2 * n) + [(0, 0.5)] * n
+
+    best_sum = -1.0
+    best_v = None
+
+    # Diverse hexagonal row patterns that sum to 26
+    patterns = [
+        [5, 6, 5, 6, 4],
+        [6, 5, 6, 5, 4],
+        [5, 5, 5, 5, 6],
+        [6, 6, 5, 5, 4],
+        [5, 5, 6, 5, 5],
+        [4, 6, 6, 5, 5],
+        [7, 5, 5, 5, 4],
+        [5, 6, 4, 6, 5],
+        [6, 4, 6, 5, 5],
+        [4, 5, 7, 5, 5],
+        [6, 6, 6, 4, 4],
+        [5, 7, 5, 4, 5],
+    ]
+
+    for pat in patterns:
+        if sum(pat) != n:
+            continue
+        for r0 in [0.085, 0.090, 0.095, 0.100]:
+            for seed in range(8):
+                pts, init_r = hex_init(pat, r0, seed)
+                if pts is None:
+                    continue
+                v0 = np.concatenate([pts.flatten(), init_r])
+
+                try:
+                    res = minimize(
+                        objective,
+                        v0,
+                        args=(n,),
+                        method="SLSQP",
+                        bounds=bounds,
+                        constraints={"type": "ineq", "fun": constraints, "args": (n,)},
+                        options={"maxiter": 6000, "ftol": 1e-14},
+                    )
+                    s = -res.fun
+                    if s > best_sum:
+                        cons = constraints(res.x, n)
+                        if np.all(cons >= -1e-5):
+                            best_sum = s
+                            best_v = res.x.copy()
+                except Exception:
+                    pass
+
+    # Second pass: perturb best solution and re-optimize
+    if best_v is not None:
+        for seed in range(10):
+            np.random.seed(seed + 9999)
+            v_pert = best_v.copy()
+            # Perturb positions
+            v_pert[: 2 * n] += np.random.uniform(-0.004, 0.004, 2 * n)
+            v_pert[: 2 * n] = np.clip(v_pert[: 2 * n], 0.01, 0.99)
+            # Slightly perturb radii
+            v_pert[2 * n:] += np.random.uniform(-0.002, 0.002, n)
+            v_pert[2 * n:] = np.clip(v_pert[2 * n:], 0.001, 0.5)
+
+            try:
+                res = minimize(
+                    objective,
+                    v_pert,
+                    args=(n,),
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints={"type": "ineq", "fun": constraints, "args": (n,)},
+                    options={"maxiter": 4000, "ftol": 1e-14},
+                )
+                s = -res.fun
+                if s > best_sum:
+                    cons = constraints(res.x, n)
+                    if np.all(cons >= -1e-5):
+                        best_sum = s
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+
+    # Third pass: try with larger perturbations
+    if best_v is not None:
+        for seed in range(6):
+            np.random.seed(seed + 50000)
+            v_pert = best_v.copy()
+            v_pert[: 2 * n] += np.random.uniform(-0.01, 0.01, 2 * n)
+            v_pert[: 2 * n] = np.clip(v_pert[: 2 * n], 0.02, 0.98)
+            v_pert[2 * n:] = best_v[2 * n:] * np.clip(1 + np.random.uniform(-0.1, 0.1, n), 0.5, 1.5)
+
+            try:
+                res = minimize(
+                    objective,
+                    v_pert,
+                    args=(n,),
+                    method="SLSQP",
+                    bounds=bounds,
+                    constraints={"type": "ineq", "fun": constraints, "args": (n,)},
+                    options={"maxiter": 3000, "ftol": 1e-14},
+                )
+                s = -res.fun
+                if s > best_sum:
+                    cons = constraints(res.x, n)
+                    if np.all(cons >= -1e-5):
+                        best_sum = s
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+
+    if best_v is None:
+        centers = np.array([[0.5, 0.5]] * n, dtype=float)
+        radii = np.full(n, 0.01)
+        return centers, radii, float(np.sum(radii))
+
+    centers = best_v[: 2 * n].reshape(n, 2)
+    radii = best_v[2 * n:].copy()
+
+    # Enforce non-negative radii
+    radii = np.maximum(radii, 0.0)
+
+    # Post-process: enforce boundary constraints strictly
+    for i in range(n):
+        radii[i] = min(
+            radii[i],
+            centers[i, 0],
+            1 - centers[i, 0],
+            centers[i, 1],
+            1 - centers[i, 1],
+        )
+
+    # Post-process: enforce non-overlap strictly
+    for _ in range(5):
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                sr = radii[i] + radii[j]
+                if d < sr:
+                    shrink = (sr - d) / 2.0 + 1e-9
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+
+    # Additional boundary enforcement after radius shrinkage
+    for i in range(n):
+        radii[i] = min(
+            radii[i],
+            centers[i, 0] - 1e-10,
+            1 - centers[i, 0] - 1e-10,
+            centers[i, 1] - 1e-10,
+            1 - centers[i, 1] - 1e-10,
+        )
+        radii[i] = max(radii[i], 0.0)
+
+    return centers, radii, float(np.sum(radii))
+```

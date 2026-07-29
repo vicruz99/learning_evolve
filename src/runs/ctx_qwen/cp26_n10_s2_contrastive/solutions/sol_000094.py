@@ -1,0 +1,242 @@
+# sol_000094 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000054 (state 65bdd474) state=4cf54399 sum of radii=2.629884 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(I_IDX)
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    
+    A_ub = np.zeros((NUM_PAIRS, n))
+    A_ub[np.arange(NUM_PAIRS), I_IDX] = 1.0
+    A_ub[np.arange(NUM_PAIRS), J_IDX] = 1.0
+    b_ub = dists[I_IDX, J_IDX]
+    
+    # Boundary constraints: 0 <= r_i <= min(x, 1-x, y, 1-y)
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        mx = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(1e-9, mx)))
+        
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.all(res.x >= -1e-9):
+            return np.maximum(res.x, 0.0)
+    except Exception:
+        pass
+    return np.full(n, 0.01)
+
+def objective(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[2 * N:])
+
+def constraints(params):
+    """Inequality constraints: boundary and non-overlap (must be >= 0)."""
+    c = params[:2 * N].reshape(N, 2)
+    r = params[2 * N:]
+    
+    # Boundary constraints
+    b1 = c[:, 0] - r
+    b2 = 1.0 - c[:, 0] - r
+    b3 = c[:, 1] - r
+    b4 = 1.0 - c[:, 1] - r
+    
+    # Pairwise non-overlap constraints
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    overlaps = dists[I_IDX, J_IDX] - r_sum[I_IDX, J_IDX]
+    
+    return np.concatenate([b1, b2, b3, b4, overlaps])
+
+def resolve_overlaps(centers, radii, iterations=40):
+    """Deterministically push overlapping circles apart to ensure feasibility."""
+    n = centers.shape[0]
+    for _ in range(iterations):
+        max_overlap = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = np.hypot(dx, dy)
+                r_sum = radii[i] + radii[j]
+                if d < r_sum and d > 1e-12:
+                    overlap = r_sum - d
+                    shift = overlap / 2.0
+                    ux = dx / d
+                    uy = dy / d
+                    centers[i, 0] += ux * shift
+                    centers[i, 1] += uy * shift
+                    centers[j, 0] -= ux * shift
+                    centers[j, 1] -= uy * shift
+                    max_overlap = max(max_overlap, overlap)
+        # Clip to boundaries after push
+        centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+        if max_overlap < 1e-8:
+            break
+    return centers
+
+def run_packing():
+    bounds_opt = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    rng = np.random.default_rng(42)
+    
+    # Generate diverse initial configurations
+    inits = []
+    
+    # 1. Hexagonal lattices with varying spacing
+    for seed in range(25):
+        r_gen = np.random.RandomState(seed * 13 + 7)
+        c = np.zeros((N, 2))
+        idx = 0
+        y = 0.05
+        row = 0
+        sp = 0.16 + r_gen.uniform(-0.02, 0.02)
+        margin = 0.04
+        while idx < N and y < 0.96:
+            x = margin + (row % 2) * sp / 2.0
+            while x < 0.96 and idx < N:
+                c[idx] = [x, y]
+                x += sp
+                idx += 1
+            y += sp * np.sqrt(3) / 2.0
+            row += 1
+        while idx < N:
+            c[idx] = r_gen.uniform(0.1, 0.9, 2)
+            idx += 1
+        c += r_gen.normal(0, 0.005, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        inits.append(c)
+        
+    # 2. Grid patterns
+    for seed in range(15):
+        r_gen = np.random.RandomState(seed * 17 + 3)
+        c = np.zeros((N, 2))
+        idx = 0
+        step = 0.18 + r_gen.uniform(-0.02, 0.02)
+        y = 0.05
+        while y < 0.95 and idx < N:
+            x = 0.05
+            while x < 0.95 and idx < N:
+                c[idx] = [x, y]
+                x += step
+                idx += 1
+            y += step
+        while idx < N:
+            c[idx] = r_gen.uniform(0.1, 0.9, 2)
+            idx += 1
+        c += r_gen.normal(0, 0.005, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        inits.append(c)
+        
+    # 3. Random feasible placements
+    for seed in range(20):
+        r_gen = np.random.RandomState(seed * 23 + 11)
+        c = r_gen.uniform(0.15, 0.85, (N, 2))
+        inits.append(c)
+        
+    def try_optimize(c_init, maxiter=10000, ftol=1e-14):
+        nonlocal best_sum, best_c, best_r
+        # Compute initial feasible radii
+        r_init = solve_lp_radii(c_init) * 0.95
+        r_init = np.maximum(r_init, 0.01)
+        
+        # Ensure strict feasibility before SLSQP
+        c_feas = resolve_overlaps(c_init.copy(), r_init.copy())
+        x0 = np.concatenate([c_feas.flatten(), r_init])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds_opt,
+                           constraints=cons_dict, options={'maxiter': maxiter, 'ftol': ftol, 'disp': False})
+            
+            if res.success:
+                co = res.x[:2 * N].reshape(N, 2)
+                # LP refinement on optimized centers
+                ro = solve_lp_radii(co)
+                s = np.sum(ro)
+                
+                if s > best_sum:
+                    best_sum = s
+                    best_c = co.copy()
+                    best_r = ro.copy()
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # Stage 1: Broad search
+    for c0 in inits:
+        try_optimize(c0, maxiter=8000, ftol=1e-13)
+        
+    # Stage 2: Local refinement around best solutions
+    if best_c is not None:
+        for scale in [0.015, 0.008, 0.003, 0.001]:
+            for _ in range(15):
+                pert = best_c + rng.normal(0, scale, best_c.shape)
+                pert = np.clip(pert, 0.02, 0.98)
+                if try_optimize(pert, maxiter=6000, ftol=1e-14):
+                    # If improved, stay near this basin
+                    pass
+                    
+    # Stage 3: Medium jumps to escape basins
+    if best_c is not None:
+        for _ in range(20):
+            jump_scale = rng.uniform(0.02, 0.05)
+            pert = best_c + rng.normal(0, jump_scale, best_c.shape)
+            pert = np.clip(pert, 0.05, 0.95)
+            try_optimize(pert, maxiter=8000, ftol=1e-14)
+            
+    # Fallback safety net
+    if best_c is None:
+        best_c = inits[0]
+        best_r = solve_lp_radii(best_c)
+        best_sum = np.sum(best_r)
+        
+    # Strict post-processing to guarantee validity
+    c_final = best_c.copy()
+    r_final = best_r.copy()
+    
+    # Enforce boundaries strictly
+    for i in range(N):
+        mx = min(c_final[i, 0], 1.0 - c_final[i, 0], 
+                 c_final[i, 1], 1.0 - c_final[i, 1])
+        r_final[i] = min(r_final[i], mx - 1e-10)
+        r_final[i] = max(r_final[i], 0.0)
+        
+    # Iteratively resolve any remaining numerical overlaps
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = c_final[i, 0] - c_final[j, 0]
+                dy = c_final[i, 1] - c_final[j, 1]
+                d = np.hypot(dx, dy)
+                if d < r_final[i] + r_final[j] - 1e-12:
+                    exc = r_final[i] + r_final[j] - d
+                    r_final[i] -= exc * 0.5
+                    r_final[j] -= exc * 0.5
+                    changed = True
+        if not changed:
+            break
+            
+    r_final = np.maximum(r_final, 0.0)
+    return c_final, r_final, float(np.sum(r_final))

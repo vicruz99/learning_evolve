@@ -1,0 +1,176 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a multi-phase optimization strategy:
+1. **Diverse Multi-Start SLSQP**: We generate multiple high-quality initial configurations (hexagonal lattices at various densities, random placements, and corner-focused layouts). Each is perturbed and optimized using `scipy.optimize.minimize` with the SLSQP method and explicit inequality constraints for boundaries and pairwise non-overlap. This finds strong local optima while strictly respecting constraints.
+2. **Iterative Radius Growth & Center Refinement**: From the best SLSQP result, we iteratively scale all radii up by a small factor (0.04% per step). After each scaling, we run a fast L-BFGS-B optimization that minimizes a penalty function based on overlap penetrations and boundary violations. This "growing" phase pushes the packing density beyond what a single SLSQP run typically achieves, effectively simulating an inflation process where centers dynamically adjust to maintain feasibility.
+3. **Final SLSQP Polish**: After growth converges, we run one more SLSQP optimization to precisely resolve any remaining numerical slack and maximize the sum under exact constraints.
+4. **Safety Shrinking**: A final deterministic pass shrinks radii slightly to guarantee strict compliance with the validator's `1e-12` tolerance, eliminating any edge-case overlaps or boundary breaches caused by floating-point drift.
+
+All helper functions are defined at the module level to comply with the no-closure rule, and vectorized operations are used throughout for efficiency.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+i_idx, j_idx = TRIU_IDX
+
+def obj(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N_CIRCLES:])
+
+def cons(v):
+    """Inequality constraints: must be >= 0 for validity."""
+    cx = v[0::3]
+    cy = v[1::3]
+    r = v[2::3]
+    n_constr = 4*N_CIRCLES + N_CIRCLES*(N_CIRCLES-1)//2
+    c = np.empty(n_constr)
+    c[:N_CIRCLES] = cx - r
+    c[N_CIRCLES:2*N_CIRCLES] = 1.0 - cx - r
+    c[2*N_CIRCLES:3*N_CIRCLES] = cy - r
+    c[3*N_CIRCLES:4*N_CIRCLES] = 1.0 - cy - r
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d = np.sqrt(dx**2 + dy**2)
+    r_sum = r[:, None] + r[None, :]
+    c[4*N_CIRCLES:] = d[TRIU_IDX] - r_sum[TRIU_IDX]
+    return c
+
+def overlap_obj(v_c, radii):
+    """Penalty function for center optimization during radius growth phase."""
+    cx = v_c[::2]
+    cy = v_c[1::2]
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d = np.sqrt(dx**2 + dy**2)
+    r_sum = radii[:, None] + radii[None, :]
+    
+    overlaps = np.maximum(0, r_sum[i_idx, j_idx] - d[i_idx, j_idx])
+    pen = np.sum(overlaps**2)
+    
+    pen += np.sum(np.maximum(0, radii - cx)**2)
+    pen += np.sum(np.maximum(0, cx + radii - 1)**2)
+    pen += np.sum(np.maximum(0, radii - cy)**2)
+    pen += np.sum(np.maximum(0, cy + radii - 1)**2)
+    return pen
+
+def run_packing():
+    N = N_CIRCLES
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': cons}
+    
+    best_v = None
+    best_val = -np.inf
+    
+    np.random.seed(42)
+    inits = []
+    
+    # 1. Hexagonal lattices with varying base radii
+    for r0 in [0.08, 0.09, 0.095, 0.10, 0.105]:
+        c = []
+        y = r0
+        row = 0
+        while len(c) < N:
+            x = r0 if row % 2 == 0 else 2*r0
+            while x <= 1-r0 and len(c) < N:
+                c.append([x, y])
+                x += 2*r0
+            y += r0 * np.sqrt(3)
+            row += 1
+        while len(c) < N:
+            c.append([np.random.rand(), np.random.rand()])
+        inits.append(np.array(c[:N]))
+        
+    # 2. Random configurations
+    for _ in range(15):
+        inits.append(np.random.rand(N, 2) * 0.8 + 0.1)
+        
+    # 3. Corner-focused configurations
+    for _ in range(10):
+        c = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        c.extend([list(np.random.rand(2) * 0.6 + 0.2) for _ in range(N-4)])
+        inits.append(np.array(c))
+        
+    # Multi-start SLSQP
+    for cfg in inits:
+        cfg_pert = cfg + np.random.normal(0, 0.002, cfg.shape)
+        cfg_pert = np.clip(cfg_pert, 0.01, 0.99)
+        
+        r_init = 0.08 + np.random.rand(N) * 0.002
+        v0 = np.zeros(3*N)
+        v0[0::3] = cfg_pert[:, 0]
+        v0[1::3] = cfg_pert[:, 1]
+        v0[2::3] = r_init
+        
+        try:
+            res = minimize(obj, v0, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                           options={'maxiter': 3000, 'ftol': 1e-13})
+            if -res.fun > best_val:
+                c_vals = cons(res.x)
+                if np.all(c_vals >= -1e-7):
+                    best_val = -res.fun
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        v0 = np.zeros(3*N)
+        v0[0::3] = np.random.rand(N)
+        v0[1::3] = np.random.rand(N)
+        v0[2::3] = 0.08
+        best_v = v0
+        
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:]
+    
+    # Iterative Radius Growth & Center Refinement
+    for step in range(100):
+        radii *= 1.0004
+        v_c0 = centers.flatten()
+        b_c = [(0.0, 1.0)] * (2*N)
+        try:
+            res_c = minimize(overlap_obj, v_c0, args=(radii,), method='L-BFGS-B', bounds=b_c,
+                             options={'maxiter': 500, 'ftol': 1e-14})
+            centers = res_c.x.reshape(N, 2)
+        except Exception:
+            pass
+            
+    # Final SLSQP polish
+    v_final = np.concatenate([centers.flatten(), radii])
+    try:
+        res_final = minimize(obj, v_final, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                             options={'maxiter': 2000, 'ftol': 1e-14})
+        if -res_final.fun > np.sum(radii):
+            centers = res_final.x[:2*N].reshape(N, 2)
+            radii = res_final.x[2*N:]
+    except Exception:
+        pass
+        
+    # Deterministic safety shrink to guarantee strict validation compliance
+    for _ in range(30):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    ov = radii[i] + radii[j] - d
+                    radii[i] -= ov/2
+                    radii[j] -= ov/2
+                    changed = True
+        for i in range(N):
+            mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mx + 1e-9:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

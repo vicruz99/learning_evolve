@@ -1,0 +1,214 @@
+# sol_000218 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b505a133) state=4772935f sum of radii=2.575218 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n_circles = 26
+    
+    # Precompute pair indices for constraints
+    pair_indices = []
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            pair_indices.append((i, j))
+            
+    def objective(vars):
+        """Objective function to minimize (negative sum of radii)"""
+        # vars layout: [x1, y1, r1, x2, y2, r2, ...]
+        radii = vars[2::3]
+        return -np.sum(radii)
+
+    def constraints_func(vars):
+        """
+        Returns a list of constraint values.
+        We want all constraints to be >= 0.
+        """
+        constraints = []
+        
+        # Boundary constraints
+        for i in range(n_circles):
+            x_i = vars[3*i]
+            y_i = vars[3*i + 1]
+            r_i = vars[3*i + 2]
+            
+            # x - r >= 0
+            constraints.append(x_i - r_i)
+            # 1 - x - r >= 0
+            constraints.append(1.0 - x_i - r_i)
+            # y - r >= 0
+            constraints.append(y_i - r_i)
+            # 1 - y - r >= 0
+            constraints.append(1.0 - y_i - r_i)
+            
+        # Non-overlap constraints
+        for i, j in pair_indices:
+            x_i, y_i = vars[3*i], vars[3*i + 1]
+            x_j, y_j = vars[3*j], vars[3*j + 1]
+            r_i, r_j = vars[3*i + 2], vars[3*j + 2]
+            
+            dist = math.sqrt((x_i - x_j)**2 + (y_i - y_j)**2)
+            constraints.append(dist - (r_i + r_j))
+            
+        return constraints
+
+    def generate_hexagonal_grid(n, scale=1.0, perturb=0.0):
+        """
+        Generates initial centers and radii based on a hexagonal packing pattern.
+        """
+        centers = np.zeros((n, 2))
+        radii = np.zeros(n)
+        
+        # Approximate number of rows
+        # For hexagonal packing, area ~ n * pi * r^2. 
+        # Also width ~ 2r * sqrt(n) roughly.
+        # Let's aim for a grid that fits roughly.
+        # Try to fit in a triangle or rectangle of hexagons.
+        
+        # Heuristic for grid dimensions
+        # Area of unit square = 1.
+        # Area per circle in hex packing ~ 2*sqrt(3)*r^2
+        # n * 2*sqrt(3)*r^2 approx 1 => r approx 1/sqrt(26*2*sqrt(3)) approx 0.11
+        
+        # Let's create a grid of points and select the first n
+        # Row offset logic for hexagonal lattice
+        points = []
+        r_est = 0.1
+        dx = 2 * r_est
+        dy = r_est * math.sqrt(3)
+        
+        # Try to fill a 6x6 area roughly
+        for row in range(8):
+            for col in range(8):
+                x = col * dx + (row % 2) * (dx / 2)
+                y = row * dy
+                points.append([x, y])
+                
+        # Scale points to fit in [0,1]x[0,1] roughly
+        # We want to maximize the minimum distance between points relative to the box size
+        # But simple scaling works.
+        
+        # Select first n points
+        if len(points) > n:
+            selected_points = points[:n]
+        else:
+            # If not enough, add random points? 
+            # 8x8 = 64, so we have enough.
+            selected_points = points[:n]
+            
+        centers = np.array(selected_points)
+        
+        # Normalize to fit in [0,1]
+        # Add small padding
+        pad = 0.05
+        centers = centers * (1 - 2*pad) / 2 + 0.5 
+        # This centers them in 0.5, 0.5 with scale 0.5
+        
+        # Add perturbation
+        if perturb > 0:
+            centers += np.random.uniform(-perturb, perturb, centers.shape)
+            
+        # Clip to [0,1]
+        centers = np.clip(centers, 0.01, 0.99)
+        
+        # Initial radii
+        radii = np.ones(n) * 0.02
+        
+        return centers, radii
+
+    def run_optimization(seed=0, perturb=0.0):
+        np.random.seed(seed)
+        centers, radii = generate_hexagonal_grid(n_circles, perturb=perturb)
+        
+        # Flatten variables
+        vars0 = np.zeros(3 * n_circles)
+        for i in range(n_circles):
+            vars0[3*i] = centers[i, 0]
+            vars0[3*i + 1] = centers[i, 1]
+            vars0[3*i + 2] = radii[i]
+            
+        # Bounds
+        bounds = []
+        for i in range(n_circles):
+            # x in [0, 1]
+            bounds.append((0.0, 1.0))
+            # y in [0, 1]
+            bounds.append((0.0, 1.0))
+            # r in [0, 0.5]
+            bounds.append((0.0, 0.5))
+            
+        constraints = {'type': 'ineq', 'fun': constraints_func}
+        
+        # Optimization
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds, 
+                           constraints=constraints, 
+                           options={'maxiter': 1000, 'ftol': 1e-8})
+            return res
+        except Exception as e:
+            print(f"Optimization failed: {e}")
+            return None
+
+    best_result = None
+    best_sum_radii = -1.0
+    
+    # Try multiple seeds and perturbations
+    # A few structured starts and some random ones
+    attempts = []
+    
+    # 1. Hexagonal grid, no perturbation
+    attempts.append((0, 0.0))
+    # 2. Hexagonal grid, small perturbation
+    attempts.append((1, 0.01))
+    # 3. Random seeds
+    for i in range(5):
+        attempts.append((100 + i, 0.05))
+
+    for seed, perturb in attempts:
+        res = run_optimization(seed=seed, perturb=perturb)
+        if res is not None and res.success:
+            sum_r = -res.fun
+            # Check validity roughly
+            vars_opt = res.x
+            centers_opt = np.zeros((n_circles, 2))
+            radii_opt = np.zeros(n_circles)
+            for i in range(n_circles):
+                centers_opt[i] = [vars_opt[3*i], vars_opt[3*i + 1]]
+                radii_opt[i] = vars_opt[3*i + 2]
+            
+            # Basic validation check (fast)
+            valid = True
+            for i in range(n_circles):
+                if radii_opt[i] < 0 or centers_opt[i,0] < 0 or centers_opt[i,0] > 1 or \
+                   centers_opt[i,1] < 0 or centers_opt[i,1] > 1:
+                    valid = False; break
+                if centers_opt[i,0] - radii_opt[i] < -1e-6 or centers_opt[i,0] + radii_opt[i] > 1 + 1e-6:
+                    valid = False; break
+                if centers_opt[i,1] - radii_opt[i] < -1e-6 or centers_opt[i,1] + radii_opt[i] > 1 + 1e-6:
+                    valid = False; break
+            
+            if valid and sum_r > best_sum_radii:
+                best_sum_radii = sum_r
+                best_result = (centers_opt, radii_opt)
+
+    if best_result is None:
+        # Fallback if all failed
+        centers = np.random.rand(n_circles, 2) * 0.8 + 0.1
+        radii = np.ones(n_circles) * 0.01
+        best_result = (centers, radii)
+        best_sum_radii = np.sum(radii)
+
+    centers, radii = best_result
+    return centers, radii, float(np.sum(radii))

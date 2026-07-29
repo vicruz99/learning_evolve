@@ -1,0 +1,170 @@
+
+
+<strategy>
+To improve the circle packing sum of radii beyond 2.622, we need a more robust optimization strategy that avoids local minima and handles the non-convex constraints efficiently. Key improvements include:
+
+1. **Squared Distance Constraints**: Replace `dist - (r_i + r_j) >= 0` with `dist_sq - (r_i + r_j)^2 >= 0`. This removes the square root, providing smoother gradients and better numerical stability near contact points.
+2. **Diverse Initializations**: Start from multiple structured layouts (hexagonal grids with varying densities, random scatters, and corner-biased configurations) to cover different topological basins of attraction.
+3. **Iterative Refinement**: After finding the best local optimum, perturb the centers (keeping radii fixed initially to maintain feasibility) and re-optimize. This helps escape rigid local minima where circles are trapped in suboptimal clusters.
+4. **Vectorized Constraint Evaluation**: Precompute triangle indices and use numpy broadcasting to evaluate all 325 pairwise constraints at once, drastically speeding up each SLSQP iteration.
+5. **Strict Post-Processing**: Ensure the final configuration strictly satisfies boundary and non-overlap constraints within the `1e-12` tolerance allowed by the validator, shrinking radii only when necessary.
+
+These changes combine global exploration with precise local refinement, typically pushing the objective function higher by allowing circles to settle into denser, more optimal arrangements with varying radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def objective(params, n):
+    """Negative sum of radii (to be minimized)."""
+    return -np.sum(params[2*n:])
+
+def constraints(params, n):
+    """
+    Inequality constraints: g(params) >= 0
+    - Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r
+    - Non-overlap: dist_sq >= (r_i + r_j)^2
+    """
+    cx = params[:n]
+    cy = params[n:2*n]
+    r = params[2*n:]
+    
+    c = []
+    # Boundary constraints (4 per circle)
+    c.extend(cx - r)
+    c.extend(1.0 - cx - r)
+    c.extend(cy - r)
+    c.extend(1.0 - cy - r)
+    
+    # Overlap constraints (squared distance to avoid sqrt gradients)
+    idx = np.triu_indices(n, k=1)
+    dx = cx[idx[0]] - cx[idx[1]]
+    dy = cy[idx[0]] - cy[idx[1]]
+    dist_sq = dx*dx + dy*dy
+    r_sum = r[idx[0]] + r[idx[1]]
+    c.extend(dist_sq - r_sum*r_sum)
+    
+    return np.array(c)
+
+def run_single_opt(x0, n, bounds, cons, max_iter=5000):
+    """Run a single SLSQP optimization and return the result."""
+    try:
+        res = minimize(
+            objective, x0, args=(n,),
+            method='SLSQP', bounds=bounds, constraints=cons,
+            options={'maxiter': max_iter, 'ftol': 1e-14, 'disp': False}
+        )
+        return res
+    except Exception:
+        return None
+
+def run_packing():
+    """Main packing function. Returns (centers, radii, sum_radii)."""
+    n = 26
+    best_sum = 0.0
+    best_params = None
+    
+    # Variable bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = [(0.0, 1.0)]*n + [(0.0, 1.0)]*n + [(0.0, 0.5)]*n
+    cons = {'type': 'ineq', 'fun': constraints, 'args': (n,)}
+    
+    inits = []
+    
+    # 1. Hexagonal grids with varying spacing
+    for spacing in [0.14, 0.15, 0.16, 0.17, 0.18]:
+        centers = []
+        r_init = spacing * 0.45
+        row = 0
+        while len(centers) < n:
+            y = r_init + row * spacing * math.sqrt(3)/2
+            if y + r_init > 1.0: break
+            x_start = r_init + (row%2)*spacing/2
+            col = 0
+            while x_start + col*spacing + r_init <= 1.0 and len(centers) < n:
+                centers.append([x_start + col*spacing, y])
+                col += 1
+            row += 1
+        while len(centers) < n:
+            centers.append([0.5, 0.5])
+        cx, cy = zip(*centers[:n])
+        inits.append(np.concatenate([list(cx), list(cy), np.full(n, r_init)]))
+        
+    # 2. Random initializations
+    np.random.seed(42)
+    for _ in range(8):
+        cx = np.random.uniform(0.15, 0.85, n)
+        cy = np.random.uniform(0.15, 0.85, n)
+        r = np.full(n, 0.04)
+        inits.append(np.concatenate([cx, cy, r]))
+        
+    # 3. Corner-biased configurations (large circles often pack well near boundaries)
+    for _ in range(4):
+        cx = np.random.uniform(0.1, 0.9, n)
+        cy = np.random.uniform(0.1, 0.9, n)
+        cx[0:4] = [0.12, 0.88, 0.88, 0.12]
+        cy[0:4] = [0.12, 0.12, 0.88, 0.88]
+        r = np.full(n, 0.05)
+        inits.append(np.concatenate([cx, cy, r]))
+
+    # Run initial optimizations
+    for x0 in inits:
+        x0_noisy = x0 + np.random.randn(len(x0)) * 1e-4
+        res = run_single_opt(x0_noisy, n, bounds, cons)
+        if res is not None and -res.fun > best_sum:
+            best_sum = -res.fun
+            best_params = res.x.copy()
+            
+    # Iterative refinement to escape local minima
+    if best_params is not None:
+        for k in range(8):
+            # Perturb centers more aggressively than radii
+            noise = np.random.randn(len(best_params)) * 0.015
+            noise[2*n:] *= 0.0 
+            x_pert = best_params + noise
+            x_pert = np.clip(x_pert, 0.0, 1.0)
+            
+            res = run_single_opt(x_pert, n, bounds, cons, max_iter=8000)
+            if res is not None and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_params = res.x.copy()
+
+    # Fallback if all optimizations fail
+    if best_params is None:
+        cx = np.tile(np.linspace(0.1, 0.9, 5), 5)[:n]
+        cy = np.repeat(np.linspace(0.1, 0.9, 5), 5)[:n]
+        best_params = np.concatenate([cx, cy, np.full(n, 0.03)])
+        
+    # Extract results
+    centers = np.column_stack((best_params[:n], best_params[n:2*n]))
+    radii = best_params[2*n:].copy()
+    
+    # Post-processing: enforce strict boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        max_r = min(x, 1-x, y, 1-y)
+        if r > max_r:
+            radii[i] = max_r
+            
+    # Post-processing: resolve overlaps by proportionally reducing radii
+    for _ in range(30):
+        max_viol = 0
+        for i in range(n):
+            for j in range(i+1, n):
+                dx = centers[i,0] - centers[j,0]
+                dy = centers[i,1] - centers[j,1]
+                d = math.sqrt(dx*dx + dy*dy)
+                if d < radii[i] + radii[j] - 1e-12:
+                    overlap = radii[i] + radii[j] - d
+                    radii[i] -= overlap/2
+                    radii[j] -= overlap/2
+                    max_viol = max(max_viol, overlap)
+        radii = np.maximum(radii, 0.0)
+        if max_viol < 1e-13:
+            break
+            
+    final_sum = float(np.sum(radii))
+    return centers, radii, final_sum
+```

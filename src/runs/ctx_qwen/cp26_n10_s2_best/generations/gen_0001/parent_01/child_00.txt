@@ -1,0 +1,162 @@
+
+
+<strategy>
+To improve the circle packing and maximize the sum of radii beyond the current best of ~2.626, I will employ a more robust optimization strategy:
+
+1. **Vectorized Constraints**: Replace pairwise distance constraints with a fully vectorized formulation using `np.triu_indices`. This dramatically speeds up constraint evaluation and improves numerical stability for SLSQP.
+2. **Feasible Initialization**: SLSQP converges much better when starting from a strictly feasible point. I will implement a radius projection step that guarantees the initial radii satisfy all boundary and non-overlap constraints for any given center configuration.
+3. **Diverse Multi-Start**: Instead of a single lattice, I will initialize from a hexagonal grid, a square grid, and several randomly perturbed versions. This covers different structural basins of attraction.
+4. **Local Refinement Loop**: After finding the best solution, I will apply small random perturbations to the center coordinates and re-optimize. This helps escape shallow local minima that often trap standard gradient-based solvers in packing problems.
+5. **Strict Post-Processing**: Finally, I will enforce strict validity within the validator's `1e-12` tolerance by scaling down radii only if constraints are slightly violated, preserving the optimized sum as much as possible.
+
+These changes combined should consistently push the sum of radii closer to or beyond the 2.63 target.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(v, n):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraints(v, n, i_idx, j_idx):
+    """
+    Computes all inequality constraints:
+    1. Boundary: x >= r, x + r <= 1, y >= r, y + r <= 1
+    2. Pairwise: dist^2 >= (r_i + r_j)^2
+    Returns a flat array where each element >= 0 indicates a satisfied constraint.
+    """
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    
+    # Boundary constraints
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints (vectorized)
+    xi, xj = x[i_idx], x[j_idx]
+    yi, yj = y[i_idx], y[j_idx]
+    ri, rj = r[i_idx], r[j_idx]
+    
+    dx = xi - xj
+    dy = yi - yj
+    dist_sq = dx*dx + dy*dy
+    r_sum = ri + rj
+    
+    c = np.concatenate([c, dist_sq - r_sum*r_sum])
+    return c
+
+def get_feasible_radii(centers, n):
+    """
+    Projects an initial radius guess to a strictly feasible configuration
+    for the given centers by iteratively shrinking overlapping circles.
+    """
+    r = np.full(n, 0.12)
+    for _ in range(80):
+        for i in range(n):
+            # Wall constraints
+            r[i] = min(r[i], centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            # Neighbor constraints
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    r[i] = min(r[i], d - r[j])
+        r = np.maximum(r, 0.0)
+    return r
+
+def run_packing():
+    np.random.seed(42)
+    n = 26
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints, 'args': (n, i_idx, j_idx)}
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # Generate diverse initial center configurations
+    init_centers_list = []
+    
+    # 1. Hexagonal lattice
+    pts = []
+    y = 0.05
+    row = 0
+    while len(pts) < n + 5:
+        x_start = 0.05 + (row % 2) * 0.1
+        x = x_start
+        while x <= 0.95:
+            pts.append([x, y])
+            x += 0.2
+        y += 0.17
+        row += 1
+    init_centers_list.append(np.array(pts[:n]))
+    
+    # 2. Uniform grid
+    xs = np.linspace(0.15, 0.85, 6)
+    ys = np.linspace(0.1, 0.9, 5)
+    grid_pts = []
+    for y_val in ys:
+        for x_val in xs:
+            grid_pts.append([x_val, y_val])
+    init_centers_list.append(np.array(grid_pts[:n]))
+    
+    # 3. Perturbed hexagonal lattices
+    for _ in range(4):
+        hex_pts = init_centers_list[0].copy()
+        hex_pts += np.random.uniform(-0.03, 0.03, hex_pts.shape)
+        init_centers_list.append(np.clip(hex_pts, 0.02, 0.98))
+
+    # Optimize from each initialization
+    for centers_init in init_centers_list:
+        centers_init = np.clip(centers_init, 0.01, 0.99)
+        r_init = get_feasible_radii(centers_init, n)
+        v0 = np.concatenate([centers_init[:, 0], centers_init[:, 1], r_init])
+        
+        res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                       args=(n, i_idx, j_idx),
+                       options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+                       
+        if -res.fun > best_sum:
+            c_vals = constraints(res.x, n, i_idx, j_idx)
+            if np.min(c_vals) >= -1e-6:
+                best_sum = -res.fun
+                best_v = res.x.copy()
+
+    # Local refinement to escape local minima
+    if best_v is not None:
+        for _ in range(8):
+            v_pert = best_v.copy()
+            v_pert[:2*n] += np.random.uniform(-1e-4, 1e-4, 2*n)
+            v_pert[:2*n] = np.clip(v_pert[:2*n], 0.001, 0.999)
+            res_pert = minimize(objective, v_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                                args=(n, i_idx, j_idx),
+                                options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if -res_pert.fun > best_sum:
+                c_vals = constraints(res_pert.x, n, i_idx, j_idx)
+                if np.min(c_vals) >= -1e-6:
+                    best_sum = -res_pert.fun
+                    best_v = res_pert.x.copy()
+
+    # Extract best solution
+    x_sol = best_v[:n]
+    y_sol = best_v[n:2*n]
+    r_sol = best_v[2*n:]
+    centers = np.column_stack((x_sol, y_sol))
+    
+    # Strict validity enforcement to guarantee pass against 1e-12 tolerance
+    c_vals = constraints(best_v, n, i_idx, j_idx)
+    min_c = np.min(c_vals)
+    if min_c < -1e-8:
+        # Slightly shrink all radii uniformly to satisfy constraints
+        scale = 1.0 + min_c / (np.max(r_sol) + 1e-9)
+        r_sol *= max(scale, 0.0)
+        
+    return centers, r_sol, float(np.sum(r_sol))
+```

@@ -1,0 +1,159 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a multi-stage constrained optimization strategy using `scipy.optimize.minimize` with the SLSQP algorithm. Key improvements over previous attempts include:
+
+1. **Robust Constraint Formulation**: We define boundary and non-overlap constraints as a single concatenated numpy array. Using `dist - (r_i + r_j) >= 0` provides smoother gradients than squared distances, helping SLSQP navigate the non-convex landscape more effectively.
+2. **Symmetry-Breaking Initialization**: Instead of purely random starts, we use a perturbed hexagonal lattice. This naturally places circles in a high-density configuration, giving the optimizer a strong feasible starting point while random perturbations prevent it from getting stuck in symmetric local minima.
+3. **Multi-Trial Exploration & Refinement**: We run 30 independent optimization trials with varied random seeds and perturbation magnitudes. After identifying the best configuration, we perform a dedicated refinement phase with tighter tolerances and smaller perturbations to squeeze out additional volume.
+4. **Strict Post-Processing**: Numerical optimizers can sometimes terminate with constraints satisfied only up to machine epsilon. We implement a deterministic post-processing step that slightly shrinks radii to guarantee strict compliance with the validation function's `1e-12` tolerance without significantly affecting the objective.
+5. **Closure-Free Architecture**: All helper functions are defined at the top level with a global constant `N=26`, strictly adhering to the prompt's structural requirements and avoiding lambda/closure pitfalls.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(x):
+    """Objective function: maximize sum of radii (minimize negative sum)."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """
+    Inequality constraints g(x) >= 0.
+    Includes boundary constraints and pairwise non-overlap constraints.
+    """
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    c = []
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c.append(cx - r)
+    c.append(1.0 - cx - r)
+    c.append(cy - r)
+    c.append(1.0 - cy - r)
+    
+    # Pairwise non-overlap constraints: dist(i,j) >= r_i + r_j
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist = np.sqrt(dx**2 + dy**2 + 1e-12)  # Small epsilon for numerical stability
+    r_sum = r[:, None] + r[None, :]
+    
+    triu = np.triu_indices(N, k=1)
+    c.append(dist[triu] - r_sum[triu])
+    
+    return np.concatenate(c)
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+
+    def make_hex_init(seed, perturbation=0.02):
+        """Generate a perturbed hexagonal lattice initialization."""
+        rng = np.random.RandomState(seed)
+        centers = []
+        r_init = 0.04
+        y = r_init
+        row = 0
+        while len(centers) < N:
+            x = r_init if row % 2 == 0 else r_init + r_init * 0.85
+            while x <= 1.0 - r_init and len(centers) < N:
+                cx = x + rng.uniform(-perturbation, perturbation)
+                cy = y + rng.uniform(-perturbation, perturbation)
+                centers.append([max(0.01, min(0.99, cx)), max(0.01, min(0.99, cy))])
+                x += 2 * r_init
+            y += r_init * np.sqrt(3)
+            row += 1
+        return np.array(centers[:N])
+
+    # Stage 1: Multiple restarts with varying seeds and perturbations
+    for trial in range(30):
+        seed = trial * 17 + 5
+        pert = 0.01 + trial * 0.001
+        centers_init = make_hex_init(seed, perturbation=pert)
+        r_init = np.full(N, 0.025)
+        
+        x0 = np.zeros(3 * N)
+        x0[0::3] = centers_init[:, 0]
+        x0[1::3] = centers_init[:, 1]
+        x0[2::3] = r_init
+        
+        # Add small random noise to break exact symmetries
+        x0 += np.random.randn(3 * N) * 0.002
+        x0 = np.clip(x0, [0.0]*2*N + [1e-6]*N, [1.0]*2*N + [0.5]*N)
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 2500, 'ftol': 1e-12, 'disp': False})
+            
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = res.x[0::3].reshape(N, 2)
+                best_radii = res.x[2::3].copy()
+        except Exception:
+            continue
+
+    # Stage 2: Refine the best solution with tighter tolerances and smaller perturbations
+    if best_centers is not None:
+        x0 = np.zeros(3 * N)
+        x0[0::3] = best_centers[:, 0]
+        x0[1::3] = best_centers[:, 1]
+        x0[2::3] = best_radii
+        
+        for _ in range(6):
+            x0 += np.random.randn(3 * N) * 0.0003
+            x0 = np.clip(x0, [0.0]*2*N + [1e-6]*N, [1.0]*2*N + [0.5]*N)
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 4000, 'ftol': 1e-14, 'disp': False})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = res.x[0::3].reshape(N, 2)
+                best_radii = res.x[2::3].copy()
+
+    # Stage 3: Post-processing to strictly enforce validation constraints
+    centers = best_centers.copy()
+    radii = best_radii.copy()
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        x, y = centers[i]
+        r = radii[i]
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        if r > max_r:
+            radii[i] = max_r - 1e-9
+            
+    # Iteratively resolve any remaining pairwise overlaps
+    for _ in range(15):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dist = np.sqrt((centers[i, 0] - centers[j, 0])**2 + (centers[i, 1] - centers[j, 1])**2)
+                if dist < radii[i] + radii[j] - 1e-10:
+                    excess = radii[i] + radii[j] - dist
+                    # Distribute reduction proportionally to radii
+                    w = radii[i] / (radii[i] + radii[j])
+                    radii[i] -= w * excess * 0.5 + 1e-9
+                    radii[j] -= (1.0 - w) * excess * 0.5 + 1e-9
+                    changed = True
+        if not changed:
+            break
+            
+    best_sum = np.sum(radii)
+    return centers, radii, float(best_sum)
+```

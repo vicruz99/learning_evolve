@@ -1,0 +1,169 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.628, we need a more aggressive global search combined with a robust local optimizer. The key insights are:
+1. **Constraint Formulation**: Using squared distances `dx^2 + dy^2 - (r_i + r_j)^2 >= 0` avoids square roots during optimization, improving numerical stability and speed.
+2. **Diverse Initialization**: Hexagonal lattices are optimal for dense packings, but rigid lattices get stuck. We generate multiple hexagonal patterns with varying jitter scales, plus random scatter initializations to explore different basins of attraction.
+3. **Expansion-Perturbation Loop**: Local optima often have circles too far apart. By intentionally scaling radii up by ~1-2% before re-optimizing, we force the solver to push centers closer together, discovering tighter configurations that increase the total radius sum.
+4. **Vectorization & Efficiency**: Precomputing pair indices and vectorizing constraint evaluation drastically reduces per-iteration overhead, allowing more restarts and perturbation steps within time limits.
+5. **Strict Post-Processing**: Optimizers converge to machine precision but may drift slightly outside tolerances. A deterministic iterative shrinkage phase guarantees the configuration strictly satisfies the validator's `1e-12` tolerance without sacrificing meaningful radius sum.
+
+This strategy combines geometric priors, constraint relaxation/expansion tricks, and rigorous feasibility enforcement to push past previous local minima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(v, n):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraints(v, n, pi, pj):
+    """
+    Computes all inequality constraints: g(v) >= 0.
+    Uses squared distances for numerical stability and speed.
+    """
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    
+    m = 4*n + len(pi)
+    c = np.empty(m)
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c[:n] = x - r
+    c[n:2*n] = 1.0 - x - r
+    c[2*n:3*n] = y - r
+    c[3*n:4*n] = 1.0 - y - r
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = x[pi] - x[pj]
+    dy = y[pi] - y[pj]
+    c[4*n:] = dx**2 + dy**2 - (r[pi] + r[pj])**2
+    
+    return c
+
+def get_hex_init(n, jitter_scale, seed):
+    """Generates a perturbed hexagonal lattice initialization."""
+    np.random.seed(seed)
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    # Pattern: 6, 5, 6, 5, 4 circles per row matches 26 circles well
+    counts = [6, 5, 6, 5, 4]
+    for count in counts:
+        x_start = r_est + (row % 2) * r_est
+        for i in range(count):
+            pts.append([x_start + i * 2 * r_est, y])
+        y += r_est * np.sqrt(3)
+        row += 1
+        
+    centers = np.array(pts[:n])
+    centers += np.random.uniform(-jitter_scale, jitter_scale, centers.shape)
+    centers = np.clip(centers, 0.02, 0.98)
+    
+    # Start with feasible but small radii to give optimizer room
+    r0 = np.full(n, 0.05)
+    return np.concatenate([centers[:,0], centers[:,1], r0])
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    # Precompute pair indices for vectorized constraints
+    pi, pj = np.triu_indices(n, k=1)
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints, 'args': (n, pi, pj)}
+    
+    best_v = None
+    best_val = -np.inf
+    
+    # Phase 1: Multi-start optimization from diverse configurations
+    starts = []
+    
+    # Hexagonal lattices with increasing jitter
+    for s in range(20):
+        starts.append(get_hex_init(n, 0.005 + s * 0.0005, s))
+        
+    # Random scatter configurations
+    for s in range(15):
+        np.random.seed(200 + s)
+        centers = np.random.uniform(0.05, 0.95, (n, 2))
+        r0 = np.full(n, 0.04)
+        starts.append(np.concatenate([centers[:,0], centers[:,1], r0]))
+        
+    for v0 in starts:
+        try:
+            res = minimize(objective, v0, args=(n,), method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            val = -res.fun
+            if val > best_val:
+                # Accept if sufficiently feasible (optimizer tolerance allows slight drift)
+                c_val = constraints(res.x, n, pi, pj)
+                if np.min(c_val) >= -1e-5:
+                    best_val = val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Expansion-Perturbation local search to escape shallow minima
+    if best_v is not None:
+        for step in range(30):
+            v_pert = best_v.copy()
+            
+            # Intentionally expand radii to force tighter packing configurations
+            v_pert[2*n:] *= 1.005 + step * 0.0005
+            
+            # Add noise to centers to break symmetry and explore adjacent basin
+            noise_c = np.random.uniform(-0.004, 0.004, 2*n)
+            v_pert[:2*n] += noise_c
+            v_pert[:2*n] = np.clip(v_pert[:2*n], 0.01, 0.99)
+            
+            try:
+                res = minimize(objective, v_pert, args=(n,), method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                val = -res.fun
+                if val > best_val:
+                    c_val = constraints(res.x, n, pi, pj)
+                    if np.min(c_val) >= -1e-5:
+                        best_val = val
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    # Fallback safe configuration (highly unlikely to be reached)
+    if best_v is None:
+        best_v = get_hex_init(n, 0.0, 0)
+        
+    centers = best_v[:2*n].reshape(n, 2)
+    radii = best_v[2*n:]
+    
+    # Phase 3: Strict post-processing to guarantee validator compliance
+    # 1. Enforce boundary constraints strictly
+    for i in range(n):
+        mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        radii[i] = min(radii[i], mr)
+        
+    # 2. Enforce non-overlap constraints iteratively with safety margin
+    for _ in range(10):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i, 0]-centers[j, 0], centers[i, 1]-centers[j, 1])
+                if radii[i] + radii[j] > d:
+                    ov = radii[i] + radii[j] - d
+                    # Shrink both circles equally, add tiny buffer for float tolerance
+                    shr = (ov + 1e-9) / 2.0
+                    radii[i] = max(0.0, radii[i] - shr)
+                    radii[j] = max(0.0, radii[j] - shr)
+                    changed = True
+        if not changed:
+            break
+            
+    return centers, radii, float(np.sum(radii))
+```

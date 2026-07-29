@@ -1,0 +1,77 @@
+# sol_000256 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state a15173c5) state=7447c229 sum of radii=2.594950 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+I_IND, J_IND = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(vars):
+    return -np.sum(vars[2*N_CIRCLES:])
+
+def constraints_func(vars):
+    n = N_CIRCLES
+    c = vars[:2*n].reshape(n, 2)
+    r = vars[2*n:]
+    
+    con_bound = np.concatenate([
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ])
+    
+    c_i = c[I_IND]
+    c_j = c[J_IND]
+    r_i = r[I_IND]
+    r_j = r[J_IND]
+    
+    dist_sq = np.sum((c_i - c_j) ** 2, axis=1)
+    r_sum_sq = (r_i + r_j) ** 2
+    con_pair = dist_sq - r_sum_sq
+    
+    return np.concatenate([con_bound, con_pair])
+
+def run_packing():
+    np.random.seed(42)
+    n = N_CIRCLES
+    
+    # Robust initialization with repulsion to ensure well-separated starts
+    centers = np.random.uniform(0.2, 0.8, (n, 2))
+    for _ in range(200):
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                if d < 0.18 and d > 1e-6:
+                    push = (0.18 - d) * 0.15
+                    centers[i, 0] += dx / d * push
+                    centers[i, 1] += dy / d * push
+                    centers[j, 0] -= dx / d * push
+                    centers[j, 1] -= dy / d * push
+    centers = np.clip(centers, 0.15, 0.85)
+    
+    radii = np.full(n, 0.05)
+    x0 = np.concatenate([centers.ravel(), radii])
+    
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 1.0)] * n
+    constraints = {'type': 'ineq', 'fun': constraints_func}
+    
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+                   options={'maxiter': 10000, 'ftol': 1e-10, 'disp': False})
+    
+    best_vars = res.x
+    best_centers = best_vars[:2*n].reshape(n, 2)
+    best_radii = best_vars[2*n:]
+    
+    # Ensure strict feasibility for validator tolerance
+    best_radii = np.maximum(best_radii, 0.0)
+    best_radii *= 0.9999
+    
+    sum_r = np.sum(best_radii)
+    return best_centers, best_radii, sum_r

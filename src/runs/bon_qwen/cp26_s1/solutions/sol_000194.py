@@ -1,5 +1,5 @@
 # sol_000194 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9dd6f42d) state=c951d806 sum of radii=2.610742 correctness=1.0
+# generation=0 parent=seed (state 320c78c6) state=d01bfd98 sum of radii=2.540000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,225 +7,145 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+def objective_function(vars, penalty_weight):
     """
-    Packs 26 circles in a unit square to maximize the sum of radii.
+    Objective function to minimize.
+    Minimizes -r (maximizing radius) plus penalty for overlaps and boundary violations.
+    
+    Args:
+        vars: Array of shape (2*n + 1), containing centers and radius.
+        penalty_weight: Weight for the constraint penalty.
     """
     n = 26
-    np.random.seed(42)
-
-    # 1. Initialization: Hexagonal-like Grid
-    # We create a 6x5 grid of points (30 points) spaced appropriately,
-    # then select 26 points.
-    # Spacing roughly 1/5 = 0.2.
-    # We place points in a dense pattern.
+    c = vars[:2*n].reshape((n, 2))
+    r = vars[2*n]
     
-    centers = []
+    # We want to maximize r, so we minimize -r
+    val = -r
+    p = 0.0
     
-    # We will try to fit circles in rows. 
-    # A hexagonal packing pattern allows for denser packing.
-    # Let's generate a large number of potential spots and pick 26 
-    # that are reasonably spread out, or just generate 26 directly.
+    # Pairwise distances
+    # Compute distance matrix efficiently
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
     
-    # Approach: 6 rows of roughly equal count, alternating shift.
-    # 26 circles. 26/6 approx 4.3.
-    # Let's do rows with counts: 4, 5, 4, 5, 4, 4 (Sum 26)
-    # Or 5, 5, 5, 5, 6?
-    # Let's use a grid of 6x5 = 30 points and pick 26.
+    # Consider only upper triangle (i < j) to avoid double counting and self-distance
+    mask = np.triu(np.ones((n, n)), k=1).astype(bool)
+    pair_dists = dists[mask]
     
-    # Grid parameters
-    rows = 6
-    cols = 5
-    # Spacing
-    dx = 1.0 / (cols + 1) * 1.1 # slightly tighter
-    dy = 1.0 / (rows + 1) * 1.1
+    # Overlap penalty: max(0, 2r - dist)^2
+    # Violation occurs if 2r > dist
+    violations = 2.0 * r - pair_dists
+    mask_pos = violations > 0
+    p += np.sum(violations[mask_pos]**2)
     
-    points = []
-    for r in range(rows):
-        for c in range(cols):
-            # Hexagonal offset
-            x = (c + 1) * dx + (r % 2) * dx / 2
-            y = (r + 1) * dy
-            # Clip to reasonable bounds [0.1, 0.9] initially to avoid walls
-            if 0.05 < x < 0.95 and 0.05 < y < 0.95:
-                points.append([x, y])
+    # Boundary penalties
+    # Constraints: r <= x <= 1-r  and  r <= y <= 1-r
+    # Violations: r - x > 0 (left), x - (1-r) > 0 (right), etc.
+    x = c[:, 0]
+    y = c[:, 1]
     
-    # If we have enough points, pick 26. If not, fill randomly.
-    if len(points) >= n:
-        # Pick points that are well distributed? 
-        # Just pick first n. The optimizer will fix it.
-        initial_centers = np.array(points[:n])
-    else:
-        # Fallback to random
-        initial_centers = np.random.uniform(0.2, 0.8, (n, 2))
-        
-    # 2. Initial Radii Calculation
-    # Compute max feasible radius for each circle based on current positions
-    # to ensure a valid starting point for the optimizer.
-    radii = np.zeros(n)
-    for i in range(n):
-        x, y = initial_centers[i]
-        # Distance to walls
-        r_wall = min(x, 1-x, y, 1-y)
-        r = r_wall
-        
-        # Distance to other centers
-        for j in range(n):
-            if i == j:
-                continue
-            dist = np.hypot(x - initial_centers[j, 0], y - initial_centers[j, 1])
-            # The radius can be at most half the distance to center j
-            # (assuming circle j has 0 radius initially, but we want a safe lower bound)
-            # Actually, for initialization, we just need a small valid radius.
-            # Let's set radii very small initially to be strictly feasible.
-            pass 
-        
-        # Set a small safe radius
-        radii[i] = min(r_wall, 0.01)
-
-    # 3. Optimization Setup
-    # Variables: [x1, y1, r1, x2, y2, r2, ...]
-    x0 = np.zeros(3 * n)
-    for i in range(n):
-        x0[3 * i] = initial_centers[i, 0]
-        x0[3 * i + 1] = initial_centers[i, 1]
-        x0[3 * i + 2] = radii[i]
-
-    # Bounds
-    bounds = []
-    for i in range(n):
-        bounds.append((0, 1))   # x
-        bounds.append((0, 1))   # y
-        bounds.append((0, 0.5)) # r
-
-    # Objective Function
-    def objective(p):
-        # Sum of radii is at indices 2, 5, 8, ...
-        return -np.sum(p[2::3])
-
-    # Constraint Function (Vectorized)
-    # Returns an array of values, all must be >= 0
-    def constraints_func(p):
-        # Extract coordinates
-        # p is shape (3*n,)
-        # Reshape to (n, 3) for easier indexing? No, slice is faster.
-        xs = p[0::3]
-        ys = p[1::3]
-        rs = p[2::3]
-        
-        cons = []
-        
-        # Boundary constraints
-        # x >= r  => x - r >= 0
-        cons.append(xs - rs)
-        # x <= 1 - r => 1 - x - r >= 0
-        cons.append(1.0 - xs - rs)
-        # y >= r => y - r >= 0
-        cons.append(ys - rs)
-        # y <= 1 - r => 1 - y - r >= 0
-        cons.append(1.0 - ys - rs)
-        
-        # Pairwise distance constraints
-        # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
-        # Compute pairwise squared distances efficiently
-        # xs is (n,), need (n, n)
-        # Use broadcasting
-        # dx_ij = xs[:, None] - xs[None, :]
-        # This creates full matrix. We only need upper triangle to avoid redundancy.
-        
-        # Compute full matrices
-        # Note: creating n x n matrices is 26x26 = 676 elements. Cheap.
-        diff_x = xs[:, None] - xs[None, :]
-        diff_y = ys[:, None] - ys[None, :]
-        sum_r = rs[:, None] + rs[None, :]
-        
-        sq_dist = diff_x**2 + diff_y**2
-        sq_sum_r = sum_r**2
-        
-        constraint_vals = sq_dist - sq_sum_r
-        
-        # We need values for i < j.
-        # Create mask for upper triangle
-        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
-        vals = constraint_vals[mask]
-        
-        cons.append(vals)
-        
-        return np.concatenate(cons)
-
-    # Define constraint dictionary for SLSQP
-    # Type 'ineq' means fun(x) >= 0
-    constraints = {'type': 'ineq', 'fun': constraints_func}
-
-    # Run Optimization
-    # SLSQP is good for this. We might need to run it a few times or increase iterations.
-    # Initial guess is valid, so it should converge.
+    p += np.sum(np.maximum(0, r - x)**2)
+    p += np.sum(np.maximum(0, x - (1.0 - r))**2)
+    p += np.sum(np.maximum(0, r - y)**2)
+    p += np.sum(np.maximum(0, y - (1.0 - r))**2)
     
-    try:
-        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
-                       options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
-        
-        if res.success:
-            final_p = res.x
-        else:
-            # If optimization didn't fully succeed, use the best found so far
-            final_p = res.x
-    except Exception:
-        # Fallback if optimization crashes (rare)
-        final_p = x0
+    return val + penalty_weight * p
 
-    # 4. Post-processing
-    # Extract results
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        tuple: (centers, radii, sum_radii)
+    """
+    n = 26
+    
+    # 1. Initialization
+    # Start with a hexagonal grid pattern which is dense
     centers = np.zeros((n, 2))
-    radii = np.zeros(n)
+    r_init = 0.1
+    # Row counts summing to 26: 5, 4, 5, 4, 5, 3
+    row_counts = [5, 4, 5, 4, 5, 3]
     
-    for i in range(n):
-        centers[i, 0] = final_p[3 * i]
-        centers[i, 1] = final_p[3 * i + 1]
-        radii[i] = final_p[3 * i + 2]
-        
-    # Ensure strict validity by shrinking radii slightly if needed (numerical safety)
-    # The optimizer pushes constraints to boundary, might have tiny violations.
-    # We can check and adjust.
+    idx = 0
+    y = r_init
+    for row, count in enumerate(row_counts):
+        # Shift odd rows to create hexagonal packing
+        x = r_init + (row % 2) * r_init 
+        for col in range(count):
+            if idx < n:
+                centers[idx] = [x, y]
+                x += 2 * r_init
+                idx += 1
+        y += np.sqrt(3) * r_init
     
-    # Check overlaps and adjust
+    # Normalize and scale to fit in unit square with margin
+    min_c = centers.min(axis=0)
+    max_c = centers.max(axis=0)
+    centers -= min_c
+    span = max_c - min_c
+    if span.max() > 0:
+        centers /= span.max()
+    centers *= 0.9 
+    centers += 0.05
+    
+    # 2. Optimization
+    # Variables: [c1x, c1y, ..., c26x, c26y, r]
+    current_vars = np.concatenate([centers.flatten(), [0.05]])
+    
+    # Bounds: centers in [0, 1], r in [0, 0.5]
+    bounds = [(0, 1)] * (2 * n)
+    bounds.append((0, 0.5))
+    
+    penalty_weight = 100.0
+    
+    # Iteratively increase penalty weight to enforce constraints strictly
+    for _ in range(15):
+        res = minimize(objective_function, current_vars, args=(penalty_weight,), method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 1000, 'ftol': 1e-15, 'gtol': 1e-10})
+        current_vars = res.x
+        penalty_weight *= 5.0
+
+    # Extract results
+    final_centers = current_vars[:2*n].reshape((n, 2))
+    final_r = current_vars[2*n]
+    final_radii = np.full(n, final_r)
+    
+    # 3. Validation and Fallback
+    # Check for validity internally
     valid = True
     for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        
-        # Check walls
-        if x < r: r = x
-        if x > 1 - r: r = 1 - x
-        if y < r: r = y
-        if y > 1 - r: r = 1 - y
-        
-        # Check neighbors
-        for j in range(i + 1, n):
-            dx = x - centers[j, 0]
-            dy = y - centers[j, 1]
-            dist = np.hypot(dx, dy)
-            required_dist = r + radii[j]
-            
-            if dist < required_dist:
-                # Overlap! Reduce radii to touch
-                # Simple fix: scale down both or just current?
-                # Better: distribute the shrinkage.
-                overlap = required_dist - dist
-                # Reduce r and radii[j] equally?
-                # Or just reduce r to satisfy dist >= r + radii[j] => r <= dist - radii[j]
-                max_r_i = dist - radii[j]
-                max_r_j = dist - r
-                
-                if max_r_i < r:
-                    r = max_r_i
-                if max_r_j < radii[j]:
-                    radii[j] = max_r_j
-                    
-        # Ensure radius non-negative
-        radii[i] = max(0, r)
-
-    # Final Sum
-    sum_radii = np.sum(radii)
+        r = final_radii[i]
+        x, y = final_centers[i]
+        # Check bounds
+        if x < -1e-12 or x > 1 + 1e-12 or y < -1e-12 or y > 1 + 1e-12:
+            valid = False
+        # Check circle inside square
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            valid = False
     
-    return centers, radii, sum_radii
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((final_centers[i] - final_centers[j])**2))
+            if dist < final_radii[i] + final_radii[j] - 1e-12:
+                valid = False
+                
+    if not valid:
+        # Fallback to a known valid configuration
+        # 25 circles in 5x5 grid with r=0.1, plus 1 small circle in a gap
+        centers_fb = []
+        radii_fb = []
+        for r in range(5):
+            for c in range(5):
+                centers_fb.append([0.1 + c*0.2, 0.1 + r*0.2])
+                radii_fb.append(0.1)
+        # Place 26th circle at (0.2, 0.2) with radius 0.04
+        # Distance to nearest grid point (0.1, 0.1) is sqrt(0.02) ~ 0.1414
+        # 0.1 + 0.04 < 0.1414, so valid.
+        centers_fb.append([0.2, 0.2])
+        radii_fb.append(0.04)
+        final_centers = np.array(centers_fb)
+        final_radii = np.array(radii_fb)
+
+    return final_centers, final_radii, np.sum(final_radii)

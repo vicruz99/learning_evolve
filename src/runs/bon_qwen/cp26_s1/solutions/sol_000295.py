@@ -1,0 +1,231 @@
+# sol_000295 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state fc92aa36) state=08632c4f sum of radii=2.617835 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def generate_hexagonal_centers(n_circles, r_guess=0.09, perturbation=0.0):
+    """
+    Generates initial centers for n_circles in a hexagonal grid pattern
+    inside a unit square.
+    """
+    centers = []
+    # Approximate number of columns needed
+    # For hexagonal packing, row spacing is r*sqrt(3), col spacing 2r
+    # But we don't know optimal r, so we just pack them tightly then scale?
+    # Or just place them in a fixed grid and let optimizer adjust.
+    # Let's try a grid of 6x5 = 30 points, pick first 26.
+    
+    rows = 6
+    cols = 5 # 6*5 = 30 > 26
+    
+    # Base spacing
+    dx = 1.0 / cols
+    dy = 1.0 / rows
+    
+    count = 0
+    for i in range(rows):
+        for j in range(cols):
+            if count >= n_circles:
+                break
+            # Hexagonal offset for odd rows
+            x = (j + 0.5) * dx
+            y = (i + 0.5) * dy
+            if i % 2 == 1:
+                x += dx / 2.0
+            
+            # Add perturbation
+            x += np.random.uniform(-perturbation, perturbation)
+            y += np.random.uniform(-perturbation, perturbation)
+            
+            # Clip to valid range (leaving margin for radius)
+            margin = 0.05 
+            x = np.clip(x, margin, 1 - margin)
+            y = np.clip(y, margin, 1 - margin)
+            
+            centers.append([x, y])
+            count += 1
+        if count >= n_circles:
+            break
+            
+    return np.array(centers)
+
+def objective(params, n_circles):
+    """
+    Objective function: maximize sum of radii.
+    Since minimize finds minimum, we return -sum(radii).
+    """
+    radii = params[2 * n_circles:]
+    return -np.sum(radii)
+
+def create_constraints(n_circles):
+    """
+    Returns a list of constraint dictionaries for scipy.optimize.minimize.
+    Constraints:
+    1. Boundary: r <= x <= 1-r, r <= y <= 1-r
+       => x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    2. Non-overlap: dist >= r_i + r_j
+       => sqrt((xi-xj)^2 + (yi-yj)^2) - ri - rj >= 0
+    """
+    constraints = []
+    
+    # Boundary constraints for each circle
+    for i in range(n_circles):
+        # x_i - r_i >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda p, i=i: p[2*i] - p[2*n_circles + i]
+        })
+        # 1 - x_i - r_i >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda p, i=i: 1.0 - p[2*i] - p[2*n_circles + i]
+        })
+        # y_i - r_i >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda p, i=i: p[2*i + 1] - p[2*n_circles + i]
+        })
+        # 1 - y_i - r_i >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda p, i=i: 1.0 - p[2*i + 1] - p[2*n_circles + i]
+        })
+        # r_i >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda p, i=i: p[2*n_circles + i]
+        })
+
+    # Non-overlap constraints
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            def non_overlap(p, i=i, j=j):
+                x1, y1 = p[2*i], p[2*i + 1]
+                x2, y2 = p[2*j], p[2*j + 1]
+                r1, r2 = p[2*n_circles + i], p[2*n_circles + j]
+                dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+                return dist - r1 - r2
+            constraints.append({
+                'type': 'ineq',
+                'fun': non_overlap
+            })
+            
+    return constraints
+
+def run_packing() -> tuple:
+    n_circles = 26
+    constraints = create_constraints(n_circles)
+    
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 1] (practical upper bound 0.5)
+    bounds = []
+    for _ in range(n_circles):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+    for _ in range(n_circles):
+        bounds.append((0, 0.5)) # r
+    
+    best_params = None
+    best_val = -np.inf
+    
+    # Try multiple restarts to avoid local optima
+    # We use a structured initial guess with small perturbations
+    initial_centers_base = generate_hexagonal_centers(n_circles, perturbation=0)
+    
+    for seed in range(5): # 5 restarts
+        np.random.seed(seed * 123)
+        # Perturb centers slightly
+        current_centers = initial_centers_base.copy()
+        # Add some randomness
+        noise_x = np.random.uniform(-0.02, 0.02, n_circles)
+        noise_y = np.random.uniform(-0.02, 0.02, n_circles)
+        current_centers[:, 0] += noise_x
+        current_centers[:, 1] += noise_y
+        # Clip
+        current_centers[:, 0] = np.clip(current_centers[:, 0], 0.05, 0.95)
+        current_centers[:, 1] = np.clip(current_centers[:, 1], 0.05, 0.95)
+        
+        # Initial radii
+        # Estimate based on min distance to neighbor and boundary
+        # But simple uniform small radius is safer for start
+        r_init = 0.05 * np.ones(n_circles)
+        
+        # Construct initial parameters vector: [x1, y1, ..., x26, y26, r1, ..., r26]
+        x0 = np.concatenate([current_centers.flatten(), r_init])
+        
+        try:
+            res = minimize(
+                objective,
+                x0,
+                args=(n_circles,),
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000, 'ftol': 1e-9}
+            )
+            
+            if not res.success:
+                # Check if we got a valid solution despite no success flag
+                # Sometimes SLSQP stops early
+                pass
+            
+            # Evaluate objective value (sum of radii)
+            # Note: objective returns -sum, so sum is -res.fun
+            # But if failed, check manually
+            radii_opt = res.x[2*n_circles:]
+            current_sum = np.sum(radii_opt)
+            
+            # Check validity manually just in case
+            centers_opt = res.x[:2*n_circles].reshape(-1, 2)
+            # Validate against constraints roughly
+            valid = True
+            for i in range(n_circles):
+                if radii_opt[i] < -1e-6:
+                    valid = False; break
+                x, y = centers_opt[i]
+                r = radii_opt[i]
+                if x < r or x > 1-r or y < r or y > 1-r:
+                    valid = False; break
+            
+            if valid and current_sum > best_val:
+                best_val = current_sum
+                best_params = res.x
+                
+        except Exception as e:
+            print(f"Optimization failed with seed {seed}: {e}")
+            continue
+
+    if best_params is not None:
+        centers = best_params[:2*n_circles].reshape(-1, 2)
+        radii = best_params[2*n_circles:]
+    else:
+        # Fallback to a simple valid grid if all optimizations failed
+        centers = np.zeros((n_circles, 2))
+        radii = np.full(n_circles, 0.05)
+        for i in range(n_circles):
+            # 5x5 grid approximation
+            r_idx = i // 5
+            c_idx = i % 5
+            centers[i, 0] = 0.1 + c_idx * 0.2
+            centers[i, 1] = 0.1 + r_idx * 0.2
+        # Adjust last circle if needed
+        if n_circles > 25:
+            centers[25] = [0.5, 0.5] # Center
+            radii[25] = 0.05
+
+    return centers, radii, np.sum(radii)
+
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # Validation check
+    try:
+        from validate_packing import validate_packing # Assuming it's available or we define it
+        # Re-defining for self-containment if needed, but prompt says validation function is separate.
+        # Just printing result.
+    except:
+        pass

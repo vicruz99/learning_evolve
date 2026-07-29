@@ -1,0 +1,171 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, I will use a numerical optimization approach combined with a penalty method. This avoids the heavy overhead of constraint-handling solvers like SLSQP while remaining robust.
+
+Key steps:
+1. **Objective Function**: Minimize the negative sum of radii plus a penalty term for boundary violations and circle overlaps. The penalty uses a squared hinge loss $\max(0, \text{violation})^2$ which is smooth and differentiable almost everywhere, making it ideal for gradient-based optimizers.
+2. **Initialization**: Provide diverse starting configurations:
+   - Hexagonal lattice arrangement (denser than grid)
+   - 5x5 grid + center
+   - Multiple random placements to escape local minima
+3. **Optimization**: Use `scipy.optimize.minimize` with the `L-BFGS-B` algorithm. Run a coarse optimization pass followed by a fine pass with a higher penalty factor to strictly enforce constraints.
+4. **Local Search**: After each optimization, apply small random perturbations to escape shallow local minima and re-optimize.
+5. **Validation & Selection**: Internally verify that the final configuration satisfies non-overlap and boundary constraints within a tight tolerance. Keep track of the best valid solution across all runs.
+6. **Fallback**: Ensure a valid default is returned if optimization unexpectedly fails.
+
+This hybrid penalty-based gradient descent with multi-start and perturbation is highly effective for circle packing problems of this size and typically reaches near-optimal sums of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_packing_loss(params, n, penalty_factor):
+    """
+    Computes the objective function: negative sum of radii + penalty for violations.
+    params: flattened array [x1, y1, ..., xn, yn, r1, ..., rn]
+    """
+    centers = params[:2*n].reshape(n, 2)
+    radii = params[2*n:]
+    
+    # Objective: maximize sum of radii -> minimize negative sum
+    loss = -np.sum(radii)
+    
+    # Boundary penalties: circle must be inside [0,1]x[0,1]
+    # x >= r
+    val = radii - centers[:, 0]
+    loss += penalty_factor * np.sum(np.maximum(0, val)**2)
+    # x + r <= 1
+    val = centers[:, 0] + radii - 1.0
+    loss += penalty_factor * np.sum(np.maximum(0, val)**2)
+    # y >= r
+    val = radii - centers[:, 1]
+    loss += penalty_factor * np.sum(np.maximum(0, val)**2)
+    # y + r <= 1
+    val = centers[:, 1] + radii - 1.0
+    loss += penalty_factor * np.sum(np.maximum(0, val)**2)
+    
+    # Overlap penalties: dist(i,j) >= r_i + r_j
+    # Vectorized pairwise computation
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    r_sum = radii[:, None] + radii[None, :]
+    
+    # Upper triangle mask to avoid double counting and self-comparison
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    pair_dists = dists[mask]
+    pair_r_sum = r_sum[mask]
+    
+    val = pair_r_sum - pair_dists
+    loss += penalty_factor * np.sum(np.maximum(0, val)**2)
+    
+    return loss
+
+def run_packing():
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Bounds: centers in [0, 1], radii in [1e-6, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(1e-6, 0.5)] * n
+    
+    # Prepare initial configurations
+    inits = []
+    
+    # 1. Hexagonal lattice initialization
+    pts_hex = []
+    r0 = 0.098
+    for row in range(6):
+        for col in range(5):
+            x = 0.02 + col * 2 * r0
+            y = 0.02 + row * np.sqrt(3) * r0
+            if row % 2 == 1:
+                x += r0
+            if x <= 0.98 and y <= 0.98:
+                pts_hex.append([x, y])
+        if len(pts_hex) >= 26:
+            break
+    while len(pts_hex) < 26:
+        pts_hex.append([0.5, 0.5])
+    inits.append(np.array(pts_hex[:26]).flatten())
+    
+    # 2. Grid initialization (5x5 + 1)
+    pts_grid = []
+    for i in range(5):
+        for j in range(5):
+            pts_grid.append([0.1 + i * 0.2, 0.1 + j * 0.2])
+    pts_grid.append([0.5, 0.5])
+    inits.append(np.array(pts_grid[:26]).flatten())
+    
+    # 3. Random initializations
+    np.random.seed(2024)
+    for _ in range(5):
+        pts_rand = np.random.rand(n, 2) * 0.6 + 0.2
+        inits.append(pts_rand.flatten())
+        
+    for x0_centers in inits:
+        # Append initial radii estimate
+        x0 = np.concatenate([x0_centers, np.full(n, 0.09)])
+        
+        # Coarse optimization
+        res = minimize(compute_packing_loss, x0, args=(n, 200.0), method='L-BFGS-B', 
+                       bounds=bounds, options={'maxiter': 2000, 'ftol': 1e-9})
+        # Fine optimization with stricter penalties
+        res = minimize(compute_packing_loss, res.x, args=(n, 2000.0), method='L-BFGS-B', 
+                       bounds=bounds, options={'maxiter': 2000, 'ftol': 1e-12})
+        
+        # Local perturbation search to escape local minima
+        for _ in range(10):
+            pert = np.random.normal(0, 0.005, res.x.shape)
+            x_pert = res.x + pert
+            # Clip to bounds
+            x_pert = np.clip(x_pert, [b[0] for b in bounds], [b[1] for b in bounds])
+            
+            res_p = minimize(compute_packing_loss, x_pert, args=(n, 2000.0), method='L-BFGS-B',
+                             bounds=bounds, options={'maxiter': 1000, 'ftol': 1e-12})
+            if res_p.fun < res.fun:
+                res = res_p
+
+        centers = res.x[:2*n].reshape(n, 2)
+        radii = res.x[2*n:]
+        
+        # Strict validation
+        valid = True
+        for i in range(n):
+            if centers[i, 0] < radii[i] - 1e-7 or centers[i, 0] > 1.0 - radii[i] + 1e-7:
+                valid = False
+                break
+            if centers[i, 1] < radii[i] - 1e-7 or centers[i, 1] > 1.0 - radii[i] + 1e-7:
+                valid = False
+                break
+                
+        if valid:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.linalg.norm(centers[i] - centers[j])
+                    if d < radii[i] + radii[j] - 1e-7:
+                        valid = False
+                        break
+                if not valid:
+                    break
+                    
+        if valid:
+            current_sum = np.sum(radii)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                
+    # Fallback configuration (should not be reached given the robust init)
+    if best_centers is None:
+        best_centers = np.tile([0.5, 0.5], (n, 1))
+        best_radii = np.full(n, 0.01)
+        best_sum = n * 0.01
+        
+    # Ensure radii are strictly positive
+    best_radii = np.maximum(best_radii, 1e-9)
+    
+    return best_centers, best_radii, best_sum
+```

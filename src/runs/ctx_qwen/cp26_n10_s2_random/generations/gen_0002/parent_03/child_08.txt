@@ -1,0 +1,225 @@
+
+
+<strategy>
+To improve the packing from ~2.624 to >2.636, we need a more robust optimization strategy that escapes local minima inherent in constrained non-linear optimization. The current approach uses SLSQP with a "grow and push" phase, which is good but can stall.
+
+Key improvements in the new strategy:
+1. **Diverse High-Quality Initializations**: Generate hexagonal lattices with varying densities, row shifts, and random seeds. This covers more of the configuration space from the start.
+2. **Hybrid Optimization Pipeline**:
+   - **Phase 1 (Multi-start SLSQP)**: Run constrained optimization from multiple starts to find strong local optima.
+   - **Phase 2 (Controlled Growth & Perturbation)**: Iteratively scale radii up slightly, perturb centers to create space, and re-run SLSQP. This forces the optimizer to explore larger radius configurations that are locally infeasible from the current point.
+   - **Phase 3 (Derivative-free Center Polish)**: Use `Powell` method on a center-only objective where radii are computed implicitly as `min(boundary_dist, 0.5*neighbor_dist)`. This bypasses SLSQP's constraint-handling limitations and often finds tighter geometric arrangements.
+   - **Phase 4 (Final Constrained Polish)**: Run SLSQP one last time on the best found configuration to ensure exact constraint satisfaction and extract precise radii.
+3. **Robust Feasibility Repair**: A deterministic shrinking/clamping loop guarantees the output strictly passes the validation function's tolerances.
+4. **Efficient Constraint Evaluation**: Precompute pairwise indices and use vectorized operations for fast evaluation during optimization.
+
+This pipeline systematically climbs the objective landscape while avoiding the constraint-induced plateaus that trap standard solvers.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute pairwise indices for overlap constraints
+TRI_U = np.triu_indices(N, k=1)
+
+def get_max_radii(centers):
+    """Computes maximum valid radii for fixed centers."""
+    n = centers.shape[0]
+    x, y = centers[:, 0], centers[:, 1]
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    dists = np.sqrt(np.sum((centers[:, None, :] - centers[None, :, :])**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective_centers(centers_flat):
+    """Objective for center-only optimization: minimize negative sum of max radii."""
+    centers = centers_flat.reshape(N, 2)
+    radii = get_max_radii(centers)
+    return -np.sum(radii)
+
+def compute_constraints(vars_flat):
+    """Computes boundary and non-overlap constraints (must be >= 0)."""
+    X = vars_flat.reshape(N, 3)
+    xs, ys, rs = X[:, 0], X[:, 1], X[:, 2]
+    
+    c = []
+    # Boundary
+    c.append(xs - rs)
+    c.append(1.0 - xs - rs)
+    c.append(ys - rs)
+    c.append(1.0 - ys - rs)
+    
+    # Overlap: dist^2 >= (ri + rj)^2
+    idx_i, idx_j = TRI_U
+    dx = xs[idx_i] - xs[idx_j]
+    dy = ys[idx_i] - ys[idx_j]
+    dr = rs[idx_i] + rs[idx_j]
+    c.append(dx**2 + dy**2 - dr**2)
+    
+    return np.concatenate(c)
+
+def compute_objective(vars_flat):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars_flat[2::3])
+
+def get_bounds():
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def make_hex_init(density=0.95, shift_pattern=0, seed=42):
+    """Generates a hexagonal lattice initialization."""
+    rng = np.random.default_rng(seed)
+    base_r = 0.10 * density
+    dy = np.sqrt(3) * base_r
+    dx = 2.0 * base_r
+    
+    pts = []
+    y = base_r
+    row = 0
+    while len(pts) < N:
+        shift = (dx / 2.0) if (row + shift_pattern) % 2 == 1 else 0.0
+        x = base_r + shift
+        while x + base_r <= 1.0 + 1e-9 and len(pts) < N:
+            pts.append([x + rng.uniform(-0.005, 0.005), y + rng.uniform(-0.005, 0.005)])
+            x += dx
+        y += dy
+        row += 1
+        
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_val = -np.inf
+    best_v = None
+    
+    # ---------------------------------------------------------
+    # Phase 1: Multi-start Constrained Optimization
+    # ---------------------------------------------------------
+    inits = []
+    for density in [0.85, 0.90, 0.95, 1.00, 1.05]:
+        for shift in [0, 1]:
+            for seed in range(4):
+                pts = make_hex_init(density, shift, seed)
+                rs = get_max_radii(pts) * 0.90  # Start safely feasible
+                v = np.zeros(N * 3)
+                v[0::3] = pts[:, 0]
+                v[1::3] = pts[:, 1]
+                v[2::3] = rs
+                inits.append(v)
+                
+    for v0 in inits:
+        try:
+            res = minimize(compute_objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-8):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        best_v = inits[0]
+        
+    # ---------------------------------------------------------
+    # Phase 2: Controlled Growth & Perturbation Loop
+    # ---------------------------------------------------------
+    curr_v = best_v.copy()
+    for step in range(20):
+        c_curr = curr_v[:2*N].reshape(N, 2)
+        r_curr = curr_v[2*N:]
+        
+        # Try to grow radii slightly
+        r_grown = r_curr * 1.0025
+        
+        # Perturb centers to help resolve inevitable overlaps from growth
+        c_pert = c_curr + np.random.normal(0, 0.0015, c_curr.shape)
+        c_pert = np.clip(c_pert, 0.02, 0.98)
+        
+        v_start = np.zeros(N * 3)
+        v_start[0::3] = c_pert[:, 0]
+        v_start[1::3] = c_pert[:, 1]
+        v_start[2::3] = r_grown
+        
+        try:
+            res = minimize(compute_objective, v_start, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-8):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    curr_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # ---------------------------------------------------------
+    # Phase 3: Derivative-free Polish on Centers Only
+    # ---------------------------------------------------------
+    # Powell method handles the non-smooth 'min' in get_max_radii well
+    c0 = curr_v[:2*N]
+    try:
+        res_powell = minimize(objective_centers, c0, method='Powell',
+                              options={'maxiter': 3000, 'ftol': 1e-12})
+        if -res_powell.fun > best_val * 0.995:
+            c_opt = res_powell.x.reshape(N, 2)
+            r_opt = get_max_radii(c_opt)
+            val_powell = np.sum(r_opt)
+            if val_powell > best_val:
+                best_val = val_powell
+                curr_v = np.zeros(N * 3)
+                curr_v[0::3] = c_opt[:, 0]
+                curr_v[1::3] = c_opt[:, 1]
+                curr_v[2::3] = r_opt
+    except Exception:
+        pass
+        
+    # Final constrained polish to lock in exact values
+    try:
+        res_final = minimize(compute_objective, curr_v, method='SLSQP', bounds=bounds,
+                             constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
+        if np.all(compute_constraints(res_final.x) >= -1e-8):
+            curr_v = res_final.x
+    except Exception:
+        pass
+        
+    # ---------------------------------------------------------
+    # Phase 4: Extraction & Strict Repair
+    # ---------------------------------------------------------
+    centers = curr_v.reshape(N, 3)[:, :2]
+    radii = curr_v.reshape(N, 3)[:, 2]
+    
+    # Iterative shrink/clamp to guarantee validation passes
+    for _ in range(15):
+        changed = False
+        # Resolve overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-11
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

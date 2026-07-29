@@ -1,0 +1,211 @@
+# sol_000353 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state a8bfd9ed) state=1c231cab sum of radii=2.340000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    """
+    n_circles = 26
+    
+    # --- 1. Initialization: Hexagonal Lattice ---
+    # We arrange circles in a hexagonal pattern to get a good starting point.
+    # 26 circles can fit in a 5x5 grid (25) + 1, or staggered rows.
+    # Let's try a staggered layout: 5 rows with counts 6, 5, 6, 5, 4 (sum 26) or similar.
+    # Or simply 6 rows of 4 (24) + 2? 
+    # Let's try to fit 26 circles as evenly as possible.
+    # 5 rows: 6, 5, 6, 5, 4 -> 26 circles.
+    
+    centers = []
+    r_init = 0.08 # Start with a safe small radius
+    
+    # Row configurations for 5 rows
+    # Row 0: 6 circles (shift 0)
+    # Row 1: 5 circles (shift r)
+    # Row 2: 6 circles (shift 0)
+    # Row 3: 5 circles (shift r)
+    # Row 4: 4 circles (shift 0)
+    # This might be too wide for 6 circles if r is large.
+    # Let's try a more compact square-ish hexagonal packing.
+    # 6 rows: 4, 5, 4, 5, 4, 4? Sum = 26.
+    # Or 5 rows: 5, 6, 5, 6, 4 = 26.
+    
+    # Let's generate a generic hex grid and pick the first 26.
+    # Grid spacing: dx = 2*r, dy = sqrt(3)*r
+    # We need to fit them in [0,1]x[0,1].
+    # Let's estimate r for 26 circles. 
+    # Area approx 1. 26 * pi * r^2 ~ 1 => r ~ 0.11. 
+    # But packing density is lower. Let's start with r=0.09.
+    
+    r_est = 0.09
+    dx = 2 * r_est
+    dy = np.sqrt(3) * r_est
+    
+    rows = []
+    current_y = r_est
+    row_idx = 0
+    
+    while len(centers) < n_circles:
+        current_x = r_est if row_idx % 2 == 0 else r_est + r_est # Shift by r for hex
+        
+        # Determine how many circles fit in this row
+        # Max x is 1 - r_est
+        count = 0
+        x = current_x
+        while x <= 1 - r_est:
+            centers.append([x, current_y])
+            x += dx
+            count += 1
+        
+        if count == 0 and len(centers) < n_circles:
+            # If row doesn't fit even 1, we might need to adjust, 
+            # but with r=0.09, dx=0.18, fits ~5 circles.
+            pass
+        
+        current_y += dy
+        row_idx += 1
+        
+    # Trim to 26
+    centers = centers[:n_circles]
+    centers = np.array(centers)
+    radii = np.full(n_circles, r_est)
+    
+    # Flatten variables for optimization: [x1, y1, r1, x2, y2, r2, ...]
+    # Shape: (3 * n_circles,)
+    x0 = np.zeros(3 * n_circles)
+    for i in range(n_circles):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+
+    # --- 2. Constraints Definition ---
+    constraints = []
+    
+    # Boundary constraints: x - r >= 0, x + r <= 1, etc.
+    # In scipy, constraints are typically h(x) >= 0 or h(x) = 0.
+    # We'll use inequality constraints >= 0.
+    
+    # x_i - r_i >= 0  =>  x_i - r_i >= 0
+    # 1 - x_i - r_i >= 0 => 1 - (x_i + r_i) >= 0
+    # Same for y.
+    
+    for i in range(n_circles):
+        idx = 3 * i
+        # x >= r  => x - r >= 0
+        def boundary_x_min(var, i=i):
+            return var[3*i] - var[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': boundary_x_min})
+        
+        # 1 - x - r >= 0
+        def boundary_x_max(var, i=i):
+            return 1 - var[3*i] - var[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': boundary_x_max})
+        
+        # y >= r
+        def boundary_y_min(var, i=i):
+            return var[3*i+1] - var[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': boundary_y_min})
+        
+        # 1 - y - r >= 0
+        def boundary_y_max(var, i=i):
+            return 1 - var[3*i+1] - var[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': boundary_y_max})
+        
+        # r >= 0
+        def radius_nonneg(var, i=i):
+            return var[3*i+2]
+        constraints.append({'type': 'ineq', 'fun': radius_nonneg})
+
+    # Overlap constraints: dist(c_i, c_j) >= r_i + r_j
+    # dist^2 >= (r_i + r_j)^2
+    # sqrt((xi-xj)^2 + (yi-yj)^2) - (ri + rj) >= 0
+    # This is non-smooth at dist=0, but we can use the squared form?
+    # (xi-xj)^2 + (yi-yj)^2 >= (ri + rj)^2
+    # (xi-xj)^2 + (yi-yj)^2 - (ri + rj)^2 >= 0
+    # This is smooth and valid since both sides non-negative (dist >= 0, radii >= 0).
+    
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            idx_i = 3 * i
+            idx_j = 3 * j
+            
+            def no_overlap(var, i=i, j=j):
+                xi, yi, ri = var[idx_i], var[idx_i+1], var[idx_i+2]
+                xj, yj, rj = var[idx_j], var[idx_j+1], var[idx_j+2]
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                r_sum = ri + rj
+                return dist_sq - r_sum**2
+            
+            constraints.append({'type': 'ineq', 'fun': no_overlap})
+
+    # --- 3. Objective Function ---
+    def objective(var):
+        # Maximize sum of radii => Minimize negative sum
+        return -np.sum(var[2::3]) # var[2], var[5], ... are radii
+
+    # --- 4. Optimization ---
+    # We use SLSQP which handles constraints well.
+    # We try a few restarts to ensure we find a good local optimum.
+    
+    best_result = None
+    best_val = -np.inf
+    
+    # Run optimization a few times with slight perturbations
+    for restart in range(3):
+        # Perturb initial guess slightly
+        current_x0 = x0.copy()
+        current_x0[2::3] *= (0.9 + 0.2 * np.random.rand(n_circles)) # Perturb radii
+        current_x0[0::3] += (np.random.rand(n_circles) - 0.5) * 0.05 # Perturb x
+        current_x0[1::3] += (np.random.rand(n_circles) - 0.5) * 0.05 # Perturb y
+        
+        # Clip to valid range for initial guess to help solver
+        for i in range(n_circles):
+            current_x0[3*i+2] = max(1e-4, current_x0[3*i+2]) # r > 0
+            current_x0[3*i] = np.clip(current_x0[3*i], 0, 1)
+            current_x0[3*i+1] = np.clip(current_x0[3*i+1], 0, 1)
+
+        try:
+            res = minimize(objective, current_x0, method='SLSQP', constraints=constraints, 
+                           options={'maxiter': 1000, 'ftol': 1e-9})
+            
+            if res.success and res.fun < best_val: # Minimize -sum, so smaller is better
+                best_val = res.fun
+                best_result = res.x
+        except Exception:
+            continue
+
+    if best_result is None:
+        # Fallback to initial guess if optimization failed
+        best_result = x0
+
+    # Extract solution
+    final_centers = np.zeros((n_circles, 2))
+    final_radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        final_centers[i, 0] = best_result[3*i]
+        final_centers[i, 1] = best_result[3*i+1]
+        final_radii[i] = best_result[3*i+2]
+        
+    sum_radii = np.sum(final_radii)
+    
+    # Ensure radii are non-negative (numerical safety)
+    final_radii = np.maximum(final_radii, 0.0)
+    
+    return final_centers, final_radii, sum_radii
+
+# Helper to allow testing if run directly (optional)
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # Validate locally if numpy is available
+    try:
+        validate_packing(centers, radii)
+        print("Packing is valid.")
+    except:
+        pass

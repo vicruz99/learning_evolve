@@ -1,0 +1,155 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that handles the non-convex, non-smooth nature of circle packing. The key insights are:
+1. **Center-Only Optimization**: Instead of optimizing both centers and radii with explicit constraints, we optimize only the centers. The radii are deterministically computed from the centers as `r_i = min(distance to boundaries, 0.5 * distance to nearest neighbor)`. This guarantees feasibility by construction and simplifies the search space to 52 variables.
+2. **Penalized Boundary Enforcement**: Since derivative-free optimizers like Powell don't strictly respect bounds, we add a quadratic penalty to the objective function that heavily penalizes centers outside [0, 1]. This naturally pulls them back without hard constraints that can cause convergence issues.
+3. **Multi-Start & Perturbation**: Circle packing has many local minima. We generate diverse initial configurations (hexagonal lattices, square grids, random, corner-focused) and perturb each multiple times. We then run `Powell` optimization on each.
+4. **Iterative Refinement**: After finding the best configuration, we perform an intensive perturbation loop to escape shallow local minima and fine-tune the positions.
+5. **Strict Validation Repair**: A final safety pass shrinks radii minimally if any numerical drift violates the strict `1e-12` tolerance of the validator.
+
+This approach avoids lambdas/closures, uses top-level functions, and leverages scipy's robust derivative-free optimizer tailored for this geometric problem.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_radii(centers):
+    """Computes maximum valid radii for fixed centers."""
+    n = centers.shape[0]
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(centers_flat):
+    """Objective: maximize sum of radii -> minimize negative sum + boundary penalty."""
+    centers = centers_flat.reshape(-1, 2)
+    radii = compute_radii(centers)
+    
+    # Quadratic penalty for centers outside [0, 1]
+    pen = np.sum(np.maximum(0, -centers[:, 0])**2 + np.maximum(0, centers[:, 0] - 1)**2 + 
+                 np.maximum(0, -centers[:, 1])**2 + np.maximum(0, centers[:, 1] - 1)**2)
+                 
+    return -np.sum(radii) + 1000.0 * pen
+
+def make_starts():
+    """Generates diverse initial configurations."""
+    starts = []
+    
+    # Hexagonal lattices with various base radii
+    for r0 in [0.09, 0.095, 0.10, 0.105, 0.11]:
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x = r0 if row % 2 == 0 else 2 * r0
+            while x + r0 <= 1.0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        starts.append(np.array(pts[:N]).flatten())
+        
+    # Square grids
+    for r0 in [0.08, 0.09, 0.10]:
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x = r0
+            while x + r0 <= 1.0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r0
+            y += 2 * r0
+            row += 1
+        starts.append(np.array(pts[:N]).flatten())
+        
+    # Pure random starts
+    for _ in range(40):
+        starts.append(np.random.rand(N * 2))
+        
+    # Corner-focused starts
+    for _ in range(15):
+        c = np.random.rand(N * 2).reshape(N, 2)
+        idx = np.random.choice(N, 4, replace=False)
+        corners = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        for i, corner in zip(idx, corners):
+            c[i] = corner
+        starts.append(c.flatten())
+        
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    starts = make_starts()
+    
+    best_val = np.inf
+    best_centers = None
+    
+    # Phase 1: Multi-start optimization
+    for s in starts:
+        for _ in range(3):
+            s_pert = np.clip(s + np.random.normal(0, 0.002, s.shape), 1e-5, 1.0 - 1e-5)
+            try:
+                res = minimize(objective, s_pert, method='Powell',
+                               options={'maxiter': 4000, 'ftol': 1e-13, 'xtol': 1e-13})
+                if res.fun < best_val:
+                    best_val = res.fun
+                    best_centers = res.x.reshape(-1, 2)
+            except Exception:
+                continue
+                
+    # Phase 2: Iterative perturbation refinement to escape local minima
+    if best_centers is not None:
+        for _ in range(80):
+            pert = best_centers.copy()
+            pert += np.random.normal(0, 0.0015, pert.shape)
+            pert = np.clip(pert, 1e-5, 1.0 - 1e-5)
+            try:
+                res = minimize(objective, pert.flatten(), method='Powell',
+                               options={'maxiter': 3000, 'ftol': 1e-13})
+                if res.fun < best_val:
+                    best_val = res.fun
+                    best_centers = res.x.reshape(-1, 2)
+            except Exception:
+                pass
+                
+    # Compute final radii exactly
+    radii = compute_radii(best_centers)
+    sum_r = float(np.sum(radii))
+    
+    # Phase 3: Strict validation repair (handles tiny numerical drift)
+    for _ in range(20):
+        valid = True
+        for i in range(N):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], radii[i]
+            if x - r < -1e-9 or x + r > 1.0 + 1e-9 or y - r < -1e-9 or y + r > 1.0 + 1e-9:
+                valid = False
+                break
+        if not valid:
+            break
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            break
+        # Proportionally shrink radii only if absolutely necessary
+        radii *= 0.99995
+        
+    return best_centers, radii, float(np.sum(radii))
+```

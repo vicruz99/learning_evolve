@@ -1,0 +1,207 @@
+# sol_000073 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000027 (state bf2de84b) state=2d569b99 sum of radii=2.569523 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(x):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def compute_constraints(x):
+    """Compute all inequality constraints: boundary containment and pairwise separation."""
+    N = 26
+    C = x.reshape(N, 3)
+    x_c = C[:, 0]
+    y_c = C[:, 1]
+    r = C[:, 2]
+    
+    c_list = []
+    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    c_list.append(x_c - r)
+    c_list.append(1.0 - x_c - r)
+    c_list.append(y_c - r)
+    c_list.append(1.0 - y_c - r)
+    
+    # Pairwise separation constraints: dist_sq >= (r_i + r_j)^2
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    dx = x_c[i_idx] - x_c[j_idx]
+    dy = y_c[i_idx] - y_c[j_idx]
+    r_sum = r[i_idx] + r[j_idx]
+    c_list.append(dx*dx + dy*dy - r_sum*r_sum)
+    
+    return np.concatenate(c_list)
+
+def generate_hex_init(N, rot_angle, seed):
+    """Generates a hexagonal lattice, applies rotation, scales to fit in unit square."""
+    np.random.seed(seed)
+    # Standard hex rows for 26 circles
+    rows_counts = [5, 6, 5, 6, 4]
+    pts = []
+    y = 0.0
+    for r_idx, count in enumerate(rows_counts):
+        shift = (r_idx % 2) * 0.5
+        x = shift
+        for _ in range(count):
+            pts.append([x, y])
+            x += 1.0
+        y += np.sqrt(3.0)/2.0
+    pts = np.array(pts[:N])
+    
+    # Apply rotation around center (0.5, 0.5)
+    ct, st = np.cos(rot_angle), np.sin(rot_angle)
+    pts_centered = pts - 0.5
+    pts_rot = pts_centered @ np.array([[ct, -st], [st, ct]])
+    pts = pts_rot + 0.5
+    
+    # Scale and shift to fit safely inside [0,1]x[0,1]
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = mx - mn
+    scale = 0.85 / max(span.max(), 1e-9)
+    pts = (pts - mn) * scale + 0.5
+    pts = np.clip(pts, 0.05, 0.95)
+    
+    # Add controlled jitter to break symmetry
+    pts += np.random.uniform(-0.02, 0.02, pts.shape)
+    pts = np.clip(pts, 0.01, 0.99)
+    return pts
+
+def grow_and_repel(centers, dt=0.0012, steps=2200):
+    """
+    Simulates circles growing uniformly and repelling upon contact.
+    Returns a tightly packed, strictly feasible configuration.
+    """
+    n = centers.shape[0]
+    radii = np.full(n, 0.001)
+    centers = centers.copy()
+    
+    for step in range(steps):
+        # Adaptive growth rate to settle into tight packing
+        current_dt = dt * (0.997 ** (step // 40))
+        radii += current_dt
+        
+        for i in range(n):
+            # Enforce wall constraints
+            cx, cy = centers[i]
+            r = radii[i]
+            if cx < r: centers[i, 0] = r
+            if cx > 1.0 - r: centers[i, 0] = 1.0 - r
+            if cy < r: centers[i, 1] = r
+            if cy > 1.0 - r: centers[i, 1] = 1.0 - r
+            
+            # Clamp radius to wall distance
+            max_r = min(cx, 1.0 - cx, cy, 1.0 - cy)
+            radii[i] = min(radii[i], max_r)
+            
+            # Check pairwise overlaps
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                req_d = radii[i] + radii[j]
+                
+                if d < req_d:
+                    overlap = req_d - d
+                    if d > 1e-9:
+                        ux, uy = dx / d, dy / d
+                        # Push apart symmetrically
+                        centers[i, 0] += ux * overlap * 0.5
+                        centers[i, 1] += uy * overlap * 0.5
+                        centers[j, 0] -= ux * overlap * 0.5
+                        centers[j, 1] -= uy * overlap * 0.5
+        
+        # Post-step wall correction for moved centers
+        for i in range(n):
+            centers[i, 0] = np.clip(centers[i, 0], radii[i], 1.0 - radii[i])
+            centers[i, 1] = np.clip(centers[i, 1], radii[i], 1.0 - radii[i])
+            radii[i] = min(radii[i], centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            
+    return centers, radii
+
+def run_packing():
+    N = 26
+    best_sum = -np.inf
+    best_x = None
+    bounds = [(0, 1), (0, 1), (0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    np.random.seed(42)
+    inits = []
+    
+    # Generate diverse initial center configurations
+    # 1. Rotated hexagonal lattices
+    for seed in range(8):
+        rot = np.radians(np.random.uniform(-15, 15))
+        pts = generate_hex_init(N, rot, seed)
+        inits.append(pts)
+        
+    # 2. Perturbed grid layouts
+    for seed in range(4):
+        np.random.seed(100 + seed)
+        pts = np.random.uniform(0.1, 0.9, (N, 2))
+        inits.append(pts)
+        
+    # Phase 1: Grow & Repel simulation + SLSQP refinement
+    for i, pts in enumerate(inits):
+        centers, radii = grow_and_repel(pts, dt=0.0012, steps=2500)
+        
+        # Shrink radii slightly to guarantee strict feasibility for SLSQP start
+        radii_init = radii * 0.97
+        
+        x0 = np.zeros(3 * N)
+        x0[0::3] = centers[:, 0]
+        x0[1::3] = centers[:, 1]
+        x0[2::3] = radii_init
+        
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-13, 'disp': False})
+            
+            if res.success:
+                cons_val = compute_constraints(res.x)
+                if np.min(cons_val) >= -1e-9:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_x = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Local perturbation & high-precision polish
+    if best_x is not None:
+        for _ in range(12):
+            # Small random perturbation to escape shallow local minima
+            x_pert = best_x + np.random.normal(0, 0.0008, 3 * N)
+            x_pert[0::3] = np.clip(x_pert[0::3], 0.001, 0.999)
+            x_pert[1::3] = np.clip(x_pert[1::3], 0.001, 0.999)
+            x_pert[2::3] = np.clip(x_pert[2::3], 0.001, 0.499)
+            
+            try:
+                res = minimize(compute_objective, x_pert, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+                if res.success:
+                    cons_val = compute_constraints(res.x)
+                    if np.min(cons_val) >= -1e-9:
+                        curr_sum = -res.fun
+                        if curr_sum > best_sum:
+                            best_sum = curr_sum
+                            best_x = res.x.copy()
+            except Exception:
+                pass
+                
+    # Fallback (should rarely trigger)
+    if best_x is None:
+        best_x = np.zeros(3 * N)
+        best_x[2::3] = 0.01
+        best_x[0::3] = np.linspace(0.2, 0.8, N)
+        best_x[1::3] = np.linspace(0.2, 0.8, N)
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))

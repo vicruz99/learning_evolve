@@ -1,0 +1,291 @@
+
+
+<strategy>
+I'll approach this circle packing problem using a two-level optimization strategy:
+
+1. **Inner level (Linear Programming)**: For fixed circle positions, compute maximum radii via LP. This is efficient because the constraints (boundary and pairwise non-overlap) are all linear in radii.
+
+2. **Outer level (Gradient-based optimization)**: Optimize positions using L-BFGS-B with analytically computed gradients from LP dual variables. The dual variables give sensitivity of the objective to constraint tightness.
+
+Key insights:
+- For fixed positions, maximizing sum of radii is an LP: r_i <= min(x_i, 1-x_i, y_i, 1-y_i), r_i + r_j <= distance(i,j)
+- The gradient w.r.t. positions comes from LP duals: boundary duals give push toward edges, pairwise duals give repulsion
+- Hexagonal lattice initialization is near-optimal for circle packing
+- Multiple random restarts avoid local minima
+
+The gradient computation uses the envelope theorem: d(optimal_value)/d(b_k) = dual_k, where b_k is the k-th constraint bound. For boundary constraints, this gives direct gradients; for pairwise constraints, chain rule through distance formula.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+
+def compute_solution(centers):
+    """
+    For fixed centers, compute max radii via LP and gradient of sum of radii w.r.t. positions.
+    
+    Uses LP: max sum(r_i) s.t. r_i <= boundary, r_i + r_j <= dist(i,j), r_i >= 0
+    Gradient computed from dual variables via sensitivity analysis.
+    """
+    n = centers.shape[0]
+    
+    n_boundary = 4 * n
+    n_pair = n * (n - 1) // 2
+    m = n_boundary + n_pair
+    
+    A = np.zeros((m, n))
+    b = np.zeros(m)
+    
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        # r_i <= x_i
+        A[k, i] = 1
+        b[k] = x
+        k += 1
+        # r_i <= 1 - x_i
+        A[k, i] = 1
+        b[k] = 1 - x
+        k += 1
+        # r_i <= y_i
+        A[k, i] = 1
+        b[k] = y
+        k += 1
+        # r_i <= 1 - y_i
+        A[k, i] = 1
+        b[k] = 1 - y
+        k += 1
+    
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs.append((i, j))
+    
+    for i, j in pairs:
+        dx = centers[i, 0] - centers[j, 0]
+        dy = centers[i, 1] - centers[j, 1]
+        d = np.sqrt(dx * dx + dy * dy)
+        A[k, i] = 1
+        A[k, j] = 1
+        b[k] = d
+        k += 1
+    
+    c_obj = -np.ones(n)
+    result = linprog(c_obj, A_ub=A, b_ub=b, bounds=[(0, None)] * n, method='highs')
+    
+    if not result.success:
+        # Fallback: small uniform radii
+        fallback = np.full(n, 0.001)
+        return fallback, np.zeros((n, 2))
+    
+    radii = np.maximum(result.x, 0)
+    duals = result.ineqlin.marginals
+    
+    # Compute gradient of sum(radii) w.r.t. center positions
+    grad = np.zeros((n, 2))
+    
+    # Boundary constraint contributions
+    for i in range(n):
+        grad[i, 0] += duals[4 * i]        # r_i <= x_i: moving right relaxes constraint
+        grad[i, 0] -= duals[4 * i + 1]    # r_i <= 1-x_i: moving right tightens constraint
+        grad[i, 1] += duals[4 * i + 2]    # r_i <= y_i: moving up relaxes constraint
+        grad[i, 1] -= duals[4 * i + 3]    # r_i <= 1-y_i: moving up tightens constraint
+    
+    # Pairwise constraint contributions
+    k = n_boundary
+    for i, j in pairs:
+        lam = max(duals[k], 0)
+        dx = centers[i, 0] - centers[j, 0]
+        dy = centers[i, 1] - centers[j, 1]
+        d = np.sqrt(dx * dx + dy * dy)
+        if d > 1e-10:
+            # Gradient of distance w.r.t. positions
+            grad[i, 0] += lam * dx / d
+            grad[j, 0] -= lam * dx / d
+            grad[i, 1] += lam * dy / d
+            grad[j, 1] -= lam * dy / d
+        k += 1
+    
+    return radii, grad
+
+
+def objective_with_grad(x_flat):
+    """Objective function with gradient for minimization."""
+    n = 26
+    centers = x_flat.reshape((n, 2))
+    radii, grad = compute_solution(centers)
+    obj_val = -np.sum(radii)
+    grad_val = -grad.flatten()
+    return obj_val, grad_val
+
+
+def objective_only(x_flat):
+    """Objective function without gradient."""
+    n = 26
+    centers = x_flat.reshape((n, 2))
+    radii, _ = compute_solution(centers)
+    return -np.sum(radii)
+
+
+def hex_init(n, spacing=0.16):
+    """Initialize centers in hexagonal pattern."""
+    centers = []
+    row = 0
+    while len(centers) < n:
+        for col in range(8):
+            if len(centers) >= n:
+                break
+            x = spacing + col * spacing * 2 + (row % 2) * spacing
+            y = spacing + row * spacing * np.sqrt(3)
+            if x <= 1 - spacing and y <= 1 - spacing:
+                centers.append([x, y])
+        row += 1
+    return np.array(centers[:n])
+
+
+def grid_init(n):
+    """Initialize centers in square grid pattern."""
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / cols))
+    centers = []
+    for r in range(rows):
+        for c in range(cols):
+            if len(centers) >= n:
+                break
+            x = 0.5 / cols + c * 1.0 / cols
+            y = 0.5 / rows + r * 1.0 / rows
+            centers.append([x, y])
+        else:
+            continue
+        break
+    return np.array(centers[:n])
+
+
+def random_init(n, seed):
+    """Random initialization with jitter."""
+    np.random.seed(seed)
+    centers = np.zeros((n, 2))
+    cols = int(np.ceil(np.sqrt(n * np.sqrt(3) / 2)))
+    rows = int(np.ceil(n / cols))
+    
+    dx = 0.9 / max(cols, 1)
+    dy = 0.9 / max(rows, 1)
+    
+    idx = 0
+    for r in range(rows + 2):
+        for c in range(cols + 2):
+            if idx >= n:
+                break
+            x = 0.05 + c * dx + (r % 2) * dx * 0.5
+            y = 0.05 + r * dy * 0.866
+            if x < 0.95 and y < 0.95:
+                centers[idx] = [x, y]
+                idx += 1
+        if idx >= n:
+            break
+    
+    centers += np.random.randn(n, 2) * 0.02
+    centers = np.clip(centers, 0.05, 0.95)
+    return centers
+
+
+def run_packing():
+    n = 26
+    bounds = [(0.01, 0.99)] * (2 * n)
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Hexagonal init with multiple seeds
+    for seed in range(60):
+        np.random.seed(seed)
+        centers = hex_init(n, spacing=0.14 + 0.02 * np.random.randn())
+        centers = np.clip(centers, 0.03, 0.97)
+        
+        x0 = centers.flatten()
+        
+        try:
+            result = minimize(objective_with_grad, x0, method='L-BFGS-B',
+                             bounds=bounds,
+                             options={'maxiter': 80000, 'ftol': 1e-14, 'gtol': 1e-10})
+            
+            centers_opt = result.x.reshape((n, 2))
+            radii_opt, _ = compute_solution(centers_opt)
+            s = np.sum(radii_opt)
+            
+            if s > best_sum:
+                best_sum = s
+                best_centers = centers_opt.copy()
+                best_radii = radii_opt.copy()
+        except Exception:
+            pass
+    
+    # Strategy 2: Grid init with perturbations
+    for seed in range(30):
+        np.random.seed(seed + 1000)
+        centers = grid_init(n)
+        centers += np.random.randn(n, 2) * 0.03
+        centers = np.clip(centers, 0.03, 0.97)
+        
+        x0 = centers.flatten()
+        
+        try:
+            result = minimize(objective_with_grad, x0, method='L-BFGS-B',
+                             bounds=bounds,
+                             options={'maxiter': 80000, 'ftol': 1e-14})
+            
+            centers_opt = result.x.reshape((n, 2))
+            radii_opt, _ = compute_solution(centers_opt)
+            s = np.sum(radii_opt)
+            
+            if s > best_sum:
+                best_sum = s
+                best_centers = centers_opt.copy()
+                best_radii = radii_opt.copy()
+        except Exception:
+            pass
+    
+    # Strategy 3: Random inits
+    for seed in range(40):
+        centers = random_init(n, seed + 2000)
+        x0 = centers.flatten()
+        
+        try:
+            result = minimize(objective_with_grad, x0, method='L-BFGS-B',
+                             bounds=bounds,
+                             options={'maxiter': 60000, 'ftol': 1e-14})
+            
+            centers_opt = result.x.reshape((n, 2))
+            radii_opt, _ = compute_solution(centers_opt)
+            s = np.sum(radii_opt)
+            
+            if s > best_sum:
+                best_sum = s
+                best_centers = centers_opt.copy()
+                best_radii = radii_opt.copy()
+        except Exception:
+            pass
+    
+    # Strategy 4: Polish best result with Nelder-Mead
+    if best_centers is not None:
+        x0 = best_centers.flatten()
+        result = minimize(objective_only, x0, method='Nelder-Mead',
+                         options={'maxiter': 200000, 'xatol': 1e-10, 'fatol': 1e-10})
+        
+        centers_polished = result.x.reshape((n, 2))
+        centers_polished = np.clip(centers_polished, 0.01, 0.99)
+        radii_polished, _ = compute_solution(centers_polished)
+        s_polished = np.sum(radii_polished)
+        
+        if s_polished > best_sum:
+            best_sum = s_polished
+            best_centers = centers_polished
+            best_radii = radii_polished
+    
+    # Ensure validity
+    best_radii = np.maximum(best_radii, 0)
+    
+    return best_centers, best_radii, best_sum
+```

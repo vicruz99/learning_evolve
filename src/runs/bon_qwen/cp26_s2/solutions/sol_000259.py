@@ -1,0 +1,224 @@
+# sol_000259 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2b83b1fb) state=c28971d6 sum of radii=2.610526 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def get_initial_packing():
+    """
+    Generates an initial hexagonal packing configuration for 26 circles.
+    Row distribution: 6, 5, 6, 5, 4.
+    """
+    # Radius derived from fitting 6 circles width-wise (12r <= 1) 
+    # and 5 rows height-wise with hexagonal shift.
+    # Width constraint: 12r <= 1 -> r <= 0.0833
+    # However, with shifted rows, we might squeeze slightly more or rearrange.
+    # Let's use a tight starting radius.
+    r = 0.088 
+    
+    centers = []
+    
+    # Row 0: 6 circles (Bottom)
+    # x: r, 3r, 5r, 7r, 9r, 11r. Rightmost edge: 11r + r = 12r.
+    # To fit in [0,1], we might need to scale or center. 
+    # Let's center the row. Width occupied by 6 circles is 11r (center to center) + 2r = 12r.
+    # If 12r > 1, we must scale. 
+    # Let's try to fit 6 circles of radius r. 
+    # If r=0.088, 12r = 1.056 > 1.
+    # We need to fit them. Maybe 5 circles in some rows is better for radius?
+    # But we need 26 circles.
+    
+    # Let's re-evaluate row counts.
+    # 5 rows.
+    # 6+5+6+5+4 = 26.
+    # Row 0 (6): y = r. x needs to fit 6 circles. 
+    # Row 1 (5): y = r + sqrt(3)r. x shifted by r.
+    # Row 2 (6): y = r + 2sqrt(3)r.
+    # Row 3 (5): y = r + 3sqrt(3)r.
+    # Row 4 (4): y = r + 4sqrt(3)r.
+    
+    # Let's calculate required dimensions for a given r.
+    # Width for 6 circles: 12r.
+    # Width for 5 circles (shifted): centers at r, 3r...9r? 
+    # If shifted by r, centers are r, 3r... but relative to row 0?
+    # Row 0 centers: r, 3r, 5r, 7r, 9r, 11r.
+    # Row 1 centers: 2r, 4r, 6r, 8r, 10r (5 circles).
+    # Leftmost of Row 1: 2r. Edge: 2r - r = r. (Touches wall at r).
+    # Rightmost of Row 1: 10r. Edge: 10r + r = 11r.
+    # So Row 1 requires width 11r (from 0 to 11r? No, from r to 11r).
+    # Actually Row 1 is inside Row 0's width.
+    # Row 4 (4 circles): centers 2r, 4r, 6r, 8r? 
+    # Shifted relative to Row 3 (which is like Row 1).
+    # Row 3 (5 circles): 2r, 4r, 6r, 8r, 10r.
+    # Row 4 (4 circles): shift by r? -> r, 3r, 5r, 7r?
+    # If Row 4 is aligned with Row 0/2, it can have 4 circles.
+    # Centers: r, 3r, 5r, 7r. Right edge 8r. Left edge 0.
+    # Width required 8r.
+    
+    # So the bottleneck is Row 0, 2 with 6 circles requiring width 12r.
+    # If 12r <= 1, r <= 0.0833.
+    # Height: Row 4 center y = r + 4*sqrt(3)*r.
+    # Top edge: r + 4*sqrt(3)*r + r = 2r + 4*sqrt(3)*r = r(2 + 6.928) = 8.928r.
+    # 8.928 * 0.0833 = 0.743 < 1. Height is fine.
+    
+    # So with 6 circles in a row, max r is 0.0833. Sum = 26 * 0.0833 = 2.16.
+    # This is worse than 5x5 grid (2.5).
+    
+    # We need fewer circles per row to increase r.
+    # But we need 26 circles.
+    # Maybe 6 rows?
+    # If r=0.1 (from 5x5), width for 5 circles is 10r = 1.0.
+    # Rows with 5 circles fit perfectly.
+    # Rows with 4 circles fit easily.
+    # Height for 6 rows of r=0.1:
+    # Bottom y=r=0.1. Top row center y = 0.1 + 5*sqrt(3)*0.1 = 0.1 + 0.866 = 0.966.
+    # Top edge 1.066 > 1.
+    # So 6 rows of r=0.1 don't fit.
+    
+    # Maybe 5 rows, but with 5 circles each? 25 circles.
+    # We need 26.
+    # Maybe 5 rows of 5 circles + 1 extra?
+    # Or adjust radii.
+    
+    # Let's try a configuration that is known to be dense.
+    # 5 rows.
+    # Row 0: 5 circles.
+    # Row 1: 5 circles.
+    # Row 2: 5 circles.
+    # Row 3: 5 circles.
+    # Row 4: 6 circles?
+    # Total 26.
+    # If Row 4 has 6 circles, it needs width 12r.
+    # If Row 0-3 have 5 circles, they need width 10r (if aligned) or similar.
+    # If we use 10r width, r=0.1.
+    # Then Row 4 (6 circles) needs 12r = 1.2 width. Doesn't fit.
+    
+    # So we must have r < 0.1 if any row has 6 circles.
+    # What if we have rows with 5 circles, but shifted to allow 26?
+    # Maybe 5, 5, 6, 5, 5?
+    # Row with 6 circles dictates r <= 1/12.
+    
+    # Is there a better arrangement?
+    # Maybe not all circles are equal.
+    # But for initial guess, let's try to fit 26 circles with high density.
+    # Maybe 4 rows?
+    # 4 rows * 7 circles = 28.
+    # 7 circles width 14r. r <= 1/14 ~ 0.07. Bad.
+    
+    # Maybe we can't beat 2.5 with equal circles?
+    # But unequal circles might.
+    # Let's start with a 5x5 grid (25 circles) of r=0.1.
+    # And place the 26th circle in a gap with small radius.
+    # Then optimize.
+    
+    # 5x5 grid centers
+    grid_c = []
+    for i in range(5):
+        for j in range(5):
+            x = 0.1 + j * 0.2
+            y = 0.1 + i * 0.2
+            grid_c.append([x, y])
+    
+    # Add 26th circle in the center of a gap?
+    # Gap at (0.2, 0.2) relative to grid?
+    # Grid points: (0.1,0.1), (0.3,0.1), (0.1,0.3), (0.3,0.3).
+    # Center of gap: (0.2, 0.2).
+    # Distance to nearest center: sqrt(0.1^2 + 0.1^2) = 0.1414.
+    # Radius of existing: 0.1.
+    # Max radius for new: 0.0414.
+    
+    centers = np.array(grid_c)
+    radii = np.array([0.1] * 25)
+    
+    centers_26 = np.array([[0.2, 0.2]])
+    radii_26 = np.array([0.0414])
+    
+    centers = np.vstack([centers, centers_26])
+    radii = np.concatenate([radii, radii_26])
+    
+    return centers, radii
+
+def run_packing():
+    # Initial guess
+    centers, radii = get_initial_packing()
+    
+    # Flatten variables for optimization
+    # x: centers, y: radii
+    # We optimize both to allow flexibility
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    n = 26
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0, 1), (0, 1)]) # x, y in [0,1]
+    for _ in range(n):
+        bounds.extend([(0, 1)]) # r >= 0
+    
+    constraints = []
+    
+    # Non-overlap constraints: ||c_i - c_j|| >= r_i + r_j
+    # We use squared distance to keep it smooth: (x_i-x_j)^2 + ... >= (r_i+r_j)^2
+    # Constraint: (r_i + r_j)^2 - dist_sq <= 0
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            def overlap_constraint(vars, i=i, j=j):
+                c_i = vars[2*i : 2*i+2]
+                c_j = vars[2*j : 2*j+2]
+                r_i = vars[2*n + i]
+                r_j = vars[2*n + j]
+                
+                dist_sq = np.sum((c_i - c_j)**2)
+                return dist_sq - (r_i + r_j)**2
+            
+            constraints.append({'type': 'ineq', 'fun': overlap_constraint})
+            
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, etc.
+    # x_i >= r_i => x_i - r_i >= 0
+    # 1 - x_i >= r_i => 1 - x_i - r_i >= 0
+    for i in range(n):
+        def bound_x_min(vars, i=i):
+            return vars[2*i] - vars[2*n + i]
+        constraints.append({'type': 'ineq', 'fun': bound_x_min})
+        
+        def bound_x_max(vars, i=i):
+            return 1.0 - vars[2*i] - vars[2*n + i]
+        constraints.append({'type': 'ineq', 'fun': bound_x_max})
+        
+        def bound_y_min(vars, i=i):
+            return vars[2*i + 1] - vars[2*n + i]
+        constraints.append({'type': 'ineq', 'fun': bound_y_min})
+        
+        def bound_y_max(vars, i=i):
+            return 1.0 - vars[2*i + 1] - vars[2*n + i]
+        constraints.append({'type': 'ineq', 'fun': bound_y_max})
+
+    def objective(vars):
+        # Maximize sum of radii -> Minimize negative sum
+        return -np.sum(vars[2*n:])
+
+    try:
+        result = opt.minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-12})
+        
+        if result.success:
+            centers_opt = result.x[:2*n].reshape(n, 2)
+            radii_opt = result.x[2*n:]
+            
+            # Clamp negative radii due to numerical errors
+            radii_opt = np.maximum(radii_opt, 0.0)
+            
+            return centers_opt, radii_opt, np.sum(radii_opt)
+        else:
+            # Fallback to initial if optimization fails
+            return centers, radii, np.sum(radii)
+            
+    except Exception as e:
+        # Fallback
+        return centers, radii, np.sum(radii)
+
+# To run the packing and print results for debugging (optional)
+# centers, radii, s = run_packing()
+# print(f"Sum of radii: {s}")

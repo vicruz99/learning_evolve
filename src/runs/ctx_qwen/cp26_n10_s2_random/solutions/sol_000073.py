@@ -1,0 +1,130 @@
+# sol_000073 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000056 (state 0fa800b4) state=e3ba239e sum of radii=1.955624 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_max_radii(centers):
+    """
+    Computes the maximum valid radius for each circle given fixed centers.
+    r_i = min(dist to boundary, 0.5 * dist to nearest neighbor)
+    """
+    n = centers.shape[0]
+    # Distance to boundaries: min(x, 1-x, y, 1-y)
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)  # Ignore self-distance
+    
+    # Radius limited by half the distance to the nearest neighbor
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(centers_flat):
+    """
+    Objective function for minimization: maximize sum of radii.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    # Strictly keep centers inside the unit square to ensure valid radii
+    centers = np.clip(centers, 1e-7, 1.0 - 1e-7)
+    radii = compute_max_radii(centers)
+    return -np.sum(radii)
+
+def generate_hex_init(n, row_counts, shift, r_init):
+    """Generates a hexagonal lattice initialization with specified row counts."""
+    pts = []
+    y = r_init
+    row_idx = 0
+    while len(pts) < n and row_idx < len(row_counts):
+        count = row_counts[row_idx]
+        x_start = r_init + shift * r_init
+        for c in range(count):
+            if len(pts) < n:
+                pts.append([x_start + c * (2.0 * r_init), y])
+        y += np.sqrt(3.0) * r_init
+        row_idx += 1
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = 26
+    bounds = [(1e-5, 1.0 - 1e-5)] * (2 * n)
+    
+    best_val = np.inf
+    best_centers = None
+    candidates = []
+    
+    # 1. Hexagonal lattice configurations with diverse topologies
+    row_patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5],
+        [6, 4, 6, 5, 5], [5, 6, 6, 5, 4], [4, 6, 6, 6, 4],
+        [5, 5, 5, 5, 6], [6, 5, 5, 5, 5], [5, 4, 6, 6, 5]
+    ]
+    
+    for rows in row_patterns:
+        for shift in [0.0, 0.5]:
+            for r_init in [0.092, 0.098, 0.105]:
+                try:
+                    pts = generate_hex_init(n, rows, shift, r_init)
+                    pts += np.random.normal(0, 0.003, pts.shape)
+                    candidates.append(np.clip(pts, 1e-5, 1.0 - 1e-5).flatten())
+                except Exception:
+                    pass
+                    
+    # 2. Random and corner-biased starts to explore non-lattice optima
+    for _ in range(25):
+        c = np.random.uniform(0.15, 0.85, (n, 2))
+        candidates.append(c.flatten())
+        
+    for _ in range(15):
+        c = np.random.rand(n, 2)
+        # Push 4 random circles toward corners
+        idx = np.random.choice(n, 4, replace=False)
+        corners = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        for i, corner in zip(idx, corners):
+            c[i] = corner + np.random.normal(0, 0.02, 2)
+        candidates.append(np.clip(c, 1e-5, 1.0 - 1e-5).flatten())
+
+    # Primary optimization phase
+    for x0 in candidates:
+        try:
+            res = minimize(objective, x0, method='Powell', bounds=bounds,
+                           options={'maxiter': 4000, 'ftol': 1e-13, 'xtol': 1e-13})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_centers = res.x.reshape(-1, 2)
+        except Exception:
+            continue
+            
+    # Iterative refinement: perturb best configuration and re-optimize to escape local minima
+    if best_centers is not None:
+        rng = np.random.default_rng(123)
+        for _ in range(40):
+            pert = best_centers.copy()
+            # Scale perturbation down as we converge
+            sigma = 0.002 * (0.95 ** (_ // 10))
+            pert += rng.normal(0, sigma, pert.shape)
+            pert = np.clip(pert, 1e-5, 1.0 - 1e-5)
+            
+            try:
+                res = minimize(objective, pert.flatten(), method='Powell', bounds=bounds,
+                               options={'maxiter': 2500, 'ftol': 1e-13})
+                if res.fun < best_val:
+                    best_val = res.fun
+                    best_centers = res.x.reshape(-1, 2)
+            except Exception:
+                pass
+
+    # Compute final radii exactly for the optimized centers
+    final_radii = compute_max_radii(best_centers)
+    final_sum = float(np.sum(final_radii))
+    
+    return best_centers, final_radii, final_sum

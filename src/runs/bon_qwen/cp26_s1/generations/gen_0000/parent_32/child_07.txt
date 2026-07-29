@@ -1,298 +1,121 @@
 
 
 <strategy>
-The problem asks for packing 26 circles in a unit square to maximize the sum of radii.
-The strategy will involve a two-phase optimization approach:
-1.  **Initialization Phase (Equal Radii Packing)**: Since optimal packings for circle sums often converge to configurations where circles are roughly equal in size (due to area constraints), we first find a dense packing of 26 equal circles. We will use an iterative force-based expansion method. We start with random centers and a small radius, then gradually increase the radius while repelling circles from each other and the boundaries to resolve overlaps. This yields a high-quality initial configuration.
-2.  **Refinement Phase (Unequal Radii Optimization)**: Starting from the equal-radius configuration, we treat both centers and radii as variables. We use `scipy.optimize.minimize` with the L-BFGS-B method to maximize the sum of radii. We incorporate overlap and boundary constraints using a penalty function. This allows the optimizer to adjust radii individually to squeeze out any remaining efficiency gains.
+To maximize the sum of radii for 26 circles in a unit square, I will use a force-directed optimization approach combined with iterative radius growth. This method is robust for non-convex packing problems and efficiently finds tight configurations.
 
-Key technical decisions:
--   Use `numpy` for vectorized distance calculations.
--   Use a strong penalty function in the optimization phase to enforce non-overlap constraints.
--   Implement the `run_packing` function to encapsulate the logic.
--   Ensure all helper functions are top-level.
+Key components of the strategy:
+1. **Initialization**: Generate 4 different initial configurations using a perturbed hexagonal lattice. Hexagonal packing naturally achieves higher density than square grids, giving the optimizer a better starting point.
+2. **Growth & Relaxation Loop**: In each iteration, all radii are scaled by a small factor to increase the total sum. If circles overlap or violate boundary constraints, repulsive forces proportional to the penetration depth push them apart. This mimics a physical system seeking equilibrium under pressure.
+3. **Adaptive Dynamics**: 
+   - Learning rate decays exponentially to transition from large structural changes to fine-grained settling.
+   - Growth rate decays periodically to prevent overshooting the feasible region.
+   - Force magnitude is clipped to prevent numerical instability during early high-overlap phases.
+   - Occasional Gaussian perturbations help escape local minima.
+4. **Multi-Trial Selection**: Run the optimizer on multiple random seeds/initial perturbations and return the configuration with the highest sum of radii.
+5. **Constraints Handling**: Forces directly encode non-overlap ($d_{ij} \ge r_i + r_j$) and boundary ($r_i \le x_i \le 1-r_i$) constraints. The optimizer naturally drives the system to a state where constraints are tight, maximizing $\sum r_i$.
+
+This approach balances exploration and exploitation, typically converging to packings well above the naive grid baseline (sum ≈ 2.5) and targeting the 2.636 threshold.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize
-import math
 
-# Constants
-N_CIRCLES = 26
-SQ_SIDE = 1.0
-
-def compute_overlap_penalty(centers, radii):
+def compute_forces(centers, radii):
     """
-    Computes the penalty for overlaps between circles and boundary violations.
-    Returns a scalar penalty value.
+    Compute repulsive forces to resolve overlaps and boundary violations.
+    Forces are proportional to penetration depth.
     """
-    penalty = 0.0
-    n = centers.shape[0]
+    N = centers.shape[0]
+    forces = np.zeros((N, 2))
     
-    # Boundary penalties: x - r >= 0, x + r <= 1, y - r >= 0, y + r <= 1
-    # Equivalent to: r - x <= 0, x + r - 1 <= 0, etc.
-    # We penalize positive violations squared.
+    # Pairwise distances and overlaps
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+    np.fill_diagonal(dists, np.inf)
     
-    # Vectorized boundary checks
-    # x - r < 0 => r - x > 0
-    pen_x_min = radii - centers[:, 0]
-    pen_x_min = np.where(pen_x_min > 0, pen_x_min, 0)
+    sum_r = radii[:, None] + radii[None, :]
+    overlap = np.maximum(0, sum_r - dists)
     
-    # x + r > 1 => x + r - 1 > 0
-    pen_x_max = centers[:, 0] + radii - 1.0
-    pen_x_max = np.where(pen_x_max > 0, pen_x_max, 0)
-    
-    # y - r < 0 => r - y > 0
-    pen_y_min = radii - centers[:, 1]
-    pen_y_min = np.where(pen_y_min > 0, pen_y_min, 0)
-    
-    # y + r > 1 => y + r - 1 > 0
-    pen_y_max = centers[:, 1] + radii - 1.0
-    pen_y_max = np.where(pen_y_max > 0, pen_y_max, 0)
-    
-    boundary_penalty = np.sum(pen_x_min**2) + np.sum(pen_x_max**2) + \
-                       np.sum(pen_y_min**2) + np.sum(pen_y_max**2)
-    
-    # Pairwise overlap penalties
-    # We iterate i < j
-    for i in range(n):
-        for j in range(i + 1, n):
-            dx = centers[i, 0] - centers[j, 0]
-            dy = centers[i, 1] - centers[j, 1]
-            dist = math.sqrt(dx*dx + dy*dy)
-            overlap = radii[i] + radii[j] - dist
-            if overlap > 0:
-                penalty += overlap**2
-                
-    penalty += boundary_penalty
-    return penalty
-
-def objective_function(vars_flat, weights):
-    """
-    Objective function to minimize.
-    We want to maximize sum(radii), so we minimize -sum(radii).
-    We add penalty terms for overlaps and boundary violations.
-    
-    vars_flat: array of shape [x1, y1, r1, x2, y2, r2, ...]
-    """
-    n = N_CIRCLES
-    centers = np.zeros((n, 2))
-    radii = np.zeros(n)
-    
-    for i in range(n):
-        idx = 3 * i
-        centers[i, 0] = vars_flat[idx]
-        centers[i, 1] = vars_flat[idx + 1]
-        radii[i] = vars_flat[idx + 2]
+    idx_i, idx_j = np.where(overlap > 0)
+    for ii, jj in zip(idx_i, idx_j):
+        o = overlap[ii, jj]
+        d = dists[ii, jj]
+        dir_vec = diff[ii, jj] / d
+        forces[ii] += o * dir_vec
+        forces[jj] -= o * dir_vec
         
-    # Penalty term
-    penalty_val = compute_overlap_penalty(centers, radii)
-    
-    # Objective: -sum(radii) + penalty_weight * penalty
-    obj_val = -np.sum(radii) + weights['penalty_w'] * penalty_val
-    
-    return obj_val
-
-def force_based_expansion():
-    """
-    Initializes a valid packing of 26 circles with equal radii using force-based repulsion.
-    This serves as a warm start for the optimization.
-    """
-    np.random.seed(42) # For reproducibility
-    
-    # Initial placement: random grid-like or random
-    centers = np.random.rand(N_CIRCLES, 2) * 0.8 + 0.1 # Keep away from edges initially
-    r = 0.05 # Initial radius
-    
-    # Simulation parameters
-    dt = 0.05
-    repulsion_strength = 10.0
-    damping = 0.9
-    
-    # Number of expansion steps
-    total_steps = 2000
-    radius_growth_rate = 0.0005
-    
-    velocities = np.zeros((N_CIRCLES, 2))
-    
-    best_sum_radii = 0
-    best_centers = centers.copy()
-    best_radii = np.full(N_CIRCLES, r)
-    
-    for step in range(total_steps):
-        # Increase radius slightly
-        if step % 10 == 0:
-            r += radius_growth_rate
-        
-        # Calculate forces
-        forces = np.zeros_like(centers)
-        
-        # Repulsion between circles
-        for i in range(N_CIRCLES):
-            for j in range(i + 1, N_CIRCLES):
-                dx = centers[i, 0] - centers[j, 0]
-                dy = centers[i, 1] - centers[j, 1]
-                dist_sq = dx*dx + dy*dy
-                dist = math.sqrt(dist_sq)
-                
-                # Overlap distance
-                overlap = 2 * r - dist
-                
-                if overlap > 0:
-                    # Repulsive force proportional to overlap
-                    if dist > 1e-9:
-                        fx = (dx / dist) * overlap * repulsion_strength
-                        fy = (dy / dist) * overlap * repulsion_strength
-                    else:
-                        # Random push if centers coincide
-                        fx = (np.random.rand() - 0.5) * 0.1
-                        fy = (np.random.rand() - 0.5) * 0.1
-                    
-                    forces[i] += [fx, fy]
-                    forces[j] -= [fx, fy]
-        
-        # Boundary forces
-        for i in range(N_CIRCLES):
-            # Left wall
-            if centers[i, 0] - r < 0:
-                forces[i, 0] += (r - centers[i, 0]) * repulsion_strength
-            # Right wall
-            if centers[i, 0] + r > 1.0:
-                forces[i, 0] -= (centers[i, 0] + r - 1.0) * repulsion_strength
-            # Bottom wall
-            if centers[i, 1] - r < 0:
-                forces[i, 1] += (r - centers[i, 1]) * repulsion_strength
-            # Top wall
-            if centers[i, 1] + r > 1.0:
-                forces[i, 1] -= (centers[i, 1] + r - 1.0) * repulsion_strength
-                
-        # Update velocities and positions
-        velocities += forces * dt
-        velocities *= damping # Damping to stabilize
-        centers += velocities * dt
-        
-        # Clamp positions to [r, 1-r] strictly to avoid huge penalties
-        centers[:, 0] = np.clip(centers[:, 0], r, 1.0 - r)
-        centers[:, 1] = np.clip(centers[:, 1], r, 1.0 - r)
-        
-        # Check validity and save best
-        # We do a rough check every 100 steps to avoid overhead
-        if step % 100 == 0:
-            # Reconstruct radii array
-            current_radii = np.full(N_CIRCLES, r)
-            # Check for overlaps roughly
-            valid = True
-            for i in range(N_CIRCLES):
-                for j in range(i+1, N_CIRCLES):
-                    d = np.linalg.norm(centers[i] - centers[j])
-                    if d < 2*r - 1e-7:
-                        valid = False
-                        break
-                if not valid: break
+    # Boundary constraints
+    for i in range(N):
+        r = radii[i]
+        x, y = centers[i]
+        if x < r:
+            forces[i, 0] += (r - x)
+        if x > 1 - r:
+            forces[i, 0] -= (x - (1 - r))
+        if y < r:
+            forces[i, 1] += (r - y)
+        if y > 1 - r:
+            forces[i, 1] -= (y - (1 - r))
             
-            # Check boundaries
-            for i in range(N_CIRCLES):
-                if centers[i, 0] < r - 1e-7 or centers[i, 0] > 1-r + 1e-7 or \
-                   centers[i, 1] < r - 1e-7 or centers[i, 1] > 1-r + 1e-7:
-                    valid = False
+    return forces
+
+def run_packing():
+    np.random.seed(42)
+    N = 26
+    best_sum = 0.0
+    best_res = None
+    
+    # Run multiple trials with different perturbations to escape local minima
+    for trial in range(5):
+        centers = np.zeros((N, 2))
+        idx = 0
+        # Hexagonal lattice initialization for high packing density
+        r_init = 0.096
+        for i in range(6):
+            for j in range(5):
+                if idx >= N: 
                     break
+                x = 0.13 + j * r_init * 2.0
+                y = 0.13 + i * r_init * 1.7320508
+                if i % 2 == 1:
+                    x += r_init
+                centers[idx] = [x, y]
+                idx += 1
+                
+        # Add controlled randomness
+        centers += np.random.uniform(-0.025, 0.025, centers.shape)
+        centers = np.clip(centers, 0.05, 0.95)
+        radii = np.full(N, r_init)
+        
+        lr = 0.035
+        grow = 1.000015
+        
+        for step in range(6000):
+            radii *= grow
+            forces = compute_forces(centers, radii)
             
-            if valid:
-                current_sum = np.sum(current_radii)
-                if current_sum > best_sum_radii:
-                    best_sum_radii = current_sum
-                    best_centers = centers.copy()
-                    best_radii = current_radii.copy()
-                    
-    return best_centers, best_radii
-
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Main function to pack 26 circles.
-    Returns (centers, radii, sum_radii).
-    """
-    # Phase 1: Get a good initial packing with equal radii
-    print("Phase 1: Initializing with force-based expansion...")
-    centers_init, radii_init = force_based_expansion()
-    print(f"Phase 1 result: Sum of radii = {np.sum(radii_init):.5f}")
-    
-    # Phase 2: Refine using scipy.optimize with penalty method
-    # We allow radii to vary to potentially increase the sum.
-    
-    # Flatten initial state
-    # Format: [x1, y1, r1, x2, y2, r2, ...]
-    x0 = np.zeros(3 * N_CIRCLES)
-    for i in range(N_CIRCLES):
-        x0[3*i] = centers_init[i, 0]
-        x0[3*i+1] = centers_init[i, 1]
-        x0[3*i+2] = radii_init[i]
-        
-    # Bounds: x, y in [0, 1], r in [0, 0.5]
-    bounds = []
-    for i in range(N_CIRCLES):
-        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
-        
-    # Penalty weights
-    # Start with high weight to enforce constraints, but might need adjustment
-    # Since we start valid, we can use a weight that pushes boundaries.
-    weights = {'penalty_w': 1000.0}
-    
-    print("Phase 2: Optimizing centers and radii...")
-    
-    # Run optimization
-    # L-BFGS-B is good for bound-constrained problems
-    result = minimize(
-        objective_function, 
-        x0, 
-        args=(weights,), 
-        method='L-BFGS-B', 
-        bounds=bounds,
-        options={'maxiter': 500, 'ftol': 1e-12}
-    )
-    
-    # Extract result
-    x_opt = result.x
-    centers_opt = np.zeros((N_CIRCLES, 2))
-    radii_opt = np.zeros(N_CIRCLES)
-    
-    for i in range(N_CIRCLES):
-        centers_opt[i, 0] = x_opt[3*i]
-        centers_opt[i, 1] = x_opt[3*i+1]
-        radii_opt[i] = x_opt[3*i+2]
-        
-    # If optimization resulted in slight violations due to numerical error or penalty balance,
-    # we might need to shrink radii slightly to ensure strict validity.
-    # However, with high penalty weight and starting from valid, it should be close.
-    # Let's check and fix.
-    
-    # Safety clamp: ensure centers are within valid range for their radii
-    for i in range(N_CIRCLES):
-        r = radii_opt[i]
-        centers_opt[i, 0] = np.clip(centers_opt[i, 0], r, 1.0 - r)
-        centers_opt[i, 1] = np.clip(centers_opt[i, 1], r, 1.0 - r)
-        
-    # Check for overlaps and shrink if necessary
-    # This is a greedy fix: if two circles overlap, reduce the larger radius or both
-    # But since we want to maximize sum, shrinking is bad.
-    # However, if the optimizer failed to satisfy constraints, we must.
-    
-    # Let's run a quick validation check logic here to adjust if needed
-    # If we detect overlap, we reduce radii slightly.
-    
-    # Heuristic shrink if penalty is non-zero
-    penalty = compute_overlap_penalty(centers_opt, radii_opt)
-    if penalty > 1e-6:
-        # Simple scaling down
-        scale = 0.95
-        radii_opt *= scale
-        # Re-center? Or just clip. Clipping is safer.
-        for i in range(N_CIRCLES):
-            r = radii_opt[i]
-            centers_opt[i, 0] = np.clip(centers_opt[i, 0], r, 1.0 - r)
-            centers_opt[i, 1] = np.clip(centers_opt[i, 1], r, 1.0 - r)
+            # Clip forces to prevent instability during high-overlap phases
+            max_force = np.max(np.abs(forces))
+            if max_force > 0.8:
+                forces = forces / max_force
+                
+            centers += lr * forces
+            centers = np.clip(centers, 0.0, 1.0)
             
-    sum_radii = np.sum(radii_opt)
-    
-    return centers_opt, radii_opt, sum_radii
+            # Random kicks to escape local minima
+            if step % 300 == 0:
+                centers += np.random.normal(0, 0.004, centers.shape)
+                centers = np.clip(centers, 0.0, 1.0)
+                
+            # Cooling schedule
+            lr *= 0.9995
+            if step % 800 == 0:
+                grow *= 0.97
+                
+        current_sum = np.sum(radii)
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_res = (centers, radii, current_sum)
+            
+    return best_res
 ```

@@ -1,0 +1,172 @@
+# sol_000030 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000028 (state 1c5b6a86) state=c8dd9bab sum of radii=0.350787 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_func(v, n):
+    """Objective: Minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def constraint_func(v, n, pair_i, pair_j):
+    """Compute inequality constraints: boundaries and non-overlap."""
+    centers = v[:2*n].reshape(n, 2)
+    radii = v[2*n:]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    b_cons = np.concatenate([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ])
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    ci = centers[pair_i]
+    cj = centers[pair_j]
+    ri = radii[pair_i]
+    rj = radii[pair_j]
+    
+    dist_sq = np.sum((ci - cj)**2, axis=1)
+    r_sum = ri + rj
+    o_cons = dist_sq - r_sum**2
+    
+    return np.concatenate([b_cons, o_cons])
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    
+    # Precompute pair indices for vectorized constraint evaluation
+    pair_i = []
+    pair_j = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_i.append(i)
+            pair_j.append(j)
+    pair_i = np.array(pair_i)
+    pair_j = np.array(pair_j)
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    best_sum = -1.0
+    best_sol = None
+    
+    # Multi-start optimization with hexagonal lattice initialization and controlled jitter
+    for seed in range(25):
+        np.random.seed(seed)
+        
+        # Generate hexagonal lattice points
+        r_start = 0.08
+        init_centers = []
+        y = r_start
+        row = 0
+        while len(init_centers) < n + 10:
+            x_start = r_start if row % 2 == 0 else 2 * r_start
+            x = x_start
+            while x <= 1 - r_start and len(init_centers) < n + 10:
+                init_centers.append([x, y])
+                x += 2 * r_start
+            y += np.sqrt(3) * r_start
+            row += 1
+            
+        init_centers = np.array(init_centers[:n])
+        
+        # Apply jitter to break symmetry and explore different basins of attraction
+        jitter_mag = 0.015 + seed * 0.004
+        init_centers += np.random.uniform(-jitter_mag, jitter_mag, size=init_centers.shape)
+        init_centers = np.clip(init_centers, 0.05, 0.95)
+        
+        # Initialize radii slightly smaller than lattice spacing to guarantee feasibility
+        r_init = np.full(n, r_start * 0.7)
+        
+        v0 = np.zeros(3 * n)
+        for i in range(n):
+            v0[3*i] = init_centers[i, 0]
+            v0[3*i+1] = init_centers[i, 1]
+            v0[3*i+2] = r_init[i]
+            
+        try:
+            res = minimize(objective_func, v0, args=(n,), method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraint_func, 'args': (n, pair_i, pair_j)},
+                           options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            
+            # Validate candidate solution before accepting
+            if -res.fun > best_sum:
+                c_opt = res.x[:2*n].reshape(n, 2)
+                r_opt = res.x[2*n:]
+                
+                valid = True
+                if np.any(r_opt < 0) or np.any(c_opt < -1e-7) or np.any(c_opt > 1 + 1e-7):
+                    valid = False
+                    
+                if valid:
+                    # Check boundary constraints
+                    if np.any(c_opt[:, 0] - r_opt < -1e-7) or np.any(1 - c_opt[:, 0] - r_opt < -1e-7):
+                        valid = False
+                    if np.any(c_opt[:, 1] - r_opt < -1e-7) or np.any(1 - c_opt[:, 1] - r_opt < -1e-7):
+                        valid = False
+                        
+                if valid:
+                    # Check pairwise overlaps
+                    diffs = c_opt[pair_i] - c_opt[pair_j]
+                    dists = np.sqrt(np.sum(diffs**2, axis=1))
+                    r_sums = r_opt[pair_i] + r_opt[pair_j]
+                    if np.any(dists < r_sums - 1e-7):
+                        valid = False
+                        
+                if valid:
+                    best_sum = -res.fun
+                    best_sol = res.x.copy()
+                    
+        except Exception:
+            continue
+            
+    # Fallback configuration if optimization fails completely
+    if best_sol is None:
+        best_sol = np.zeros(3*n)
+        grid = np.linspace(0.1, 0.9, 6)
+        idx = 0
+        for x in grid:
+            for y in grid:
+                if idx < n:
+                    best_sol[3*idx] = x
+                    best_sol[3*idx+1] = y
+                    best_sol[3*idx+2] = 0.05
+                    idx += 1
+                    
+    centers = best_sol[:2*n].reshape(n, 2)
+    radii = best_sol[2*n:]
+    
+    # Strict post-processing to guarantee validator compliance
+    # Iteratively resolves micro-violations from floating-point drift
+    for _ in range(30):
+        changed = False
+        
+        # Enforce boundary constraints strictly
+        for i in range(n):
+            max_r = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            if radii[i] > max_r + 1e-9:
+                radii[i] = max_r
+                changed = True
+                
+        # Enforce non-overlap constraints strictly
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt((centers[i, 0] - centers[j, 0])**2 + (centers[i, 1] - centers[j, 1])**2)
+                if radii[i] + radii[j] > d + 1e-9:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-10
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+                    changed = True
+                    
+        if not changed:
+            break
+            
+    return centers, radii, float(np.sum(radii))

@@ -1,0 +1,235 @@
+
+
+<strategy>
+To push the sum of radii beyond 2.636, we need a robust global-to-local optimization pipeline that escapes local minima effectively and precisely tunes both centers and radii.
+
+1. **Decouple Centers and Radii**: For fixed centers, finding optimal radii is a Linear Program (LP). This gives an exact, differentiable objective landscape w.r.t centers.
+2. **Global Search via Differential Evolution (DE)**: Use DE to explore the 52-dimensional center space. The objective function evaluates the LP-based max sum of radii. DE is robust for non-convex landscapes and will find high-quality topological arrangements (likely hexagonal-like).
+3. **Exact Gradient Ascent**: After DE, refine centers using gradient ascent. The gradient is computed exactly using LP dual variables (shadow prices), which indicate how much the sum of radii increases per unit movement of each center. This is mathematically precise and faster than numerical gradients.
+4. **Diverse Initializations**: Supplement DE with hand-crafted hexagonal lattice patterns (varied row counts) run through the gradient ascent to ensure we cover known dense packing topologies.
+5. **Joint SLSQP Polish**: Finally, optimize centers and radii simultaneously using SLSQP with squared-distance constraints to squeeze out the last bits of precision.
+6. **Strict Numerical Repair**: Iteratively shrink radii to strictly satisfy the validator's `1e-12` tolerance for overlaps and boundaries, guaranteeing `validate_packing` returns `True`.
+
+This pipeline combines global exploration, exact mathematical gradients, and constrained local polishing to systematically approach the theoretical optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, differential_evolution, minimize
+
+N = 26
+A_ub_global = None
+pairs_global = None
+
+def init_lp_matrices():
+    global A_ub_global, pairs_global
+    num_pairs = N * (N - 1) // 2
+    A = np.zeros((num_pairs + 4 * N, N))
+    idx = 0
+    pairs = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            pairs.append((i, j))
+            idx += 1
+    for i in range(N):
+        for _ in range(4):
+            A[idx, i] = 1.0
+            idx += 1
+    A_ub_global = A
+    pairs_global = pairs
+
+def solve_lp_gradient(centers):
+    global A_ub_global, pairs_global
+    n = centers.shape[0]
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    b_ub = np.zeros(A_ub_global.shape[0])
+    idx = 0
+    for i, j in pairs_global:
+        b_ub[idx] = dists[i, j]
+        idx += 1
+    for i in range(n):
+        b_ub[idx] = centers[i, 0]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        b_ub[idx] = centers[i, 1]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    res = linprog(-np.ones(n), A_ub=A_ub_global, b_ub=b_ub, bounds=[(0, u) for u in ub], method='highs')
+    if not res.success:
+        return None, -1.0, None
+        
+    radii = res.x
+    duals = res.ineqlin.marginals
+    grad = np.zeros_like(centers)
+    
+    idx = 0
+    for i, j in pairs_global:
+        lam = duals[idx]
+        if lam > 1e-8:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        idx += 1
+        
+    b_start = len(pairs_global)
+    for i in range(n):
+        grad[i, 0] += duals[b_start + 4*i] - duals[b_start + 4*i + 1]
+        grad[i, 1] += duals[b_start + 4*i + 2] - duals[b_start + 4*i + 3]
+        
+    return radii, np.sum(radii), grad
+
+def obj_de(x):
+    c = x.reshape(N, 2)
+    _, s = solve_lp_gradient(c)
+    return -s if s > 0 else 10.0
+
+def run_gradient_ascent(centers0, max_iter=3000):
+    centers = centers0.copy()
+    best_c = centers.copy()
+    best_sum = -1.0
+    step = 0.005
+    for k in range(max_iter):
+        radii, curr_sum, grad = solve_lp_gradient(centers)
+        if radii is None:
+            break
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_c = centers.copy()
+            
+        g_norm = np.linalg.norm(grad)
+        if g_norm < 1e-10:
+            break
+            
+        if k > 1500:
+            step *= 0.998
+        if k % 500 == 0 and k > 0:
+            step *= 0.8
+            
+        centers += step * grad / g_norm
+        centers = np.clip(centers, 0.001, 0.999)
+        
+        if k % 200 == 0:
+            centers += np.random.normal(0, 0.0005, centers.shape)
+            centers = np.clip(centers, 0.001, 0.999)
+            
+    return best_c, best_sum
+
+def get_slsqp_bounds():
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def slsqp_obj(v):
+    return -np.sum(v[2::3])
+
+def slsqp_cons(v):
+    c = v.reshape(N, 3)
+    xs = c[:, 0]
+    ys = c[:, 1]
+    rs = c[:, 2]
+    
+    con = [xs - rs, 1.0 - xs - rs, ys - rs, 1.0 - ys - rs]
+    
+    idx = np.triu_indices(N, 1)
+    dx = xs[idx[0]] - xs[idx[1]]
+    dy = ys[idx[0]] - ys[idx[1]]
+    dr = rs[idx[0]] + rs[idx[1]]
+    con.append(dx**2 + dy**2 - dr**2)
+    
+    return np.concatenate(con)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    init_lp_matrices()
+    
+    best_c = None
+    best_sum = -1.0
+    
+    # 1. Differential Evolution on centers
+    bounds_de = [(0.05, 0.95)] * (2 * N)
+    res_de = differential_evolution(obj_de, bounds_de, popsize=20, maxiter=150, 
+                                    seed=42, workers=1, tol=1e-8, polish=False)
+    c_de = res_de.x.reshape(N, 2)
+    
+    # 2. Gradient Ascent from DE result
+    c_ga, s_ga = run_gradient_ascent(c_de)
+    if s_ga > best_sum:
+        best_sum = s_ga
+        best_c = c_ga
+        
+    # 3. Try diverse hexagonal starts + GA
+    patterns = [[6,5,6,5,4], [5,6,5,6,4], [5,5,5,5,6], [4,6,6,6,4], [6,4,6,5,5]]
+    for pat in patterns:
+        r_est = 0.095
+        c = []
+        y = r_est
+        for r_idx, cnt in enumerate(pat):
+            shift = r_est if r_idx % 2 == 1 else 0.0
+            x = r_est + shift
+            for _ in range(cnt):
+                c.append([x, y])
+                x += 2.0 * r_est
+            y += r_est * np.sqrt(3)
+        c = np.array(c[:N])
+        c += np.random.normal(0, 0.002, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        
+        c_opt, s_opt = run_gradient_ascent(c)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt
+            
+    # 4. SLSQP Polish (joint centers + radii)
+    r_lp, _, _ = solve_lp_gradient(best_c)
+    v0 = np.zeros(3 * N)
+    v0[0::3] = best_c[:, 0]
+    v0[1::3] = best_c[:, 1]
+    v0[2::3] = r_lp
+    
+    try:
+        res = minimize(slsqp_obj, v0, method='SLSQP', bounds=get_slsqp_bounds(),
+                       constraints={'type': 'ineq', 'fun': slsqp_cons},
+                       options={'maxiter': 5000, 'ftol': 1e-14})
+        if -res.fun > best_sum:
+            best_c = res.x.reshape(N, 3)[:, :2]
+            r_lp = res.x.reshape(N, 3)[:, 2]
+            best_sum = -res.fun
+    except Exception:
+        pass
+        
+    # 5. Strict numerical repair to guarantee validation passes
+    centers = best_c
+    radii = r_lp
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            mr = min(x, 1.0 - x, y, 1.0 - y)
+            if r > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

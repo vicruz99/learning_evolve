@@ -1,0 +1,162 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust global optimization strategy that escapes local minima typical of dense packing problems. Gradient-based methods like SLSQP work well for local refinement but struggle with initialization. We will use a two-stage approach:
+
+1. **Global Exploration with Differential Evolution (DE)**: We formulate a penalty-based objective function that penalizes boundary violations and circle overlaps quadratically. DE explores the 78-dimensional space (x, y, r for each circle) robustly without requiring gradients. A high penalty weight ensures the search focuses on feasible configurations.
+2. **Local Refinement with SLSQP**: The best solution from DE is passed to SLSQP with explicit inequality constraints. SLSQP precisely pushes the radii to their maximum feasible values while maintaining strict non-overlap and boundary conditions.
+3. **Optimization & Safety**: We precompute triangular indices to speed up pairwise constraint evaluations. A post-processing safety loop slightly scales down radii if numerical drift causes micro-violations, ensuring strict compliance with the validator. Multiple DE seeds are tried briefly to improve the chance of finding the global basin.
+
+This hybrid method combines DE's global reach with SLSQP's constraint-handling precision, reliably surpassing greedy or pure-grid approaches.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+
+N_CIRCLES = 26
+PENALTY_W = 1e5
+
+def objective_de(x):
+    """Objective for Differential Evolution with penalty terms."""
+    centers = x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = x[2*N_CIRCLES:]
+    
+    # Primary objective: maximize sum of radii -> minimize negative sum
+    obj = -np.sum(radii)
+    
+    # Boundary penalties
+    v1 = np.maximum(0, radii - centers[:, 0])
+    v2 = np.maximum(0, radii + centers[:, 0] - 1.0)
+    v3 = np.maximum(0, radii - centers[:, 1])
+    v4 = np.maximum(0, radii + centers[:, 1] - 1.0)
+    b_pen = np.sum(v1**2) + np.sum(v2**2) + np.sum(v3**2) + np.sum(v4**2)
+    
+    # Overlap penalties
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-12)
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    idx_u, idx_v = np.triu_indices(N_CIRCLES, k=1)
+    o_pen = np.sum(np.maximum(0, r_sum[idx_u, idx_v] - dists[idx_u, idx_v])**2)
+    
+    return obj + PENALTY_W * (b_pen + o_pen)
+
+def slsqp_obj(x):
+    """Objective for SLSQP refinement."""
+    return -np.sum(x[2*N_CIRCLES:])
+
+def slsqp_constr(x):
+    """Explicit inequality constraints for SLSQP."""
+    centers = x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = x[2*N_CIRCLES:]
+    c = []
+    
+    # Boundary: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c.extend(centers[:, 0] - radii)
+    c.extend(1.0 - centers[:, 0] - radii)
+    c.extend(centers[:, 1] - radii)
+    c.extend(1.0 - centers[:, 1] - radii)
+    
+    # Non-overlap: dist^2 >= (r_i + r_j)^2
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    idx_u, idx_v = np.triu_indices(N_CIRCLES, k=1)
+    c.extend(dist_sq[idx_u, idx_v] - r_sum[idx_u, idx_v]**2)
+    
+    return np.array(c)
+
+def get_bounds_list():
+    """Variable bounds: x,y in [0,1], r in [1e-6, 0.5]."""
+    bounds = []
+    for _ in range(N_CIRCLES):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)])
+    return bounds
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bnds = get_bounds_list()
+    
+    # Stage 1: Global search with Differential Evolution
+    best_x = None
+    best_val = np.inf
+    
+    # Run a few seeds to ensure we hit a good basin
+    for seed in range(3):
+        np.random.seed(seed)
+        try:
+            res = differential_evolution(
+                objective_de,
+                bounds=bnds,
+                popsize=15,
+                maxiter=250,
+                tol=1e-8,
+                mutation=(0.5, 1.0),
+                recombination=0.9,
+                seed=seed,
+                polishing=False
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                best_x = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback initialization if DE fails
+    if best_x is None:
+        best_x = np.zeros(3 * N_CIRCLES)
+        r_init = 0.06
+        dx = 2.0 * r_init * 1.1
+        dy = np.sqrt(3) * r_init * 1.1
+        y = r_init
+        row = 0
+        idx = 0
+        while idx < N_CIRCLES:
+            x = r_init
+            if row % 2 == 1:
+                x += dx / 2.0
+            while x <= 1.0 - r_init and idx < N_CIRCLES:
+                best_x[3*idx] = x
+                best_x[3*idx+1] = y
+                best_x[3*idx+2] = r_init
+                idx += 1
+                x += dx
+            y += dy
+            row += 1
+
+    # Stage 2: Local refinement with SLSQP
+    cons = {'type': 'ineq', 'fun': slsqp_constr}
+    try:
+        res_sl = minimize(slsqp_obj, best_x, method='SLSQP', bounds=bnds, constraints=cons,
+                          options={'maxiter': 2000, 'ftol': 1e-12})
+        if res_sl.success and res_sl.fun < best_val:
+            best_x = res_sl.x
+    except Exception:
+        pass
+        
+    centers = best_x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = best_x[2*N_CIRCLES:]
+    
+    # Safety scaling to guarantee strict validity against validator tolerances
+    for _ in range(50):
+        valid = True
+        for i in range(N_CIRCLES):
+            x, y = centers[i]
+            r = radii[i]
+            if x < r - 1e-9 or x > 1.0 - r + 1e-9 or y < r - 1e-9 or y > 1.0 - r + 1e-9:
+                valid = False
+                break
+        if valid:
+            for i in range(N_CIRCLES):
+                for j in range(i+1, N_CIRCLES):
+                    dist = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                    if dist < radii[i] + radii[j] - 1e-9:
+                        valid = False
+                        break
+                if not valid: break
+        if valid:
+            break
+        radii *= 0.999
+        
+    radii = np.maximum(radii, 1e-6)
+    return centers, radii, float(np.sum(radii))
+```

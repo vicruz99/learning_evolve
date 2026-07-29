@@ -1,0 +1,182 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat the problem as a bi-level optimization:
+1. **Inner Problem (Radii)**: For any fixed set of centers, finding the optimal radii that maximize $\sum r_i$ subject to non-overlap and boundary constraints is a **Linear Program (LP)**. This can be solved exactly and very quickly.
+2. **Outer Problem (Centers)**: We optimize the centers to maximize the optimal objective value of the inner LP. The gradient of the LP objective with respect to the centers can be computed exactly using the **dual variables (shadow prices)** from the LP solution via sensitivity analysis. 
+   - If a pairwise constraint $r_i + r_j \le d_{ij}$ is active, the dual $\lambda_{ij} \ge 0$ tells us how much the sum of radii increases if we increase the distance $d_{ij}$. This yields a repulsive force proportional to $\lambda_{ij} \frac{\vec{c}_i - \vec{c}_j}{d_{ij}}$.
+   - If a boundary constraint $r_i \le x_i$ is active, the dual $\mu_i \ge 0$ yields a force pushing $x_i$ positively, etc.
+
+We implement this by defining a function that returns the negative sum of radii and its gradient with respect to flattened centers, then use `scipy.optimize.minimize` with `L-BFGS-B` to perform gradient ascent on the centers. We run this from multiple diverse initial configurations (hexagonal lattices and force-repulsion spread points) to escape local minima. Finally, we solve the LP one last time for the best centers and apply a strict numerical repair pass to guarantee all constraints are satisfied within tolerance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+NUM_PAIRS = N * (N - 1) // 2
+NUM_BOUND = 4 * N
+M = NUM_PAIRS + NUM_BOUND
+
+# Precompute A_ub and pair_indices for LP
+A_ub = np.zeros((M, N))
+pair_indices = []
+idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_ub[idx, i] = 1.0
+        A_ub[idx, j] = 1.0
+        pair_indices.append((i, j))
+        idx += 1
+
+for i in range(N):
+    A_ub[idx, i] = 1.0; idx += 1
+    A_ub[idx, i] = 1.0; idx += 1
+    A_ub[idx, i] = 1.0; idx += 1
+    A_ub[idx, i] = 1.0; idx += 1
+
+c_obj = -np.ones(N)
+bounds_r = [(0.0, None)] * N
+
+def eval_and_grad_C(centers_flat):
+    """
+    Computes the negative sum of optimal radii and its gradient w.r.t centers.
+    Uses LP dual variables for exact gradient via sensitivity analysis.
+    """
+    c = centers_flat.reshape(N, 2)
+    b_ub = np.zeros(M)
+    p_idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(c[i,0]-c[j,0], c[i,1]-c[j,1])
+            b_ub[p_idx] = d
+            p_idx += 1
+            
+    for i in range(N):
+        b_ub[p_idx] = c[i, 0]; p_idx += 1
+        b_ub[p_idx] = 1.0 - c[i, 0]; p_idx += 1
+        b_ub[p_idx] = c[i, 1]; p_idx += 1
+        b_ub[p_idx] = 1.0 - c[i, 1]; p_idx += 1
+        
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+    
+    if not res.success:
+        return 1e9, np.zeros_like(centers_flat)
+        
+    duals = res.ineqlin.marginals
+    sum_r = np.sum(res.x)
+    
+    grad_flat = np.zeros_like(centers_flat)
+    grad = grad_flat.reshape(N, 2)
+    
+    # Pairwise gradient terms from duals
+    p_idx = 0
+    for i, j in pair_indices:
+        lam = max(duals[p_idx], 0.0)
+        d = np.hypot(c[i,0]-c[j,0], c[i,1]-c[j,1])
+        if d > 1e-9:
+            vec = c[i] - c[j]
+            force = (lam / d) * vec
+            grad[i] += force
+            grad[j] -= force
+        p_idx += 1
+        
+    # Boundary gradient terms from duals
+    b_start = NUM_PAIRS
+    for i in range(N):
+        grad[i, 0] += duals[b_start + 4*i]
+        grad[i, 0] -= duals[b_start + 4*i + 1]
+        grad[i, 1] += duals[b_start + 4*i + 2]
+        grad[i, 1] -= duals[b_start + 4*i + 3]
+        
+    # Return negative sum and negative gradient for minimization framework
+    return -sum_r, -grad_flat
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    
+    # 1. Hexagonal lattice initialization
+    pts = []
+    for row in range(7):
+        for col in range(7):
+            x = col * 0.18 + (row % 2) * 0.09 + 0.06
+            y = row * 0.155 + 0.06
+            if x < 0.94 and y < 0.94:
+                pts.append([x, y])
+    inits.append(np.array(pts[:N]) + rng.normal(0, 0.003, (N, 2)))
+    
+    # 2. Force-repulsion spread initializations to find diverse basins
+    for _ in range(18):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(400):
+            diff = c[:, None, :] - c[None, :, :]
+            dists = np.linalg.norm(diff, axis=2)
+            np.fill_diagonal(dists, 1.0)
+            forces = np.sum(diff / (dists**2)[:, :, None], axis=1)
+            c += 0.008 * forces
+            c = np.clip(c, 0.08, 0.92)
+        inits.append(c)
+        
+    bounds_c = [(0.005, 0.995)] * (2*N)
+    
+    for c_init in inits:
+        x0 = c_init.flatten()
+        try:
+            # Gradient ascent on centers via L-BFGS-B
+            res = minimize(eval_and_grad_C, x0, method='L-BFGS-B', bounds=bounds_c,
+                           options={'maxiter': 1000, 'ftol': 1e-15, 'gtol': 1e-13})
+            c_opt = res.x.reshape(N, 2)
+            
+            # Final exact LP solve for radii on optimized centers
+            b_ub = np.zeros(M)
+            p_idx = 0
+            for i in range(N):
+                for j in range(i+1, N):
+                    b_ub[p_idx] = np.hypot(c_opt[i,0]-c_opt[j,0], c_opt[i,1]-c_opt[j,1])
+                    p_idx += 1
+            for i in range(N):
+                b_ub[p_idx] = c_opt[i,0]; p_idx += 1
+                b_ub[p_idx] = 1.0-c_opt[i,0]; p_idx += 1
+                b_ub[p_idx] = c_opt[i,1]; p_idx += 1
+                b_ub[p_idx] = 1.0-c_opt[i,1]; p_idx += 1
+                
+            res_lp = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+            if res_lp.success:
+                s = np.sum(res_lp.x)
+                if s > best_sum:
+                    best_sum = s
+                    best_c = c_opt.copy()
+                    best_r = res_lp.x.copy()
+        except Exception:
+            pass
+            
+    # Strict numerical repair to guarantee validation passes within tolerance
+    radii = best_r.copy()
+    centers = best_c.copy()
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    shr = (radii[i] + radii[j] - d)/2.0 + 1e-9
+                    radii[i] -= shr
+                    radii[j] -= shr
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed: 
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

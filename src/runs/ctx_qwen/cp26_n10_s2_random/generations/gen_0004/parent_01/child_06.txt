@@ -1,0 +1,160 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a hybrid optimization strategy combining global search, structured initializations, and intensive local refinement:
+
+1. **Global Search via Differential Evolution (DE)**: We first optimize only the center coordinates (52 variables) using DE. The objective is the negative sum of the maximum feasible radii given fixed centers. This avoids the non-convex joint constraint landscape initially and finds a high-quality region of the configuration space.
+2. **Structured Hexagonal Initializations**: We generate several hexagonal lattice patterns with varying row counts and shifts. Hexagonal packing is theoretically optimal for density, providing strong baselines that DE might miss.
+3. **Intensive Local Refinement (SLSQP)**: Starting from the best configurations found (DE result and hex patterns), we run `scipy.optimize.minimize` with the SLSQP method on the full 78-dimensional space (centers + radii). We use strict inequality constraints for boundaries and non-overlap. Multiple perturbation passes with decaying noise help escape shallow local minima.
+4. **Strict Numerical Repair**: Finally, we iteratively shrink radii to resolve any residual overlaps or boundary violations caused by numerical precision limits, ensuring the output strictly satisfies the validation function's `1e-12` tolerance.
+
+This multi-phase approach balances exploration and exploitation, pushing the sum of radii well past the 2.628 baseline toward the theoretical limit.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+
+N = 26
+
+def compute_max_radii(centers):
+    """Computes the maximum feasible radius for each circle given fixed centers."""
+    c = centers.copy()
+    c = np.clip(c, 1e-9, 1.0 - 1e-9)
+    rb = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), 
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    dists = np.linalg.norm(c[:, None, :] - c[None, :, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+    rp = 0.5 * np.min(dists, axis=1)
+    return np.minimum(rb, rp)
+
+def de_objective(centers_flat):
+    """Objective for Differential Evolution: maximize sum of radii."""
+    c = centers_flat.reshape(N, 2)
+    r = compute_max_radii(c)
+    return -np.sum(r)
+
+def obj_func(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def compute_constraints(v):
+    """Computes boundary and non-overlap constraints. Must be >= 0."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = []
+    # Boundary constraints
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    # Overlap constraints
+    idx = np.triu_indices(N, 1)
+    d = np.linalg.norm(c[idx[0]] - c[idx[1]], axis=1)
+    con.append(d - (r[idx[0]] + r[idx[1]]))
+    return np.concatenate(con)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    bounds_opt = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    # Phase 1: Global search with Differential Evolution
+    bounds_de = [(0.02, 0.98)] * (2 * N)
+    try:
+        de_res = differential_evolution(de_objective, bounds_de, seed=42, maxiter=150, 
+                                        popsize=15, tol=1e-9, mutation=(0.5, 1.0), 
+                                        recombination=0.9, polish=True)
+        c_de = de_res.x.reshape(N, 2)
+        r_de = compute_max_radii(c_de)
+        if np.sum(r_de) > best_sum:
+            best_sum = np.sum(r_de)
+            best_c = c_de.copy()
+            best_r = r_de.copy()
+    except Exception:
+        pass
+        
+    # Phase 2: Structured Hexagonal Starts
+    patterns = [[5,5,5,5,6], [5,6,5,6,4], [6,5,6,5,4], [4,6,6,6,4]]
+    for pat in patterns:
+        c_hex = []
+        r_est = 0.095
+        y = r_est
+        for r_idx, cnt in enumerate(pat):
+            shift = r_est if r_idx % 2 == 1 else 0.0
+            x = r_est + shift
+            for _ in range(cnt):
+                if len(c_hex) < N:
+                    c_hex.append([x, y])
+                x += 2.0 * r_est
+            y += r_est * np.sqrt(3)
+        c_hex = np.array(c_hex[:N]) + rng.normal(0, 0.002, (N, 2))
+        c_hex = np.clip(c_hex, 0.1, 0.9)
+        r_hex = compute_max_radii(c_hex)
+        if np.sum(r_hex) > best_sum:
+            best_sum = np.sum(r_hex)
+            best_c = c_hex.copy()
+            best_r = r_hex.copy()
+            
+    if best_c is None:
+        best_c = rng.uniform(0.15, 0.85, (N, 2))
+        best_r = compute_max_radii(best_c)
+        best_sum = np.sum(best_r)
+
+    # Phase 3: Local Refinement with SLSQP
+    v0 = np.concatenate([best_c.flatten(), best_r])
+    
+    for i in range(20):
+        if i == 0:
+            v_curr = v0.copy()
+        else:
+            noise = 0.005 * (0.8 ** (i // 3))
+            c_pert = best_c.copy() + rng.normal(0, noise, best_c.shape)
+            c_pert = np.clip(c_pert, 0.01, 0.99)
+            r_pert = compute_max_radii(c_pert) * 0.99
+            v_curr = np.concatenate([c_pert.flatten(), r_pert])
+            
+        try:
+            res = minimize(obj_func, v_curr, method='SLSQP', bounds=bounds_opt, 
+                          constraints=cons, options={'maxiter': 20000, 'ftol': 1e-15, 'disp': False})
+            
+            c_vals = compute_constraints(res.x)
+            if np.min(c_vals) >= -1e-8:
+                s = np.sum(res.x[2*N:])
+                if s > best_sum:
+                    best_sum = s
+                    best_c = res.x[:2*N].reshape(N, 2).copy()
+                    best_r = res.x[2*N:].copy()
+        except Exception:
+            continue
+            
+    # Phase 4: Strict Numerical Repair
+    radii = best_r.copy()
+    centers = best_c.copy()
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            max_r = min(x, 1.0-x, y, 1.0-y)
+            if r > max_r + 1e-12:
+                radii[i] = max_r
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,207 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we can exploit the fact that for any fixed set of centers, the optimal radii are found by solving a Linear Programming (LP) problem. This transforms the non-convex joint optimization into a bi-level optimization: optimize centers to maximize the LP objective.
+
+1. **LP Formulation for Radii**: Given centers, radii `r_i` are constrained by `r_i + r_j <= dist(i,j)` and `r_i <= distance to boundary`. Maximizing `sum(r_i)` under these linear constraints is solved exactly and quickly using `scipy.optimize.linprog` with the `highs` method.
+2. **Center Optimization**: We optimize only the 52 center coordinates. The objective function evaluates the LP for radii and returns the negative sum. Since this objective is non-smooth (piecewise linear due to min/max constraints), we use `Powell` (derivative-free) which handles such landscapes robustly.
+3. **Multi-Start & Local Search**: We initialize with diverse configurations (hexagonal lattices, corner-focused, random dense). After finding the best local optimum with Powell, we perform a targeted local search with decaying step-size perturbations to escape shallow local minima.
+4. **Final Polish & Validation**: A final high-precision Powell run squeezes out remaining gains. We then run a strict numerical repair pass to guarantee compliance with the `1e-12` tolerance in the validation function.
+
+This hybrid LP + derivative-free center optimization approach typically outperforms direct SLSQP on the full 78-dimensional space because it decouples the hard non-convex distance constraints from the radius variables, allowing the optimizer to focus purely on geometry.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+
+# Precompute indices and matrices for the LP to maximize efficiency
+pair_indices = [(i, j) for i in range(N) for j in range(i + 1, N)]
+num_pairs = len(pair_indices)
+
+# A_ub structure: [pairwise constraints] + [boundary constraints]
+A_ub_pairs = np.zeros((num_pairs, N))
+for k, (i, j) in enumerate(pair_indices):
+    A_ub_pairs[k, i] = 1.0
+    A_ub_pairs[k, j] = 1.0
+
+A_ub_bound = np.zeros((4 * N, N))
+for i in range(N):
+    A_ub_bound[4 * i, i] = 1.0      # x
+    A_ub_bound[4 * i + 1, i] = 1.0  # 1-x
+    A_ub_bound[4 * i + 2, i] = 1.0  # y
+    A_ub_bound[4 * i + 3, i] = 1.0  # 1-y
+
+A_ub = np.vstack([A_ub_pairs, A_ub_bound])
+c_obj = -np.ones(N)
+bounds_r = [(0.0, None)] * N
+
+def compute_max_sum_radii(centers):
+    """Solves LP to find max sum of radii for a given set of centers."""
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    b_ub = np.empty(num_pairs + 4 * N)
+    idx = 0
+    
+    # Pairwise distances
+    for k, (i, j) in enumerate(pair_indices):
+        b_ub[idx] = dists[i, j]
+        idx += 1
+        
+    # Boundary distances
+    for i in range(N):
+        b_ub[idx] = centers[i, 0]
+        b_ub[idx+1] = 1.0 - centers[i, 0]
+        b_ub[idx+2] = centers[i, 1]
+        b_ub[idx+3] = 1.0 - centers[i, 1]
+        idx += 4
+        
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+    if res.success:
+        return -res.fun, res.x
+    return 0.0, np.zeros(N)
+
+def objective_centers(centers_flat):
+    """Objective for center optimization: minimize negative sum of LP-optimal radii."""
+    centers = centers_flat.reshape(N, 2)
+    # Ensure centers stay strictly inside to prevent LP boundary issues
+    centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+    val, _ = compute_max_sum_radii(centers)
+    return -val
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Packs 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    bounds_centers = [(0.0, 1.0)] * (2 * N)
+    
+    # Generate diverse initial configurations
+    inits = []
+    
+    # 1. Hexagonal lattices with varying base radii
+    for r0 in [0.085, 0.09, 0.095, 0.10, 0.105]:
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x = r0 if row % 2 == 0 else 2 * r0
+            while x + r0 <= 1.0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        inits.append(np.array(pts[:N]))
+        
+    # 2. Perturbed hexagonal lattices
+    for base in inits[:3]:
+        for _ in range(3):
+            p = base + np.random.normal(0, 0.004, base.shape)
+            p = np.clip(p, 0.02, 0.98)
+            inits.append(p)
+            
+    # 3. Dense random configurations
+    for _ in range(6):
+        c = np.random.rand(N, 2) * 0.8 + 0.1
+        inits.append(c)
+        
+    # 4. Corner and edge focused configurations
+    for _ in range(4):
+        c = np.random.rand(N, 2) * 0.7 + 0.15
+        c[:4] = [[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.88]]
+        c[4:8] = [[0.5, 0.12], [0.5, 0.88], [0.12, 0.5], [0.88, 0.5]]
+        c = np.clip(c, 0.05, 0.95)
+        inits.append(c)
+
+    # Phase 1: Multi-start Powell optimization on centers
+    for c0 in inits:
+        try:
+            res = minimize(objective_centers, c0.flatten(), method='Powell', bounds=bounds_centers,
+                           options={'maxiter': 1200, 'ftol': 1e-15, 'xtol': 1e-15})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            pass
+            
+    # Phase 2: Iterative perturbation search to escape local minima
+    if best_centers is not None:
+        curr_c = best_centers.copy()
+        curr_sum = best_sum
+        step = 0.004
+        
+        for epoch in range(50):
+            improved = False
+            for _ in range(20):
+                p_c = curr_c + np.random.normal(0, step, curr_c.shape)
+                p_c = np.clip(p_c, 0.001, 0.999)
+                s, _ = compute_max_sum_radii(p_c)
+                if s > curr_sum + 1e-9:
+                    curr_c = p_c
+                    curr_sum = s
+                    improved = True
+            if not improved:
+                step *= 0.85
+            if step < 1e-6:
+                break
+                
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = curr_c
+            
+        # Phase 3: Final high-precision Powell polish
+        try:
+            res = minimize(objective_centers, best_centers.flatten(), method='Powell', bounds=bounds_centers,
+                           options={'maxiter': 2500, 'ftol': 1e-16, 'xtol': 1e-16})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            pass
+
+        # Compute exact optimal radii for the final centers
+        _, best_radii = compute_max_sum_radii(best_centers)
+        
+    # Fallback if optimization fails unexpectedly
+    if best_centers is None:
+        best_centers = np.random.rand(N, 2) * 0.8 + 0.1
+        _, best_radii = compute_max_sum_radii(best_centers)
+        best_sum = np.sum(best_radii)
+        
+    # Phase 4: Strict numerical repair to guarantee validator tolerance (1e-12)
+    best_radii = np.maximum(best_radii, 1e-12)
+    
+    for _ in range(30):
+        valid = True
+        
+        # Fix boundary violations
+        for i in range(N):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], best_radii[i]
+            mx = min(x, 1.0 - x, y, 1.0 - y)
+            if r > mx + 1e-12:
+                best_radii[i] = mx
+                valid = False
+                
+        # Fix overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                             best_centers[i, 1] - best_centers[j, 1])
+                req = best_radii[i] + best_radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-12
+                    best_radii[i] -= shrink
+                    best_radii[j] -= shrink
+                    valid = False
+                    
+        best_radii = np.maximum(best_radii, 0.0)
+        if valid:
+            break
+            
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

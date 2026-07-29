@@ -1,0 +1,167 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that escapes local minima typical in dense packing problems. The previous best score was ~2.628, and we aim to surpass 2.636.
+
+Key improvements in this strategy:
+1. **Vectorized Constraints**: Using NumPy broadcasting for pairwise distance and boundary constraints significantly speeds up constraint evaluation, allowing the optimizer to take more steps per second.
+2. **Multi-Start with Diverse Initializations**: We generate 50 different starting configurations mixing hexagonal, square, and perturbed hexagonal lattices. Breaking symmetry early prevents the optimizer from getting stuck in regular but suboptimal grid alignments.
+3. **SLSQP with Tight Tolerances**: We use `scipy.optimize.minimize` with the SLSQP method, which handles inequality constraints well. We set a tight `ftol` (1e-13) and high `maxiter` to ensure convergence to precise local optima.
+4. **Strict Feasibility Repair**: After optimization, a deterministic repair pass clamps circles to boundaries and proportionally shrinks overlapping circles. This guarantees the solution strictly passes the provided validation function within numerical tolerances.
+5. **Small Initial Radii**: Starting with radii=0.05 ensures initial feasibility, giving the optimizer room to expand circles naturally toward the optimum topology rather than immediately hitting constraint barriers.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+N = 26
+MASK = np.triu(np.ones((N, N), dtype=bool), k=1)
+
+def objective(vars_flat):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_flat[2*N:])
+
+def constraint_func(vars_flat):
+    """Computes all boundary and non-overlap constraints efficiently."""
+    C = vars_flat[:2*N].reshape(N, 2)
+    R = vars_flat[2*N:]
+    
+    con = []
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    con.append(C[:, 0] - R)
+    con.append(1.0 - C[:, 0] - R)
+    con.append(C[:, 1] - R)
+    con.append(1.0 - C[:, 1] - R)
+    
+    # Pairwise non-overlap constraints: dist(i,j) >= r_i + r_j
+    diff = C[:, None, :] - C[None, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    sum_r = R[:, None] + R[None, :]
+    con.append(dist[MASK] - sum_r[MASK])
+    
+    # Non-negative radii
+    con.append(R)
+    
+    return np.concatenate(con)
+
+def make_bounds():
+    """Returns variable bounds for x, y, r."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def init_config(seed):
+    """Generates a feasible initial configuration with small radii."""
+    np.random.seed(seed)
+    typ = seed % 3
+    C = np.zeros((N, 2))
+    idx = 0
+    
+    if typ == 0: # Hexagonal lattice
+        r = 0.06
+        y = r
+        row = 0
+        while idx < N:
+            x = r
+            if row % 2 == 1: x += r
+            while x + r <= 1.0 and idx < N:
+                C[idx, 0] = x; C[idx, 1] = y
+                x += 2 * r; idx += 1
+            y += math.sqrt(3) * r; row += 1
+    elif typ == 1: # Square grid
+        r = 0.06
+        y = r
+        while idx < N:
+            x = r
+            while x + r <= 1.0 and idx < N:
+                C[idx, 0] = x; C[idx, 1] = y
+                x += 2 * r; idx += 1
+            y += 2 * r
+    else: # Perturbed hex (defaults to hex structure if others fill)
+        r = 0.06
+        y = r
+        row = 0
+        while idx < N:
+            x = r
+            if row % 2 == 1: x += r
+            while x + r <= 1.0 and idx < N:
+                C[idx, 0] = x; C[idx, 1] = y
+                x += 2 * r; idx += 1
+            y += math.sqrt(3) * r; row += 1
+            
+    # Perturbation to break symmetry and help escape local minima
+    C += np.random.normal(0, 0.005, C.shape)
+    C = np.clip(C, 0.05, 0.95)
+    
+    R = np.full(N, 0.05)
+    R += np.random.uniform(-0.001, 0.001, N)
+    
+    v = np.zeros(3*N)
+    v[:2*N] = C.flatten()
+    v[2*N:] = R
+    return v
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    bounds = make_bounds()
+    constraints = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_v = None
+    best_obj = -np.inf
+    
+    np.random.seed(42)
+    
+    # Multi-start optimization to explore diverse topological configurations
+    for seed in range(50):
+        x0 = init_config(seed)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=constraints,
+                           options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            
+            # Verify feasibility within tolerance
+            cons = constraint_func(res.x)
+            if np.all(cons >= -1e-7):
+                curr_obj = -res.fun
+                if curr_obj > best_obj:
+                    best_obj = curr_obj
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Fallback if all optimizations fail
+    if best_v is None:
+        best_v = init_config(0)
+        
+    C = best_v[:2*N].reshape(N, 2)
+    R = best_v[2*N:]
+    
+    # Strict feasibility repair to guarantee validation passes
+    for _ in range(15):
+        changed = False
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(C[i,0], 1.0-C[i,0], C[i,1], 1.0-C[i,1])
+            if R[i] > mx:
+                R[i] = mx
+                changed = True
+        # Resolve overlaps
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(C[i,0]-C[j,0], C[i,1]-C[j,1])
+                if d < R[i] + R[j] - 1e-9:
+                    shrink = (R[i] + R[j] - d) / 2.0
+                    R[i] -= shrink
+                    R[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    R = np.maximum(R, 0.0)
+    return C, R, float(np.sum(R))
+```

@@ -1,0 +1,142 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.627 and reach the 2.636 target, we shift from a direct constrained optimization of both centers and radii to a **hierarchical optimization approach**:
+
+1. **LP-Based Radius Computation**: For any fixed set of centers, the maximum valid radii that satisfy non-overlap ($r_i + r_j \le d_{ij}$) and boundary ($r_i \le \min(x_i, 1-x_i, y_i, 1-y_i)$) constraints can be found exactly and efficiently via a Linear Program (LP). This guarantees feasibility and removes constraint-handling overhead from the center optimization.
+2. **Center Optimization via Powell**: We optimize the 52-dimensional center coordinates using `scipy.optimize.minimize` with the `Powell` method, which handles the non-smooth objective (sum of LP-optimized radii) robustly. The objective function simply returns `-sum(radii)`.
+3. **Diverse Topological Initializations**: Optimal packings for $N=26$ often follow hexagonal lattices, shifted grids, or $5\times5$ + 1 patterns. We generate dozens of structured starts (hexagonal with varying spacings, $5\times5$ grid + center/corner fill, uniform grids, and random dense clusters) to ensure we explore the correct basin of attraction.
+4. **Iterative Perturbation Refinement**: After finding the best local optimum, we perform controlled random perturbations followed by re-optimization to escape shallow local minima and settle into the global optimum.
+5. **Strict Validation Safety**: A final micro-shrink on radii guarantees satisfaction of the validator's $10^{-12}$ tolerance, while the LP formulation inherently maximizes the sum.
+
+This method decouples the combinatorial complexity of constraints from the geometric optimization, typically yielding tighter packings and higher sum-of-radii scores for circle packing problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+# Precompute constraint matrix for LP: r_i + r_j <= d_ij, r_i <= b_i
+_NUM_PAIRS = N * (N - 1) // 2
+_A_ub = np.zeros((_NUM_PAIRS + N, N))
+_IDX = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        _A_ub[_IDX, i] = 1.0
+        _A_ub[_IDX, j] = 1.0
+        _IDX += 1
+for i in range(N):
+    _A_ub[_IDX, i] = 1.0
+    _IDX += 1
+
+def solve_radii(centers):
+    """Solves LP to find optimal radii for fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    # Distance to boundaries
+    b = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dists = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dists, 1e9)
+    
+    # Build RHS vector for A_ub * r <= b_ub
+    b_ub = np.empty(_NUM_PAIRS + N)
+    b_ub[:_NUM_PAIRS] = dists[np.triu_indices(N, k=1)]
+    b_ub[_NUM_PAIRS:] = b
+    
+    # Solve LP: max sum(r) s.t. A_ub r <= b_ub, r >= 0
+    res = linprog(-np.ones(N), A_ub=_A_ub, b_ub=b_ub, bounds=[(0, None)]*N, method='highs')
+    if res.success:
+        return np.maximum(res.x, 0.0), res.fun * -1
+    return np.zeros(N), 0.0
+
+def obj_centers(v):
+    """Objective for center optimization: maximize sum of radii."""
+    c = np.clip(v.reshape(N, 2), 1e-5, 1.0 - 1e-5)
+    _, s = solve_radii(c)
+    return -s
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds_c = [(1e-4, 1.0 - 1e-4)] * (2 * N)
+    
+    best_sum = -1.0
+    best_c = None
+    
+    starts = []
+    
+    # 1. Hexagonal lattice variations with different base radii
+    for r0 in [0.09, 0.10, 0.11, 0.12]:
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x = r0 + (row % 2) * r0
+            while x <= 1.0 - r0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        starts.append(np.array(pts[:N]).flatten())
+        
+    # 2. 5x5 grid + 1 variations (common optimal topology for N=26)
+    gx = np.linspace(0.1, 0.9, 5)
+    gy = np.linspace(0.1, 0.9, 5)
+    gx, gy = np.meshgrid(gx, gy)
+    grid_pts = np.column_stack((gx.flatten(), gy.flatten()))
+    for extra in [[0.5, 0.5], [0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9], [0.2, 0.2]]:
+        pts = np.vstack([grid_pts, extra])
+        starts.append(pts.flatten())
+        
+    # 3. Uniform square grid starts
+    for sp in [0.18, 0.20, 0.22]:
+        pts = []
+        y = sp
+        while y <= 1.0 - sp and len(pts) < N:
+            x = sp
+            while x <= 1.0 - sp and len(pts) < N:
+                pts.append([x, y])
+                x += sp
+            y += sp
+        starts.append(np.array(pts[:N]).flatten())
+
+    # 4. Dense random starts
+    for _ in range(20):
+        starts.append(np.random.uniform(0.1, 0.9, 2*N))
+        
+    # Phase 1: Multi-Start Local Optimization
+    for x0 in starts:
+        try:
+            res = minimize(obj_centers, x0, method='Powell', bounds=bounds_c,
+                           options={'maxiter': 3000, 'ftol': 1e-13, 'xtol': 1e-13})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_c = res.x.reshape(N, 2)
+        except Exception:
+            pass
+
+    # Phase 2: Perturbation Refinement to escape local minima
+    if best_c is not None:
+        for _ in range(40):
+            pert = best_c + np.random.normal(0, 0.003, best_c.shape)
+            pert = np.clip(pert, 0.02, 0.98)
+            try:
+                res = minimize(obj_centers, pert.flatten(), method='Powell', bounds=bounds_c,
+                               options={'maxiter': 2000, 'ftol': 1e-13})
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_c = res.x.reshape(N, 2)
+            except Exception:
+                pass
+
+    # Final LP to get exact optimal radii for the best centers
+    radii, final_sum = solve_radii(best_c)
+    
+    # Safety shrink to strictly satisfy validator tolerance (1e-12)
+    radii *= 0.999999
+    
+    return best_c, radii, float(final_sum)
+```

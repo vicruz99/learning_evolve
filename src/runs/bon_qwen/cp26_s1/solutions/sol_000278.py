@@ -1,0 +1,406 @@
+# sol_000278 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 085da352) state=78bcf346 sum of radii=2.517150 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    Returns a tuple of (centers, radii, sum_radii).
+    """
+    n = 26
+    
+    # Target radius for sum of radii ~ 2.636
+    # Target r = 2.636 / 26 ~ 0.10138
+    r_target = 0.10138
+    
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Hexagonal row vertical spacing: r * sqrt(3)
+    # We arrange 25 circles in a 5x5 hexagonal block and 1 circle in the 6th row.
+    
+    # Vertical coordinates for the 5 main rows
+    # We center them vertically.
+    # Distance between centers of adjacent rows is r * sqrt(3)
+    v_dist = r_target * np.sqrt(3)
+    
+    # We have 5 rows of 5 circles. 
+    # To center them, the top row center y and bottom row center y are symmetric.
+    # Total height for 5 rows centers: 4 * v_dist
+    # We need margins of r_target on top and bottom.
+    # y_bottom = r_target + 2 * v_dist
+    # y_top = 1 - r_target - 2 * v_dist
+    # Let's place centers at: y_bottom, y_bottom + v_dist, ..., y_top
+    
+    y_base = r_target + 2 * v_dist
+    y_centers_5rows = [y_base, y_base + v_dist, y_base + 2 * v_dist, y_base + 3 * v_dist, y_base + 4 * v_dist]
+    
+    # Horizontal coordinates for 5 circles per row
+    # Centered horizontally.
+    # Total width for 5 circles centers: 4 * (2 * r_target) = 8 * r_target
+    # Margin x = r_target
+    # x_first = r_target
+    # But in hexagonal packing, alternate rows are shifted by r_target (or 2r_target? shift is radius)
+    # Shift is 2r for tangent circles? No, shift is r (horizontal distance between centers of touching circles in adjacent rows is 2r, vertical is r*sqrt(3). 
+    # Wait, horizontal distance is 2r. Vertical distance is r*sqrt(3). 
+    # So if row 1 is at x, row 2 is at x + r?
+    # No, the lattice points are (2ir, 2jr) for square.
+    # For hexagonal, points are (2ir + j*r, j*r*sqrt(3))? 
+    # Let's just use standard offsets.
+    # Row 0: x at r + i*2r for i=0..4
+    # Row 1: x at r + r + i*2r (shifted by r)
+    # Actually, to maximize space, we just center the block.
+    
+    x_step = 2 * r_target
+    
+    # Row 0 (bottom)
+    x_row0 = np.linspace(r_target, 1 - r_target, 5)
+    for i in range(5):
+        centers[i, 0] = x_row0[i]
+        centers[i, 1] = y_centers_5rows[0]
+        radii[i] = r_target
+        
+    # Row 1 (shifted right by r_target)
+    # We need to keep circles inside [0,1].
+    # If we shift by r_target, the x-coords become r + r + i*2r = 2r + i*2r.
+    # The last circle (i=4) would be at 2r + 8r = 10r. 
+    # With r=0.1014, 10r = 1.014 > 1. This might go out of bounds.
+    # We need to center the shifted row.
+    
+    # Let's define centers relative to center 0.5
+    # Row with 5 circles width is 8r. Extent from -4r to 4r relative to center.
+    # Row 0: x in [0.5 - 4r, 0.5 + 4r] step 2r.
+    # Row 1 (shifted): x in [0.5 - 3r, 0.5 + 3r] ? No, that's 4 circles.
+    # For 5 circles, if we shift, the width increases?
+    # Actually, the minimal bounding box for 5 circles in a row is 10r.
+    # If we shift, the bounding box might be 10r + r? 
+    # Let's check: Row 0 centers at 0.5 +/- 4r.
+    # Row 1 centers at 0.5 +/- 3r ? No, that would be 3 circles.
+    # If we have 5 circles in row 1 as well, and we want them to fit in the gaps,
+    # they must be at 0.5 +/- 3r? No.
+    # The gaps in Row 0 are at 0.5 +/- 2r, 0.5, 0.5 +/- 4r... wait.
+    # Centers at 0.5, 0.5+-2r, 0.5+-4r.
+    # Gaps at 0.5+-r, 0.5+-3r, 0.5+-5r.
+    # 0.5+-5r is outside the range of Row 0 circles (which end at 0.5+-4r).
+    # So we can fit circles at 0.5+-r and 0.5+-3r. That's 4 circles.
+    # The 5th circle in Row 1 would be at 0.5+-5r?
+    # If 0.5+5r <= 1-r => 6r <= 0.5 => r <= 0.0833.
+    # But our r is 0.1014. So we cannot fit 5 circles in a shifted row if the row below has 5 circles?
+    # Wait, the "gaps" are between circles.
+    # Row 0: C0, C1, C2, C3, C4.
+    # Gaps: G0(C0,C1), G1(C1,C2), G2(C2,C3), G3(C3,C4).
+    # We can place 4 circles in Row 1 directly above gaps.
+    # What about the 5th?
+    # It would have to be "outside" the width of Row 0, but still inside square.
+    # Since r > 0.0833, we can't fit 5 circles in a shifted row if the previous row has 5 circles and they are aligned to maximize density?
+    # Actually, for 5x5 grid, they are all aligned.
+    # For hexagonal, we might have 5, 4, 5, 4, 5? That's 23.
+    # 5, 5, 5, 5, 5 requires no shifting (grid).
+    # But grid is less dense.
+    # However, for N=26, maybe we don't need full hexagonal.
+    # Maybe 5, 5, 5, 5, 5, 1.
+    # The 25 circles in 5x5 grid can be slightly perturbed?
+    # Or maybe we just use the 5x5 grid for 25 and add 1 in the top gap?
+    # But 5x5 grid with r=0.1014 won't fit (width 1.014).
+    # We MUST use hexagonal packing to fit 5 circles with r=0.1014?
+    # Wait, 5 circles of r=0.1014 need width 1.014.
+    # They cannot fit in a row in a unit square.
+    # So we cannot have ANY row with 5 circles if r=0.1014?
+    # This implies my assumption that r=0.1014 is achievable with 5 circles per row is wrong.
+    # If r=0.1014, max circles per row is 4.
+    # If max circles per row is 4, how do we get 26 circles?
+    # 6 rows of 4 = 24.
+    # 7 rows of 4 = 28.
+    # With 7 rows of hexagonal packing, height is 2r + 6*r*sqrt(3) = r(2 + 10.39) = 12.39r.
+    # 12.39 * 0.1014 = 1.25 > 1.
+    # So we cannot fit 7 rows of r=0.1014.
+    # So 26 circles of radius 0.1014 seems geometrically impossible?
+    
+    # Let's re-read the prompt target. "Target: 2.636".
+    # Maybe the target is just a goal, and 2.636 is not strictly achievable?
+    # Or maybe I am missing a configuration.
+    # What if circles are not equal?
+    # What if we have a large circle and many small ones?
+    # But we established that's inefficient for sum of radii.
+    
+    # Let's try to maximize sum of radii with a solver.
+    # Since I cannot run a solver, I must provide a static solution.
+    # I will provide the best equal-circle packing I can.
+    # For N=26, the best equal circle packing is likely related to 5x5 grid but perturbed.
+    # Actually, for N=26, the optimal radius is known to be slightly less than 0.1.
+    # r ~ 0.098? Sum ~ 2.55.
+    # But target is 2.636.
+    # There must be a configuration with unequal circles or a specific arrangement.
+    
+    # Let's try a configuration with 1 large circle and 25 small ones?
+    # No.
+    # What about 2 large and 24 small?
+    
+    # Let's look at the "Target: 2.636" again.
+    # 2.636 / 26 = 0.10138.
+    # If r=0.10138, diameter = 0.20276.
+    # 4 circles width = 0.811. Fits easily.
+    # 5 circles width = 1.0138. Does not fit.
+    # So we MUST have rows of at most 4 circles.
+    # To get 26 circles, we need at least 7 rows (4*6=24, 4*7=28).
+    # Height for 7 rows: 2r + 6*r*sqrt(3) = r(2 + 10.392) = 12.392r.
+    # 12.392 * 0.10138 = 1.256 > 1.
+    # So 7 rows of r=0.10138 do not fit.
+    
+    # Conclusion: It is impossible to pack 26 equal circles of radius 0.10138.
+    # Therefore, the optimal solution MUST involve unequal circles.
+    # To get sum 2.636 with unequal circles, we need some circles larger than 0.10138 and some smaller.
+    # But larger circles are even harder to fit.
+    # Wait. If r > 0.10138, width > 1.0138. Even 5 circles can't fit.
+    # So no circle can have radius > 0.1 (since 2r < 0.2 is needed for 5 circles, but actually even for 1 circle, 2r <= 1 => r <= 0.5).
+    # The constraint is the packing density.
+    
+    # Maybe the target 2.636 is achievable with a specific unequal packing.
+    # Let's try to construct a packing with sum 2.636.
+    # Suppose we have 25 circles of radius 0.1 (sum 2.5) and 1 circle of radius 0.136?
+    # Radius 0.136 diameter 0.272.
+    # Can we fit 1 circle of r=0.136 and 25 of r=0.1?
+    # 25 circles of r=0.1 fit in 1x1 square (grid).
+    # But they fill it completely. No space for 0.136 circle.
+    
+    # What if we have 1 circle of r=0.2 and 25 circles of r=0.085?
+    # Sum = 0.2 + 25*0.085 = 0.2 + 2.125 = 2.325. Too low.
+    
+    # What if we have 2 circles of r=0.2 and 24 circles of r=0.09?
+    # Sum = 0.4 + 2.16 = 2.56.
+    
+    # What if we have a few medium circles?
+    # Maybe the optimal is close to equal circles, but with a specific arrangement that I am missing.
+    # Or maybe the target 2.636 is for a different N? No, N=26.
+    
+    # Let's try to find a known result.
+    # For N=26, the maximum sum of radii might be achieved by a configuration that is not equal circles.
+    # However, without a solver, I will provide the best equal-circle packing I can.
+    # The best equal circle packing for N=26 has r ~ 0.098. Sum ~ 2.55.
+    # I will provide that, and hope the validator accepts it or the target is loose.
+    # But the prompt says "Target: 2.636. Current gap: 2.636000."
+    # And "Further improvements will also be generously rewarded."
+    # This suggests 2.636 is a high bar.
+    
+    # Let's try a configuration with 6 rows.
+    # Rows: 5, 4, 5, 4, 5, 3? Sum = 26.
+    # This is a hexagonal-like packing.
+    # Let's calculate the required radius for this pattern.
+    # Width: 5 circles -> 10r <= 1 => r <= 0.1.
+    # Height: 6 rows -> 2r + 5*r*sqrt(3) <= 1 => r(2 + 8.66) <= 1 => r <= 1/10.66 = 0.0938.
+    # Sum = 26 * 0.0938 = 2.44.
+    
+    # What if we have 5 rows?
+    # 5, 5, 5, 5, 6? No, 6 needs width 12r.
+    # 5, 5, 5, 5, 5 is 25.
+    # We need 1 more.
+    # Maybe 5, 5, 5, 5, 5 with a tiny one in the corner?
+    # 25 circles of r=0.1. Sum 2.5.
+    # Corner gap radius ~ 0.04.
+    # Sum 2.54.
+    
+    # What if we shrink 25 circles to r=0.095?
+    # Width 0.95. Fits.
+    # Height 0.95. Fits.
+    # Space available for 26th circle?
+    # The 25 circles now have gaps.
+    # Gap size increases.
+    # Maybe we can fit a 26th circle of radius 0.15?
+    # Sum = 25*0.095 + 0.15 = 2.375 + 0.15 = 2.525.
+    
+    # It seems hard to beat 2.6 with simple logic.
+    # I will provide a 5x5 grid of 25 circles and 1 circle in the corner, optimized.
+    # Or better, a 5x5 grid of 25 circles with r=0.1 and a 26th circle of r=0.04 in corner.
+    # Sum 2.54.
+    
+    # Let's try to output a valid packing with sum ~ 2.54.
+    pass
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Configuration: 5x5 grid of 25 circles, plus 1 circle in a corner.
+    # To maximize sum, we want the 25 circles to be as large as possible.
+    # Let's set r_25 = 0.1.
+    # They fit in a 5x5 grid exactly.
+    # Centers: (0.1 + i*0.2, 0.1 + j*0.2) for i,j in 0..4.
+    
+    r_main = 0.1
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            centers[idx, 0] = r_main + i * 2 * r_main
+            centers[idx, 1] = r_main + j * 2 * r_main
+            radii[idx] = r_main
+            idx += 1
+            
+    # 26th circle in corner (0,0)
+    # The closest circles are at (0.1, 0.1) and (0.1, 0.3) etc.
+    # Distance to (0.1, 0.1) is sqrt(0.1^2 + 0.1^2) = 0.1414.
+    # We need dist >= r_26 + r_main.
+    # 0.1414 >= r_26 + 0.1 => r_26 <= 0.0414.
+    # Also need to be inside square: r_26 <= 0 (if center at 0,0? No, center at (r,r)).
+    # Let's place center at (r_26, r_26).
+    # Then dist to (0.1, 0.1) is sqrt((0.1-r)^2 + (0.1-r)^2) = (0.1-r)*sqrt(2).
+    # Constraint: (0.1-r)*sqrt(2) >= 0.1 + r.
+    # 0.1414 - 1.414r >= 0.1 + r
+    # 0.0414 >= 2.414r
+    # r <= 0.0414 / 2.414 = 0.0171.
+    # Wait, if I place it at (r,r), it's tangent to walls.
+    # But I can place it closer to the corner? No, (r,r) is the closest to corner.
+    # If I place it at (0,0), it's invalid (outside).
+    # So max r for corner circle is ~0.017.
+    # Sum = 2.5 + 0.017 = 2.517.
+    
+    # Can we do better?
+    # Maybe place 26th circle in the center?
+    # Center (0.5, 0.5).
+    # Closest circles at (0.3, 0.3), (0.7, 0.3), etc.
+    # Dist to (0.3, 0.3) is sqrt(0.2^2 + 0.2^2) = 0.2828.
+    # Constraint: 0.2828 >= r_26 + 0.1 => r_26 <= 0.1828.
+    # But we also need to fit in square?
+    # Circle at (0.5, 0.5) with r=0.18 fits in square (extent 0.32 to 0.68).
+    # So we can have a large circle in the center!
+    # But wait, the 25 circles are at radius 0.1.
+    # The gaps in the center are large.
+    # So we can have 25 circles of r=0.1 and 1 circle of r=0.182?
+    # Sum = 2.5 + 0.182 = 2.682!
+    # This is > 2.636.
+    
+    # Let's verify.
+    # 25 circles at grid positions with r=0.1.
+    # They touch each other and walls.
+    # The center circle at (0.5, 0.5) with r=0.182.
+    # Distance to nearest grid circle (0.3, 0.3) is 0.2828.
+    # Sum of radii 0.1 + 0.182 = 0.282.
+    # 0.2828 > 0.282. So they don't overlap.
+    # But wait, are the grid circles fixed?
+    # If we add a large circle in the center, we might need to shrink the grid circles slightly to make room?
+    # No, the distance is 0.2828. The sum is 0.282.
+    # There is a tiny gap of 0.0008.
+    # So r=0.1 is valid for grid circles and r=0.182 for center circle?
+    # Let's check distance to (0.3, 0.5)?
+    # Grid circles are at (0.1, 0.1), (0.3, 0.1), (0.5, 0.1), (0.7, 0.1), (0.9, 0.1)
+    # (0.1, 0.3), (0.3, 0.3), (0.5, 0.3), (0.7, 0.3), (0.9, 0.3)
+    # (0.1, 0.5), (0.3, 0.5), (0.5, 0.5), (0.7, 0.5), (0.9, 0.5)
+    # (0.1, 0.7), (0.3, 0.7), (0.5, 0.7), (0.7, 0.7), (0.9, 0.7)
+    # (0.1, 0.9), (0.3, 0.9), (0.5, 0.9), (0.7, 0.9), (0.9, 0.9)
+    
+    # Center circle at (0.5, 0.5).
+    # Nearest grid circles:
+    # (0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7).
+    # Distance = sqrt(0.2^2 + 0.2^2) = 0.28284.
+    # (0.5, 0.3) is at distance 0.2.
+    # Wait! (0.5, 0.3) is a grid circle!
+    # Distance from (0.5, 0.5) to (0.5, 0.3) is 0.2.
+    # Sum of radii = r_grid + r_center.
+    # 0.2 >= 0.1 + r_center => r_center <= 0.1.
+    # Oh! I missed the circles in the same row/column.
+    # The grid has a circle at (0.5, 0.3) and (0.5, 0.7).
+    # So the center circle must be smaller than 0.1.
+    # Specifically, r_center <= 0.2 - 0.1 = 0.1.
+    # So we can have r_center = 0.1.
+    # Sum = 26 * 0.1 = 2.6.
+    
+    # So the center circle doesn't help if grid is 0.1.
+    # But if we shrink grid circles slightly, we can increase center circle?
+    # Let grid radius be r_g, center radius r_c.
+    # Constraint 1: r_g + r_c <= 0.2 (distance to (0.5, 0.3)).
+    # Constraint 2: r_g <= 0.1 (grid packing).
+    # Maximize 25*r_g + r_c.
+    # From 1: r_c <= 0.2 - r_g.
+    # Sum S = 25*r_g + 0.2 - r_g = 24*r_g + 0.2.
+    # To maximize S, maximize r_g.
+    # Max r_g = 0.1.
+    # Then r_c = 0.1.
+    # S = 2.6.
+    
+    # So 2.6 is the limit for this configuration.
+    # We need 2.636.
+    # We need a configuration where we can have sum > 2.6.
+    # This implies we need to break the grid symmetry.
+    # Maybe 24 circles of r=0.1 and 2 circles of r=0.118?
+    # But 24 circles of r=0.1 fit in a 4x6 grid?
+    # 4x6 grid: 4 rows of 6? No, 6 circles width 1.2.
+    # 6 rows of 4? 4 circles width 0.8. Fits.
+    # Height 6 rows: 2r + 5*2r = 12r = 1.2 > 1.
+    # So 24 circles of r=0.1 don't fit in 6x4 grid.
+    # They fit in 5x5 grid (25 circles).
+    # So we can have 24 circles of r=0.1.
+    # And 2 circles?
+    # Where?
+    # In the gaps of the 5x5 grid?
+    # The gaps are small.
+    # But if we remove 1 circle from the center (0.5, 0.5), we have a hole.
+    # The hole is surrounded by 4 circles at (0.3, 0.5), (0.7, 0.5), (0.5, 0.3), (0.5, 0.7).
+    # Distance between these is 0.4.
+    # We can fit 2 circles in this hole?
+    # Diameter of hole is 0.4.
+    # Two circles of radius r_hole.
+    # If we place them side by side, width 4*r_hole <= 0.4 => r_hole <= 0.1.
+    # So we can replace 1 circle of r=0.1 with 2 circles of r=0.1?
+    # That would be 26 circles of r=0.1.
+    # But we established 26 circles of r=0.1 don't fit.
+    # Why? Because the 5x5 grid has 25 circles.
+    # If we remove 1, we have 24.
+    # The hole is 0.4 wide.
+    # But the hole is surrounded by circles.
+    # The space is not a square hole.
+    # It's a cross shape?
+    # Actually, if we remove (0.5, 0.5), the neighbors are at distance 0.2.
+    # The space available is the intersection of 4 excluded disks.
+    # It's a small region.
+    # We can't fit 2 circles of r=0.1.
+    
+    # So 2.636 seems very challenging.
+    # I will provide the 25-circle grid + 1 corner circle solution, but optimized.
+    # Or better, a 5x5 grid of 25 circles with r=0.1 and 1 circle of r=0.1 at center?
+    # No, center is occupied.
+    # I will provide a 5x5 grid of 25 circles with r=0.1 and 1 circle of r=0.04 in corner.
+    # Sum 2.54.
+    
+    # Wait, I can do better with 26 equal circles in a hexagonal packing?
+    # r=0.098. Sum 2.55.
+    
+    # I will output the 5x5 grid + corner circle.
+    pass
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # 5x5 grid
+    r_grid = 0.1
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            centers[idx, 0] = 0.1 + i * 0.2
+            centers[idx, 1] = 0.1 + j * 0.2
+            radii[idx] = r_grid
+            idx += 1
+            
+    # 26th circle in corner
+    # Place at (r, r)
+    # Max r such that dist to (0.1, 0.1) >= 0.1 + r
+    # (0.1-r)*sqrt(2) >= 0.1 + r
+    # r <= (0.1*sqrt(2) - 0.1) / (sqrt(2) + 1)
+    # r <= 0.1 * (1.414 - 1) / 2.414 = 0.1 * 0.414 / 2.414 = 0.01715
+    r_corner = 0.01715
+    centers[25, 0] = r_corner
+    centers[25, 1] = r_corner
+    radii[25] = r_corner
+    
+    return centers, radii, np.sum(radii)
+
+# Final check of the code structure
+# The function must be defined.
+# The logic is sound.
+# The sum is 2.517.
+# It's a valid packing.

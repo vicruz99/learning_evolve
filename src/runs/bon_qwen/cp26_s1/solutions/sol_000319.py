@@ -1,0 +1,141 @@
+# sol_000319 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 78c934c9) state=a14f9547 sum of radii=2.607072 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the positions and radii of 26 circles in a unit square 
+    to maximize the sum of radii.
+    """
+    n = 26
+    
+    def objective(x):
+        # x contains [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+        radii = x[2::3]
+        return -np.sum(radii) # Minimize negative sum = Maximize sum
+
+    def constraint_boundary(x):
+        # x_i - r_i >= 0  =>  r_i <= x_i
+        # x_i + r_i <= 1  =>  r_i <= 1 - x_i
+        # Same for y
+        x_coords = x[0::3]
+        y_coords = x[1::3]
+        radii = x[2::3]
+        
+        # Lower bounds: x - r >= 0 => r - x <= 0
+        c1 = radii - x_coords
+        c2 = radii - y_coords
+        
+        # Upper bounds: x + r <= 1 => x + r - 1 <= 0
+        c3 = x_coords + radii - 1.0
+        c4 = y_coords + radii - 1.0
+        
+        return np.concatenate([c1, c2, c3, c4])
+
+    def constraint_overlap(x):
+        constraints = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                
+                dist = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+                # dist >= ri + rj  =>  ri + rj - dist <= 0
+                constraints.append(ri + rj - dist)
+        return np.array(constraints)
+
+    best_result = None
+    best_sum = -np.inf
+
+    # Helper to run optimization from a specific initial guess
+    def try_optimization(x0):
+        try:
+            # Define bounds for variables [x, y, r]
+            # x, y in [0, 1], r in [0, 0.5]
+            bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+            
+            # Combine constraints
+            cons = [
+                {'type': 'ineq', 'fun': lambda x: -constraint_boundary(x)}, # Boundary (r - x <= 0 -> -(r-x) >= 0)
+                {'type': 'ineq', 'fun': lambda x: -constraint_overlap(x)}   # Overlap (r1+r2-dist <= 0)
+            ]
+
+            # Use SLSQP which handles constraints well
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                           options={'maxiter': 500, 'ftol': 1e-12})
+            
+            if res.success or (res.nit > 50 and -res.fun > best_sum):
+                return res
+        except Exception:
+            pass
+        return None
+
+    # Initialization Strategy 1: Perturbed Grid (5x5 + 1)
+    # We place 25 circles in a grid and 1 in the center
+    # To make it feasible, we start with small radii
+    r_init = 0.05 
+    x0_1 = []
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            x_val = 0.1 + i * 0.2
+            y_val = 0.1 + j * 0.2
+            # Add some noise to break symmetry and help optimizer
+            x0_1.extend([x_val, y_val, r_init])
+    # 26th circle in center
+    x0_1.extend([0.5, 0.5, r_init])
+    
+    res1 = try_optimization(np.array(x0_1))
+    if res1 is not None and -res1.fun > best_sum:
+        best_sum = -res1.fun
+        best_result = res1
+
+    # Initialization Strategy 2: Hexagonal-like packing
+    # Rows of 5, 4, 5, 4, 5, 3 (total 26)
+    x0_2 = []
+    row_y = 0.1
+    cols_per_row = [5, 4, 5, 4, 5, 3]
+    for r_idx, count in enumerate(cols_per_row):
+        # Calculate row x start to center the row
+        total_width = (count - 1) * 0.2
+        start_x = (1.0 - total_width) / 2.0
+        for k in range(count):
+            x_val = start_x + k * 0.2
+            y_val = row_y + r_idx * 0.18 # Vertical spacing
+            x0_2.extend([x_val, y_val, r_init])
+    
+    res2 = try_optimization(np.array(x0_2))
+    if res2 is not None and -res2.fun > best_sum:
+        best_sum = -res2.fun
+        best_result = res2
+
+    # Initialization Strategy 3: Random restarts
+    for _ in range(5):
+        np.random.seed(_)
+        x_rand = np.zeros(3 * n)
+        for i in range(n):
+            x_rand[3*i] = np.random.rand()
+            x_rand[3*i+1] = np.random.rand()
+            x_rand[3*i+2] = 0.05 # Small initial radius
+        res_rand = try_optimization(x_rand)
+        if res_rand is not None and -res_rand.fun > best_sum:
+            best_sum = -res_rand.fun
+            best_result = res_rand
+
+    if best_result is None:
+        # Fallback to simple grid if optimization fails
+        centers = np.array([[0.5, 0.5]]) * 1.0 # Placeholder
+        radii = np.zeros(26)
+        sum_radii = 0.0
+    else:
+        x_opt = best_result.x
+        centers = np.column_stack((x_opt[0::3], x_opt[1::3]))
+        radii = x_opt[2::3]
+        sum_radii = np.sum(radii)
+
+    return centers, radii, sum_radii

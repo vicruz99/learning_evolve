@@ -1,0 +1,217 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond the current ~2.634, I will adopt a robust optimization strategy that addresses key challenges in non-convex circle packing:
+
+1. **Parameterization for Automatic Boundary Satisfaction**: Instead of enforcing boundary constraints explicitly, I will use the parameterization `x = r + u*(1-2r)` and `y = r + v*(1-2r)` with `u, v ∈ [0, 1]`. This guarantees `r ≤ x ≤ 1-r` and `r ≤ y ≤ 1-r` by construction, removing ~104 constraints and significantly simplifying the feasible manifold for the solver.
+
+2. **Diverse High-Quality Initializations**: 
+   - Force-directed layouts that simulate repulsive forces and wall constraints to naturally spread circles into dense, non-overlapping configurations.
+   - Rotated hexagonal lattices with random perturbations to explore different boundary alignments and break symmetry.
+   - All initializations are mapped to the `(r, u, v)` parameter space with a safety factor (0.80) to ensure strict feasibility before optimization begins.
+
+3. **Multi-Phase SLSQP Optimization**:
+   - **Phase 1**: Broad search from ~65 diverse starts. SLSQP is run with high iteration limits and tight tolerances.
+   - **Phase 2**: Local perturbation refinement. The best solution is repeatedly perturbed in `(r, u, v)` space to escape shallow local minima, followed by re-optimization.
+   - **Phase 3**: High-precision polishing with `ftol=1e-14` to squeeze out the last decimal of improvement.
+
+4. **Robustness & Safety**: Explicit feasibility checks (`min(constraints) >= -1e-7`) filter out numerically invalid solutions. A fallback configuration ensures the function always returns a valid result.
+
+This approach systematically explores the configuration space while keeping the constraint dimension low, which has consistently pushed packing densities to their theoretical limits in computational geometry benchmarks.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[:N])
+
+def constraints(params):
+    """
+    Inequality constraints: g(params) >= 0.
+    Uses parameterization to automatically satisfy boundary constraints.
+    Only pairwise non-overlap constraints are enforced.
+    """
+    r = params[:N]
+    u = params[N:2*N]
+    v = params[2*N:3*N]
+    
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    
+    return dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2
+
+def make_params(centers, radii):
+    """Map physical centers/radii to (r, u, v) optimization parameters."""
+    r = radii.copy()
+    d = 1.0 - 2.0 * r
+    d = np.clip(d, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r) / d, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / d, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def get_safe_radii(centers):
+    """Compute strictly feasible initial radii for given centers."""
+    n = centers.shape[0]
+    r = np.zeros(n)
+    for i in range(n):
+        dw = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        dm = np.inf
+        for j in range(n):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i]-centers[j])**2))
+                if d < dm: 
+                    dm = d
+        # 0.80 factor ensures strict feasibility for SLSQP start
+        r[i] = max(1e-4, min(dw, dm/2.0) * 0.80)
+    return r
+
+def force_init(seed):
+    """Generates a strictly feasible initial configuration using force-directed layout."""
+    rng = np.random.RandomState(seed)
+    pts = rng.rand(N, 2)
+    r_curr = np.full(N, 0.08)
+    
+    for step in range(400):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        dists = np.maximum(dists, 1e-8)
+        repulsion = 1.0 / (dists**2 + 0.01)
+        np.fill_diagonal(repulsion, 0.0)
+        forces = np.sum(repulsion[:, :, None] * diff / dists[:, :, None], axis=1)
+        
+        for d in range(2):
+            forces[:, d] += 15.0 * np.maximum(0, r_curr - pts[:, d])
+            forces[:, d] -= 15.0 * np.maximum(0, pts[:, d] - (1.0 - r_curr))
+            
+        step_size = 0.003 * (0.995**step)
+        pts += step_size * forces
+        pts = np.clip(pts, 1e-5, 1.0 - 1e-5)
+        
+        for i in range(N):
+            d_wall = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+            d_pair = np.min(np.linalg.norm(pts[i] - pts, axis=1))
+            d_pair = max(d_pair, 1e-6)
+            r_curr[i] = 0.9 * min(d_wall, d_pair/2.0)
+            
+    return pts, r_curr
+
+def hex_init(seed, rotation=0.0):
+    """Generates a hexagonal lattice initialization with rotation and perturbation."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        x_off = (row % 2) * r_est
+        x = r_est + x_off
+        while x <= 1.0 - r_est and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+        
+    pts = np.array(pts[:N])
+    pts += rng.uniform(-0.04, 0.04, (N, 2))
+    pts = np.clip(pts, 0.02, 0.98)
+    
+    if rotation != 0.0:
+        c, s = np.cos(rotation), np.sin(rotation)
+        rot = np.array([[c, -s], [s, c]])
+        pts = (pts - 0.5) @ rot + 0.5
+        
+    return pts, get_safe_radii(pts)
+
+def run_packing():
+    bounds = [(1e-6, 0.49)] * N + [(0.0, 1.0)] * N + [(0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_params = None
+    best_sum = -np.inf
+    
+    rng_main = np.random.RandomState(42)
+    inits = []
+    
+    # Phase 0: Generate diverse initial configurations
+    for s in range(40):
+        inits.append(force_init(seed=s))
+    for s in range(25):
+        rot = rng_main.uniform(-0.3, 0.3)
+        inits.append(hex_init(seed=s, rotation=rot))
+        
+    # Phase 1: Broad global search
+    for pts, r0 in inits:
+        p0 = make_params(pts, r0)
+        try:
+            res = minimize(objective, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-13, 'disp': False})
+            if res.success:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_params = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Local perturbation refinement to escape local minima
+    if best_params is not None:
+        for trial in range(50):
+            p0 = best_params.copy()
+            p0[:N] += rng_main.uniform(-0.002, 0.002, N)
+            p0[N:3*N] += rng_main.uniform(-0.015, 0.015, 2*N)
+            p0[:N] = np.clip(p0[:N], 1e-6, 0.49)
+            p0[N:3*N] = np.clip(p0[N:3*N], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, p0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+                if res.success:
+                    c_val = constraints(res.x)
+                    if np.min(c_val) >= -1e-7:
+                        s_val = -res.fun
+                        if s_val > best_sum:
+                            best_sum = s_val
+                            best_params = res.x.copy()
+            except Exception:
+                pass
+                
+        # Phase 3: High-precision polish
+        try:
+            res = minimize(objective, best_params, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if res.success and np.min(constraints(res.x)) >= -1e-8:
+                best_params = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+
+    # Fallback configuration (should rarely be reached)
+    if best_params is None:
+        pts, r0 = hex_init(seed=0)
+        best_params = make_params(pts, r0)
+        best_sum = np.sum(best_params[:N])
+
+    # Reconstruct centers from optimized parameters
+    r_opt = best_params[:N]
+    u_opt = best_params[N:2*N]
+    v_opt = best_params[2*N:3*N]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack([x_opt, y_opt])
+    radii = np.maximum(r_opt, 0.0)
+    
+    return centers, radii, float(best_sum)
+```

@@ -1,0 +1,152 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.625 and approach the 2.636 target, I will employ a more robust optimization strategy:
+
+1. **Diverse High-Quality Initializations**: Instead of a simple grid, I'll use hexagonal lattice initializations, which are theoretically closer to optimal for dense circle packing. I'll vary the initial radius across multiple restarts (0.05 to 0.095) to explore different packing densities and escape symmetric local minima. Small random perturbations will be added to break degeneracies.
+2. **Precision-Tuned SLSQP**: I'll increase iteration limits (`maxiter=3000`) and tighten tolerance (`ftol=1e-11`) for the main optimization phase. A secondary high-precision refinement pass (`ftol=1e-14`) will be run on the best candidate to squeeze out remaining marginal gains.
+3. **Robust Constraint Handling**: The constraint function is fully vectorized for speed and numerical stability. Boundary and pairwise non-overlap constraints are formulated as `g(vars) >= 0`. A strict feasibility check filters out numerically drifted solutions.
+4. **Post-Processing Validity Enforcement**: After optimization, a deterministic pass adjusts radii minimally downwards only if constraints are violated by more than `1e-10`, ensuring the `validate_packing` function will always return `True` while preserving the maximized sum.
+5. **Strict Compliance**: All helper functions are defined at the top level with no closures or lambda functions, adhering strictly to the provided rules.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars):
+    """Constraint function: returns array of constraint values >= 0."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    # Boundary constraints: x >= r, x + r <= 1, y >= r, y + r <= 1
+    c_boundary = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints: dist^2 >= (ri + rj)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    i, j = np.triu_indices(N_CIRCLES, k=1)
+    c_overlap = dist_sq[i, j] - r_sum_sq[i, j]
+    
+    return np.concatenate([c_boundary, c_overlap])
+
+def generate_hex_init(r_init, seed):
+    """Generates a hexagonal lattice initialization with perturbation."""
+    np.random.seed(seed)
+    pts = []
+    y = r_init
+    row = 0
+    max_rows = 15
+    while len(pts) < N_CIRCLES and row < max_rows:
+        x = r_init if row % 2 == 0 else 2.0 * r_init
+        while x <= 1.0 - r_init and len(pts) < N_CIRCLES:
+            pts.append([x, y])
+            x += 2.0 * r_init
+        y += np.sqrt(3.0) * r_init
+        row += 1
+        
+    if len(pts) < N_CIRCLES:
+        while len(pts) < N_CIRCLES:
+            pts.append([np.random.uniform(r_init, 1.0 - r_init), 
+                        np.random.uniform(r_init, 1.0 - r_init)])
+                        
+    centers = np.array(pts[:N_CIRCLES])
+    centers += np.random.uniform(-0.002, 0.002, centers.shape)
+    centers = np.clip(centers, r_init, 1.0 - r_init)
+    
+    vars = np.empty(3 * N_CIRCLES)
+    vars[0::3] = centers[:, 0]
+    vars[1::3] = centers[:, 1]
+    vars[2::3] = r_init
+    return vars
+
+def run_packing():
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    # Multiple restarts from hexagonal grids with varying densities
+    for seed in range(15):
+        # Start radius between 0.05 and 0.095 to ensure feasibility and diversity
+        r_start = 0.05 + seed * 0.004
+        
+        vars0 = generate_hex_init(r_start, seed)
+        
+        # Enforce strict initial feasibility for boundaries
+        for i in range(N_CIRCLES):
+            x, y = vars0[3*i], vars0[3*i+1]
+            r = vars0[3*i+2]
+            margin = min(x, 1.0 - x, y, 1.0 - y)
+            if r > margin * 0.99:
+                vars0[3*i+2] = margin * 0.99
+                
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-11})
+            
+            # Verify constraints are satisfied within tolerance
+            cons_val = constraint_func(res.x)
+            if np.min(cons_val) >= -1e-6:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # High-precision refinement on the best configuration found
+    if best_vars is not None:
+        try:
+            res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                                 constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+            if np.min(constraint_func(res_final.x)) >= -1e-6:
+                best_vars = res_final.x
+                best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    # Extract results
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3].copy()
+    
+    # Post-optimization validity enforcement (fixes tiny numerical drifts)
+    for _ in range(3):
+        changed = False
+        for i in range(N_CIRCLES):
+            x, y = centers[i]
+            r = radii[i]
+            max_r_boundary = min(x, 1.0 - x, y, 1.0 - y)
+            if r > max_r_boundary + 1e-10:
+                radii[i] = max_r_boundary
+                changed = True
+                
+            for j in range(i + 1, N_CIRCLES):
+                dist = np.sqrt((x - centers[j, 0])**2 + (y - centers[j, 1])**2)
+                max_r_pair = dist - radii[j]
+                if r > max_r_pair + 1e-10:
+                    radii[i] = max_r_pair
+                    changed = True
+        if not changed:
+            break
+            
+    return centers, radii, float(np.sum(radii))
+```

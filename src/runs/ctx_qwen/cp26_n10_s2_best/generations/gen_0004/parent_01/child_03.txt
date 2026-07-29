@@ -1,0 +1,192 @@
+
+
+<strategy>
+The key insight to improve the packing is to decouple the optimization of centers and radii. For any fixed set of circle centers, finding the optimal radii to maximize their sum is a **Linear Programming (LP)** problem. The constraints are linear in radii: $r_i + r_j \leq \text{dist}(c_i, c_j)$ and $0 \leq r_i \leq \text{wall\_dist}(c_i)$. By solving this LP exactly at each step, we avoid the non-linear constraint handling pitfalls of SLSQP and get a precise, feasible objective value for any center configuration.
+
+We then treat the center coordinates as the optimization variables and use a derivative-free optimizer (Powell's method) to maximize the LP objective. Powell's method handles the piecewise-linear nature of the LP objective landscape effectively. To escape local minima, we combine multi-start Powell optimization with a simulated-annealing-style perturbation loop that periodically jumps the centers and re-optimizes.
+
+This approach:
+1. Guarantees strict feasibility by construction (LP solves radius constraints exactly).
+2. Avoids gradient computation errors from squared distance constraints.
+3. Efficiently explores the configuration space with targeted local refinements.
+4. Naturally pushes circles to optimal positions near boundaries and corners where wall constraints allow larger radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+IX, JX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(IX)
+
+def compute_optimal_radii(centers):
+    """
+    Solves the LP to find radii that maximize sum(r) for fixed centers.
+    Returns (sum_radii, radii_array).
+    """
+    # Distance constraints: r_i + r_j <= dist_ij
+    dx = centers[IX, 0] - centers[JX, 0]
+    dy = centers[IX, 1] - centers[JX, 1]
+    b_ub = np.hypot(dx, dy)
+    
+    # Sparse-ish constraint matrix
+    A_ub = np.zeros((NUM_PAIRS, N))
+    A_ub[np.arange(NUM_PAIRS), IX] = 1.0
+    A_ub[np.arange(NUM_PAIRS), JX] = 1.0
+    
+    # Wall constraints: 0 <= r_i <= min(x, 1-x, y, 1-y)
+    wall_max = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                          np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    bounds = [(0.0, w) for w in wall_max]
+    
+    # Maximize sum(r) <=> Minimize -sum(r)
+    res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        return -res.fun, res.x
+    return 0.0, np.zeros(N)
+
+def objective_func(centers_flat):
+    centers = centers_flat.reshape(N, 2)
+    val, _ = compute_optimal_radii(centers)
+    return -val
+
+def generate_initial_configs():
+    """Generates a diverse set of initial center configurations."""
+    configs = []
+    
+    # 1. Hexagonal lattice variations with rotations and shifts
+    for r0 in [0.09, 0.10, 0.11]:
+        for angle in np.linspace(-0.25, 0.25, 7):
+            for sx in [-0.02, 0.0, 0.02]:
+                for sy in [-0.02, 0.0, 0.02]:
+                    pts = []
+                    y = r0 + sy
+                    row = 0
+                    while len(pts) < N + 5:
+                        x_start = r0 + (row % 2) * r0 + sx
+                        x = x_start
+                        while x <= 1.0 - r0 and len(pts) < N + 5:
+                            pts.append([x, y])
+                            x += 2.0 * r0
+                        y += np.sqrt(3.0) * r0
+                        row += 1
+                        
+                    pts = np.array(pts[:N])
+                    # Rotate around center
+                    c, s = np.cos(angle), np.sin(angle)
+                    pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+                    pts = np.clip(pts, 0.04, 0.96)
+                    configs.append(pts.flatten())
+                    
+    # 2. Row-distributed patterns (known good packings for N=26)
+    row_patterns = [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [4, 6, 6, 6, 4], [6, 6, 5, 5, 4]]
+    for pat in row_patterns:
+        pts = []
+        ry = 0.07
+        for r_idx, count in enumerate(pat):
+            rx = 0.07 + (r_idx % 2) * 0.07
+            for k in range(count):
+                if len(pts) >= N: break
+                pts.append([rx + k * 0.145, ry])
+            ry += 0.175
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.01, 0.01, pts.shape)
+        configs.append(np.clip(pts, 0.04, 0.96).flatten())
+        
+    # 3. Force-relaxed random scatter
+    for seed in range(10):
+        np.random.seed(seed + 99)
+        pts = np.random.uniform(0.15, 0.85, (N, 2))
+        for _ in range(300):
+            forces = np.zeros_like(pts)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.linalg.norm(pts[i] - pts[j])
+                    if d < 0.25 and d > 1e-5:
+                        f = (0.25 - d) / d
+                        diff = pts[i] - pts[j]
+                        forces[i] += f * diff
+                        forces[j] -= f * diff
+            pts += forces * 0.02
+            pts = np.clip(pts, 0.05, 0.95)
+        configs.append(pts.flatten())
+        
+    return configs
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    bounds = [(0.03, 0.97)] * (2 * N)
+    
+    best_v = None
+    best_sum = -1.0
+    inits = generate_initial_configs()
+    
+    # Phase 1: Multi-start Powell optimization
+    # Powell's method is derivative-free and excels at optimizing non-smooth objectives like LP values
+    for i, v0 in enumerate(inits):
+        try:
+            res = minimize(objective_func, v0, method='Powell', bounds=bounds,
+                           options={'maxiter': 1200, 'ftol': 1e-12, 'disp': False})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback if all optimizations fail
+    if best_v is None:
+        best_v = inits[0]
+        
+    # Phase 2: Perturbation & Re-optimization (Simulated Annealing style)
+    # Helps escape shallow local minima by periodically shaking centers
+    curr_v = best_v.copy()
+    for step in range(50):
+        noise_scale = 0.012 * (0.94 ** step)
+        v_pert = curr_v + np.random.uniform(-noise_scale, noise_scale, 2*N)
+        v_pert = np.clip(v_pert, 0.03, 0.97)
+        
+        s_pert, _ = compute_optimal_radii(v_pert.reshape(N, 2))
+        if s_pert > best_sum:
+            best_sum = s_pert
+            best_v = v_pert.copy()
+            
+            # Local refinement around new best
+            res = minimize(objective_func, best_v, method='Powell', bounds=bounds,
+                           options={'maxiter': 600, 'ftol': 1e-12, 'disp': False})
+            s_ref = -res.fun
+            if s_ref > best_sum:
+                best_sum = s_ref
+                best_v = res.x.copy()
+                
+        # Occasionally pull from random init if stuck
+        if step % 10 == 0 and step > 0:
+            rand_init = inits[np.random.randint(len(inits))]
+            res_r = minimize(objective_func, rand_init, method='Powell', bounds=bounds,
+                             options={'maxiter': 400, 'ftol': 1e-12, 'disp': False})
+            if -res_r.fun > best_sum:
+                best_sum = -res_r.fun
+                best_v = res_r.x.copy()
+
+    # Final extraction and strict validation compliance
+    final_centers = best_v.reshape(N, 2)
+    final_sum, final_radii = compute_optimal_radii(final_centers)
+    
+    # Apply tiny safety margin to guarantee dist >= r1 + r2 - 1e-12 strictly
+    final_radii *= 0.99999995
+    final_radii = np.maximum(final_radii, 0.0)
+    
+    # Enforce wall constraints explicitly
+    for i in range(N):
+        mr = min(final_centers[i, 0], 1.0 - final_centers[i, 0],
+                 final_centers[i, 1], 1.0 - final_centers[i, 1])
+        final_radii[i] = min(final_radii[i], mr)
+        
+    return final_centers, final_radii, float(np.sum(final_radii))
+```

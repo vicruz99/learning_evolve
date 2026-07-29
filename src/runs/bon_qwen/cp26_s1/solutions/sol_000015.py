@@ -1,106 +1,489 @@
 # sol_000015 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 60d0e48a) state=5439dc47 sum of radii=2.606906 correctness=1.0
+# generation=0 parent=seed (state 07a91dcd) state=03d2421d sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+import scipy.optimize as opt
 
-def obj_func(x, n):
-    """Objective: maximize sum of radii (minimize negative sum)"""
-    return -np.sum(x[2*n:])
-
-def constr_func(x, n):
-    """Constraint function: returns array of constraint values >= 0"""
-    cx = x[:n]
-    cy = x[n:2*n]
-    r = x[2*n:]
-    
-    # Boundary constraints: circles inside [0,1]^2
-    cons = [cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r]
-    
-    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
-    dx = cx[:, None] - cx[None, :]
-    dy = cy[:, None] - cy[None, :]
-    dist_sq = dx**2 + dy**2
-    
-    r_sum = r[:, None] + r[None, :]
-    pair_diff = dist_sq - r_sum**2
-    
-    # Extract upper triangle to avoid duplicates
-    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
-    cons.append(pair_diff[mask])
-    
-    return np.concatenate(cons)
-
-def get_initial_guess(n):
-    """Generate initial hexagonal packing configuration"""
-    r0 = 0.07
-    cx = np.zeros(n)
-    cy = np.zeros(n)
-    
-    # Hexagonal row structure for n=26
-    row_counts = [5, 6, 5, 6, 4]
-    idx = 0
-    y_pos = r0
-    
-    for r_idx, count in enumerate(row_counts):
-        x_shift = r0 if r_idx % 2 == 1 else 0.0
-        for c_idx in range(count):
-            cx[idx] = r0 + x_shift + c_idx * 2 * r0
-            cy[idx] = y_pos
-            idx += 1
-        y_pos += np.sqrt(3) * r0
-        
-    # Center the configuration in the unit square
-    cx -= cx.mean() - 0.5
-    cy -= cy.mean() - 0.5
-    
-    r = np.full(n, r0)
-    return np.concatenate([cx, cy, r])
-
-def run_packing():
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
     n = 26
-    np.random.seed(42)
     
-    # Variable bounds: x in [0,1], y in [0,1], r in [1e-6, 0.5]
-    bounds = [(0.0, 1.0)] * n + [(0.0, 1.0)] * n + [(1e-6, 0.5)] * n
-    constraints = {'type': 'ineq', 'fun': constr_func, 'args': (n,)}
-    
-    x0 = get_initial_guess(n)
-    best_sum = -1.0
-    best_x = None
-    
-    # Multi-start optimization to improve robustness
-    for _ in range(5):
-        # Perturb initial guess slightly
-        x_start = x0 + np.random.randn(3*n) * 0.02
-        # Project back to valid bounds
-        for i in range(n):
-            x_start[i] = np.clip(x_start[i], 0.0, 1.0)
-            x_start[n+i] = np.clip(x_start[n+i], 0.0, 1.0)
-            x_start[2*n+i] = np.clip(x_start[2*n+i], 1e-6, 0.5)
-            
-        res = minimize(obj_func, x_start, args=(n,), method='SLSQP',
-                       bounds=bounds, constraints=constraints,
-                       options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
-                       
-        curr_sum = -res.fun
-        # Verify constraints are satisfied within tolerance
-        cons_val = constr_func(res.x, n)
-        if np.all(cons_val >= -1e-8) and curr_sum > best_sum:
-            best_sum = curr_sum
-            best_x = res.x.copy()
-            
-    # Fallback if optimization fails completely
-    if best_x is None:
-        best_x = x0
+    # Helper function to generate initial configurations
+    def generate_initial_guesses():
+        guesses = []
         
-    # Extract and clean results
-    cx = np.clip(best_x[:n], 1e-6, 1.0 - 1e-6)
-    cy = np.clip(best_x[n:2*n], 1e-6, 1.0 - 1e-6)
-    r = np.clip(best_x[2*n:], 1e-6, 0.5)
+        # 1. Hexagonal Lattice Packing
+        # Try to arrange in rows. 
+        # For 26 circles, maybe 5 rows? 
+        # Pattern: 5, 5, 5, 5, 6? No, hexagonal rows usually alternate count.
+        # Let's try a dense hexagonal grid filling.
+        # We can try to place centers on a hexagonal grid scaled to fit.
+        
+        # Estimate radius for 26 equal circles in square ~ 0.1
+        # Let's generate a grid of potential centers and pick 26 closest to a regular pattern
+        # Or just construct rows.
+        
+        # Configuration A: 6 rows. 5, 4, 5, 4, 5, 3? Sum=26.
+        # Or 5, 5, 5, 5, 4, 2? 
+        # Let's try a more uniform distribution.
+        # 5 rows of ~5 circles.
+        # Row 0: 5 circles. Row 1: 5 circles (shifted).
+        # Width for 5 circles: 4*2r + 2r = 10r.
+        # Width for 5 shifted circles: 4*2r + 2r + offset? 
+        # Shifted row centers at 2r, 4r, 6r, 8r, 10r? No, that's width 11r.
+        # Shifted row centers at r+delta?
+        
+        # Let's just generate points on a fine hexagonal grid and select 26.
+        # Hex grid spacing.
+        # Let's assume target r ~ 0.1. Spacing ~ 0.2.
+        # Grid points:
+        pts = []
+        r_est = 0.1
+        dy = np.sqrt(3)/2 * 2 * r_est # Height of row
+        # Rows
+        for row in range(8):
+            y = r_est + row * dy
+            if y + r_est > 1.0: break
+            # Shift x for odd rows
+            shift = r_est if row % 2 == 1 else 0
+            x = r_est + shift
+            while x + r_est <= 1.0:
+                pts.append([x, y])
+                x += 2 * r_est
+        
+        # If we have enough points, take first 26
+        if len(pts) >= n:
+            # Shuffle to add randomness or just take first
+            pts = pts[:n]
+            # Initialize radii to a small value to allow optimization to grow them
+            # Or initialize to r_est? 
+            # Better to initialize radii to a feasible value. 
+            # If points are far, r can be large.
+            # Let's just set r = 0.05 initially.
+            centers = np.array(pts[:n])
+            radii = np.full(n, 0.04) # Feasible start
+            guesses.append((centers, radii))
+
+        # Configuration B: Square Grid 5x5 + 1
+        # 5x5 grid centers
+        gx = np.linspace(0.1, 0.9, 5)
+        gy = np.linspace(0.1, 0.9, 5)
+        grid_pts = []
+        for y in gy:
+            for x in gx:
+                grid_pts.append([x, y])
+        # Add a point in the center or a hole
+        # Holes are at 0.2, 0.4, etc?
+        # Actually grid is 0.1, 0.3, 0.5, 0.7, 0.9
+        # Hole at 0.2 is good.
+        grid_pts.append([0.2, 0.2])
+        
+        centers = np.array(grid_pts[:n])
+        radii = np.full(n, 0.05)
+        guesses.append((centers, radii))
+
+        # Configuration C: Random
+        centers = np.random.rand(n, 2)
+        # Scale to be inside
+        centers = centers * 0.8 + 0.1
+        radii = np.full(n, 0.02)
+        guesses.append((centers, radii))
+        
+        # Configuration D: Random with larger radii (might overlap, but optimizer fixes)
+        # Actually, if overlap, constraints violated. 
+        # Better to keep initial valid.
+        # Let's try random centers with small radius.
+        centers = np.random.rand(n, 2)
+        # Push away from boundaries
+        margins = 0.1
+        centers = np.clip(centers, margins, 1-margins)
+        radii = np.full(n, 0.02)
+        guesses.append((centers, radii))
+
+        return guesses
+
+    def objective(x_vars):
+        # x_vars contains [x0, y0, r0, x1, y1, r1, ...]
+        # We want to maximize sum(r) -> minimize -sum(r)
+        radii_part = x_vars[2::3]
+        return -np.sum(radii_part)
+
+    def constraints_func(x_vars):
+        # Returns a list of constraint dictionaries for scipy
+        # Or we can define them separately.
+        # But for SLSQP, we can pass a list of dicts.
+        # However, defining a function that returns the constraint values is easier for some solvers,
+        # but SLSQP likes list of dicts with 'fun' key.
+        # Let's construct the list.
+        
+        centers = x_vars[0::3], x_vars[1::3]
+        cx = np.array(centers[0])
+        cy = np.array(centers[1])
+        r = np.array(x_vars[2::3])
+        
+        cons = []
+        
+        # 1. Boundary constraints:
+        # r <= x, r <= 1-x, r <= y, r <= 1-y
+        # x - r >= 0
+        # 1 - x - r >= 0
+        # y - r >= 0
+        # 1 - y - r >= 0
+        
+        # We can vectorize or loop. Loop is safer for defining individual constraints if needed,
+        # but SLSQP can handle vectorized constraints if type='ineq' and fun returns array.
+        # But for distance constraints, it's pairwise, hard to vectorize into one array easily without bloating.
+        # Let's stick to list of dicts or a single function returning all.
+        # SLSQP supports constraints with fun returning array.
+        
+        # Let's return all constraints as one array.
+        # But we need to know which is which? No, just >= 0.
+        
+        vals = []
+        
+        # Boundary
+        vals.extend(cx - r)
+        vals.extend(1.0 - cx - r)
+        vals.extend(cy - r)
+        vals.extend(1.0 - cy - r)
+        
+        # Pairwise distance: dist^2 - (r_i + r_j)^2 >= 0
+        # dist^2 = (xi - xj)^2 + (yi - yj)^2
+        # Constraint: (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist_sq = (cx[i] - cx[j])**2 + (cy[i] - cy[j])**2
+                sum_r = r[i] + r[j]
+                vals.append(dist_sq - sum_r**2)
+        
+        return vals
+
+    # Actually, passing a function that returns a large array is efficient.
+    # But we need to wrap it in a constraint dict.
     
-    centers = np.column_stack((cx, cy))
-    return centers, r, np.sum(r)
+    def constraint_array(x_vars):
+        cx = x_vars[0::3]
+        cy = x_vars[1::3]
+        r = x_vars[2::3]
+        
+        vals = []
+        # Boundary
+        vals.extend(cx - r)
+        vals.extend(1.0 - cx - r)
+        vals.extend(cy - r)
+        vals.extend(1.0 - cy - r)
+        
+        # Distance
+        # Vectorized pairwise?
+        # cx shape (n,), r shape (n,)
+        # diff cx: (n, n)
+        # This might be memory heavy for n=26? 26x26 is small.
+        
+        # Using broadcasting
+        # cx_i - cx_j
+        # We only need upper triangle.
+        
+        # Let's do loops for simplicity and correctness, 26*25/2 = 325 is small.
+        for i in range(n):
+            xi, yi, ri = cx[i], cy[i], r[i]
+            for j in range(i + 1, n):
+                xj, yj, rj = cx[j], cy[j], r[j]
+                d2 = (xi - xj)**2 + (yi - yj)**2
+                vals.append(d2 - (ri + rj)**2)
+                
+        return np.array(vals)
+
+    constraints = [{'type': 'ineq', 'fun': constraint_array}]
+    
+    bounds = []
+    for i in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)]) # x, y, r
+
+    best_val = -1.0
+    best_centers = None
+    best_radii = None
+    
+    guesses = generate_initial_guesses()
+    
+    # Try multiple random restarts if guesses list is short or to improve
+    # Let's add some random perturbations to the best guess or new random ones
+    for _ in range(10):
+        centers = np.random.rand(n, 2) * 0.8 + 0.1
+        radii = np.random.rand(n) * 0.05 + 0.01 # Small positive
+        # Ensure radii are feasible (small enough not to overlap immediately? 
+        # Optimizer handles infeasible start, but might struggle. 
+        # Let's keep radii small.
+        guesses.append((centers, radii))
+
+    # Run optimization
+    for k, (centers, radii) in enumerate(guesses):
+        # Flatten
+        x0 = np.empty(n * 3)
+        x0[0::3] = centers[:, 0]
+        x0[1::3] = centers[:, 1]
+        x0[2::3] = radii
+        
+        # Check if initial guess is valid? 
+        # If not valid, SLSQP might fail or take long.
+        # But we can try.
+        
+        try:
+            res = opt.minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                               options={'maxiter': 500, 'ftol': 1e-9})
+            
+            if res.success or res.fun < best_val * -1 - 1e-4: # Note: obj is negative sum
+                current_sum = -res.fun
+                if current_sum > best_val:
+                    best_val = current_sum
+                    best_centers = np.column_stack((res.x[0::3], res.x[1::3]))
+                    best_radii = res.x[2::3]
+        except Exception as e:
+            print(f"Optimization failed for guess {k}: {e}")
+            continue
+
+    # If we didn't find anything good, fallback to a simple grid
+    if best_val < 0.001:
+        # 5x5 grid + 1
+        gx = np.linspace(0.1, 0.9, 5)
+        gy = np.linspace(0.1, 0.9, 5)
+        c = []
+        r = []
+        for y in gy:
+            for x in gx:
+                c.append([x, y])
+                r.append(0.09) # Slightly less than 0.1 to be safe? 
+                # Actually 0.1 is valid if neighbors touch. 
+                # But we have 26 circles. 
+                # Let's just return a valid packing.
+        # 26th circle
+        c.append([0.5, 0.5]) # Might overlap
+        r.append(0.0)
+        
+        # Better fallback: small random circles
+        best_centers = np.random.rand(n, 2) * 0.6 + 0.2
+        best_radii = np.full(n, 0.01)
+        best_val = np.sum(best_radii)
+
+    # Final validation and clipping
+    # Ensure radii are not negative (should be handled by bounds, but just in case)
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    # Check validity
+    # If invalid, shrink radii
+    # But the optimizer should satisfy constraints.
+    # Let's do a quick check.
+    # ... (re-using validate logic mentally)
+    
+    return best_centers, best_radii, float(best_val)
+
+# To ensure the code is self-contained and robust, I'll rely on the optimizer.
+# However, for the output, I need to make sure I don't import things that might be missing?
+# scipy is allowed.
+
+# One concern: The optimizer might find a solution where circles overlap due to numerical error.
+# The validation function has a tolerance of 1e-12.
+# SLSQP should respect constraints.
+# But sometimes it converges to boundary.
+# We might want to slightly shrink radii by a tiny epsilon if close to violation, 
+# but the optimizer objective pushes radii up, so it will hit constraints exactly.
+# The validation allows < 1e-12 overlap? No, it checks `dist < r1+r2 - 1e-12`.
+# So if dist == r1+r2, it is valid.
+# Optimizer should find dist >= r1+r2.
+
+# Let's refine the initial guesses to be more promising.
+# The hexagonal guess logic was a bit rough. Let's make it deterministic and good.
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # Optimization Setup
+    def obj(x):
+        return -np.sum(x[2::3])
+    
+    def constr(x):
+        cx = x[0::3]
+        cy = x[1::3]
+        r = x[2::3]
+        
+        # Boundary
+        v = []
+        v.append(cx - r)
+        v.append(1.0 - cx - r)
+        v.append(cy - r)
+        v.append(1.0 - cy - r)
+        
+        # Pairwise
+        for i in range(n):
+            for j in range(i+1, n):
+                v.append((cx[i]-cx[j])**2 + (cy[i]-cy[j])**2 - (r[i]+r[j])**2)
+        return np.concatenate(v)
+
+    cons = {'type': 'ineq', 'fun': constr}
+    bnds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+
+    best_score = 0.0
+    best_sol = None
+
+    # Helper to run optimizer
+    def try_opt(x0):
+        nonlocal best_score, best_sol
+        try:
+            res = opt.minimize(obj, x0, method='SLSQP', bounds=bnds, constraints=cons, 
+                               options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+            score = -res.fun
+            # Validate manually to be sure
+            if score > best_score:
+                # Check validity roughly
+                cx = res.x[0::3]
+                cy = res.x[1::3]
+                r = res.x[2::3]
+                
+                # Quick check for huge violations
+                valid = True
+                if np.any(r < -1e-6): valid = False
+                if np.any(cx < -1e-6) or np.any(cx > 1+1e-6): valid = False
+                if np.any(cy < -1e-6) or np.any(cy > 1+1e-6): valid = False
+                
+                if valid:
+                    best_score = score
+                    best_sol = (np.column_stack((cx, cy)), r)
+        except:
+            pass
+
+    # Guess 1: Hexagonal-ish
+    # 5 rows. 
+    # Row 0: 5 circles. y=0.1
+    # Row 1: 5 circles. y=0.1 + sqrt(3)/2 * 0.2 approx 0.273
+    # Let's just pack them tightly.
+    # We want to maximize r. 
+    # If we assume r=0.1, hex spacing is 0.1 * sqrt(3) ~ 0.173.
+    # Let's place centers.
+    
+    # Strategy: Place circles on a grid that approximates optimal packing.
+    # Known packing for 26 circles?
+    # Let's try to distribute them evenly.
+    # 26 circles. 
+    # Maybe 6 circles on each side? 6x6 = 36.
+    # 5x5 = 25.
+    # Let's try a perturbed 5x5 grid + 1.
+    
+    # Start with 5x5 grid centers
+    xs = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    ys = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    centers_25 = np.zeros((25, 2))
+    idx = 0
+    for y in ys:
+        for x in xs:
+            centers_25[idx] = [x, y]
+            idx += 1
+    
+    # 26th circle at center of a hole? 
+    # Holes are at (0.2, 0.2), (0.2, 0.4)...
+    # (0.2, 0.2) is equidistant to (0.1, 0.1), (0.3, 0.1), (0.1, 0.3), (0.3, 0.3).
+    # Distance to (0.1, 0.1) is sqrt(0.01+0.01) = 0.1414.
+    # If neighbors are radius 0.1, gap is 0.0414.
+    # Let's place 26th at (0.2, 0.2) with radius 0.04.
+    
+    centers = np.vstack([centers_25, [[0.2, 0.2]]])
+    radii = np.ones(26) * 0.05 # Start with feasible radii
+    x0 = np.zeros(78)
+    x0[0::3] = centers[:, 0]
+    x0[1::3] = centers[:, 1]
+    x0[2::3] = radii
+    try_opt(x0)
+    
+    # Guess 2: Hexagonal packing structure
+    # 6 rows. 
+    # Row 0: 5 circles at y=0.1
+    # Row 1: 4 circles at y=0.1 + 0.1732, x shifted
+    # Row 2: 5 circles
+    # Row 3: 4 circles
+    # Row 4: 5 circles
+    # Row 5: 3 circles? 
+    # 5+4+5+4+5+3 = 26.
+    
+    r_start = 0.09
+    dy = r_start * np.sqrt(3)
+    centers_h = []
+    
+    # Row 0: 5 circles
+    for i in range(5):
+        x = r_start + i * 2 * r_start
+        centers_h.append([x, r_start])
+        
+    # Row 1: 4 circles, shifted by r_start
+    y1 = r_start + dy
+    for i in range(4):
+        x = r_start + r_start + i * 2 * r_start # Shifted start
+        centers_h.append([x, y1])
+        
+    # Row 2: 5 circles
+    y2 = y1 + dy
+    for i in range(5):
+        x = r_start + i * 2 * r_start
+        centers_h.append([x, y2])
+        
+    # Row 3: 4 circles
+    y3 = y2 + dy
+    for i in range(4):
+        x = r_start + r_start + i * 2 * r_start
+        centers_h.append([x, y3])
+        
+    # Row 4: 5 circles
+    y4 = y3 + dy
+    for i in range(5):
+        x = r_start + i * 2 * r_start
+        centers_h.append([x, y4])
+        
+    # Row 5: 3 circles
+    y5 = y4 + dy
+    for i in range(3):
+        x = r_start + r_start + i * 2 * r_start
+        centers_h.append([x, y5])
+        
+    centers = np.array(centers_h)
+    # Check if within bounds
+    # If r_start=0.09, width ~ 0.09 + 4*0.18 + 0.09 = 0.9. OK.
+    # Height ~ 0.09 + 5*0.155 + 0.09 = 0.09 + 0.775 + 0.09 = 0.955. OK.
+    
+    radii_h = np.ones(26) * 0.04
+    x0_h = np.zeros(78)
+    x0_h[0::3] = centers[:, 0]
+    x0_h[1::3] = centers[:, 1]
+    x0_h[2::3] = radii_h
+    try_opt(x0_h)
+
+    # Guess 3: Random
+    for _ in range(5):
+        centers_r = np.random.rand(n, 2) * 0.8 + 0.1
+        radii_r = np.full(n, 0.02)
+        x0_r = np.zeros(78)
+        x0_r[0::3] = centers_r[:, 0]
+        x0_r[1::3] = centers_r[:, 1]
+        x0_r[2::3] = radii_r
+        try_opt(x0_r)
+
+    if best_sol is None:
+        # Fallback
+        centers = np.zeros((n, 2))
+        radii = np.zeros(n)
+        # Simple grid
+        for i in range(n):
+            centers[i] = [0.5, 0.5]
+            radii[i] = 0.0
+    else:
+        centers, radii = best_sol
+
+    # Final check and correction for numerical stability
+    # If any constraint is slightly violated due to float error, fix it?
+    # The validation is strict but allows 1e-12.
+    # We return the result.
+    
+    return centers, radii, float(np.sum(radii))

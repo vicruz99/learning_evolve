@@ -1,0 +1,158 @@
+# sol_000041 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 12653929) state=d818ca4b sum of radii=2.574839 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import warnings
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # Suppress warnings for cleaner output during optimization
+    warnings.filterwarnings("ignore")
+
+    n_circles = 26
+    
+    # 1. Initialization: Dense Hexagonal/Square Grid
+    # 5 rows with a staggered pattern to fit 26 circles
+    # Row structure: 6, 5, 6, 5, 4 circles
+    initial_radii = np.full(n_circles, 0.08) 
+    centers = np.zeros((n_circles, 2))
+    
+    row_y = 0.1
+    row_spacing = 0.15
+    circle_idx = 0
+    
+    row_configs = [
+        {"n": 6, "x_start": 0.08},
+        {"n": 5, "x_start": 0.16},
+        {"n": 6, "x_start": 0.08},
+        {"n": 5, "x_start": 0.16},
+        {"n": 4, "x_start": 0.24}
+    ]
+    
+    for config in row_configs:
+        num = config["n"]
+        for i in range(num):
+            x = config["x_start"] + i * 0.16
+            centers[circle_idx] = [x, row_y]
+            circle_idx += 1
+        row_y += row_spacing
+        
+    # 2. Physics-Based Relaxation to expand circles
+    # Iteratively increase radii and resolve overlaps using repulsive forces
+    radii = initial_radii.copy()
+    learning_rate = 0.001
+    growth_factor = 1.0005
+    
+    for step in range(2000):
+        radii *= growth_factor
+        
+        # Calculate forces
+        force_x = np.zeros(n_circles)
+        force_y = np.zeros(n_circles)
+        
+        # Boundary repulsion
+        for i in range(n_circles):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < 0: force_x[i] += (r - x) * 10
+            if x + r > 1: force_x[i] -= (x + r - 1) * 10
+            if y - r < 0: force_y[i] += (r - y) * 10
+            if y + r > 1: force_y[i] -= (y + r - 1) * 10
+            
+        # Pairwise repulsion
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                overlap = radii[i] + radii[j] - dist
+                
+                if overlap > 0:
+                    fx = (dx / dist) * overlap
+                    fy = (dy / dist) * overlap
+                    force_x[i] += fx
+                    force_y[i] += fy
+                    force_x[j] -= fx
+                    force_y[j] -= fy
+                    
+        centers[:, 0] += force_x * learning_rate
+        centers[:, 1] += force_y * learning_rate
+        centers[:, 0] = np.clip(centers[:, 0], 0, 1)
+        centers[:, 1] = np.clip(centers[:, 1], 0, 1)
+
+    # 3. Gradient Ascent to maximize sum of radii
+    # Flattened vector: [x1, y1, r1, ..., x26, y26, r26]
+    x0 = np.zeros(3 * n_circles)
+    for i in range(n_circles):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+
+    constraints = []
+    for i in range(n_circles):
+        # Boundary constraints: x-r >= 0, x+r <= 1, y-r >= 0, y+r <= 1
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[3*i] - v[3*i+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[3*i+1] - v[3*i+2]})
+        # Non-negative radius
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+2]})
+        
+        for j in range(i + 1, n_circles):
+            # Non-overlap constraint: dist^2 >= (r1+r2)^2
+            def overlap_con(v, i=i, j=j):
+                dx = v[3*i] - v[3*j]
+                dy = v[3*i+1] - v[3*j+1]
+                dr = v[3*i+2] + v[3*j+2]
+                return dx*dx + dy*dy - dr*dr
+            constraints.append({'type': 'ineq', 'fun': overlap_con})
+
+    def objective(v):
+        # Negative sum of radii to maximize
+        return -np.sum(v[2::3])
+
+    result = minimize(objective, x0, method='SLSQP', constraints=constraints, 
+                     options={'maxiter': 500, 'ftol': 1e-9})
+
+    final_centers = np.zeros((n_circles, 2))
+    final_radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        final_centers[i, 0] = result.x[3*i]
+        final_centers[i, 1] = result.x[3*i+1]
+        final_radii[i] = result.x[3*i+2]
+        
+    # Validation
+    sum_radii = np.sum(final_radii)
+    if not validate_packing(final_centers, final_radii):
+        print("Final configuration failed validation, falling back to relaxed physics config.")
+        return centers, radii, np.sum(radii)
+        
+    return final_centers, final_radii, sum_radii
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+
+    for i in range(n):
+        if radii[i] < 0: return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+
+    return True

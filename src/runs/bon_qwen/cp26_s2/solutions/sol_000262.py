@@ -1,0 +1,173 @@
+# sol_000262 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 3433cac4) state=7b1dfb6b sum of radii=2.594544 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    np.random.seed(42)  # For reproducibility
+
+    # --- 1. Initialization ---
+    # We use a 5x5 grid structure plus one extra point, with slight perturbations.
+    # A 5x5 grid of circles with radius 0.1 fits exactly (width 1.0).
+    # We start with slightly smaller radii to allow room for movement and optimization.
+    
+    centers = np.zeros((n, 2))
+    radii = np.full(n, 0.05) # Start with small radii
+
+    # Generate a 5x5 grid
+    grid_x = np.linspace(0.1, 0.9, 5)
+    grid_y = np.linspace(0.1, 0.9, 5)
+    
+    idx = 0
+    for y in grid_y:
+        for x in grid_x:
+            if idx < n - 1:
+                centers[idx] = [x, y]
+                idx += 1
+    
+    # Place the 26th circle in the center of the square, slightly perturbed
+    # The center (0.5, 0.5) is occupied by a grid point in a 5x5 grid starting at 0.1?
+    # 0.1, 0.3, 0.5, 0.7, 0.9. Yes, (0.5, 0.5) is occupied.
+    # Let's shift it slightly or place it in a gap.
+    # A gap exists at (0.5, 0.1) relative to (0.5, 0.3)? No.
+    # Let's just place it at (0.5, 0.5) + small offset if occupied, 
+    # or better, initialize it at a random location in the center area.
+    centers[n-1] = [0.5 + 0.01, 0.5 + 0.01]
+
+    # Add small random noise to break symmetry
+    centers += np.random.uniform(-0.01, 0.01, size=centers.shape)
+    
+    # Clip centers to stay within reasonable bounds [0.1, 0.9] initially
+    centers = np.clip(centers, 0.1, 0.9)
+
+    # --- 2. Objective and Constraints ---
+    
+    # Objective: Maximize sum of radii -> Minimize negative sum of radii
+    def objective(vars):
+        # vars structure: [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+        # But it's easier to map indices: 0..25 for x, 26..51 for y, 52..77 for r
+        # Let's use a flatter array for scipy: [x0, y0, r0, x1, y1, r1, ...]
+        # Total 78 variables.
+        
+        r = vars[2::3]
+        return -np.sum(r)
+
+    def boundary_constraints(vars):
+        """
+        Constraints:
+        r_i <= x_i
+        r_i <= 1 - x_i
+        r_i <= y_i
+        r_i <= 1 - y_i
+        => x_i - r_i >= 0
+           1 - x_i - r_i >= 0
+           y_i - r_i >= 0
+           1 - y_i - r_i >= 0
+        """
+        constraints = []
+        for i in range(n):
+            idx = i * 3
+            x = vars[idx]
+            y = vars[idx+1]
+            r = vars[idx+2]
+            
+            constraints.append(x - r)
+            constraints.append(1 - x - r)
+            constraints.append(y - r)
+            constraints.append(1 - y - r)
+        return np.array(constraints)
+
+    def non_overlap_constraints(vars):
+        """
+        Constraint: dist(i, j) >= r_i + r_j
+        => (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        """
+        constraints = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                idx_i = i * 3
+                idx_j = j * 3
+                
+                x_i, y_i, r_i = vars[idx_i], vars[idx_i+1], vars[idx_i+2]
+                x_j, y_j, r_j = vars[idx_j], vars[idx_j+1], vars[idx_j+2]
+                
+                dist_sq = (x_i - x_j)**2 + (y_i - y_j)**2
+                rad_sum_sq = (r_i + r_j)**2
+                
+                constraints.append(dist_sq - rad_sum_sq)
+        return np.array(constraints)
+
+    # Combine constraints
+    # SciPy expects constraints as a list of dictionaries or a single dictionary.
+    # We can provide a function that returns an array of constraint values.
+    
+    def combined_constraints(vars):
+        c1 = boundary_constraints(vars)
+        c2 = non_overlap_constraints(vars)
+        return np.concatenate((c1, c2))
+
+    # Define constraint dictionary for SLSQP
+    cons = ({'type': 'ineq', 'fun': combined_constraints})
+
+    # Initial guess vector
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[i*3] = centers[i, 0]
+        x0[i*3+1] = centers[i, 1]
+        x0[i*3+2] = radii[i]
+
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+        bounds.append((0, 0.5)) # r
+
+    # --- 3. Optimization ---
+    # Use SLSQP method
+    # options={'ftol': 1e-9, 'maxiter': 1000}
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                       options={'ftol': 1e-9, 'maxiter': 2000, 'disp': False})
+        
+        if res.success or res.nit > 0:
+            # Extract results
+            opt_vars = res.x
+            opt_centers = np.zeros((n, 2))
+            opt_radii = np.zeros(n)
+            
+            for i in range(n):
+                opt_centers[i, 0] = opt_vars[i*3]
+                opt_centers[i, 1] = opt_vars[i*3+1]
+                opt_radii[i] = opt_vars[i*3+2]
+            
+            # Clean up tiny radii or negative values due to numerical noise
+            opt_radii = np.maximum(opt_radii, 0)
+            
+            # Ensure centers are consistent with radii (clip if needed, though optimizer should respect bounds)
+            # Sometimes optimizer might push center slightly outside due to r being 0?
+            # Let's just return what we got.
+            
+            sum_r = np.sum(opt_radii)
+            return opt_centers, opt_radii, sum_r
+        else:
+            # Fallback if optimization fails
+            return centers, radii, np.sum(radii)
+            
+    except Exception:
+        return centers, radii, np.sum(radii)
+
+# Function to be called by the runner
+def run_packing_runner():
+    return run_packing()

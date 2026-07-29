@@ -1,0 +1,113 @@
+# sol_000027 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000015 (state cc21d5f7) state=bf2de84b sum of radii=2.627588 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(x):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def compute_constraints(x):
+    """Compute all inequality constraints: boundary and separation."""
+    N = 26
+    C = x.reshape(N, 3)
+    x_c = C[:, 0]
+    y_c = C[:, 1]
+    r = C[:, 2]
+    
+    c_list = []
+    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    c_list.append(x_c - r)
+    c_list.append(1.0 - x_c - r)
+    c_list.append(y_c - r)
+    c_list.append(1.0 - y_c - r)
+    
+    # Pairwise separation constraints: dist_sq >= (r_i + r_j)^2
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    dx = x_c[i_idx] - x_c[j_idx]
+    dy = y_c[i_idx] - y_c[j_idx]
+    r_sum = r[i_idx] + r[j_idx]
+    c_list.append(dx*dx + dy*dy - r_sum*r_sum)
+    
+    return np.concatenate(c_list)
+
+def generate_init(N, seed, perturb_std):
+    """Generate a feasible initial configuration based on a hexagonal lattice."""
+    np.random.seed(seed)
+    rows_counts = [5, 6, 5, 6, 4]
+    pts = []
+    y = 0.05
+    for r_idx, count in enumerate(rows_counts):
+        shift = (r_idx % 2) * 0.1
+        x = 0.05 + shift
+        for _ in range(count):
+            pts.append([x, y])
+            x += 0.2
+        y += 0.17320508
+    pts = np.array(pts[:N])
+    
+    if perturb_std > 0:
+        pts += np.random.normal(0, perturb_std, pts.shape)
+        pts = np.clip(pts, 0.01, 0.99)
+        
+    # Compute strictly feasible initial radii
+    radii = np.zeros(N)
+    for i in range(N):
+        d_wall = min(pts[i, 0], 1.0 - pts[i, 0], pts[i, 1], 1.0 - pts[i, 1])
+        d_min = 1.0
+        for j in range(N):
+            if i != j:
+                d = np.sqrt(np.sum((pts[i] - pts[j])**2))
+                if d < d_min:
+                    d_min = d
+        radii[i] = 0.4 * min(d_wall, 0.5 * d_min)
+        
+    x0 = np.zeros(3 * N)
+    for i in range(N):
+        x0[3*i] = pts[i, 0]
+        x0[3*i+1] = pts[i, 1]
+        x0[3*i+2] = radii[i]
+    return x0
+
+def run_packing():
+    N = 26
+    best_sum = -np.inf
+    best_x = None
+    
+    # Variable bounds: x in [0,1], y in [0,1], r in [0, 0.5]
+    bounds = [(0, 1), (0, 1), (0, 0.5)] * N
+    
+    # Run multiple restarts to escape local minima
+    for seed in range(12):
+        perturb = 0.0 if seed < 2 else 0.025
+        x0 = generate_init(N, seed, perturb)
+        
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': compute_constraints},
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            
+            if res.success:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    # Verify constraints are satisfied within tolerance
+                    cons_vals = compute_constraints(res.x)
+                    if np.min(cons_vals) >= -1e-9:
+                        best_sum = curr_sum
+                        best_x = res.x
+        except Exception:
+            continue
+
+    # Fallback to deterministic init if optimization fails
+    if best_x is None:
+        best_x = generate_init(N, 0, 0.0)
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))

@@ -1,0 +1,258 @@
+# sol_000106 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000080 (state b3333e60) state=53792c0d sum of radii=2.619176 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+_BOUNDS = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+
+def get_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c = -np.ones(n)
+    A_ub = []
+    b_ub = []
+    
+    x, y = centers[:, 0], centers[:, 1]
+    bounds_val = np.column_stack([x, 1.0 - x, y, 1.0 - y])
+    
+    # Boundary constraints: r_i <= dist_to_boundary
+    for i in range(n):
+        for b in bounds_val[i]:
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(b)
+            
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dists[i, j])
+            
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    bounds = [(0.0, None)] * n
+    
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and res.x is not None:
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    return np.full(n, 1e-5), 2.6e-4
+
+def force_layout(seed, base_pattern='hex'):
+    """Generate a feasible configuration using force-directed growth."""
+    rng = np.random.RandomState(seed)
+    
+    if base_pattern == 'hex':
+        pts = []
+        r0 = 0.09
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x_off = (row % 2) * r0
+            x = r0 + x_off
+            while x <= 1.0 - r0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+            row += 1
+        centers = np.array(pts[:N])
+    else:
+        centers = rng.uniform(0.2, 0.8, (N, 2))
+        
+    radii = np.full(N, 0.005)
+    
+    for step in range(2500):
+        radii += 0.00015
+        forces = np.zeros_like(centers)
+        
+        # Wall repulsion
+        for i in range(N):
+            cx, cy, r = centers[i, 0], centers[i, 1], radii[i]
+            if cx < r: forces[i, 0] += 15.0 * (r - cx)
+            if cx > 1.0 - r: forces[i, 0] -= 15.0 * (cx - (1.0 - r))
+            if cy < r: forces[i, 1] += 15.0 * (r - cy)
+            if cy > 1.0 - r: forces[i, 1] -= 15.0 * (cy - (1.0 - r))
+            
+        # Pairwise repulsion
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d = np.sqrt(dx * dx + dy * dy)
+                if d < 1e-6:
+                    d = 1e-6
+                    dx, dy = 1.0, 0.0
+                r_sum = radii[i] + radii[j]
+                if d < r_sum:
+                    overlap = r_sum - d
+                    f = overlap * 80.0 / d
+                    fx, fy = f * dx, f * dy
+                    forces[i, 0] -= fx
+                    forces[i, 1] -= fy
+                    forces[j, 0] += fx
+                    forces[j, 1] += fy
+                    
+        centers += forces * 0.001
+        centers = np.clip(centers, 0.02, 0.98)
+        
+    radii *= 0.97
+    return centers, radii
+
+def s_obj(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def s_cons(v):
+    """Inequality constraints: boundary containment and pairwise separation."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    
+    c = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    d2 = dx**2 + dy**2
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    c.append(d2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2)
+    return np.concatenate(c)
+
+def run_packing():
+    best_sum = -np.inf
+    best_v = None
+    cons = {'type': 'ineq', 'fun': s_cons}
+    
+    # Phase 1: Force-directed layouts from multiple seeds
+    for s in range(15):
+        c, r = force_layout(s, base_pattern='hex')
+        r_lp, _ = get_lp_radii(c)
+        v0 = np.zeros(3 * N)
+        v0[0::3] = c[:, 0]
+        v0[1::3] = c[:, 1]
+        v0[2::3] = r_lp * 0.99
+        
+        try:
+            res = minimize(s_obj, v0, method='SLSQP', bounds=_BOUNDS, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if np.min(s_cons(res.x)) >= -1e-7:
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Systematically rotated hexagonal lattices
+    for ang in np.linspace(0.0, np.pi / 6, 12):
+        pts = []
+        r0 = 0.092
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x_off = (row % 2) * r0
+            x = r0 + x_off
+            while x <= 1.0 - r0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r0
+            y += np.sqrt(3.0) * r0
+            row += 1
+        pts = np.array(pts[:N])
+        
+        # Rotate around center
+        ca, sa = np.cos(ang), np.sin(ang)
+        pts = pts - 0.5
+        pts = pts @ np.array([[ca, -sa], [sa, ca]]).T
+        pts = pts + 0.5
+        pts = np.clip(pts, 0.04, 0.96)
+        
+        r_lp, _ = get_lp_radii(pts)
+        v0 = np.zeros(3 * N)
+        v0[0::3] = pts[:, 0]
+        v0[1::3] = pts[:, 1]
+        v0[2::3] = r_lp * 0.99
+        
+        try:
+            res = minimize(s_obj, v0, method='SLSQP', bounds=_BOUNDS, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if np.min(s_cons(res.x)) >= -1e-7:
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 3: Perturbation refinement to escape local minima
+    if best_v is not None:
+        for _ in range(40):
+            vp = best_v.copy()
+            # Perturb centers more than radii to explore topology changes
+            vp[0::3] += np.random.uniform(-0.006, 0.006, N)
+            vp[1::3] += np.random.uniform(-0.006, 0.006, N)
+            vp[0::3] = np.clip(vp[0::3], 0.01, 0.99)
+            vp[1::3] = np.clip(vp[1::3], 0.01, 0.99)
+            
+            # Re-optimize radii for perturbed centers
+            c_p = np.column_stack((vp[0::3], vp[1::3]))
+            r_p, _ = get_lp_radii(c_p)
+            vp[2::3] = r_p * 0.995
+            
+            try:
+                res = minimize(s_obj, vp, method='SLSQP', bounds=_BOUNDS, constraints=cons,
+                               options={'maxiter': 2500, 'ftol': 1e-12, 'disp': False})
+                if np.min(s_cons(res.x)) >= -1e-7:
+                    s_val = -res.fun
+                    if s_val > best_sum:
+                        best_sum = s_val
+                        best_v = res.x.copy()
+            except Exception:
+                pass
+
+    # Phase 4: High-precision final polish
+    if best_v is not None:
+        try:
+            res_f = minimize(s_obj, best_v, method='SLSQP', bounds=_BOUNDS, constraints=cons,
+                             options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if np.min(s_cons(res_f.x)) >= -1e-8:
+                best_v = res_f.x
+                best_sum = -res_f.fun
+        except Exception:
+            pass
+            
+    # Fallback (strictly valid grid packing)
+    if best_v is None:
+        best_v = np.zeros(3 * N)
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                if idx < N:
+                    best_v[3 * idx] = 0.1 + 0.2 * i
+                    best_v[3 * idx + 1] = 0.1 + 0.2 * j
+                    best_v[3 * idx + 2] = 0.09
+                    idx += 1
+        if idx < N:
+            best_v[3 * 25] = 0.5
+            best_v[3 * 25 + 1] = 0.5
+            best_v[3 * 25 + 2] = 0.09
+        best_sum = np.sum(best_v[2::3])
+        
+    centers = np.column_stack((best_v[0::3], best_v[1::3]))
+    radii = np.maximum(best_v[2::3], 0.0)
+    return centers, radii, float(np.sum(radii))

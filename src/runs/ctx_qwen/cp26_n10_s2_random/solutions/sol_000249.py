@@ -1,0 +1,287 @@
+# sol_000249 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000214 (state 097281dc) state=31e1bc1e sum of radii=2.624554 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+NUM_PAIRS = N * (N - 1) // 2
+TRIU_IND = np.triu_indices(N, 1)
+
+def build_lp_matrices(n):
+    A = np.zeros((NUM_PAIRS + 4 * n, n))
+    pairs = []
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            pairs.append((i, j))
+            k += 1
+    for i in range(n):
+        base = NUM_PAIRS + 4 * i
+        A[base, i] = 1.0
+        A[base + 1, i] = 1.0
+        A[base + 2, i] = 1.0
+        A[base + 3, i] = 1.0
+    return A, pairs
+
+A_LP, LP_PAIRS = build_lp_matrices(N)
+
+def solve_lp_radii(centers):
+    n = centers.shape[0]
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-12)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.zeros(A_LP.shape[0])
+    idx = 0
+    for i, j in LP_PAIRS:
+        b[idx] = dists[i, j]
+        idx += 1
+    for i in range(n):
+        b[idx] = centers[i, 0]; idx += 1
+        b[idx] = 1.0 - centers[i, 0]; idx += 1
+        b[idx] = centers[i, 1]; idx += 1
+        b[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b, 
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    if res.success:
+        marg = getattr(res, 'marginals', None)
+        if marg is not None:
+            duals = getattr(marg, 'ineqlin', None)
+            if duals is None:
+                duals = np.zeros_like(b)
+        else:
+            duals = getattr(res, 'ineqlin', None)
+            if duals is not None:
+                duals = getattr(duals, 'marginals', np.zeros_like(b))
+            else:
+                duals = np.zeros_like(b)
+        return res.x, np.sum(res.x), duals
+    return np.zeros(n), 0.0, np.zeros_like(b)
+
+def compute_grad(centers, duals):
+    n = centers.shape[0]
+    grad = np.zeros_like(centers)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    idx = 0
+    for i, j in LP_PAIRS:
+        mu = duals[idx]
+        if mu > 1e-9:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+        idx += 1
+        
+    bound_start = NUM_PAIRS
+    for i in range(n):
+        grad[i, 0] += duals[bound_start + 4*i] - duals[bound_start + 4*i + 1]
+        grad[i, 1] += duals[bound_start + 4*i + 2] - duals[bound_start + 4*i + 3]
+    return grad
+
+def gradient_ascent(centers0, max_iter=5000, init_step=0.008, rng=None):
+    if rng is None:
+        rng = np.random.default_rng(0)
+    centers = centers0.copy()
+    best_centers = centers.copy()
+    best_sum = -1.0
+    step = init_step
+    patience = 0
+    
+    for k in range(max_iter):
+        radii, curr_sum, duals = solve_lp_radii(centers)
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_centers = centers.copy()
+            patience = 0
+        else:
+            patience += 1
+            if patience > 40:
+                step *= 0.7
+            
+        if step < 1e-12:
+            break
+            
+        grad = compute_grad(centers, duals)
+        gn = np.linalg.norm(grad)
+        if gn < 1e-12:
+            # Add jitter to escape flat region
+            centers += rng.normal(0, step * 0.5, centers.shape)
+            centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+            continue
+            
+        centers += step * (grad / gn)
+        centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+        
+        # Periodic cooling jitter
+        if k % 150 == 0 and k > 0:
+            jitter_amp = 0.004 * np.exp(-k / 2000.0)
+            centers += rng.normal(0, jitter_amp, centers.shape)
+            centers = np.clip(centers, 1e-5, 1.0 - 1e-5)
+            
+    return best_centers, best_sum
+
+def slsqp_obj(v):
+    return -np.sum(v[2*N:])
+
+def slsqp_cons(v):
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = []
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    dx = c[TRIU_IND[0], 0] - c[TRIU_IND[1], 0]
+    dy = c[TRIU_IND[0], 1] - c[TRIU_IND[1], 1]
+    dr = r[TRIU_IND[0]] + r[TRIU_IND[1]]
+    con.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(con)
+
+SLSQP_BOUNDS = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+
+def slsqp_optimize(c_init, r_init, maxiter=8000):
+    v0 = np.concatenate([c_init.flatten(), r_init])
+    try:
+        res = minimize(slsqp_obj, v0, method='SLSQP', bounds=SLSQP_BOUNDS,
+                       constraints={'type': 'ineq', 'fun': slsqp_cons},
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if np.min(slsqp_cons(res.x)) >= -1e-8:
+            return res.x[:2*N].reshape(N, 2), res.x[2*N:], -res.fun
+    except Exception:
+        pass
+    return c_init, r_init, 0.0
+
+def repair(centers, radii):
+    radii = radii.copy()
+    for _ in range(300):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-11:
+                    shrink = (req - d) / 2.0 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], 
+                     centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def generate_inits(rng, n_inits=45):
+    inits = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 5, 6, 5, 5],
+        [5, 4, 6, 6, 5], [6, 5, 5, 5, 5], [5, 5, 5, 6, 5],
+        [5, 6, 4, 5, 6], [6, 4, 6, 5, 5], [5, 7, 5, 5, 4],
+        [4, 5, 6, 6, 5], [6, 6, 4, 6, 4], [5, 5, 4, 7, 5]
+    ]
+    for pat in patterns:
+        for r0 in [0.088, 0.094, 0.098, 0.102, 0.106]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x + rng.normal(0, 0.002), y + rng.normal(0, 0.002)])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            inits.append(np.array(c[:N]))
+            
+    # Force-directed random starts
+    for _ in range(15):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(800):
+            forces = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i+1, N):
+                    d_vec = c[i] - c[j]
+                    d = np.linalg.norm(d_vec)
+                    if d < 0.20 and d > 1e-6:
+                        f = (0.20 - d) / d * 0.015
+                        forces[i] += d_vec * f
+                        forces[j] -= d_vec * f
+            c += forces
+            c = np.clip(c, 0.05, 0.95)
+        inits.append(c)
+        
+    return inits[:n_inits]
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    inits = generate_inits(rng, 50)
+    
+    # Phase 1: Multi-start Gradient Ascent
+    for c_init in inits:
+        c_opt, s_opt = gradient_ascent(c_init, max_iter=4000, init_step=0.009, rng=rng)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            r_lp, _, _ = solve_lp_radii(best_c)
+            best_r = r_lp
+            
+    if best_c is None:
+        best_c = inits[0]
+        best_r, best_sum, _ = solve_lp_radii(best_c)
+
+    # Phase 2: Basin Hopping / Perturbation Search
+    for hop in range(30):
+        noise_scale = 0.012 * (0.92 ** hop)
+        c_pert = best_c + rng.normal(0, noise_scale, best_c.shape)
+        c_pert = np.clip(c_pert, 0.04, 0.96)
+        c_opt, s_opt = gradient_ascent(c_pert, max_iter=3000, init_step=0.007, rng=rng)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            r_lp, _, _ = solve_lp_radii(best_c)
+            best_r = r_lp
+
+    # Phase 3: Joint SLSQP Polish
+    if best_c is not None:
+        ub = np.minimum(np.minimum(best_c[:, 0], 1.0 - best_c[:, 0]),
+                        np.minimum(best_c[:, 1], 1.0 - best_c[:, 1]))
+        dists = np.linalg.norm(best_c[:, None, :] - best_c[None, :, :], axis=2)
+        np.fill_diagonal(dists, np.inf)
+        rp = 0.5 * np.min(dists, axis=1)
+        r_init = np.minimum(ub, rp) * 0.90
+        
+        c_final, r_final, s_final = slsqp_optimize(best_c, r_init, maxiter=10000)
+        if s_final > best_sum:
+            best_sum = s_final
+            best_c = c_final.copy()
+            best_r = r_final.copy()
+            
+    # Phase 4: Final LP match & Strict Repair
+    r_lp, s_lp, _ = solve_lp_radii(best_c)
+    if s_lp > best_sum:
+        best_sum = s_lp
+        best_r = r_lp
+        
+    radii = repair(best_c.copy(), best_r.copy())
+    return best_c, radii, float(np.sum(radii))

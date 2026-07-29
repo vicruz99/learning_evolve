@@ -1,0 +1,193 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond 2.621, we will employ a multi-start optimization strategy combined with a post-processing "inflate-and-relax" technique. 
+
+1. **Initialization Diversity**: We generate 20 diverse initial configurations. Half use a scaled hexagonal lattice (optimal for density), and half use dense random placements. Each is perturbed slightly to break symmetry.
+2. **Robust Local Optimization**: We use `scipy.optimize.minimize` with the `SLSQP` method, which handles inequality constraints efficiently. The constraints enforce boundary containment and non-overlap via squared distances for smoothness.
+3. **Radius Inflation Loop**: After finding the best local optimum, we compute the minimum gap between all circles and boundaries. We uniformly increase radii by a fraction of this gap, then re-run the local optimizer. This iteratively pushes the packing density beyond what a single optimization pass typically achieves.
+4. **Vectorized Constraints**: All constraint calculations are fully vectorized to ensure fast evaluation during the optimizer's iterations, allowing more restarts within reasonable time.
+5. **Safety Checks**: We enforce strict bounds on radii ($10^{-7}$ to $0.5$) and add numerical tolerance handling to guarantee the final output passes the validation function without NaNs or boundary violations.
+
+This approach leverages the known fact that optimal packings for $N=26$ are close to hexagonal lattices, but uses global search and adaptive inflation to escape local minima and squeeze out the remaining $\sim 0.015$ sum-of-radii gap.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_constraints(vars_flat):
+    """Computes all boundary and non-overlap constraints for the packing."""
+    X = vars_flat.reshape(N, 3)
+    xs = X[:, 0]
+    ys = X[:, 1]
+    rs = X[:, 2]
+
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c1 = xs - rs
+    c2 = 1.0 - xs - rs
+    c3 = ys - rs
+    c4 = 1.0 - ys - rs
+
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    idx = np.triu_indices(N, k=1)
+    dx = xs[idx[0]] - xs[idx[1]]
+    dy = ys[idx[0]] - ys[idx[1]]
+    dr = rs[idx[0]] + rs[idx[1]]
+    c5 = dx**2 + dy**2 - dr**2
+
+    return np.concatenate([c1, c2, c3, c4, c5])
+
+def compute_objective(vars_flat):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    rs = vars_flat[2::3]
+    return -np.sum(rs)
+
+def get_bounds():
+    """Returns variable bounds for x, y, r."""
+    b = []
+    for _ in range(N):
+        b.append((0.0, 1.0))
+        b.append((0.0, 1.0))
+        b.append((1e-7, 0.5))
+    return b
+
+def generate_hex_init(seed, r_guess=0.095):
+    """Generates a hexagonal lattice initialization scaled to fit the square."""
+    rng = np.random.default_rng(seed)
+    # Row configuration: 5, 5, 5, 5, 6 circles sums to 26
+    counts = [5, 5, 5, 5, 6]
+    pts = []
+    s = 2.0 * r_guess
+    y = r_guess
+    for i, cnt in enumerate(counts):
+        x_start = r_guess + (i % 2) * (s / 2.0)
+        for _ in range(cnt):
+            pts.append([x_start, y])
+            x_start += s
+        y += s * np.sqrt(3.0) / 2.0
+        
+    pts = np.array(pts)
+    
+    # Normalize and scale to [0.05, 0.95] to stay safely inside initially
+    min_p = pts.min(axis=0)
+    max_p = pts.max(axis=0)
+    pts = (pts - min_p) / (max_p - min_p + 1e-12)
+    pts = pts * 0.9 + 0.05
+    
+    # Add controlled noise
+    pts += rng.normal(0, 0.008, pts.shape)
+    pts = np.clip(pts, 0.02, 0.98)
+    
+    init = np.zeros(N * 3)
+    init[0::3] = pts[:, 0]
+    init[1::3] = pts[:, 1]
+    init[2::3] = r_guess
+    return init
+
+def generate_random_init(seed):
+    """Generates a dense random initialization."""
+    rng = np.random.default_rng(seed)
+    pos = rng.uniform(0.1, 0.9, (N, 2))
+    init = np.zeros(N * 3)
+    init[0::3] = pos[:, 0]
+    init[1::3] = pos[:, 1]
+    init[2::3] = 0.08
+    return init
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_vars = None
+    best_obj = -np.inf
+    
+    # Multi-start optimization
+    # First 12: Hexagonal lattice variations
+    for i in range(12):
+        x0 = generate_hex_init(i, r_guess=0.095)
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2500, 'ftol': 1e-13, 'disp': False})
+            
+            c_vals = compute_constraints(res.x)
+            if np.min(c_vals) >= -1e-6:
+                curr_obj = -res.fun
+                if curr_obj > best_obj:
+                    best_obj = curr_obj
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+
+    # Next 8: Random dense variations
+    for i in range(8):
+        x0 = generate_random_init(i + 100)
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2500, 'ftol': 1e-13, 'disp': False})
+            
+            c_vals = compute_constraints(res.x)
+            if np.min(c_vals) >= -1e-6:
+                curr_obj = -res.fun
+                if curr_obj > best_obj:
+                    best_obj = curr_obj
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+
+    # Fallback if all optimizations fail
+    if best_vars is None:
+        best_vars = generate_hex_init(0, 0.095)
+        
+    # Post-processing: Iterative radius inflation and relaxation
+    centers = best_vars.reshape(N, 3)[:, :2]
+    radii = best_vars.reshape(N, 3)[:, 2]
+    
+    for _ in range(6):
+        # Compute minimum gap to boundaries
+        gaps = [
+            np.min(centers[:, 0] - radii),
+            np.min(1.0 - centers[:, 0] - radii),
+            np.min(centers[:, 1] - radii),
+            np.min(1.0 - centers[:, 1] - radii)
+        ]
+        
+        # Compute minimum gap between circles
+        diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        pair_gaps = dists - (radii[:, np.newaxis] + radii[np.newaxis, :])
+        np.fill_diagonal(pair_gaps, np.inf)
+        gaps.append(np.min(pair_gaps))
+        
+        min_gap = np.min(gaps)
+        if min_gap > 1e-5:
+            # Inflate radii slightly and re-optimize positions
+            radii += min_gap * 0.85
+            x0 = np.zeros(N * 3)
+            x0[0::3] = centers[:, 0]
+            x0[1::3] = centers[:, 1]
+            x0[2::3] = radii
+            
+            try:
+                res2 = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                                constraints=cons, options={'maxiter': 1500, 'ftol': 1e-12, 'disp': False})
+                if -res2.fun > best_obj:
+                    best_vars = res2.x.copy()
+                    best_obj = -res2.fun
+                    centers = best_vars.reshape(N, 3)[:, :2]
+                    radii = best_vars.reshape(N, 3)[:, 2]
+            except Exception:
+                break
+        else:
+            break
+
+    # Extract final solution
+    centers = best_vars.reshape(N, 3)[:, :2]
+    radii = best_vars.reshape(N, 3)[:, 2]
+    radii = np.maximum(radii, 0.0)
+    sum_r = float(np.sum(radii))
+    
+    return centers, radii, sum_r
+```

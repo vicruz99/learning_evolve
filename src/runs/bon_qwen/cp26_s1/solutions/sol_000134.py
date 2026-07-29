@@ -1,289 +1,153 @@
 # sol_000134 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 0b92a944) state=0c6a5cfa sum of radii=1.333311 correctness=1.0
+# generation=0 parent=seed (state 5da4630c) state=ac9ba782 sum of radii=2.564464 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import minimize
+
+def objective(vars):
+    """
+    Objective function: minimize negative sum of radii.
+    vars is a 1D array: [x0, y0, r0, x1, y1, r1, ...]
+    """
+    # Radii are at indices 2, 5, 8, ...
+    return -np.sum(vars[2::3])
+
+def all_boundary_constraints_vec(vars):
+    """
+    Vectorized boundary constraints.
+    Returns an array of values that must be >= 0.
+    Constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    """
+    n = len(vars) // 3
+    x = vars[::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    # x - r >= 0
+    # 1 - x - r >= 0
+    # y - r >= 0
+    # 1 - y - r >= 0
+    return np.concatenate([x - r, 1 - x - r, y - r, 1 - y - r])
+
+def all_overlap_constraints_vec(vars):
+    """
+    Vectorized overlap constraints.
+    Returns an array of values that must be >= 0.
+    Constraints: dist(i, j)^2 >= (r_i + r_j)^2 for all i < j
+    """
+    n = len(vars) // 3
+    x = vars[::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    # Compute pairwise squared Euclidean distances
+    # dx[i, j] = x[i] - x[j]
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Compute squared sum of radii
+    # sum_r[i, j] = r[i] + r[j]
+    sum_r = r[:, None] + r[None, :]
+    rad_sq = sum_r**2
+    
+    # We only need constraints for i < j (upper triangle of the matrix)
+    # np.triu_indices(n, k=1) gives indices for the upper triangle excluding diagonal
+    idx = np.triu_indices(n, k=1)
+    
+    # Constraint: dist_sq - rad_sq >= 0
+    return dist_sq[idx] - rad_sq[idx]
 
 def run_packing():
-    """
-    Packs 26 circles in a unit square [0,1]x[0,1] to maximize sum of radii.
-    Uses an iterative method: fixing centers, solving LP for radii, then moving centers
-    based on LP dual variables (sensitivities).
-    """
     n = 26
-    np.random.seed(42)
-
-    # 1. Initialization: Hexagonal-like grid
-    # We try to place points roughly evenly.
-    # 26 points. 5x5 grid is 25. Add 1 in center or adjust.
-    # Let's use a 6x5 grid subset or just random dense points.
-    # A dense random initialization often works well with this optimizer.
     
-    # Better init: Grid with some jitter
-    cols = 6
-    rows = 5
-    xs = np.linspace(0.1, 0.9, cols)
-    ys = np.linspace(0.1, 0.9, rows)
+    # 1. Initialize centers using a hexagonal grid pattern for good initial spacing
+    centers = []
+    step = 0.2
+    y = 0.1
+    row_idx = 0
     
-    grid_points = []
-    for y in ys:
-        for x in xs:
-            grid_points.append([x, y])
+    # Generate hex grid points
+    while y <= 0.95:
+        # Alternate offset for hexagonal packing
+        offset = 0.1 if row_idx % 2 == 0 else 0.2
+        x = offset
+        while x <= 0.95:
+            centers.append([x, y])
+            x += step
+        y += step * (np.sqrt(3)/2)
+        row_idx += 1
+        
+    # Fallback to rectangular grid if hex grid doesn't provide enough points
+    if len(centers) < n:
+        x_coords = np.linspace(0.1, 0.9, 6)
+        y_coords = np.linspace(0.1, 0.9, 5)
+        centers = []
+        for yy in y_coords:
+            for xx in x_coords:
+                centers.append([xx, yy])
     
-    # We have 30 points, need 26. Remove 4 corners or random?
-    # Let's just pick first 26 or optimize selection. 
-    # Actually, random perturbation of a grid is safer to avoid symmetries that get stuck.
-    centers = np.random.uniform(0.05, 0.95, size=(n, 2))
+    # Select exactly n points
+    centers = centers[:n]
+    centers = np.array(centers)
     
-    # 2. Optimization Loop
-    # We want to maximize sum(r).
-    # Constraints: r_i + r_j <= dist(i,j), r_i <= dist_to_wall(i)
+    # 2. Initial radii (small value to ensure feasibility)
+    radii = np.full(n, 0.01)
     
-    num_iter = 2000
-    learning_rate = 0.005
-    lr_decay = 0.9995
-    
-    # Precompute pair indices for LP matrix construction
-    pairs = []
+    # 3. Setup initial vector for optimizer
+    # Structure: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(n * 3)
     for i in range(n):
-        for j in range(i + 1, n):
-            pairs.append((i, j))
-    num_pairs = len(pairs)
-    
-    best_sum_r = -1.0
-    best_centers = centers.copy()
-    best_radii = np.zeros(n)
-
-    for step in range(num_iter):
-        # -- Solve LP --
-        # Variables: r_0 ... r_25
-        # Objective: minimize -sum(r)
-        c_obj = -np.ones(n)
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
         
-        # Constraints matrix A_ub x <= b_ub
-        # 1. Pairwise: r_i + r_j <= dist_ij
-        # 2. Boundary: r_i <= min(x, 1-x, y, 1-y)
-        
-        A_ub = np.zeros((num_pairs + n, n))
-        b_ub = np.zeros(num_pairs + n)
-        
-        # Fill pairwise constraints
-        for k, (i, j) in enumerate(pairs):
-            d = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            A_ub[k, i] = 1.0
-            A_ub[k, j] = 1.0
-            b_ub[k] = d
-        
-        # Fill boundary constraints
-        # r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-        # This is equivalent to r_i <= min(...)
-        # But for LP, we can just use the single constraint r_i <= B_i
-        # where B_i is the current distance to the closest wall.
-        # Note: This is a linear approximation of the boundary constraint for fixed centers.
-        for i in range(n):
-            x, y = centers[i]
-            dist_to_wall = min(x, 1 - x, y, 1 - y)
-            row_idx = num_pairs + i
-            A_ub[row_idx, i] = 1.0
-            b_ub[row_idx] = dist_to_wall
-            
-        # Bounds for radii: r >= 0
-        bounds = [(0, None) for _ in range(n)]
-        
-        # Solve
-        try:
-            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if res.success:
-                radii = res.x
-                duals = res.ineqlin.marginals # Marginals for A_ub x <= b_ub
-            else:
-                # Fallback if LP fails (rare)
-                radii = np.zeros(n)
-                duals = np.zeros(len(b_ub))
-        except Exception:
-            radii = np.zeros(n)
-            duals = np.zeros(len(b_ub))
-            
-        current_sum = np.sum(radii)
-        if current_sum > best_sum_r:
-            best_sum_r = current_sum
-            best_centers = centers.copy()
-            best_radii = radii.copy()
-
-        # -- Compute Gradient --
-        # Gradient of Objective (sum r) w.r.t centers.
-        # We use the envelope theorem / sensitivity analysis.
-        # d(sum r)/d(center) = sum (dual_k * d(RHS_k)/d(center))
-        
-        grad_centers = np.zeros_like(centers)
-        
-        # 1. Pairwise constraints duals
-        # Constraint k: r_i + r_j <= ||c_i - c_j||
-        # Dual lambda_k >= 0.
-        # Contribution to gradient of c_i: lambda_k * (c_i - c_j) / ||c_i - c_j||
-        # Contribution to gradient of c_j: lambda_k * (c_j - c_i) / ||c_i - c_j||
-        
-        # We only iterate if dual is significant to save time
-        # duals[:num_pairs] correspond to pairs
-        
-        # Vectorized calculation might be faster but loop is fine for N=26
-        for k in range(num_pairs):
-            lam = duals[k]
-            if lam > 1e-8: # Active constraint
-                i, j = pairs[k]
-                vec = centers[i] - centers[j]
-                dist = np.linalg.norm(vec)
-                if dist > 1e-9:
-                    unit_vec = vec / dist
-                    grad_centers[i] += lam * unit_vec
-                    grad_centers[j] -= lam * unit_vec
-        
-        # 2. Boundary constraints duals
-        # Constraint num_pairs + i: r_i <= dist_to_wall_i
-        # Dual mu_i >= 0.
-        # dist_to_wall_i = min(x, 1-x, y, 1-y)
-        # Gradient of min(...) w.r.t (x,y) is (1,0), (-1,0), (0,1), or (0,-1) depending on active wall.
-        
-        for i in range(n):
-            mu = duals[num_pairs + i]
-            if mu > 1e-8:
-                x, y = centers[i]
-                # Determine active wall
-                d_left = x
-                d_right = 1 - x
-                d_bottom = y
-                d_top = 1 - y
-                
-                min_d = min(d_left, d_right, d_bottom, d_top)
-                
-                # Tolerance for min check
-                eps = 1e-9
-                active_grad = np.array([0.0, 0.0])
-                
-                if abs(d_left - min_d) < eps:
-                    active_grad[0] += 1.0 # Move right increases distance to left
-                if abs(d_right - min_d) < eps:
-                    active_grad[0] -= 1.0 # Move left increases distance to right
-                if abs(d_bottom - min_d) < eps:
-                    active_grad[1] += 1.0 # Move up increases distance to bottom
-                if abs(d_top - min_d) < eps:
-                    active_grad[1] -= 1.0 # Move down increases distance to top
-                
-                # Normalize if multiple active? 
-                # If x=0.5, left and right are 0.5. Moving right increases left dist, decreases right dist.
-                # But min(0.5+dx, 0.5-dx) = 0.5-dx (for dx>0). So min decreases.
-                # So gradient should be 0?
-                # Actually, if min is achieved by multiple, the function is not differentiable or gradient is 0?
-                # In LP duals, if multiple constraints are active (tight), the dual might be split or assigned to one.
-                # But geometrically, if r_i = x = 1-x = 0.5, circle touches both walls.
-                # Moving center doesn't help increase radius.
-                # So we should only apply gradient if there is a unique minimum or direction helps.
-                # Actually, simpler logic: if r_i == x, push right. If r_i == 1-x, push left.
-                # If both, they cancel out?
-                # Let's trust the dual logic:
-                # If dual > 0, constraint is tight. 
-                # If x is the min, constraint r_i <= x is tight. Dual > 0 implies relaxing x (increasing x) helps.
-                # So force right.
-                # If 1-x is min, constraint r_i <= 1-x is tight. Relaxing 1-x means decreasing 1-x? No.
-                # RHS is 1-x. Increasing RHS means decreasing x?
-                # Wait. Constraint: r_i <= 1 - x_i.
-                # To relax, we need larger RHS. 1-x_i increases if x_i decreases.
-                # So force left.
-                # If both x and 1-x are min (x=0.5), then r_i <= 0.5 and r_i <= 0.5.
-                # If dual on first is >0 -> push right.
-                # If dual on second is >0 -> push left.
-                # If both tight, we might get canceling forces, which is correct (no direction helps).
-                
-                grad_centers[i] += mu * active_grad
-
-        # -- Update Centers --
-        centers += learning_rate * grad_centers
-        
-        # Project to [0, 1]
-        # Although gradient should keep them inside if logic is correct,
-        # numerical noise might push them out.
-        # But wait, if center is at 0, x=0. dist_to_wall=0. r_i=0.
-        # If we move out (x<0), dist_to_wall becomes negative? 
-        # No, dist_to_wall logic should handle it, but LP constraints might break if we assume valid geometry.
-        # Better to clamp centers strictly.
-        centers = np.clip(centers, 0.0, 1.0)
-        
-        # Decay learning rate
-        learning_rate *= lr_decay
-
-    # Final validation and cleanup
-    # Sometimes the last step might have slight overlap due to clipping or noise?
-    # But LP guarantees valid radii for the final centers.
-    # However, we must ensure centers are valid.
-    
-    # Re-solve LP for best_centers to ensure radii match
-    # (In case best_centers was from a previous step and centers drifted)
-    # Actually best_centers was saved when sum was max.
-    # But we need radii for that specific center config.
-    
-    # Let's just use the best state found.
-    # But we need to return centers and radii.
-    # The radii corresponding to best_centers might be different if we just saved best_sum_r.
-    # Let's re-run the LP on best_centers to be safe and consistent.
-    
-    final_centers = best_centers
-    # Re-calculate radii
-    c_obj = -np.ones(n)
-    A_ub = np.zeros((num_pairs + n, n))
-    b_ub = np.zeros(num_pairs + n)
-    
-    for k, (i, j) in enumerate(pairs):
-        d = np.sqrt(np.sum((final_centers[i] - final_centers[j])**2))
-        A_ub[k, i] = 1.0
-        A_ub[k, j] = 1.0
-        b_ub[k] = d
-    
+    # 4. Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5] (radius cannot exceed 0.5 in unit square)
+    bounds = []
     for i in range(n):
-        x, y = final_centers[i]
-        dist_to_wall = min(x, 1 - x, y, 1 - y)
-        row_idx = num_pairs + i
-        A_ub[row_idx, i] = 1.0
-        b_ub[row_idx] = dist_to_wall
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 0.5))
         
-    bounds = [(0, None) for _ in range(n)]
+    # 5. Constraints
+    constraints = [
+        {'type': 'ineq', 'fun': all_boundary_constraints_vec},
+        {'type': 'ineq', 'fun': all_overlap_constraints_vec}
+    ]
     
+    # 6. Run optimization
+    # SLSQP is suitable for nonlinear constraints
     try:
-        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        if res.success:
-            final_radii = res.x
-        else:
-            final_radii = np.zeros(n) # Should not happen
-    except:
-        final_radii = np.zeros(n)
-
-    final_sum = np.sum(final_radii)
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                       options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+        x_opt = res.x
+    except Exception:
+        # Fallback in case of optimization failure
+        x_opt = x0
+        
+    # 7. Extract results
+    centers_opt = np.zeros((n, 2))
+    radii_opt = np.zeros(n)
+    for i in range(n):
+        centers_opt[i, 0] = x_opt[3*i]
+        centers_opt[i, 1] = x_opt[3*i+1]
+        radii_opt[i] = x_opt[3*i+2]
+        
+    # Ensure radii are non-negative (handling potential numerical noise)
+    radii_opt = np.maximum(radii_opt, 0.0)
     
-    return final_centers, final_radii, final_sum
-
-# For testing locally
-if __name__ == "__main__":
-    import sys
-    # Check if validation function is available or mock it
-    # But we just need to run the function.
-    centers, radii, s = run_packing()
-    print(f"Sum of radii: {s}")
-    print(f"Min radius: {np.min(radii)}, Max radius: {np.max(radii)}")
+    # Calculate sum of radii
+    sum_radii = float(np.sum(radii_opt))
     
-    # Quick self-validation
-    valid = True
-    for i in range(26):
-        x, y = centers[i]
-        r = radii[i]
-        if x - r < -1e-6 or x + r > 1 + 1e-6 or y - r < -1e-6 or y + r > 1 + 1e-6:
-            valid = False
-            print(f"Circle {i} out of bounds")
-    for i in range(26):
-        for j in range(i+1, 26):
-            d = np.sqrt(np.sum((centers[i]-centers[j])**2))
-            if d < radii[i] + radii[j] - 1e-6:
-                valid = False
-                print(f"Circles {i}, {j} overlap")
-    print(f"Valid: {valid}")
+    # Basic sanity check / cleanup for NaNs
+    if np.isnan(centers_opt).any() or np.isnan(radii_opt).any():
+        # Fallback to initial valid configuration
+        centers_opt = centers
+        radii_opt = radii
+        sum_radii = float(np.sum(radii_opt))
+        
+    return centers_opt, radii_opt, sum_radii

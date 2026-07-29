@@ -1,220 +1,368 @@
 # sol_000174 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 8150d860) state=3fe3e9a7 sum of radii=1.511866 correctness=1.0
+# generation=0 parent=seed (state ae68a5b3) state=90f1513e sum of radii=0.065000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import math
+from scipy.optimize import minimize
 
-def calculate_distance(c1, c2):
-    """Calculate Euclidean distance between two centers."""
-    return np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+# Global variable for penalty weight to avoid closures
+PENALTY_WEIGHT = 1000.0
 
-def evaluate_packing(centers, radii, penalty_factor=100.0):
+def compute_objective_and_penalty(v, n_circles=26):
     """
-    Evaluate the packing quality.
-    Returns a score where higher is better.
-    Penalizes overlaps and boundary violations.
-    """
-    n = centers.shape[0]
-    score = np.sum(radii)
+    Computes the objective function value (negative sum of radii) 
+    plus a penalty for constraint violations.
     
-    # Boundary penalties
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
+    Args:
+        v: numpy array of shape (3 * n_circles,) containing x, y, r for each circle.
+        n_circles: number of circles (default 26).
         
-        # Check boundaries with a small tolerance to allow optimization to settle
-        # But strict validation requires strict adherence. 
-        # We use a soft penalty here to guide the optimizer.
-        violation = 0.0
-        if x - r < 0: violation += (r - x)
-        if x + r > 1: violation += (x + r - 1)
-        if y - r < 0: violation += (r - y)
-        if y + r > 1: violation += (y + r - 1)
-        
-        if violation > 0:
-            score -= penalty_factor * violation
-
-    # Overlap penalties
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = calculate_distance(centers[i], centers[j])
-            r_sum = radii[i] + radii[j]
-            if dist < r_sum:
-                overlap = r_sum - dist
-                score -= penalty_factor * overlap
-                
-    return score
-
-def run_packing():
+    Returns:
+        float: Objective value.
     """
-    Optimizes the packing of 26 circles in a unit square.
+    # Reshape to (n_circles, 3)
+    coords = v.reshape(n_circles, 3)
+    x = coords[:, 0]
+    y = coords[:, 1]
+    r = coords[:, 2]
+    
+    # Objective: Maximize sum of radii -> Minimize negative sum
+    obj = -np.sum(r)
+    
+    penalty = 0.0
+    
+    # Boundary constraints penalty
+    # Circles must be inside [0, 1] x [0, 1]
+    # Violations: r - x < 0, r - (1-x) < 0, etc.
+    # We penalize max(0, violation)^2
+    
+    # Left: x - r >= 0 => r - x <= 0. Violation if r - x > 0.
+    # Wait, x >= r. So if x < r, violation.
+    # Violation amount: r - x.
+    left_viol = np.maximum(0, r - x)
+    penalty += np.sum(left_viol**2)
+    
+    # Right: x + r <= 1 => x + r - 1 <= 0. Violation if x + r - 1 > 0.
+    right_viol = np.maximum(0, x + r - 1.0)
+    penalty += np.sum(right_viol**2)
+    
+    # Bottom: y - r >= 0. Violation if r - y > 0.
+    bottom_viol = np.maximum(0, r - y)
+    penalty += np.sum(bottom_viol**2)
+    
+    # Top: y + r <= 1. Violation if y + r - 1 > 0.
+    top_viol = np.maximum(0, y + r - 1.0)
+    penalty += np.sum(top_viol**2)
+    
+    # Overlap constraints penalty
+    # For each pair i < j, dist(i, j) >= r_i + r_j
+    # Violation if r_i + r_j - dist > 0
+    
+    # Vectorized computation for overlaps might be heavy for 26 circles in a loop,
+    # but 26 is small enough. 26*25/2 = 325 pairs.
+    # Let's use loops for clarity or simple vectorization.
+    
+    # Compute pairwise distances
+    # x is shape (26,), expand to (26, 1)
+    x_mat = x[:, np.newaxis]
+    y_mat = y[:, np.newaxis]
+    r_mat = r[:, np.newaxis]
+    
+    # Difference matrices
+    dx = x_mat - x_mat.T # (26, 26)
+    dy = y_mat - y_mat.T
+    dr = r_mat + r_mat.T # Sum of radii matrix (26, 26)
+    
+    # Squared distances
+    dist_sq = dx**2 + dy**2
+    # Distance
+    dist = np.sqrt(dist_sq)
+    
+    # Overlap violation: max(0, r_i + r_j - dist)
+    # We only care about upper triangle (i < j), but squaring symmetric matrix doubles it, which is fine for penalty.
+    # Or just sum all and divide by 2.
+    overlap_viol = np.maximum(0, dr - dist)
+    
+    # Sum of squared violations (excluding diagonal which is 0)
+    # np.sum(overlap_viol**2) sums all elements. Diagonal is 0.
+    # Each pair counted twice.
+    penalty += 0.5 * np.sum(overlap_viol**2)
+    
+    return obj + PENALTY_WEIGHT * penalty
+
+def generate_hexagonal_initial_guess(n_circles=26, seed=0):
+    """
+    Generates an initial configuration based on a hexagonal lattice.
+    
+    Args:
+        n_circles: Number of circles to pack.
+        seed: Random seed for jitter.
+        
+    Returns:
+        numpy array of shape (3 * n_circles,)
+    """
+    np.random.seed(seed)
+    
+    # Estimate radius for initial guess
+    # Area argument: 26 * pi * r^2 approx 1 => r approx 0.11
+    # But packing efficiency < 1. Let's start with r = 0.08
+    initial_r = 0.08
+    
+    centers = []
+    
+    # Try to fit circles in rows
+    # Hexagonal packing: rows shifted by r
+    # Vertical spacing sqrt(3) * r
+    
+    # We need to determine how many rows and circles per row.
+    # Let's just generate a grid of points and pick the first n_circles.
+    # Or better, pack them in.
+    
+    y = initial_r
+    x_start = initial_r
+    row_count = 0
+    
+    while len(centers) < n_circles:
+        # Determine how many circles fit in this row
+        # Width available: 1.0
+        # Circles take 2*r width, but first and last touch walls?
+        # Actually centers at r, 3r, 5r...? No, distance 2r.
+        # Centers at r, r + 2r, ...
+        # Max x = 1 - r.
+        # Number of circles k: r + (k-1)*2r <= 1 - r => 2r + (k-1)*2r <= 1 => k*2r <= 1 => k <= 1/(2r)
+        max_in_row = int(1.0 / (2 * initial_r))
+        
+        # For hexagonal, odd rows might have different count or shift
+        # Let's shift every other row by r
+        shift = 0.0
+        if row_count % 2 == 1:
+            shift = initial_r
+            # If shifted, effective width starts at 2r?
+            # Center at r + shift = 2r?
+            # Actually, if shifted by r, first center at r + r = 2r.
+            # Last center at 1 - r - r = 1 - 2r.
+            # Available width 1 - 4r.
+            # Number of circles k: 2r + (k-1)*2r <= 1 - 2r => k*2r <= 1 - 2r => k <= (1-2r)/2r = 1/(2r) - 1.
+            max_in_row_shifted = int((1.0 - 4 * initial_r) / (2 * initial_r)) + 1
+            # Wait, let's just generate points and check if they fit.
+            
+        if row_count % 2 == 1:
+            # Shifted row
+            # Start at 2r?
+            # Let's try to place circles at x = 2r, 4r, ...
+            # Actually, simpler: generate potential centers and filter.
+            pass
+
+        # Simpler approach: Just generate a dense hex grid and pick points that fit?
+        # No, we need exactly n_circles.
+        
+        # Let's just place them manually based on row count.
+        # 26 circles. 
+        # 5 rows: 5, 5, 5, 5, 6? No.
+        # 6 rows: 5, 4, 5, 4, 5, 3 = 26.
+        
+        row_targets = []
+        # Try pattern 5, 4, 5, 4, 5, 3
+        targets = [5, 4, 5, 4, 5, 3]
+        if sum(targets) >= n_circles:
+            # Adjust last row
+            current_sum = 0
+            for t in targets:
+                if current_sum + t > n_circles:
+                    row_targets.append(n_circles - current_sum)
+                else:
+                    row_targets.append(t)
+                    current_sum += t
+            # If we still need more, add a row?
+            if current_sum < n_circles:
+                row_targets.append(n_circles - current_sum)
+        else:
+            # Fallback to 5,5,5,5,4,2?
+            row_targets = [5, 5, 5, 5, 4, 2]
+            # Truncate/Adjust if needed
+            while sum(row_targets) > n_circles:
+                row_targets[-1] -= 1
+            while sum(row_targets) < n_circles:
+                row_targets[-1] += 1
+
+        for i, count in enumerate(row_targets):
+            if len(centers) >= n_circles:
+                break
+            row_idx = i
+            # y coordinate
+            y_pos = initial_r + row_idx * np.sqrt(3) * initial_r
+            
+            # x coordinates
+            # If row_idx is odd, shift by initial_r
+            start_x = initial_r
+            if row_idx % 2 == 1:
+                start_x = 2 * initial_r # Shifted
+            
+            # Generate x positions
+            # We need 'count' circles in this row.
+            # Spread them evenly? Or tightly packed?
+            # Tightly packed at 2r spacing is best for initial guess.
+            for k in range(count):
+                x_pos = start_x + k * (2 * initial_r)
+                # Check bounds roughly
+                if x_pos + initial_r <= 1.0 + 1e-5:
+                    centers.append((x_pos, y_pos, initial_r))
+                else:
+                    # If it doesn't fit, try to squeeze?
+                    # For initial guess, just place it and let optimizer fix.
+                    centers.append((x_pos, y_pos, initial_r))
+        
+        # If we didn't fill rows correctly, fallback to random grid
+        if len(centers) < n_circles:
+             # Fallback
+             grid_x = np.linspace(initial_r, 1-initial_r, 6)
+             grid_y = np.linspace(initial_r, 1-initial_r, 5)
+             for gx in grid_x:
+                 for gy in grid_y:
+                     if len(centers) < n_circles:
+                         centers.append((gx, gy, initial_r))
+                     else:
+                         break
+                 if len(centers) >= n_circles:
+                     break
+        break # Done generating
+
+    # Add small jitter
+    jitter = 0.001 * np.random.randn(len(centers), 3)
+    # Ensure r stays positive
+    jitter[:, 2] = np.abs(jitter[:, 2])
+    
+    final_centers = np.array(centers) + jitter
+    
+    # Clip to valid bounds roughly
+    final_centers[:, 0] = np.clip(final_centers[:, 0], initial_r, 1-initial_r)
+    final_centers[:, 1] = np.clip(final_centers[:, 1], initial_r, 1-initial_r)
+    final_centers[:, 2] = np.clip(final_centers[:, 2], 0.01, 0.4)
+    
+    # Flatten
+    return final_centers.flatten()
+
+def run_packing() -> tuple:
+    """
+    Runs the circle packing optimization.
     
     Returns:
         tuple: (centers, radii, sum_radii)
     """
+    global PENALTY_WEIGHT
+    
     n_circles = 26
+    n_vars = 3 * n_circles
     
-    # 1. Initialization: Perturbed Hexagonal Grid
-    centers = np.zeros((n_circles, 2))
-    radii = np.full(n_circles, 0.1) # Start with a reasonable radius
+    best_sum_radii = -1.0
+    best_centers = None
+    best_radii = None
     
-    # Hexagonal packing parameters
-    # Try to fit roughly 5-6 per row
-    # Height of row spacing for hex packing is sqrt(3)/2 * diameter = sqrt(3) * r
-    # Width spacing is 2 * r
+    # Try multiple initializations
+    seeds = [0, 1, 2, 3, 4, 10, 20, 42, 100, 200]
     
-    # Estimate number of rows needed. 
-    # If r ~ 0.1, diameter 0.2. 5 rows of height 0.173 take ~0.7. 
-    # Let's try to distribute points in a grid that mimics hexagonal density.
+    # Sequential penalty weights
+    weights = [100.0, 1000.0, 10000.0, 50000.0]
     
-    # Simple grid init first, then we rely on optimization
-    # Square grid 5x5 = 25 points. We need 26.
-    # Place 25 in 5x5 grid, 1 in center or random.
-    
-    # Better init: Random valid placement
-    rng = np.random.default_rng(42)
-    
-    # Initialize with small circles to ensure no overlaps
-    current_radii = np.full(n_circles, 0.02)
-    current_centers = np.zeros((n_circles, 2))
-    
-    for i in range(n_circles):
-        # Random position inside [0.05, 0.95]
-        cx = rng.uniform(0.05, 0.95)
-        cy = rng.uniform(0.05, 0.95)
+    # Bounds for L-BFGS-B
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n_circles):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
         
-        # Ensure it doesn't overlap with existing circles (simple check)
-        attempts = 0
-        while attempts < 100:
+    for seed in seeds:
+        # Generate initial guess
+        v0 = generate_hexagonal_initial_guess(n_circles, seed)
+        
+        current_v = v0
+        
+        # Sequential optimization
+        for weight in weights:
+            PENALTY_WEIGHT = weight
+            
+            # Use L-BFGS-B
+            # maxiter can be increased if needed
+            res = minimize(
+                compute_objective_and_penalty,
+                current_v,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 2000, 'ftol': 1e-9, 'gtol': 1e-6}
+            )
+            
+            if res.success or res.nit > 0:
+                current_v = res.x
+            
+            # Check feasibility of current_v with high penalty to see if valid
+            # We can check manually
+            coords = current_v.reshape(n_circles, 3)
+            x = coords[:, 0]
+            y = coords[:, 1]
+            r = coords[:, 2]
+            
+            # Simple check
             valid = True
-            for j in range(i):
-                d = calculate_distance([cx, cy], current_centers[j])
-                if d < current_radii[i] + current_radii[j] + 0.001:
-                    valid = False
-                    cx = rng.uniform(0.05, 0.95)
-                    cy = rng.uniform(0.05, 0.95)
-                    break
-            if valid:
-                break
-        
-        current_centers[i] = [cx, cy]
-        
-    # Set initial radii to a slightly larger value to start growth
-    # But keep them valid. Let's just start optimization from a safe state.
-    # We will let the optimizer grow them.
-    
-    best_centers = current_centers.copy()
-    best_radii = current_radii.copy()
-    best_score = evaluate_packing(best_centers, best_radii)
-    
-    # Simulated Annealing Parameters
-    current_temperature = 1.0
-    min_temperature = 1e-6
-    cooling_rate = 0.995
-    iterations = 50000 # Number of steps
-    
-    # Initial "growth" phase: Try to increase radii
-    # We can run a few steps to expand radii before full SA
-    
-    for step in range(iterations):
-        # Acceptance probability threshold
-        T = current_temperature
-        
-        # Select a random circle to perturb
-        idx = rng.integers(0, n_circles)
-        
-        # Proposed move
-        # Perturb center
-        move_size = T * 0.1 # Move size scales with temperature
-        new_centers = best_centers.copy()
-        new_radii = best_radii.copy()
-        
-        # Random direction for center
-        dx = rng.normal(0, move_size)
-        dy = rng.normal(0, move_size)
-        
-        new_centers[idx, 0] += dx
-        new_centers[idx, 1] += dy
-        
-        # Perturb radius: try to increase radius
-        # Bias towards increasing radius to maximize sum
-        radius_change = rng.normal(0, T * 0.05)
-        # Encourage growth
-        radius_change += T * 0.01 
-        
-        new_radii[idx] += radius_change
-        
-        # Clamp radius to be non-negative and not too huge (max 0.5)
-        if new_radii[idx] < 0.001:
-            new_radii[idx] = 0.001
-        if new_radii[idx] > 0.5:
-            new_radii[idx] = 0.5
-            
-        # Clamp centers to be within [0, 1] roughly, but let penalty handle boundary
-        # Actually, keeping centers somewhat inside helps stability
-        new_centers[idx, 0] = np.clip(new_centers[idx, 0], 0.0, 1.0)
-        new_centers[idx, 1] = np.clip(new_centers[idx, 1], 0.0, 1.0)
-        
-        new_score = evaluate_packing(new_centers, new_radii)
-        delta_score = new_score - best_score
-        
-        # Metropolis criterion
-        if delta_score > 0 or rng.random() < math.exp(delta_score / T):
-            best_centers = new_centers
-            best_radii = new_radii
-            best_score = new_score
-        
-        # Cool down
-        current_temperature *= cooling_rate
-        if current_temperature < min_temperature:
-            current_temperature = min_temperature
-            
-    # Final cleanup: Ensure strict validity for the returned solution
-    # The optimization might have left small violations due to penalty approximation.
-    # We will scale down radii slightly if needed to ensure validity.
-    
-    # Check validity
-    valid = True
-    for i in range(n_circles):
-        x, y = best_centers[i]
-        r = best_radii[i]
-        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
-            valid = False
-            break
-        for j in range(i + 1, n_circles):
-            dist = calculate_distance(best_centers[i], best_centers[j])
-            if dist < best_radii[i] + best_radii[j] - 1e-12:
+            # Boundary
+            if np.any(x < r) or np.any(x + r > 1.0) or np.any(y < r) or np.any(y + r > 1.0):
                 valid = False
-                break
-        if not valid:
-            break
             
-    if not valid:
-        # If invalid, scale down radii uniformly until valid
-        scale = 1.0
-        while not valid and scale > 0.1:
-            scale -= 0.01
+            # Overlap
+            # Check a few random pairs or all
+            # For robustness, check all
             for i in range(n_circles):
-                best_radii[i] *= scale
-            
-            valid = True
-            for i in range(n_circles):
-                x, y = best_centers[i]
-                r = best_radii[i]
-                if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
-                    valid = False
-                    break
                 for j in range(i + 1, n_circles):
-                    dist = calculate_distance(best_centers[i], best_centers[j])
-                    if dist < best_radii[i] + best_radii[j] - 1e-12:
+                    dist = np.sqrt((x[i]-x[j])**2 + (y[i]-y[j])**2)
+                    if dist < r[i] + r[j] - 1e-9:
                         valid = False
                         break
                 if not valid:
                     break
+            
+            # If valid and better sum, save
+            if valid:
+                s = np.sum(r)
+                if s > best_sum_radii:
+                    best_sum_radii = s
+                    best_centers = coords[:, :2].copy()
+                    best_radii = r.copy()
+        
+        # If not valid after all weights, maybe it's stuck. 
+        # But we try multiple seeds.
+        
+    # If best_centers is still None, fallback to a safe small packing
+    if best_centers is None:
+        # Grid packing with small radius
+        # 5x5 grid = 25 circles. Need 26.
+        # Put 25 in grid, 1 in center?
+        # Radius 0.05 fits easily.
+        side = 5
+        step = 1.0 / (side + 1)
+        centers_list = []
+        radii_list = []
+        r_safe = 0.04
+        count = 0
+        for i in range(1, side + 1):
+            for j in range(1, side + 1):
+                centers_list.append([i * step, j * step])
+                radii_list.append(r_safe)
+                count += 1
+                if count == n_circles:
+                    break
+            if count == n_circles:
+                break
+        # If we need more (26), add one?
+        # The loop above gives 25.
+        # Add one at (0.5, 0.5) if not overlapping?
+        # With r=0.04, distance 0.2 is enough.
+        centers_list.append([0.5, 0.5])
+        radii_list.append(r_safe)
+        
+        best_centers = np.array(centers_list[:n_circles])
+        best_radii = np.array(radii_list[:n_circles])
+        best_sum_radii = np.sum(best_radii)
 
-    sum_radii = np.sum(best_radii)
-    
-    return best_centers, best_radii, sum_radii
+    return best_centers, best_radii, best_sum_radii

@@ -1,0 +1,122 @@
+# sol_000080 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 3e058973) state=3b95b4ed sum of radii=2.617986 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+
+    # 1. Initialization
+    # Arrange 26 centers in a staggered hexagonal-like grid
+    # Rows: 5, 5, 5, 5, 6 (Total 26)
+    # This creates a dense initial packing to help the optimizer find a good local maximum.
+    
+    centers = np.zeros((n, 2))
+    radii = np.full(n, 0.05) # Initial small valid radius
+    
+    idx = 0
+    n_rows = 5
+    circles_per_row = [5, 5, 5, 5, 6]
+    
+    # Estimate grid dimensions to fit inside unit square
+    # Width approx: 6 circles * diameter. Let's start with spacing 0.2
+    # Height approx: 5 rows * row_height
+    dx = 0.18
+    dy = 0.18 * np.sqrt(3) / 2
+    start_x = 0.1
+    start_y = 0.1
+
+    for r_idx, count in enumerate(circles_per_row):
+        y = start_y + r_idx * dy
+        # Shift every other row for hexagonal pattern
+        x_offset = start_x + (0.5 * dx if r_idx % 2 == 1 else 0)
+        
+        for c_idx in range(count):
+            x = x_offset + c_idx * dx
+            # Ensure we stay within bounds roughly for initialization
+            x = np.clip(x, 0.1, 0.9)
+            y = np.clip(y, 0.1, 0.9)
+            
+            centers[idx] = [x, y]
+            idx += 1
+
+    # 2. Setup Optimization Problem
+    # Variables: [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+    x0 = np.zeros(n * 3)
+    for i in range(n):
+        x0[i*3] = centers[i, 0]
+        x0[i*3+1] = centers[i, 1]
+        x0[i*3+2] = radii[i]
+
+    def objective(vars):
+        # We want to maximize sum of radii, so minimize negative sum
+        current_radii = vars[2::3]
+        return -np.sum(current_radii)
+
+    def constraint_bound(vars):
+        # Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+        # vars: [x1, y1, r1, ...]
+        con = []
+        for i in range(n):
+            x = vars[i*3]
+            y = vars[i*3+1]
+            r = vars[i*3+2]
+            con.append(x - r)       # r <= x
+            con.append(1 - x - r)   # r <= 1 - x
+            con.append(y - r)       # r <= y
+            con.append(1 - y - r)   # r <= 1 - y
+        return np.array(con)
+
+    def constraint_overlap(vars):
+        # Non-overlap: dist^2 >= (r1 + r2)^2
+        con = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                xi, yi = vars[i*3], vars[i*3+1]
+                xj, yj = vars[j*3], vars[j*3+1]
+                ri, rj = vars[i*3+2], vars[j*3+2]
+                
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                sum_r_sq = (ri + rj)**2
+                con.append(dist_sq - sum_r_sq)
+        return np.array(con)
+
+    # 3. Bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0, 1), (0, 1), (0, 0.5)])
+
+    # 4. Run Optimizer
+    # SLSQP handles constraints well
+    cons = [
+        {'type': 'ineq', 'fun': constraint_bound},
+        {'type': 'ineq', 'fun': constraint_overlap}
+    ]
+
+    # Use a robust method, limit iterations to prevent hanging
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'maxiter': 1000, 'ftol': 1e-9})
+
+    # 5. Extract Results
+    final_vars = res.x
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i] = [final_vars[i*3], final_vars[i*3+1]]
+        final_radii[i] = final_vars[i*3+2]
+
+    # Ensure non-negative radii just in case
+    final_radii = np.maximum(final_radii, 0)
+    
+    # Clamp centers to [0, 1]
+    final_centers = np.clip(final_centers, 0, 1)
+
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii

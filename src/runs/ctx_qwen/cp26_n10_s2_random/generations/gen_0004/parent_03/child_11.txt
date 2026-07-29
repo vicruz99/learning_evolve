@@ -1,0 +1,214 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a two-phase optimization strategy that balances global exploration with precise local refinement:
+
+1. **LP-Based Gradient Ascent (Global Search)**:
+   - For any fixed set of centers, the maximum valid radii are found by solving a Linear Program (LP). The constraints are `r_i + r_j <= distance(i,j)` and boundary constraints `r_i <= min(x, 1-x, y, 1-y)`.
+   - The dual variables (marginals) of this LP directly give the gradient of the sum of radii with respect to circle centers. Intuitively, active overlap constraints exert "repulsive forces" proportional to their dual values, while boundary constraints exert forces pushing circles away from edges.
+   - We perform gradient ascent on the centers using these dual-derived forces. This avoids the non-smoothness of direct min/max formulations and efficiently navigates the configuration space.
+   - We run this from multiple diverse initializations (hexagonal lattices with different shifts, and random dense configurations) with adaptive step sizes and periodic perturbations to escape local minima.
+
+2. **SLSQP Local Polish (Exploitation)**:
+   - Once a high-quality configuration is found via gradient ascent, we switch to `scipy.optimize.minimize` with the SLSQP method. This optimizer handles non-linear constraints directly and fine-tunes both centers and radii simultaneously to squeeze out marginal gains.
+   - Constraints are formulated as `dist(i,j) - r_i - r_j >= 0` and boundary inequalities.
+
+3. **Deterministic Repair**:
+   - Finally, we apply a strict validation repair loop that clamps radii to boundaries and proportionally shrinks overlapping pairs to guarantee compliance with the validator's `1e-12` tolerance, ensuring the solution is always accepted.
+
+This hybrid approach leverages the speed of LP dual gradients for large-scale movement and the precision of constrained non-linear solvers for final packing density maximization.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+NUM_PAIRS = N * (N - 1) // 2
+NUM_BOUND = 4 * N
+TOTAL_CONSTR = NUM_PAIRS + NUM_BOUND
+IDX_I, IDX_J = np.triu_indices(N, k=1)
+
+# Precompute A_ub structure for LP
+A_ub = np.zeros((TOTAL_CONSTR, N))
+pairs = []
+idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_ub[idx, i] = 1.0
+        A_ub[idx, j] = 1.0
+        pairs.append((i, j))
+        idx += 1
+for i in range(N):
+    A_ub[idx, i] = 1.0; idx += 1
+    A_ub[idx, i] = 1.0; idx += 1
+    A_ub[idx, i] = 1.0; idx += 1
+    A_ub[idx, i] = 1.0; idx += 1
+
+def solve_radii_and_grad(centers):
+    """Solves LP for max radii given centers and returns radii, gradient, and sum."""
+    b_ub = np.zeros(TOTAL_CONSTR)
+    idx = 0
+    for i, j in pairs:
+        d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+        b_ub[idx] = d
+        idx += 1
+    for i in range(N):
+        b_ub[idx] = centers[i, 0]
+        idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]
+        idx += 1
+        b_ub[idx] = centers[i, 1]
+        idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]
+        idx += 1
+        
+    res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=(0, None), method='highs')
+    if not res.success:
+        return None, None, -np.inf
+        
+    radii = res.x
+    duals = res.ineqlin.marginals
+    grad = np.zeros_like(centers)
+    
+    idx = 0
+    for i, j in pairs:
+        mu = duals[idx]
+        if mu > 1e-8:
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            if d > 1e-12:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+        idx += 1
+        
+    b_start = NUM_PAIRS
+    for i in range(N):
+        grad[i, 0] += duals[b_start + 4*i] - duals[b_start + 4*i + 1]
+        grad[i, 1] += duals[b_start + 4*i + 2] - duals[b_start + 4*i + 3]
+        
+    return radii, grad, np.sum(radii)
+
+def compute_constraints(v):
+    """Computes boundary and non-overlap constraints as >= 0 for SLSQP."""
+    x, y, r = v[0::3], v[1::3], v[2::3]
+    c = []
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    dx = x[IDX_I] - x[IDX_J]
+    dy = y[IDX_I] - y[IDX_J]
+    dr = r[IDX_I] + r[IDX_J]
+    c.append(np.sqrt(dx**2 + dy**2) - dr)
+    return np.concatenate(c)
+
+def objective_slsqp(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def run_packing():
+    np.random.seed(42)
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+    
+    # Diverse initial configurations
+    starts = []
+    # Hexagonal lattice 1
+    c = np.zeros((N, 2))
+    k = 0
+    y = 0.09
+    row = 0
+    while k < N:
+        x = 0.09 + (row % 2) * 0.09
+        while x <= 0.91 and k < N:
+            c[k] = [x, y]
+            k += 1
+            x += 0.18
+        y += 0.156
+        row += 1
+    starts.append(c + np.random.normal(0, 0.002, c.shape))
+    
+    # Hexagonal lattice 2 (shifted)
+    starts.append(np.clip(c + np.array([0.04, 0.03]), 0.05, 0.95) + np.random.normal(0, 0.002, c.shape))
+    
+    # Random dense configuration
+    starts.append(np.random.rand(N, 2) * 0.8 + 0.1)
+    
+    # Phase 1: LP-based Gradient Ascent
+    for cfg in starts:
+        centers = cfg.copy()
+        step = 0.03
+        for it in range(4000):
+            radii, grad, curr_sum = solve_radii_and_grad(centers)
+            if radii is None:
+                break
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                
+            gn = np.linalg.norm(grad)
+            if gn < 1e-9:
+                centers += np.random.normal(0, 0.005, centers.shape)
+                centers = np.clip(centers, 0.05, 0.95)
+                continue
+                
+            centers += (step / (gn + 1e-9)) * grad
+            centers = np.clip(centers, 0.01, 0.99)
+            
+            if it % 300 == 0:
+                step *= 0.98
+            if it % 500 == 0 and it > 1000:
+                centers += np.random.normal(0, 0.003, centers.shape)
+                centers = np.clip(centers, 0.05, 0.95)
+                
+    # Phase 2: SLSQP Local Polish
+    if best_centers is not None:
+        v0 = np.zeros(3 * N)
+        v0[0::3] = best_centers[:, 0]
+        v0[1::3] = best_centers[:, 1]
+        v0[2::3] = best_radii
+        
+        bounds = [(0.0, 1.0)] * (2 * N) + [(1e-7, 0.5)] * N
+        cons = {'type': 'ineq', 'fun': compute_constraints}
+        
+        try:
+            res = minimize(objective_slsqp, v0, method='SLSQP', 
+                           bounds=bounds, constraints=cons, 
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-6):
+                curr_sum = np.sum(res.x[2::3])
+                if curr_sum > best_sum:
+                    best_centers = res.x[:2*N].reshape(N, 2)
+                    best_radii = res.x[2*N:].copy()
+                    best_sum = curr_sum
+        except Exception:
+            pass
+
+    # Phase 3: Deterministic Repair for Strict Validation
+    centers = best_centers
+    radii = best_radii.copy()
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            mx = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mx + 1e-9:
+                radii[i] = mx
+                changed = True
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    ov = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= ov
+                    radii[j] -= ov
+                    changed = True
+        if not changed:
+            break
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

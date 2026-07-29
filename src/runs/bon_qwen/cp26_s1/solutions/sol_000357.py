@@ -1,0 +1,238 @@
+# sol_000357 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b8d6b6a1) state=d0326bfc sum of radii=2.594224 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    n = 26
+
+    # Helper function to generate initial centers
+    def generate_initial_centers(n):
+        # We try to fit 26 circles in a hexagonal-like arrangement
+        # or a dense grid.
+        # A 5x6 grid has 30 spots. We can pick 26.
+        # Let's use a slightly randomized grid or a specific pattern.
+        
+        # Pattern: 5 columns, 6 rows roughly.
+        # To maximize packing, hexagonal shift is better.
+        
+        centers = []
+        # Approximate spacing for equal circles of radius ~0.1
+        # Width 1.0, 5 circles -> spacing 0.2. Centers at 0.1, 0.3, 0.5, 0.7, 0.9
+        # Height 1.0, 6 circles -> spacing ~0.17 (hex) or 0.166 (grid)
+        
+        # Let's try to construct a valid initial configuration with radius 0.08
+        # Hexagonal packing parameters
+        r_init = 0.08
+        dx = 2 * r_init * 1.01 # slight gap
+        dy = np.sqrt(3) * r_init * 1.01
+        
+        # We need 26 circles.
+        # Let's fill rows.
+        # Row 0: 5 circles
+        # Row 1: 5 circles (shifted)
+        # ...
+        # 6 rows * 5 circles = 30. We need 26.
+        
+        row_count = 0
+        total_circles = 0
+        
+        # We'll fill rows until we have 26
+        # Start y at r_init
+        y = r_init
+        
+        while total_circles < n:
+            # Determine how many circles in this row
+            # Max x is 1 - r_init.
+            # If even row, start at r_init. If odd, start at r_init + dx/2 (shifted)
+            # Actually simpler: just use a grid and trim, or fill systematically.
+            
+            # Let's try to fit as many as possible in width
+            # Max index k such that r_init + k*dx <= 1 - r_init
+            # k*dx <= 1 - 2*r_init
+            # k <= (1 - 2*r_init)/dx
+            
+            max_k = int((1 - 2 * r_init) / dx) + 1
+            # If shifted row, first center is r_init + dx/2
+            # So max index might be different.
+            
+            # Let's just try to place 5 or 6.
+            # With r=0.08, dx~0.162. 1-0.16 = 0.84. 0.84/0.162 = 5.1. So 5 circles fit easily.
+            
+            num_in_row = 5
+            if (row_count % 2 == 1):
+                # Shifted row. Center starts at r_init + dx/2
+                # Check if it fits.
+                # 5 circles: centers at x0, x0+dx, ... x0+4dx
+                # x0 + 4dx + r_init <= 1?
+                # (r_init + dx/2) + 4dx + r_init = 2r_init + 4.5 dx
+                # 0.16 + 4.5*0.162 = 0.16 + 0.729 = 0.889 <= 1. Fits.
+                pass
+            else:
+                # Aligned row.
+                # 5 circles: r_init, r_init+dx...
+                # r_init + 4dx + r_init = 0.16 + 0.648 = 0.808 <= 1. Fits.
+                pass
+            
+            # If we need more, we can try 6?
+            # 6 circles in aligned row: 2r + 5dx = 0.16 + 5*0.162 = 0.97 <= 1. Fits!
+            # So we can fit 6 circles in a row with r=0.08.
+            
+            # Let's target 26.
+            # 5 rows of 5 = 25. Plus 1.
+            # Or 4 rows of 6 = 24. Plus 2.
+            
+            # Let's just generate a grid and pick first 26.
+            break
+        
+        # Fallback to simple grid generation
+        # 6 rows, 5 columns
+        ys = np.linspace(r_init, 1 - r_init, 6)
+        xs = np.linspace(r_init, 1 - r_init, 5)
+        
+        for y in ys:
+            for x in xs:
+                centers.append([x, y])
+                total_circles += 1
+                if total_circles == n:
+                    break
+            if total_circles == n:
+                break
+                
+        # If we still have space or logic issue, append random
+        while len(centers) < n:
+            x = r_init + np.random.rand() * (1 - 2 * r_init)
+            y = r_init + np.random.rand() * (1 - 2 * r_init)
+            centers.append([x, y])
+            
+        return np.array(centers)
+
+    def get_constraints(centers, radii):
+        # This is for validation logic inside optimizer if needed, 
+        # but we pass constraints to minimize.
+        pass
+
+    # Objective function
+    def objective(vars):
+        # vars: [x1, y1, r1, x2, y2, r2, ...]
+        # Actually easier to unpack
+        # Structure: x (n), y (n), r (n)
+        # Or mixed. Let's use mixed: x1, y1, r1, x2, y2, r2 ...
+        # vars shape: 3n
+        
+        r = vars[2:n*3:n+2] # Wait, slicing mixed is tricky
+        # Let's reshape
+        shape = (n, 3)
+        data = vars.reshape(shape)
+        # data[:, 0] = x, data[:, 1] = y, data[:, 2] = r
+        radii = data[:, 2]
+        return -np.sum(radii)
+
+    # Constraints
+    # 1. Boundary constraints for each circle i
+    # x_i - r_i >= 0  => x_i - r_i >= 0
+    # x_i + r_i <= 1  => 1 - x_i - r_i >= 0
+    # y_i - r_i >= 0
+    # y_i + r_i <= 1
+    # r_i >= 0 (handled by bounds or separate constraint)
+
+    # 2. Non-overlap constraints
+    # dist(i,j)^2 - (r_i + r_j)^2 >= 0
+
+    # We will define these inside the minimize call as dicts.
+    
+    def bound_constraint(vars, i, axis, sign):
+        # vars: [x1, y1, r1, ...]
+        # index in vars: i*3 + axis (0 for x, 1 for y)
+        # r index: i*3 + 2
+        x_idx = i * 3 + axis
+        r_idx = i * 3 + 2
+        x_val = vars[x_idx]
+        r_val = vars[r_idx]
+        if sign == 'lower':
+            return x_val - r_val
+        else:
+            return 1.0 - x_val - r_val
+
+    def overlap_constraint(vars, i, j):
+        x1, y1, r1 = vars[3*i], vars[3*i+1], vars[3*i+2]
+        x2, y2, r2 = vars[3*j], vars[3*j+1], vars[3*j+2]
+        
+        dist_sq = (x1 - x2)**2 + (y1 - y2)**2
+        radii_sum = r1 + r2
+        return dist_sq - radii_sum**2
+
+    # Initial guess
+    centers_init = generate_initial_centers(n)
+    # Initialize radii to a small safe value, e.g. 0.02
+    radii_init = np.full(n, 0.02)
+    
+    # Flatten to 1D array: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers_init[i, 0]
+        x0[3*i+1] = centers_init[i, 1]
+        x0[3*i+2] = radii_init[i]
+        
+    # Bounds for variables
+    # x, y in [0, 1]
+    # r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+
+    constraints = []
+    
+    # Boundary constraints
+    for i in range(n):
+        # x_i >= r_i  => x_i - r_i >= 0
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+        # x_i + r_i <= 1 => 1 - x_i - r_i >= 0
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i] - v[3*i+2]})
+        
+        # y_i >= r_i
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+        # y_i + r_i <= 1
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i+1] - v[3*i+2]})
+        
+        # r_i >= 0 (covered by bounds, but good to have explicit if bounds loose)
+        # Bounds handle it.
+
+    # Overlap constraints
+    for i in range(n):
+        for j in range(i + 1, n):
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i, j=j: overlap_constraint(v, i, j)})
+
+    # Run optimization
+    # Use SLSQP
+    # Max iterations might need to be high
+    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                      options={'ftol': 1e-8, 'maxiter': 1000, 'disp': False})
+    
+    # Extract solution
+    best_vars = result.x
+    centers = np.array([[best_vars[3*i], best_vars[3*i+1]] for i in range(n)])
+    radii = np.array([best_vars[3*i+2] for i in range(n)])
+    
+    sum_radii = np.sum(radii)
+    
+    # Validation check (internal)
+    # Just to be safe, clip radii if negative due to numerical error
+    radii = np.maximum(radii, 0.0)
+    
+    # Re-center if needed? No, optimizer should keep them valid.
+    # But ensure inside square strictly
+    for i in range(n):
+        r = radii[i]
+        x, y = centers[i]
+        # Clamp center to valid range [r, 1-r]
+        centers[i, 0] = np.clip(x, r, 1.0 - r)
+        centers[i, 1] = np.clip(y, r, 1.0 - r)
+
+    return centers, radii, sum_radii

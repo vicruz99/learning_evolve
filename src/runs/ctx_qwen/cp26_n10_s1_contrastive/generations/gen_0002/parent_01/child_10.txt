@@ -1,0 +1,159 @@
+
+
+<strategy>
+To improve the packing and bridge the gap to the target sum of radii (~2.636), we employ a robust multi-start optimization strategy with careful initialization and high-precision polishing:
+
+1. **Diverse Initializations**: Generate multiple hexagonal lattice configurations with varying horizontal/vertical spacings. The hexagonal arrangement is theoretically optimal for dense circle packing, but boundary distortions are necessary. We also include a grid-based initialization for topological diversity.
+2. **Strict Feasibility Handling**: Initial radii are conservatively set to ensure strict satisfaction of all constraints before optimization begins. This prevents SLSQP from getting trapped by infeasible starting points.
+3. **Multi-Stage Optimization**:
+   - **Broad Search**: Run SLSQP from all diverse initializations with tight tolerances.
+   - **Local Refinement**: Perform targeted random perturbations around the best-found solution to escape local minima. Perturbations are applied to both centers and radii, followed by SLSQP recovery.
+   - **High-Precision Polish**: A final optimization pass with extended iterations and extremely tight `ftol` to squeeze out the last bits of radius sum.
+4. **Constraint Formulation**: Use squared distance constraints `dist^2 >= (r_i + r_j)^2` to avoid square-root singularities, combined with explicit boundary constraints. Pre-computed triangular indices speed up evaluation.
+5. **Validation & Safety**: Explicitly check constraint satisfaction within numerical tolerance (`1e-9`) before accepting any solution. Radii are clamped to non-negative values.
+
+This approach balances global exploration with local exploitation, systematically improving upon the baseline hexagonal layout while respecting the non-convex nature of packing constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+BOUNDS = [(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)] * N
+
+def objective(x):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Compute all inequality constraints: boundary containment and pairwise separation."""
+    C = x.reshape(N, 3)
+    xc = C[:, 0]
+    yc = C[:, 1]
+    r = C[:, 2]
+    
+    c_list = []
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c_list.append(xc - r)
+    c_list.append(1.0 - xc - r)
+    c_list.append(yc - r)
+    c_list.append(1.0 - yc - r)
+    
+    # Pairwise separation constraints: dist^2 >= (r_i + r_j)^2
+    dx = xc[I_IDX] - xc[J_IDX]
+    dy = yc[I_IDX] - yc[J_IDX]
+    r_sum = r[I_IDX] + r[J_IDX]
+    c_list.append(dx*dx + dy*dy - r_sum*r_sum)
+    
+    return np.concatenate(c_list)
+
+def get_hex_init(scale_x, scale_y, r_base):
+    """Generate a hexagonal lattice initialization normalized to the unit square."""
+    rows_counts = [5, 6, 5, 6, 4]
+    pts = []
+    y = 0.0
+    row_idx = 0
+    for count in rows_counts:
+        shift = (row_idx % 2) * 0.5 * scale_x
+        x = 0.0 + shift
+        for _ in range(count):
+            pts.append([x, y])
+            x += scale_x
+        y += scale_y
+        row_idx += 1
+        
+    pts = np.array(pts[:N])
+    # Normalize to fit comfortably inside [0,1]^2
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = mx - mn
+    pts = (pts - mn) / span * 0.8 + 0.1
+    
+    x0 = np.zeros(3 * N)
+    x0[0::3] = pts[:, 0]
+    x0[1::3] = pts[:, 1]
+    x0[2::3] = r_base
+    return x0
+
+def run_packing():
+    best_sum = -np.inf
+    best_x = None
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    inits = []
+    # Generate varied hexagonal lattices
+    for sx in [0.18, 0.19, 0.20, 0.21]:
+        for sy in [0.15, 0.16, 0.17, 0.18]:
+            inits.append(get_hex_init(sx, sy, 0.06))
+            
+    # Random perturbations of a central hex configuration
+    base_hex = get_hex_init(0.19, 0.165, 0.07)
+    for seed in range(50):
+        np.random.seed(seed)
+        x0 = base_hex + np.random.normal(0, 0.02, base_hex.shape)
+        x0[0::3] = np.clip(x0[0::3], 0.05, 0.95)
+        x0[1::3] = np.clip(x0[1::3], 0.05, 0.95)
+        x0[2::3] = np.clip(x0[2::3], 0.01, 0.35)
+        inits.append(x0)
+        
+    # Grid initialization for structural diversity
+    grid_pts = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)] + [[0.5, 0.5]])[:N]
+    x0_grid = np.zeros(3*N)
+    x0_grid[0::3] = grid_pts[:, 0]
+    x0_grid[1::3] = grid_pts[:, 1]
+    x0_grid[2::3] = 0.07
+    inits.append(x0_grid)
+
+    # Phase 1: Broad search across diverse basins
+    for x0 in inits:
+        res = minimize(objective, x0, method='SLSQP', bounds=BOUNDS,
+                       constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+        cons_val = constraints(res.x)
+        if np.min(cons_val) >= -1e-9:
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_x = res.x.copy()
+                
+    # Phase 2: Local refinement via targeted perturbations
+    if best_x is not None:
+        for seed in range(60):
+            np.random.seed(seed + 300)
+            x_pert = best_x + np.random.normal(0, 0.008, best_x.shape)
+            x_pert[0::3] = np.clip(x_pert[0::3], 0.01, 0.99)
+            x_pert[1::3] = np.clip(x_pert[1::3], 0.01, 0.99)
+            x_pert[2::3] = np.clip(x_pert[2::3], 0.001, 0.48)
+            
+            res = minimize(objective, x_pert, method='SLSQP', bounds=BOUNDS,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-14, 'disp': False})
+            cons_val = constraints(res.x)
+            if np.min(cons_val) >= -1e-9:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_x = res.x.copy()
+                    
+        # Phase 3: High-precision polishing
+        try:
+            res_final = minimize(objective, best_x, method='SLSQP', bounds=BOUNDS,
+                                 constraints=cons, options={'maxiter': 10000, 'ftol': 1e-15, 'disp': False})
+            cons_val = constraints(res_final.x)
+            if np.min(cons_val) >= -1e-9:
+                best_x = res_final.x
+                best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    # Fallback guarantee
+    if best_x is None:
+        best_x = inits[0]
+        best_sum = -objective(best_x)
+        
+    centers = np.column_stack((best_x[0::3], best_x[1::3]))
+    radii = best_x[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(best_sum)
+```

@@ -1,0 +1,203 @@
+# sol_000103 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 93a6f440) state=8e007e49 sum of radii=2.287341 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Returns (centers, radii, sum_radii) for 26 circles in a unit square.
+    """
+    n = 26
+    
+    # 1. Initialize Centers using a Hexagonal Grid
+    # We place circles in staggered rows.
+    # Approximate row height sqrt(3)/2 * 2r ~ 0.173 for r=0.1. 
+    # We will fit 6 rows to accommodate 26 circles.
+    centers = np.zeros((n, 2))
+    idx = 0
+    
+    # Rows configuration: 5, 4, 5, 4, 5, 3 = 26 circles
+    row_counts = [5, 4, 5, 4, 5, 3]
+    
+    y = 0.1 # Initial y center
+    for i, count in enumerate(row_counts):
+        # Horizontal spacing for hexagonal packing is r*sqrt(3) approx? 
+        # No, if rows are shifted by r horizontally, spacing is 2r.
+        # To pack densely, we want spacing ~ 2r. 
+        # For 5 circles in width 1, spacing ~ 0.2.
+        # Let's initialize with radius 0.1.
+        r_init = 0.1
+        
+        # Shift alternating rows by r
+        shift = r_init if i % 2 == 1 else 0
+        x_start = r_init + shift
+        
+        # Calculate x positions to center them in the square
+        # Width occupied by 'count' circles with radius r and spacing 2r is (count-1)*2r + 2r = count*2r?
+        # Actually, if centers are at x, x+2r, ..., the span is (count-1)*2r.
+        # Plus margin r on each side -> total width (count-1)*2r + 2r = 2r*count.
+        # If 2r*count > 1, we compress.
+        
+        total_width = 1.0
+        if count > 1:
+            # Space available for spacing
+            available_space = 1.0 - 2 * r_init
+            step = available_space / (count - 1)
+        else:
+            step = 0
+            
+        for j in range(count):
+            if count == 1:
+                cx = 0.5
+            else:
+                cx = r_init + j * step
+            
+            if idx < n:
+                centers[idx, 0] = cx
+                centers[idx, 1] = y
+                idx += 1
+        
+        # Move to next row
+        # Vertical distance for hex packing is r * sqrt(3)
+        y += r_init * np.sqrt(3)
+
+    # 2. Optimization
+    # We want to maximize sum(radii) subject to constraints.
+    # We will use a barrier method. 
+    # Variables: x1, y1, r1, x2, y2, r2, ..., x26, y26, r26 (78 vars)
+    
+    # Helper to compute cost
+    def objective(vars):
+        # vars is flat array of length 3*n
+        c = vars[:2*n].reshape(n, 2)
+        r = vars[2*n:]
+        
+        # Objective: Minimize negative sum of radii
+        obj = -np.sum(r)
+        
+        penalty = 0.0
+        alpha = 100.0 # Barrier strength
+        
+        # Boundary constraints: x - r >= 0, 1 - x - r >= 0, etc.
+        # Barrier: -ln(x - r)
+        for i in range(n):
+            xi, yi = c[i]
+            ri = r[i]
+            
+            # Safety check for log domain
+            if ri > xi or ri > 1 - xi or ri > yi or ri > 1 - yi:
+                return 1e9 # Hard violation
+            
+            penalty += alpha * (np.log(max(1e-10, xi - ri)) + 
+                                np.log(max(1e-10, 1 - xi - ri)) + 
+                                np.log(max(1e-10, yi - ri)) + 
+                                np.log(max(1e-10, 1 - yi - ri)))
+        
+        # Overlap constraints: dist(i, j) - (ri + rj) >= 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((c[i] - c[j])**2))
+                sum_r = r[i] + r[j]
+                
+                if sum_r >= dist:
+                    return 1e9 # Hard violation
+                
+                gap = dist - sum_r
+                if gap > 1e-12:
+                    penalty += alpha * np.log(gap)
+                else:
+                    penalty -= 1e5 # Penalty for touching too closely without gap? 
+                    # Actually log barrier goes to -infinity as gap->0.
+                    # We want to push gap away from 0? 
+                    # No, we want to allow gap -> 0 but not < 0.
+                    # Barrier function -ln(gap) pushes gap to be large? 
+                    # No, -ln(gap) -> +infinity as gap -> 0.
+                    # So penalty increases, objective decreases (since we min -sum_r + penalty).
+                    # Wait, we want to MAXIMIZE sum_r. So we MINIMIZE -sum_r.
+                    # If we add +alpha*(-ln(gap)), we penalize small gaps.
+                    # This forces circles apart, reducing radii. 
+                    # We want them to touch. 
+                    # Actually, standard barrier for inequality g(x) >= 0 is -mu * sum(ln(g(x))).
+                    # If we use that, as g->0, -ln(g) -> +inf.
+                    # So we cannot let them touch. 
+                    # But we want them to touch to maximize radii.
+                    
+                    # Better approach: Just use a penalty for violations.
+                    # And maximize sum r.
+                    # But SLSQP handles constraints directly.
+                    pass 
+        
+        # Let's switch to SLSQP with explicit constraints for better behavior.
+        return -np.sum(r) # We will handle constraints via bounds/constraints
+
+    # We will define constraints for SLSQP
+    def constraint_boundary(vars):
+        c = vars[:2*n].reshape(n, 2)
+        r = vars[2*n:]
+        vals = []
+        for i in range(n):
+            vals.append(c[i, 0] - r[i])       # x >= r
+            vals.append(1 - c[i, 0] - r[i])    # 1-x >= r
+            vals.append(c[i, 1] - r[i])        # y >= r
+            vals.append(1 - c[i, 1] - r[i])    # 1-y >= r
+        return np.array(vals)
+
+    def constraint_overlap(vars):
+        c = vars[:2*n].reshape(n, 2)
+        r = vars[2*n:]
+        vals = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((c[i] - c[j])**2))
+                vals.append(dist - r[i] - r[j])
+        return np.array(vals)
+
+    # Initial guess
+    x0 = np.concatenate([centers.flatten(), np.full(n, 0.1)])
+    
+    # Bounds
+    # x, y in [0, 1], r in [0, 1]
+    bounds = [(0, 1)] * (2 * n) + [(1e-6, 1)] * n
+
+    # Constraints
+    # SLSQP requires 'type': 'ineq' (function >= 0)
+    cons = []
+    cons.append({'type': 'ineq', 'fun': constraint_boundary})
+    cons.append({'type': 'ineq', 'fun': constraint_overlap})
+
+    best_sol = None
+    best_obj = -np.inf
+
+    # Run optimization a few times with slight perturbations
+    for trial in range(5):
+        # Perturb initial positions slightly
+        current_x0 = x0.copy()
+        current_x0[:2*n] += np.random.normal(0, 0.01, size=2*n)
+        # Clamp to bounds
+        current_x0[:2*n] = np.clip(current_x0[:2*n], 0, 1)
+        
+        res = minimize(
+            objective, 
+            current_x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=cons, 
+            options={'maxiter': 1000, 'ftol': 1e-9}
+        )
+        
+        if -res.fun > best_obj:
+            best_obj = -res.fun
+            best_sol = res.x
+
+    if best_sol is None:
+        # Fallback to initial
+        best_sol = x0
+
+    final_centers = best_sol[:2*n].reshape(n, 2)
+    final_radii = best_sol[2*n:]
+    
+    return final_centers, final_radii, np.sum(final_radii)

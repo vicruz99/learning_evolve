@@ -1,0 +1,236 @@
+
+
+<strategy>
+To improve the packing sum of radii from ~2.6307 to the target of ~2.636, I will focus on:
+1. **Better Initial Configurations**: Generate highly diverse starting points using a vectorized force-directed layout that dynamically expands circle radii while pushing them apart, mimicking physical packing. This naturally finds dense local configurations. I'll combine this with rotated/shifted hexagonal lattices and grid patterns.
+2. **Robust Optimization**: Use SLSQP with increased iterations (`maxiter=10000`) and tighter tolerances. The squared-distance constraint formulation is maintained for smooth gradients.
+3. **Local Escape Mechanism**: After finding the best configuration, run a refinement loop that shrinks radii to create slack, perturbs centers significantly, and re-optimizes. This helps escape shallow local minima common in high-dimensional non-convex problems.
+4. **Strict Validation Compliance**: Implement a careful post-processing step that enforces boundary and non-overlap constraints with a safety margin (`1e-8`) to guarantee the validator passes without reducing the objective value meaningfully.
+5. **Performance**: Vectorize the force layout computation to allow more initial samples and refinement steps within reasonable runtime.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """
+    Compute inequality constraints: boundaries and pairwise non-overlap.
+    Uses squared distances for smoother gradients and numerical stability.
+    All elements must be >= 0.
+    """
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    
+    return c
+
+def make_feasible(v):
+    """Adjusts radii to guarantee the configuration satisfies all constraints strictly."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:].copy()
+    
+    # Enforce boundary constraints
+    r = np.minimum(r, np.minimum(x, 1.0 - x))
+    r = np.minimum(r, np.minimum(y, 1.0 - y))
+    
+    # Enforce non-overlap constraints iteratively
+    for _ in range(20):
+        dx = x[PAIR_I] - x[PAIR_J]
+        dy = y[PAIR_I] - y[PAIR_J]
+        dist = np.sqrt(dx**2 + dy**2)
+        overlap = (r[PAIR_I] + r[PAIR_J]) - dist
+        if np.max(overlap) < 1e-10:
+            break
+        shrink = np.maximum(0.0, overlap) / 2.0 + 1e-9
+        r[PAIR_I] = np.maximum(0.0, r[PAIR_I] - shrink)
+        r[PAIR_J] = np.maximum(0.0, r[PAIR_J] - shrink)
+        
+    return np.concatenate([x, y, r])
+
+def force_layout(seed, steps=100):
+    """Generates a dense initial configuration using vectorized repulsion forces."""
+    np.random.seed(seed)
+    pts = np.random.uniform(0.15, 0.85, (N, 2))
+    r = np.full(N, 0.04)
+    
+    for _ in range(steps):
+        # Vectorized pairwise differences and distances
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dists = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(dists, np.inf)
+        
+        forces = np.zeros_like(pts)
+        target_dist = r[:, np.newaxis] + r[np.newaxis, :] + 0.015
+        mask = dists < target_dist
+        f_mag = np.where(mask, (target_dist - dists) * 3.0 / dists, 0.0)
+        f_vec = diff * f_mag[:, :, np.newaxis]
+        forces = np.sum(f_vec, axis=1)
+        
+        # Wall repulsion forces
+        forces[pts[:,0] < r + 0.02, 0] += 1.5
+        forces[pts[:,0] > 1.0 - r - 0.02, 0] -= 1.5
+        forces[pts[:,1] < r + 0.02, 1] += 1.5
+        forces[pts[:,1] > 1.0 - r - 0.02, 1] -= 1.5
+        
+        pts += forces * 0.02
+        pts = np.clip(pts, 0.02, 0.98)
+        r *= 1.0008  # Gradually grow radii to find tight packing
+        
+    return pts, r
+
+def generate_initial_configs():
+    """Generates a diverse set of initial configurations for multi-start optimization."""
+    configs = []
+    
+    # 1. Hexagonal lattices with variations
+    for r0 in [0.085, 0.095, 0.105]:
+        for angle in np.linspace(-0.2, 0.2, 5):
+            for sx in np.linspace(-0.02, 0.02, 3):
+                for sy in np.linspace(-0.02, 0.02, 3):
+                    pts = []
+                    y = r0 + sy
+                    row = 0
+                    while len(pts) < N:
+                        x_start = r0 + sx + (row % 2) * r0
+                        x = x_start
+                        while x <= 1.0 - r0 and len(pts) < N:
+                            pts.append([x, y])
+                            x += 2.0 * r0
+                        y += r0 * np.sqrt(3.0)
+                        row += 1
+                        
+                    pts = np.array(pts[:N])
+                    if angle != 0.0:
+                        c, s = np.cos(angle), np.sin(angle)
+                        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+                    pts = np.clip(pts, 0.02, 0.98)
+                    
+                    r_init = np.full(N, 0.04)
+                    v = make_feasible(np.concatenate([pts[:,0], pts[:,1], r_init]))
+                    configs.append(v)
+                    
+    # 2. Force-relaxed dense layouts
+    for seed in range(15):
+        pts, r_init = force_layout(seed)
+        v = make_feasible(np.concatenate([pts[:,0], pts[:,1], r_init]))
+        configs.append(v)
+        
+    # 3. Staggered grid patterns
+    for shift in [0.0, 0.02, -0.02]:
+        pts = []
+        for i in range(6):
+            for j in range(5):
+                pts.append([0.08 + i*0.16 + shift, 0.08 + j*0.20 + shift])
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.005, 0.005, pts.shape)
+        pts = np.clip(pts, 0.02, 0.98)
+        r_init = np.full(N, 0.04)
+        v = make_feasible(np.concatenate([pts[:,0], pts[:,1], r_init]))
+        configs.append(v)
+        
+    return configs
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    np.random.seed(42)
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.3)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    configs = generate_initial_configs()
+    
+    best_v = None
+    best_sum = -1.0
+    
+    # Phase 1: Multi-start exploration
+    for v0 in configs:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict,
+                           options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+            
+            s = -res.fun
+            c = constraints(res.x)
+            if np.min(c) >= -1e-6 and s > best_sum:
+                best_sum = s
+                best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        best_v = configs[0]
+        
+    # Phase 2: Iterative shrink & perturb to escape local minima
+    current_v = best_v.copy()
+    for step in range(15):
+        pert = current_v.copy()
+        pert[2*N:] *= 0.96  # Shrink radii to create room for center movement
+        pert[:2*N] += np.random.uniform(-0.004, 0.004, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        pert = make_feasible(pert)
+        
+        try:
+            res = minimize(objective, pert, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict,
+                           options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+            
+            s = -res.fun
+            c = constraints(res.x)
+            if np.min(c) >= -1e-6 and s > best_sum:
+                best_sum = s
+                best_v = res.x.copy()
+                current_v = best_v.copy()
+        except Exception:
+            pass
+            
+    # Extract results
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    
+    # Phase 3: Strict Post-Processing for Validator Compliance
+    eps = 1e-8
+    # 1. Enforce boundary constraints strictly
+    for i in range(N):
+        cr[i] = min(cr[i], cx[i] - eps, 1.0 - cx[i] - eps, 
+                    cy[i] - eps, 1.0 - cy[i] - eps)
+        cr[i] = max(cr[i], 0.0)
+        
+    # 2. Enforce non-overlap constraints iteratively with safety margin
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                if cr[i] + cr[j] > d - eps:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + eps
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    centers = np.column_stack((cx, cy))
+    return centers, cr, float(np.sum(cr))
+```

@@ -1,0 +1,136 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond the current 2.630818, we need a more robust global optimization strategy. Standard multi-start SLSQP often gets trapped in local optima due to the highly non-convex nature of circle packing constraints.
+
+My strategy employs a two-phase hybrid optimization approach:
+1. **Penalty-Based Global Exploration**: Convert the constrained problem into an unconstrained (bounds-only) problem using a smooth penalty function. The penalty heavily penalizes boundary violations and circle overlaps. By gradually increasing the penalty weight (continuation method), we guide the optimizer through a smooth energy landscape that helps escape shallow local minima. `L-BFGS-B` is used here for its speed and robustness on smooth objectives.
+2. **Constrained Local Polishing**: Once a high-quality configuration is found via the penalty phase, we switch to `SLSQP` with exact inequality constraints. This enforces strict feasibility and fine-tunes the positions/radii to maximize the sum precisely.
+3. **Diverse Initializations**: We seed the process with hexagonal lattices (shifted/rotated) and random dense clusters to cover multiple basins of attraction.
+4. **Strict Post-Processing**: A deterministic shrinkage routine ensures the final configuration strictly satisfies the validator's `1e-12` tolerance, preventing numerical false negatives.
+
+This pipeline significantly increases the probability of finding a denser, more optimal arrangement than standard gradient-based methods alone.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute pair indices for vectorized constraint evaluation
+PI, PJ = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: Minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and pairwise non-overlap."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    cons = [
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r,
+        np.sqrt(np.sum((c[PI] - c[PJ])**2, axis=1)) - (r[PI] + r[PJ])
+    ]
+    return np.concatenate(cons)
+
+def smooth_penalty(v, lam):
+    """Smooth penalty objective for global exploration."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    val = -np.sum(r)
+    
+    # Boundary penalties
+    val += lam * (np.sum(np.maximum(0, r - c[:,0])**2) +
+                  np.sum(np.maximum(0, r - (1.0 - c[:,0]))**2) +
+                  np.sum(np.maximum(0, r - c[:,1])**2) +
+                  np.sum(np.maximum(0, r - (1.0 - c[:,1]))**2))
+                  
+    # Overlap penalties
+    d = np.sqrt(np.sum((c[PI] - c[PJ])**2, axis=1))
+    ov = np.maximum(0, r[PI] + r[PJ] - d)
+    val += lam * np.sum(ov**2)
+    return val
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    best_sum = -1.0
+    best_v = None
+
+    # Generate diverse initial configurations
+    starts = []
+    
+    # 1. Hexagonal lattice variants
+    for s in range(12):
+        np.random.seed(s)
+        r0 = 0.095
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N:
+            x_s = r0 if row % 2 == 0 else 2 * r0
+            x = x_s
+            while x <= 1 - r0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r0
+            y += np.sqrt(3) * r0
+            row += 1
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
+        starts.append(pts)
+
+    # 2. Random dense clusters
+    for s in range(13):
+        np.random.seed(100 + s)
+        starts.append(np.random.uniform(0.1, 0.9, (N, 2)))
+
+    # Optimization pipeline
+    for centers in starts:
+        r_init = np.full(N, 0.04)
+        v0 = np.concatenate([centers.flatten(), r_init])
+
+        # Phase 1: Penalty-based exploration to find high-quality basins
+        curr = v0.copy()
+        for lam in [10, 50, 200, 1000, 5000]:
+            res = minimize(smooth_penalty, curr, args=(lam,), method='L-BFGS-B', bounds=bounds,
+                           options={'maxiter': 2000, 'ftol': 1e-12})
+            curr = res.x
+
+        # Phase 2: Constrained SLSQP polish for exact feasibility and precision
+        res = minimize(objective, curr, method='SLSQP', bounds=bounds,
+                       constraints={'type': 'ineq', 'fun': constraints},
+                       options={'maxiter': 5000, 'ftol': 1e-12})
+
+        # Accept if better and sufficiently feasible
+        if -res.fun > best_sum:
+            c_val = constraints(res.x)
+            if np.min(c_val) >= -1e-7:
+                best_sum = -res.fun
+                best_v = res.x.copy()
+
+    # Extract final configuration
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:].copy()
+
+    # Strict post-processing to guarantee validator compliance
+    # 1. Enforce boundary constraints
+    radii = np.minimum(radii, np.minimum(centers[:, 0], 1.0 - centers[:, 0]))
+    radii = np.minimum(radii, np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    # 2. Enforce non-overlap constraints iteratively with safety margin
+    for _ in range(10):
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if radii[i] + radii[j] > d:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] = max(0.0, radii[i] - shrink)
+                    radii[j] = max(0.0, radii[j] - shrink)
+    radii = np.maximum(radii, 0.0)
+
+    return centers, radii, float(np.sum(radii))
+```

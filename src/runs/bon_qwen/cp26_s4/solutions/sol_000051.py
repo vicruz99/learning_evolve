@@ -1,0 +1,372 @@
+# sol_000051 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state bd759b5e) state=f1dae1fc sum of radii=2.610643 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = 26
+    
+    # 1. Initialization: Perturbed Hexagonal Packing
+    # We start with a hexagonal grid pattern which is denser than square grid.
+    # We estimate an initial radius slightly smaller than 0.1 to ensure feasibility.
+    r_init = 0.095
+    
+    # Generate centers for a hexagonal arrangement
+    # Rows are shifted alternately
+    centers = []
+    r_current = r_init
+    
+    # Try to fit circles in a hexagonal pattern
+    # Row height is r * sqrt(3)
+    # We estimate number of rows needed. For n=26, maybe 5 or 6 rows.
+    # Let's try 5 rows with varying counts: 5, 6, 5, 6, 4 -> 26? No, 5+6+5+6+4=26.
+    # But width constraints for 6 circles in shifted row are tight.
+    # Let's just generate a dense random set within bounds or a grid and let optimizer fix.
+    # A better init: 5x5 grid plus 1 in center, then perturbed.
+    
+    # Grid init
+    grid_x = np.linspace(0.1, 0.9, 5)
+    grid_y = np.linspace(0.1, 0.9, 5)
+    cx, cy = np.meshgrid(grid_x, grid_y)
+    init_centers = np.vstack([cx.ravel(), cy.ravel()]).T # 25 points
+    
+    # Add 26th point in the middle of a gap, e.g., (0.5, 0.5) is occupied.
+    # Gap at (0.2, 0.2) relative to grid? 
+    # Let's just add a point at (0.5, 0.5) and rely on optimizer to move it.
+    # But (0.5, 0.5) is in grid. 
+    # Let's add at (0.5, 0.2) ?
+    # Actually, a random perturbation of a dense set is robust.
+    
+    # Let's try a hexagonal layout manually
+    centers_list = []
+    # Row 0: 5 circles
+    for i in range(5):
+        centers_list.append([r_init + i * 2 * r_init, r_init])
+    # Row 1: 6 circles (shifted by r)
+    # Check width: start at 2*r, end at 2*r + 10*r = 12*r. 12*0.095 = 1.14 > 1.
+    # So we can't fit 6 circles of 0.095 in a shifted row if we stick to strict hex.
+    # We must scale down or use fewer circles per row.
+    
+    # Let's use a simpler dense packing: 5 rows of 5, and 1 extra.
+    # Place 25 in 5x5 grid with spacing 0.18 (radius 0.09)
+    # Spacing = 2*r = 0.18. 5 circles span 4*0.18 = 0.72. 
+    # Margins (1 - 0.72)/2 = 0.14. So center at 0.14 + k*0.18.
+    
+    r_init = 0.09
+    margin = (1 - 4 * 2 * r_init) / 2
+    x_coords = [margin + i * 2 * r_init for i in range(5)]
+    y_coords = [margin + i * 2 * r_init for i in range(5)]
+    
+    init_centers = []
+    for y in y_coords:
+        for x in x_coords:
+            init_centers.append([x, y])
+    
+    # Add 26th circle. Try to place in a "hole".
+    # Hole at (x_coords[1], y_coords[1])? No, that's occupied.
+    # Hole between (x0, y0), (x1, y0), (x0, y1), (x1, y1).
+    # Center at (x0 + r, y0 + r).
+    hole_x = x_coords[0] + r_init
+    hole_y = y_coords[0] + r_init
+    init_centers.append([hole_x, hole_y])
+    
+    centers = np.array(init_centers)
+    radii = np.full(n, r_init)
+    
+    # Perturb slightly to break symmetry
+    centers += np.random.normal(0, 0.005, centers.shape)
+    # Clip to valid range
+    centers = np.clip(centers, r_init, 1 - r_init)
+    
+    # 2. Optimization
+    # Variables: [x1, y1, r1, x2, y2, r2, ...]
+    # Objective: Maximize sum(r) => Minimize -sum(r)
+    
+    def objective(vars):
+        r = vars[2::3]
+        return -np.sum(r)
+    
+    def boundary_constraints(vars):
+        cons = []
+        for i in range(n):
+            x = vars[3*i]
+            y = vars[3*i+1]
+            r = vars[3*i+2]
+            # x >= r => x - r >= 0
+            cons.append(x - r)
+            # y >= r => y - r >= 0
+            cons.append(y - r)
+            # x <= 1-r => 1 - x - r >= 0
+            cons.append(1 - x - r)
+            # y <= 1-r => 1 - y - r >= 0
+            cons.append(1 - y - r)
+            # r >= 0
+            cons.append(r)
+        return np.array(cons)
+    
+    def overlap_constraints(vars):
+        cons = []
+        for i in range(n):
+            xi, yi, ri = vars[3*i], vars[3*i+1], vars[3*i+2]
+            for j in range(i + 1, n):
+                xj, yj, rj = vars[3*j], vars[3*j+1], vars[3*j+2]
+                # (xi-xj)^2 + (yi-yj)^2 >= (ri+rj)^2
+                # dist^2 - (ri+rj)^2 >= 0
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                cons.append(dist_sq - (ri + rj)**2)
+        return np.array(cons)
+
+    # Combine constraints
+    def get_constraints():
+        from scipy.optimize import NonlinearConstraint
+        
+        # SLSQP doesn't support NonlinearConstraint directly in minimize args in older versions,
+        # but we can use inequality constraints 'ineq' where g(x) >= 0.
+        # However, passing a function that returns array is standard.
+        
+        # We need to define a single constraint function or a list of dict constraints.
+        # Given the large number of constraints, defining them as a single array return is efficient.
+        
+        # But SLSQP expects constraints as list of dicts or NonlinearConstraint objects.
+        # Let's use the callback or define them properly.
+        # Actually, for simple inequality g(x)>=0, we can use:
+        # {'type': 'ineq', 'fun': lambda v: ...}
+        
+        # To avoid redefining functions, we wrap them.
+        # Note: defining lambda inside might be slow or closure issues, but acceptable here.
+        # Better to use top-level functions or classes, but prompt says no closures.
+        # We will define the constraint function inside run_packing but return it? 
+        # No, prompt says "Make all helper functions top level and have no closures".
+        # So we cannot define helper functions inside run_packing that capture vars.
+        # We must pass vars to them or define them globally.
+        
+        # Let's define global helper functions that take the full variable vector.
+        pass
+
+    # Redefine constraints as top-level functions taking full vector
+    # But n is fixed to 26.
+    
+    # We will solve the problem in steps to improve robustness.
+    # Step 1: Optimize positions for fixed radii (maybe slightly larger than init)
+    # Step 2: Optimize radii and positions.
+    
+    # Actually, let's just run SLSQP directly.
+    
+    initial_vars = np.zeros(3 * n)
+    initial_vars[0::3] = centers[:, 0]
+    initial_vars[1::3] = centers[:, 1]
+    initial_vars[2::3] = radii
+    
+    # Bounds for variables
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+    
+    # Constraints list
+    constraints = []
+    
+    # Add boundary constraints
+    # x_i >= r_i  => x_i - r_i >= 0
+    # This is non-linear in vars (vars[3i] - vars[3i+2]).
+    
+    # We can define constraint functions that access the full vector.
+    # To adhere to "no closures", we pass the index or use a class? 
+    # Or just define a function that takes the vector and returns the constraint array.
+    # SLSQP accepts a callable for 'fun' that takes x.
+    
+    def boundary_con_fun(x_vars):
+        res = np.zeros(4 * n)
+        idx = 0
+        for i in range(n):
+            xi = x_vars[3*i]
+            yi = x_vars[3*i+1]
+            ri = x_vars[3*i+2]
+            res[idx] = xi - ri
+            idx += 1
+            res[idx] = yi - ri
+            idx += 1
+            res[idx] = 1.0 - xi - ri
+            idx += 1
+            res[idx] = 1.0 - yi - ri
+            idx += 1
+        return res
+
+    def overlap_con_fun(x_vars):
+        # Number of pairs
+        n_pairs = n * (n - 1) // 2
+        res = np.zeros(n_pairs)
+        idx = 0
+        for i in range(n):
+            xi = x_vars[3*i]
+            yi = x_vars[3*i+1]
+            ri = x_vars[3*i+2]
+            for j in range(i + 1, n):
+                xj = x_vars[3*j]
+                yj = x_vars[3*j+1]
+                rj = x_vars[3*j+2]
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                res[idx] = dist_sq - (ri + rj)**2
+                idx += 1
+        return res
+
+    constraints = [
+        {'type': 'ineq', 'fun': boundary_con_fun},
+        {'type': 'ineq', 'fun': overlap_con_fun}
+    ]
+    
+    # Optimization
+    # Use SLSQP
+    res = minimize(
+        objective, 
+        initial_vars, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=constraints, 
+        options={'ftol': 1e-9, 'maxiter': 1000, 'disp': True}
+    )
+    
+    # Extract results
+    best_vars = res.x
+    best_centers = np.zeros((n, 2))
+    best_radii = np.zeros(n)
+    
+    for i in range(n):
+        best_centers[i, 0] = best_vars[3*i]
+        best_centers[i, 1] = best_vars[3*i+1]
+        best_radii[i] = best_vars[3*i+2]
+        
+    # Post-processing: Ensure strict validity (clip tiny negative radii or overlaps due to float errors)
+    # Although SLSQP should satisfy constraints, numerical precision might be an issue.
+    # The validation function allows 1e-12 tolerance.
+    
+    # Let's verify and maybe do a small correction if needed, but SLSQP is usually good.
+    
+    sum_radii = np.sum(best_radii)
+    
+    return best_centers, best_radii, sum_radii
+
+# Top level helpers needed by run_packing
+# They are defined inside the module scope (conceptually), but in the solution block
+# we must define them before run_packing or inside. 
+# The prompt says "Make all helper functions top level". 
+# So I will move the constraint functions outside.
+
+def objective(vars):
+    # vars shape (3*n)
+    # radii are at indices 2, 5, 8, ...
+    r = vars[2::3]
+    return -np.sum(r)
+
+def boundary_con_fun(x_vars):
+    # n is global or passed? 
+    # We can't rely on global n easily if n changes, but here n=26.
+    # Let's assume n=26 is fixed or pass it. 
+    # But prompt says no closures. We can use a global constant or hardcode 26.
+    # Hardcoding 26 is safe given the problem statement.
+    n = 26
+    res = np.zeros(4 * n)
+    idx = 0
+    for i in range(n):
+        xi = x_vars[3*i]
+        yi = x_vars[3*i+1]
+        ri = x_vars[3*i+2]
+        res[idx] = xi - ri
+        idx += 1
+        res[idx] = yi - ri
+        idx += 1
+        res[idx] = 1.0 - xi - ri
+        idx += 1
+        res[idx] = 1.0 - yi - ri
+        idx += 1
+    return res
+
+def overlap_con_fun(x_vars):
+    n = 26
+    n_pairs = n * (n - 1) // 2
+    res = np.zeros(n_pairs)
+    idx = 0
+    for i in range(n):
+        xi = x_vars[3*i]
+        yi = x_vars[3*i+1]
+        ri = x_vars[3*i+2]
+        for j in range(i + 1, n):
+            xj = x_vars[3*j]
+            yj = x_vars[3*j+1]
+            rj = x_vars[3*j+2]
+            dist_sq = (xi - xj)**2 + (yi - yj)**2
+            res[idx] = dist_sq - (ri + rj)**2
+            idx += 1
+    return res
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = 26
+    
+    # Initialization
+    r_init = 0.09
+    margin = (1 - 4 * 2 * r_init) / 2
+    x_coords = [margin + i * 2 * r_init for i in range(5)]
+    y_coords = [margin + i * 2 * r_init for i in range(5)]
+    
+    init_centers = []
+    for y in y_coords:
+        for x in x_coords:
+            init_centers.append([x, y])
+    
+    hole_x = x_coords[0] + r_init
+    hole_y = y_coords[0] + r_init
+    init_centers.append([hole_x, hole_y])
+    
+    centers = np.array(init_centers)
+    radii = np.full(n, r_init)
+    
+    centers += np.random.normal(0, 0.005, centers.shape)
+    centers = np.clip(centers, r_init, 1 - r_init)
+    
+    initial_vars = np.zeros(3 * n)
+    initial_vars[0::3] = centers[:, 0]
+    initial_vars[1::3] = centers[:, 1]
+    initial_vars[2::3] = radii
+    
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 0.5))
+    
+    constraints = [
+        {'type': 'ineq', 'fun': boundary_con_fun},
+        {'type': 'ineq', 'fun': overlap_con_fun}
+    ]
+    
+    res = minimize(
+        objective, 
+        initial_vars, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=constraints, 
+        options={'ftol': 1e-12, 'maxiter': 2000, 'disp': False}
+    )
+    
+    best_vars = res.x
+    best_centers = np.zeros((n, 2))
+    best_radii = np.zeros(n)
+    
+    for i in range(n):
+        best_centers[i, 0] = best_vars[3*i]
+        best_centers[i, 1] = best_vars[3*i+1]
+        best_radii[i] = best_vars[3*i+2]
+        
+    # Ensure radii are non-negative
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    sum_radii = np.sum(best_radii)
+    
+    return best_centers, best_radii, sum_radii

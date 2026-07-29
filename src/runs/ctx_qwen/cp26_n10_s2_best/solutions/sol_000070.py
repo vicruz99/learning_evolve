@@ -1,0 +1,141 @@
+# sol_000070 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000026 (state f081a56f) state=fb695acc sum of radii=2.586554 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_objective(v, n):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def compute_constraints(v, n, pairs_i, pairs_j):
+    """Compute inequality constraints: boundaries and non-overlap."""
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    
+    cons = []
+    # Boundary constraints
+    cons.append(x - r)            # x >= r
+    cons.append(1.0 - x - r)      # x + r <= 1
+    cons.append(y - r)            # y >= r
+    cons.append(1.0 - y - r)      # y + r <= 1
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[pairs_i] - x[pairs_j]
+    dy = y[pairs_i] - y[pairs_j]
+    dist_sq = dx**2 + dy**2
+    sum_r = r[pairs_i] + r[pairs_j]
+    cons.append(dist_sq - sum_r**2)
+    
+    return np.concatenate(cons)
+
+def run_packing():
+    n = 26
+    
+    # Precompute pair indices for vectorized constraint evaluation
+    pairs_i = []
+    pairs_j = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs_i.append(i)
+            pairs_j.append(j)
+    pairs_i = np.array(pairs_i)
+    pairs_j = np.array(pairs_j)
+    
+    # Variable bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    cons_dict = {'type': 'ineq', 'fun': compute_constraints, 'args': (n, pairs_i, pairs_j)}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Multiple restarts with diverse initializations to escape local minima
+    for seed in range(30):
+        np.random.seed(seed)
+        
+        # Hexagonal lattice initialization
+        r_est = 0.08
+        centers = []
+        y = r_est
+        row = 0
+        while len(centers) < n:
+            x_start = r_est + (row % 2) * r_est
+            x = x_start
+            while x <= 1.0 - r_est and len(centers) < n:
+                centers.append([x, y])
+                x += 2.0 * r_est
+            y += np.sqrt(3) * r_est
+            row += 1
+            
+        centers = np.array(centers[:n])
+        
+        # Add controlled jitter to break symmetry
+        centers += np.random.uniform(-0.015, 0.015, size=centers.shape)
+        centers = np.clip(centers, 0.02, 0.98)
+        
+        # Initial variable vector: [x..., y..., r...]
+        x0 = np.concatenate([centers[:, 0], centers[:, 1], np.full(n, 0.04)])
+        
+        try:
+            res = minimize(compute_objective, x0, args=(n,), method='SLSQP', 
+                           bounds=bounds, constraints=cons_dict,
+                           options={'maxiter': 5000, 'ftol': 1e-11, 'disp': False})
+            
+            if res.success:
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    # Fallback to a valid grid configuration if optimization fails completely
+    if best_x is None:
+        x_fb = np.zeros(n)
+        y_fb = np.zeros(n)
+        r_fb = np.full(n, 0.08)
+        idx = 0
+        for i in range(5):
+            for j in range(6):
+                if idx < n:
+                    x_fb[idx] = 0.1 + j * 0.16
+                    y_fb[idx] = 0.1 + i * 0.16
+                    idx += 1
+        best_x = np.concatenate([x_fb, y_fb, r_fb])
+        best_sum = 0.08 * n
+        
+    x_sol = best_x[:n]
+    y_sol = best_x[n:2*n]
+    r_sol = best_x[2*n:]
+    
+    # Strict validity enforcement to satisfy validator tolerances
+    # 1. Boundary constraints
+    r_sol = np.minimum(r_sol, np.minimum(x_sol, 1.0 - x_sol))
+    r_sol = np.minimum(r_sol, np.minimum(y_sol, 1.0 - y_sol))
+    r_sol = np.maximum(r_sol, 0.0)
+    
+    # 2. Pairwise constraints (iterative shrinking to resolve numerical overlaps)
+    for _ in range(10):
+        overlap_found = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.hypot(x_sol[i] - x_sol[j], y_sol[i] - y_sol[j])
+                if dist < r_sol[i] + r_sol[j] - 1e-9:
+                    overlap = r_sol[i] + r_sol[j] - dist
+                    shrink = overlap / 2.0 + 1e-7
+                    r_sol[i] = max(0.0, r_sol[i] - shrink)
+                    r_sol[j] = max(0.0, r_sol[j] - shrink)
+                    overlap_found = True
+        if not overlap_found:
+            break
+            
+    r_sol = np.maximum(r_sol, 0.0)
+    
+    centers_final = np.column_stack([x_sol, y_sol])
+    sum_radii = float(np.sum(r_sol))
+    
+    return centers_final, r_sol, sum_radii

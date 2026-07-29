@@ -1,0 +1,244 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat this as a constrained optimization problem.
+1.  **Problem Decomposition**: The problem involves optimizing 52 center coordinates and 26 radii. The constraints are non-linear (distance between centers $\ge$ sum of radii).
+2.  **Approach**: We use a hybrid method.
+    *   **Radius Determination (LP)**: For any fixed set of centers, finding the optimal radii is a Linear Programming (LP) problem. We maximize $\sum r_i$ subject to $r_i + r_j \le \|c_i - c_j\|$ and boundary constraints. This is solved efficiently using `scipy.optimize.linprog`.
+    *   **Center Optimization (Force-Directed)**: We iteratively update the centers to increase the objective (sum of radii). We use a force-directed simulation where circles exert repulsive forces on each other. The force magnitude is weighted by the "tightness" of the packing constraint (i.e., if circles are touching, the force is strong; if they are far apart, the force is weak). We also apply repulsive forces from the boundaries.
+3.  **Initialization**: We start with a grid-like distribution of centers to ensure a valid initial configuration, then perturb them slightly.
+4.  **Execution**: We run the optimization loop for a fixed number of iterations, adjusting step sizes and cooling the system to settle into a high-density packing.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # 1. Initialize centers
+    # We use a 5x5 grid for 25 points and add one extra point.
+    # Coordinates are placed in [0.1, 0.9] to keep them away from boundaries initially.
+    centers = np.zeros((n, 2))
+    
+    # Generate a 5x5 grid
+    grid_points = []
+    for i in range(5):
+        for j in range(5):
+            grid_points.append([0.1 + i * 0.2, 0.1 + j * 0.2])
+            
+    # Assign first 25 points
+    centers[:25] = grid_points
+    
+    # Assign 26th point. Place it in a gap, e.g., near center but shifted?
+    # The grid has a point at (0.5, 0.5). 
+    # Let's place the 26th point slightly off-center or in a corner gap.
+    # Actually, a random perturbation of the whole set is safer for optimization.
+    centers[25] = [0.5, 0.5] # Temporarily same as center, will move.
+    
+    # Add small random noise to break symmetry and avoid degenerate configs
+    np.random.seed(42)
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    
+    # Clamp to [0, 1]
+    centers = np.clip(centers, 1e-5, 1 - 1e-5)
+
+    # Helper function to solve LP for radii given centers
+    def solve_radii(c):
+        # Objective: Maximize sum(r_i) -> Minimize -sum(r_i)
+        c_obj = -np.ones(n)
+        
+        A_ub = []
+        b_ub = []
+        
+        # Precompute distances for pairwise constraints
+        # dists[i, j] is distance between circle i and j
+        diffs = c[:, None, :] - c[None, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        
+        # Pairwise constraints: r_i + r_j <= dists[i, j]
+        # We only need to add constraints for pairs that are relatively close 
+        # to reduce matrix size, but for N=26, full matrix is fine (325 constraints).
+        # Let's add all.
+        for i in range(n):
+            for j in range(i + 1, n):
+                row = np.zeros(n)
+                row[i] = 1
+                row[j] = 1
+                A_ub.append(row)
+                b_ub.append(dists[i, j])
+        
+        # Boundary constraints: r_i <= x, r_i <= 1-x, r_i <= y, r_i <= 1-y
+        for i in range(n):
+            x, y = c[i]
+            # r_i <= x
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(x)
+            # r_i <= 1-x
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(1 - x)
+            # r_i <= y
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(y)
+            # r_i <= 1-y
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(1 - y)
+            
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        # Bounds: r_i >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                # Radii are -res.x (since we minimized negative sum)
+                # Actually res.x are the variables, which are radii.
+                # Objective value is res.fun = -sum(radii)
+                return -res.fun, res.x
+            else:
+                # Fallback to small radii if LP fails (shouldn't happen)
+                return 0, np.zeros(n)
+        except Exception:
+            return 0, np.zeros(n)
+
+    # Optimization Loop
+    # We iterate: solve for radii -> compute forces -> move centers
+    num_iters = 2000
+    step_size = 0.05
+    
+    current_centers = centers
+    best_sum = 0
+    best_radii = np.zeros(n)
+    
+    # Initial solve
+    current_sum, current_radii = solve_radii(current_centers)
+    best_sum = current_sum
+    best_radii = current_radii.copy()
+
+    for _ in range(num_iters):
+        # 1. Solve LP to get optimal radii for current centers
+        current_sum, current_radii = solve_radii(current_centers)
+        
+        # Track best
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_radii = current_radii.copy()
+            best_centers = current_centers.copy()
+
+        # 2. Compute Forces
+        forces = np.zeros_like(current_centers)
+        
+        # Compute distance matrix
+        diffs = current_centers[:, None, :] - current_centers[None, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        
+        # Slack: dist - (r_i + r_j). 
+        # If slack is small (close to 0), constraint is tight -> strong repulsion.
+        # If slack is large, constraint is loose -> weak repulsion.
+        # Note: LP ensures r_i + r_j <= dist, so slack >= 0.
+        r_sum_matrix = current_radii[:, None] + current_radii[None, :]
+        slack = dists - r_sum_matrix
+        
+        # Add epsilon to avoid division by zero
+        slack_safe = np.maximum(slack, 1e-6)
+        
+        # Repulsive force magnitude
+        # We want to push circles apart if they are touching (slack ~ 0).
+        # Force ~ 1 / (slack * dist) ?
+        # A simple inverse square law on distance, weighted by tightness.
+        # Tightness weight: 1 / slack_safe
+        # Distance weight: 1 / dists^2 (standard Coulomb repulsion)
+        
+        # Avoid singularity at dist=0
+        dists_safe = np.maximum(dists, 1e-6)
+        
+        # Force vector calculation
+        # F_ij direction is from j to i (diffs[i,j])
+        # Magnitude
+        magnitude = (1.0 / (slack_safe * dists_safe**2))
+        
+        # Apply forces
+        # Vectorized accumulation
+        # force on i from j: magnitude[i,j] * diffs[i,j] / dists[i,j]
+        # diffs[i,j] / dists[i,j] is unit vector from j to i
+        
+        unit_diffs = diffs / np.expand_dims(dists_safe, 2)
+        force_vectors = np.expand_dims(magnitude, 2) * unit_diffs
+        
+        # Sum forces over j for each i
+        # force_vectors[i, j, :] is force on i due to j
+        forces += np.sum(force_vectors, axis=1)
+
+        # 3. Boundary Forces
+        # Push away from walls if close
+        margin = 1e-3
+        for i in range(n):
+            x, y = current_centers[i]
+            # Left wall
+            if x < margin:
+                forces[i, 0] += (margin - x) * 100
+            # Right wall
+            if x > 1 - margin:
+                forces[i, 0] -= (x - (1 - margin)) * 100
+            # Bottom wall
+            if y < margin:
+                forces[i, 1] += (margin - y) * 100
+            # Top wall
+            if y > 1 - margin:
+                forces[i, 1] -= (y - (1 - margin)) * 100
+                
+        # 4. Update Centers
+        # Normalize forces or use step size
+        max_force = np.max(np.linalg.norm(forces, axis=1))
+        if max_force > 0:
+            # Scale step size by force magnitude but cap it
+            # Adaptive step size
+            current_step = step_size * (1.0 / (1.0 + max_force)) 
+            # Or just fixed small step
+            # current_step = 0.01
+            
+            # Simple scaling:
+            current_step = 0.02 
+            
+            current_centers += current_step * forces
+            
+            # Project back to [0, 1]
+            current_centers = np.clip(current_centers, 1e-5, 1 - 1e-5)
+            
+            # Decay step size
+            step_size *= 0.995
+            
+        else:
+            break
+
+    # Final validation and return
+    # Re-solve LP one last time on best_centers to ensure consistency
+    final_sum, final_radii = solve_radii(best_centers)
+    
+    # If best_centers didn't store properly, use current
+    if best_centers is None:
+        best_centers = current_centers
+        
+    # Just to be safe, re-solve on the centers that yielded best_sum
+    # Actually, best_radii corresponds to best_centers.
+    # But we might have moved centers after recording best.
+    # Let's ensure validity.
+    
+    # Validate and clean up
+    centers_out = best_centers
+    radii_out = best_radii
+    sum_out = best_sum
+    
+    # Ensure strict validity with tolerance
+    # The LP solution should be valid, but floating point might be loose.
+    # We rely on the LP to have found a valid solution.
+    
+    return centers_out, radii_out, float(sum_out)
+
+# Placeholder for variables used in the strategy description but defined inside
+best_centers = None
+
+```

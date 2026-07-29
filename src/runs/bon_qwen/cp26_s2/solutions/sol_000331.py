@@ -1,0 +1,187 @@
+# sol_000331 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state cc22fbce) state=80fd1905 sum of radii=0.279344 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+
+    def objective(vars):
+        # Maximize sum of radii -> minimize negative sum
+        # radii are at indices 2, 5, 8...
+        return -np.sum(vars[2::3])
+
+    def make_constraints():
+        constraints = []
+        
+        # Boundary constraints: x_i >= r_i, x_i <= 1-r_i, etc.
+        for i in range(n):
+            idx = 3 * i
+            # x_i - r_i >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+            # 1 - x_i - r_i >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i] - v[3*i+2]})
+            # y_i - r_i >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+            # 1 - y_i - r_i >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i+1] - v[3*i+2]})
+
+        # Non-overlap constraints: (x_i-x_j)^2 + (y_i-y_j)^2 >= (r_i+r_j)^2
+        # Using squared distance to keep constraint smooth and avoid sqrt
+        for i in range(n):
+            for j in range(i + 1, n):
+                idx_i, idx_j = 3 * i, 3 * j
+                constraints.append({
+                    'type': 'ineq',
+                    'fun': lambda v, i=i, j=j: 
+                        (v[idx_i] - v[idx_j])**2 + (v[idx_i+1] - v[idx_j+1])**2 - (v[idx_i+2] + v[idx_j+2])**2
+                })
+        return constraints
+
+    def get_initial_guess(offset_x=0.0, offset_y=0.0):
+        # Generate a staggered hexagonal grid initialization
+        # This places circles in a valid configuration with small radii
+        # allowing the optimizer to expand them.
+        
+        initial_vars = np.zeros(n * 3)
+        
+        # Estimate a small starting radius to fit 26 circles easily
+        # Area argument suggests r ~ 0.1. Let's start at 0.03.
+        r_start = 0.03
+        
+        idx = 0
+        row = 0
+        while idx < n:
+            y = r_start + row * (r_start * np.sqrt(3))
+            # Alternate shift for hexagonal packing
+            x_start = r_start if (row % 2 == 0) else 2 * r_start
+            
+            # Determine how many circles fit in this row
+            # Width available is 1.0. Diameter is 2*r.
+            # We can fit floor((1 - 2*r) / 2*r) + 1 circles roughly.
+            # But we just place them until we run out of width or need to stop.
+            
+            # Simplified: place in a grid that fits easily
+            # We'll iterate x
+            col = 0
+            while idx < n:
+                x = x_start + col * (2 * r_start)
+                if x + r_start > 1.0:
+                    break
+                
+                initial_vars[3*idx] = x + offset_x * 0.1
+                initial_vars[3*idx+1] = y + offset_y * 0.1
+                initial_vars[3*idx+2] = r_start
+                
+                idx += 1
+                col += 1
+            row += 1
+            
+        return initial_vars
+
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 1.0))
+        bounds.append((0.0, 0.5))
+
+    constraints = make_constraints()
+
+    # Run multiple optimizations with different starting points to escape local optima
+    seeds = [0, 1, 5, 10, 15, 20]
+    
+    for seed in seeds:
+        np.random.seed(seed)
+        # Small random perturbation to the grid init
+        offset = np.random.uniform(-0.05, 0.05)
+        
+        vars0 = get_initial_guess(offset, offset)
+        
+        # Ensure initial feasibility by slightly reducing radii if needed
+        # (Though our init should be safe, this is a precaution)
+        # vars0[2::3] = 0.02 
+
+        try:
+            res = minimize(
+                objective, 
+                vars0, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraints,
+                options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False}
+            )
+            
+            if res.success:
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    # Extract and sanitize
+                    centers_raw = res.x.reshape(-1, 3)[:, :2]
+                    radii_raw = res.x.reshape(-1, 3)[:, 2]
+                    
+                    # Sanitization: Clamp boundaries strictly
+                    # This helps with the 1e-12 tolerance in validation
+                    for i in range(n):
+                        r = radii_raw[i]
+                        x, y = centers_raw[i]
+                        
+                        # Correct boundary violations
+                        if x - r < -1e-12:
+                            radii_raw[i] = x + 1e-12
+                            r = radii_raw[i]
+                        if x + r > 1 + 1e-12:
+                            radii_raw[i] = 1 - x + 1e-12
+                            r = radii_raw[i]
+                        if y - r < -1e-12:
+                            radii_raw[i] = y + 1e-12
+                            r = radii_raw[i]
+                        if y + r > 1 + 1e-12:
+                            radii_raw[i] = 1 - y + 1e-12
+                            r = radii_raw[i]
+                        
+                        # Correct overlaps (simple reduction)
+                        for j in range(n):
+                            if i == j: continue
+                            dist = np.linalg.norm(centers_raw[i] - centers_raw[j])
+                            r_sum = r + radii_raw[j]
+                            if dist < r_sum - 1e-12:
+                                # Reduce radius of current circle to resolve overlap
+                                new_r = (dist - radii_raw[j] + 1e-12) / 2
+                                if new_r < radii_raw[i]:
+                                    radii_raw[i] = max(0, new_r)
+                                    r = radii_raw[i]
+                                    
+                    best_centers = centers_raw
+                    best_radii = radii_raw
+                    best_sum = np.sum(best_radii)
+                    
+        except Exception:
+            continue
+
+    # If no valid packing found (unlikely), return a fallback
+    if best_centers is None:
+        # Fallback to simple grid
+        centers = np.zeros((n, 2))
+        radii = np.zeros(n)
+        idx = 0
+        for r in range(5):
+            for c in range(6):
+                if idx < n:
+                    centers[idx] = [0.1 + c*0.18, 0.1 + r*0.18]
+                    radii[idx] = 0.01
+                    idx += 1
+        best_centers = centers
+        best_radii = radii
+        best_sum = np.sum(radii)
+
+    return best_centers, best_radii, best_sum

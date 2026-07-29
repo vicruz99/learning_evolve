@@ -1,0 +1,213 @@
+# sol_000007 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state d25b46ef) state=d96109f6 sum of radii=2.445035 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import time
+from scipy.optimize import linprog
+
+def solve_radii(centers):
+    """
+    Given a fixed set of centers, find radii that maximize the sum of radii
+    subject to non-overlap and boundary constraints using Linear Programming.
+    """
+    n = centers.shape[0]
+    
+    # Objective: Maximize sum(r_i) -> Minimize -sum(r_i)
+    c_obj = np.ones(n) * -1
+    
+    A_ub = []
+    b_ub = []
+    
+    # 1. Boundary Constraints
+    # For each circle i:
+    # r_i <= x_i
+    # r_i <= 1 - x_i
+    # r_i <= y_i
+    # r_i <= 1 - y_i
+    for i in range(n):
+        x, y = centers[i]
+        
+        # r_i <= x
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(x)
+        
+        # r_i <= 1 - x
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(1.0 - x)
+        
+        # r_i <= y
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(y)
+        
+        # r_i <= 1 - y
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(1.0 - y)
+        
+    # 2. Pairwise Constraints
+    # For each pair (i, j): r_i + r_j <= distance(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dist)
+    
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x, np.sum(res.x)
+        else:
+            # Fallback to zero radii if LP fails (unlikely)
+            return np.zeros(n), 0.0
+    except Exception:
+        return np.zeros(n), 0.0
+
+def run_packing():
+    """
+    Generates a packing of 26 circles in a unit square maximizing sum of radii.
+    """
+    n = 26
+    np.random.seed(42) # For reproducibility
+
+    # --- Initialization: Hexagonal Pattern ---
+    # We try to arrange 26 circles in 5 rows.
+    # Pattern: 5, 5, 5, 5, 6 circles per row.
+    # This is a good starting geometry.
+    
+    centers = np.zeros((n, 2))
+    
+    # Estimate a starting radius for initialization placement
+    # If we fit 6 circles in width, diameter <= 1/6, r <= 1/12 approx 0.083
+    # If we fit 5 rows with vertical spacing sqrt(3)/2 * d
+    # Let's just place them uniformly in a grid/hex pattern and let optimization fix it.
+    
+    # Create a 5x6 grid and pick first 26 points, perturbed slightly
+    # Or just a specific hex layout
+    
+    row_counts = [5, 6, 5, 6, 4] # Sum = 26. Wait 5+6+5+6+4 = 26.
+    # Actually 5,5,5,5,6 is 26. Let's use that.
+    row_counts = [5, 5, 5, 5, 6]
+    
+    # Horizontal spacing
+    # For 6 circles, width is 1. So spacing 1/5 (centers at 0.1, 0.3, 0.5, 0.7, 0.9, 1.1?)
+    # No, if 6 circles fit, diameter <= 1/6. 
+    # Let's just space them evenly in [0, 1].
+    
+    idx = 0
+    num_rows = 5
+    row_height = 1.0 / (num_rows + 1)
+    
+    for r in range(num_rows):
+        count = row_counts[r]
+        # Shift for hexagonal packing
+        shift = 0.5 / count if r % 2 == 1 else 0.0 
+        # Actually standard hex shift is half the horizontal step.
+        # Let's just use a simple grid first, optimization will shift.
+        
+        # Distribute 'count' circles in the row
+        # x coords: evenly spaced
+        # To fit in [0,1], if we have 'count' circles, maybe spacing is 1/(count+1)?
+        # Let's try to pack them somewhat tightly but valid.
+        
+        # Simple uniform distribution for initialization
+        x_coords = np.linspace(0.05, 0.95, count)
+        
+        y_coord = (r + 1) * row_height
+        
+        for k in range(count):
+            if idx < n:
+                centers[idx, 0] = x_coords[k]
+                centers[idx, 1] = y_coord
+                idx += 1
+
+    # Ensure we have exactly n centers (just in case logic above is off)
+    # If we have fewer, add random ones. If more, truncate.
+    if centers.shape[0] < n:
+        # This shouldn't happen with logic above, but safety
+        pass
+    
+    # Optimization Parameters
+    current_sum = 0
+    best_centers = centers.copy()
+    best_radii = np.zeros(n)
+    best_sum = 0
+    
+    # Initial solve
+    current_radii, current_sum = solve_radii(centers)
+    best_radii = current_radii.copy()
+    best_sum = current_sum
+    best_centers = centers.copy()
+
+    # Local Search / Simulated Annealing
+    # We perturb centers to find better configurations.
+    
+    iterations = 2000 # Run for a fixed number of iterations
+    step_size = 0.05
+    
+    for it in range(iterations):
+        # Decay step size
+        current_step = step_size * (1 - it / iterations)
+        if current_step < 0.001:
+            current_step = 0.001
+            
+        # Pick a random circle to move
+        i_move = np.random.randint(0, n)
+        
+        # Store old position
+        old_pos = centers[i_move].copy()
+        
+        # Generate random move
+        dx = np.random.uniform(-current_step, current_step)
+        dy = np.random.uniform(-current_step, current_step)
+        
+        new_pos = old_pos + np.array([dx, dy])
+        
+        # Boundary check for center (must be in [0,1] roughly, though LP handles radius constraints)
+        # It's better to keep centers inside [0,1] to allow non-zero radii.
+        # If center is at 0, radius must be 0.
+        new_pos = np.clip(new_pos, 1e-4, 1 - 1e-4)
+        
+        centers[i_move] = new_pos
+        
+        # Solve for radii
+        new_radii, new_sum = solve_radii(centers)
+        
+        # Accept if better
+        if new_sum > best_sum:
+            best_sum = new_sum
+            best_centers = centers.copy()
+            best_radii = new_radii.copy()
+        else:
+            # Revert move
+            centers[i_move] = old_pos
+            
+        # Occasionally print progress (optional, but good for debugging if allowed)
+        # if it % 500 == 0:
+        #     print(f"Iter {it}: Sum = {best_sum:.5f}")
+
+    # Final Validation Check inside the function logic (mental check)
+    # The LP guarantees constraints.
+    
+    # However, we might want to run a few more iterations with smaller step for fine tuning
+    # Or just rely on the loop above.
+    
+    return best_centers, best_radii, best_sum

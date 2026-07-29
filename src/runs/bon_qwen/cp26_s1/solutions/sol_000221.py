@@ -1,116 +1,151 @@
 # sol_000221 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 5b6844e7) state=daa1f19f sum of radii=2.030555 correctness=1.0
+# generation=0 parent=seed (state df9a626f) state=a3a77849 sum of radii=1.950000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 
-N_CIRCLES = 26
-
-def _objective(vars_):
-    """Objective function: minimize negative sum of radii."""
-    r = vars_[2::3]
-    return -np.sum(r)
-
-def _constraints(vars_):
+def validate_packing(centers, radii):
     """
-    Returns array of constraint values. All must be >= 0 for feasibility.
-    Constraints include boundary checks and pairwise non-overlap.
+    Validate that circles don't overlap and are inside the unit square
     """
-    x = vars_[::3]
-    y = vars_[1::3]
-    r = vars_[2::3]
-    
-    # Boundary constraints: x-r >= 0, 1-x-r >= 0, etc.
-    boundary_c = np.concatenate([
-        x - r,
-        1.0 - x - r,
-        y - r,
-        1.0 - y - r
-    ])
-    
-    # Overlap constraints: dist(i,j) - r(i) - r(j) >= 0
-    # Use broadcasting for O(N^2) calculation
-    dx = x[:, None] - x[None, :]
-    dy = y[:, None] - y[None, :]
-    dist = np.sqrt(dx**2 + dy**2)
-    r_sum = r[:, None] + r[None, :]
-    
-    # Upper triangular mask to avoid duplicates and self-comparison
-    mask = np.triu(np.ones((N_CIRCLES, N_CIRCLES), dtype=bool), k=1)
-    overlap_c = dist[mask] - r_sum[mask]
-    
-    return np.concatenate([boundary_c, overlap_c])
-
-def _generate_initial_guess(n):
-    """Generates a hexagonal-like initial placement for n circles."""
-    r_init = 0.08  # Small enough to guarantee no initial overlap
-    h = r_init * np.sqrt(3.0)
-    w = 2.0 * r_init
-    
-    points = []
-    rows = 6
-    for i in range(rows):
-        y = r_init + i * h
-        # Stagger columns for hexagonal packing
-        num_cols = 5 if i % 2 == 0 else 4
-        for j in range(num_cols):
-            x = r_init + j * w + (r_init if i % 2 == 1 else 0.0)
-            points.append([x, y])
-            
-    # Ensure we have at least n points, trim if necessary
-    if len(points) < n:
-        # Fallback to grid if hex rows were too short
-        step = 0.2
-        for i in range(6):
-            for j in range(6):
-                if len(points) >= n:
-                    break
-                points.append([0.1 + j * step, 0.1 + i * step])
-    
-    pts = points[:n]
-    
-    # Construct initial variables vector [x1, y1, r1, x2, y2, r2, ...]
-    init_vars = np.zeros(3 * n)
-    for i, (x, y) in enumerate(pts):
-        init_vars[3 * i] = x
-        init_vars[3 * i + 1] = y
-        init_vars[3 * i + 2] = r_init
-        
-    return init_vars
+    n = centers.shape[0]
+    if np.isnan(centers).any():
+        return False
+    if np.isnan(radii).any():
+        return False
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    n = N_CIRCLES
+    n = 26
     
-    # Bounds for variables: x, y in [0, 1], r in [0, 0.5]
-    bounds = [(0.0, 1.0)] * n + [(0.0, 1.0)] * n + [(0.0, 0.5)] * n
+    # 1. Initialization: Hexagonal Grid
+    centers = []
+    # Parameters for hex grid
+    row_count = 6
+    for i in range(row_count):
+        # Y coordinate with vertical spacing
+        y = 0.15 + i * 0.15 
+        # Number of circles in this row
+        num_in_row = 5 if i % 2 == 0 else 4
+        # X coordinates
+        for j in range(num_in_row):
+            if len(centers) >= n:
+                break
+            x = 0.15 + j * 0.15 + (i % 2) * 0.075 # Stagger odd rows
+            centers.append([x, y])
     
-    # Constraint setup
-    cons = {'type': 'ineq', 'fun': _constraints}
+    centers = np.array(centers[:n])
     
-    # Initial guess
-    x0 = _generate_initial_guess(n)
+    # 2. Iterative Optimization (Repulsion/Inflation)
+    radii = np.full(n, 0.01)
     
-    # Run optimization
-    # SLSQP is suitable for this constrained non-linear problem
-    result = minimize(
-        _objective, 
-        x0, 
-        method='SLSQP', 
-        bounds=bounds, 
-        constraints=cons,
-        options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False}
-    )
+    # Parameters for the simulation
+    learning_rate = 0.05
+    repulsion_strength = 1.0
+    damping = 0.9
     
-    if not result.success:
-        # Fallback if optimization fails, though it rarely does with this setup
-        pass
+    for step in range(2000):
+        # Update radii based on current positions
+        for i in range(n):
+            # Distance to walls
+            min_wall = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            
+            # Distance to other circles
+            min_dist = 1.0
+            for j in range(n):
+                if i == j:
+                    continue
+                dist = np.linalg.norm(centers[i] - centers[j])
+                if dist < min_dist:
+                    min_dist = dist
+            
+            # Radius is limited by walls and half the distance to nearest neighbor
+            new_r = min(min_wall, min_dist / 2.0)
+            radii[i] = new_r
         
-    vars_opt = result.x
-    centers = np.column_stack((vars_opt[::3], vars_opt[1::3]))
-    radii = vars_opt[2::3]
-    sum_radii = np.sum(radii)
+        # Compute forces
+        forces = np.zeros_like(centers)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                
+                if dist > 0:
+                    # Target distance is sum of radii
+                    target_dist = radii[i] + radii[j]
+                    
+                    if dist < target_dist:
+                        # Overlap: Repulsion force
+                        overlap = target_dist - dist
+                        force_mag = (overlap * repulsion_strength) / dist
+                        forces[i] += diff * force_mag
+                        forces[j] -= diff * force_mag
+            else:
+                # Prevent division by zero
+                pass
+
+        # Apply boundary forces (push towards center if too close to wall)
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left wall
+            if x - r < 0:
+                forces[i, 0] += (r - x) * 10.0
+            # Right wall
+            if x + r > 1:
+                forces[i, 0] -= (x + r - 1) * 10.0
+            # Bottom wall
+            if y - r < 0:
+                forces[i, 1] += (r - y) * 10.0
+            # Top wall
+            if y + r > 1:
+                forces[i, 1] -= (y + r - 1) * 10.0
+
+        # Update positions
+        centers += forces * learning_rate
+        
+        # Clip to square (safety)
+        centers = np.clip(centers, 0, 1)
+
+    # 3. Final Radius Calculation
+    final_radii = np.zeros(n)
+    for i in range(n):
+        min_wall = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        min_dist = 1.0
+        for j in range(n):
+            if i == j: continue
+            dist = np.linalg.norm(centers[i] - centers[j])
+            min_dist = min(min_dist, dist)
+        
+        final_radii[i] = min(min_wall, min_dist / 2.0)
+
+    # 4. Final Adjustment to ensure strict non-overlap (epsilon margin)
+    # We reduce radii slightly if necessary to handle float precision
+    # But usually the min logic above ensures dist >= 2r.
     
-    return centers, radii, float(sum_radii)
+    sum_radii = np.sum(final_radii)
+    
+    return centers, final_radii, sum_radii
+
+# Run and print result
+if __name__ == "__main__":
+    c, r, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # print(validate_packing(c, r))

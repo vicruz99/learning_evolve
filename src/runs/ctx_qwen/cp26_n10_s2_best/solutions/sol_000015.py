@@ -1,0 +1,288 @@
+# sol_000015 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 7b3d1146) state=f3797842 sum of radii=2.520142 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    """
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Function to compute energy (overlap + boundary penalty)
+    def compute_energy(centers_flat, radii_flat):
+        centers = centers_flat.reshape(n, 2)
+        radii = radii_flat
+        
+        energy = 0.0
+        
+        # Boundary penalties
+        # We want centers[r] <= x <= 1 - centers[r]
+        # If x < r, penalty. If x > 1-r, penalty.
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left/Right walls
+            if x - r < 0:
+                energy += (x - r) ** 2 * 1000 # High penalty
+            if x + r > 1:
+                energy += (x + r - 1) ** 2 * 1000
+            
+            # Top/Bottom walls
+            if y - r < 0:
+                energy += (y - r) ** 2 * 1000
+            if y + r > 1:
+                energy += (y + r - 1) ** 2 * 1000
+                
+        # Overlap penalties
+        # dist >= r_i + r_j
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist:
+                    overlap = min_dist - dist
+                    energy += overlap ** 2 * 1000
+        
+        return energy
+
+    # Function to compute negative sum of radii (to minimize)
+    # We want to maximize sum(radii), so we minimize -sum(radii)
+    # But we must satisfy constraints. 
+    # A better approach for this specific problem is to fix radii and optimize centers, 
+    # or use a method that balances both.
+    
+    # Let's use a iterative approach: 
+    # 1. Start with a feasible packing.
+    # 2. Gradually increase radii.
+    # 3. Optimize centers to relieve overlaps.
+    
+    # Initialization: Grid pattern perturbed
+    # 5x5 grid has 25 circles. We need 26.
+    # Let's try a hexagonal packing initialization.
+    # Rows with 6, 5, 6, 5, 4? Sum = 26.
+    # Or 5, 5, 5, 5, 6?
+    
+    # Let's generate a random initial configuration that is feasible with small radii
+    np.random.seed(42)
+    centers = np.random.uniform(0.1, 0.9, size=(n, 2))
+    radii = np.ones(n) * 0.05 # Small initial radius
+    
+    # Optimization loop
+    # We will try to find a configuration that fits a target radius R
+    # and maximize R.
+    
+    target_R = 0.05
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    max_R = 0.05
+    
+    # Step 1: Find a good configuration for R ~ 0.10
+    # We can use scipy's minimize to optimize positions for a fixed R
+    # but R is also a variable.
+    
+    # Let's define a combined objective: Maximize sum(radii) - Penalty(overlaps, boundaries)
+    # This is tricky because penalty weights need tuning.
+    
+    # Alternative: Use the "circle packing" algorithm logic.
+    # While not converged:
+    #   1. Apply repulsive forces based on overlaps and walls.
+    #   2. Move centers.
+    #   3. If no overlaps, increase radii slightly.
+    
+    # Let's implement a simple force-directed layout
+    dt = 0.01
+    k_repulsion = 10.0
+    k_wall = 10.0
+    k_expand = 0.001
+    
+    # Run for a fixed number of iterations to be safe
+    iterations = 2000
+    
+    current_radii = np.ones(n) * 0.05
+    current_centers = np.random.uniform(0.2, 0.8, size=(n, 2))
+    
+    # Better initialization: Grid
+    # 5x5 grid centers
+    grid_centers = []
+    for i in range(5):
+        for j in range(5):
+            grid_centers.append([0.1 + i*0.2, 0.1 + j*0.2])
+    # 25th circle at (0.9, 0.9)? No, grid is 0.1, 0.3, 0.5, 0.7, 0.9
+    # 26th circle? Place at center of a hole? (0.2, 0.2) is a hole in 5x5?
+    # 5x5 centers: (0.1,0.1)...(0.9,0.9).
+    # Hole at (0.2, 0.2) is surrounded by (0.1,0.1), (0.3,0.1), (0.1,0.3), (0.3,0.3).
+    # Distance to nearest center is sqrt(0.1^2 + 0.1^2) = 0.1414.
+    # Radius of hole = 0.1414 - 0.1 = 0.0414.
+    # So we can place 26th circle at (0.2, 0.2) with radius 0.0414.
+    # But we want equal radii.
+    
+    # Let's start with a perturbed hexagonal lattice
+    # Hexagonal packing density is higher.
+    # Try to fit 26 circles in a hexagonal arrangement.
+    # 4 rows: 7, 6, 7, 6? Sum = 26.
+    # Or 6, 5, 6, 5, 4?
+    # Let's try 6, 5, 6, 5, 4 (5 rows).
+    # Row 0: 6 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 6 circles
+    # Row 3: 5 circles (shifted)
+    # Row 4: 4 circles
+    
+    # But this might not fit well.
+    # Let's stick to random restart + optimization.
+    
+    def optimize_packing(init_centers, init_radii, max_iter=1000):
+        centers = init_centers.copy()
+        radii = init_radii.copy()
+        
+        # Use L-BFGS-B to maximize sum of radii subject to constraints?
+        # Constraints are non-smooth (max(0, overlap)).
+        # Let's use a penalty method with scipy.optimize.minimize
+        
+        def objective(x):
+            # x contains 2*n center coordinates and n radii
+            c = x[:2*n].reshape(n, 2)
+            r = x[2*n:]
+            
+            # Penalty for boundary
+            pen = 0
+            # Clamp radii to be positive
+            r = np.maximum(r, 1e-6)
+            
+            # Boundary constraints: r <= x <= 1-r
+            # If violated, add penalty
+            for i in range(n):
+                # x bounds
+                if c[i, 0] < r[i]: pen += 1000 * (c[i, 0] - r[i])**2
+                if c[i, 0] > 1 - r[i]: pen += 1000 * (c[i, 0] - (1 - r[i]))**2
+                # y bounds
+                if c[i, 1] < r[i]: pen += 1000 * (c[i, 1] - r[i])**2
+                if c[i, 1] > 1 - r[i]: pen += 1000 * (c[i, 1] - (1 - r[i]))**2
+            
+            # Overlap constraints
+            for i in range(n):
+                for j in range(i+1, n):
+                    dist = np.sqrt(np.sum((c[i] - c[j])**2))
+                    if dist < r[i] + r[j]:
+                        pen += 1000 * (dist - r[i] - r[j])**2
+            
+            return -np.sum(r) + pen
+
+        x0 = np.hstack([init_centers.flatten(), init_radii])
+        
+        # Bounds: centers in [0,1], radii in [0, 0.5]
+        bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+        
+        # Run optimization multiple times from different starts or just once with good start
+        try:
+            res = opt.minimize(objective, x0, method='L-BFGS-B', bounds=bounds, 
+                               options={'maxiter': 2000, 'ftol': 1e-12})
+            return res.x
+        except:
+            return x0
+
+    # Run optimization with a few random restarts to find best sum
+    best_sum = -1
+    best_x = None
+    
+    # Initial guess: 5x5 grid + 1 in center, with radius 0.1
+    # 5x5 grid centers
+    grid_pts = []
+    for i in range(5):
+        for j in range(5):
+            grid_pts.append([0.1 + i*0.2, 0.1 + j*0.2])
+    # 26th point: (0.5, 0.5) is occupied. 
+    # Let's use (0.2, 0.2) or (0.8, 0.8) etc.
+    # Actually (0.5, 0.5) is the center of the grid.
+    # Let's put 26th at (0.2, 0.2) ? No, that's a hole.
+    # But for initialization, just random perturbations of a grid is fine.
+    
+    init_centers = np.array(grid_pts + [[0.2, 0.2]]) # 26th at hole
+    init_radii = np.ones(n) * 0.09 # Start slightly smaller than 0.1 to be feasible
+    
+    best_x = optimize_packing(init_centers, init_radii)
+    
+    # Extract results
+    final_centers = best_x[:2*n].reshape(n, 2)
+    final_radii = best_x[2*n:]
+    
+    # Ensure radii are valid
+    final_radii = np.maximum(final_radii, 0)
+    
+    # Validate and adjust if necessary (clipping)
+    # The optimization should have handled it, but let's be safe.
+    # If any circle is outside, move it in.
+    for i in range(n):
+        r = final_radii[i]
+        x, y = final_centers[i]
+        if x < r: x = r
+        if x > 1 - r: x = 1 - r
+        if y < r: y = r
+        if y > 1 - r: y = 1 - r
+        final_centers[i] = [x, y]
+        
+        # If still invalid due to r being too large, reduce r
+        # This shouldn't happen if optimization worked, but just in case
+        if x < 0 or x > 1 or y < 0 or y > 1:
+             # Fallback: reduce radius
+             margin = max(x, y, 1-x, 1-y) # This logic is flawed, just clamp
+             # Better: ensure r <= min(x, 1-x, y, 1-y)
+             max_r = min(x, 1-x, y, 1-y)
+             if r > max_r:
+                 r = max(max_r, 0)
+                 final_radii[i] = r
+
+    # Check overlaps and resolve by reducing radii slightly if needed
+    # This is a post-processing step to ensure validity
+    # Since the validator is strict, we must ensure no overlaps.
+    # The optimization with penalty should have done this, but let's verify.
+    
+    # Simple overlap resolution: if overlap, reduce radii proportionally
+    for _ in range(10): # Iterative reduction
+        max_overlap = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((final_centers[i] - final_centers[j])**2))
+                overlap = (final_radii[i] + final_radii[j]) - dist
+                if overlap > 1e-12:
+                    if overlap > max_overlap:
+                        max_overlap = overlap
+        
+        if max_overlap > 0:
+            # Reduce all radii slightly to resolve overlaps
+            # Or just the ones involved. 
+            # Simple global reduction
+            factor = 0.99
+            final_radii *= factor
+            # Re-check bounds
+            for i in range(n):
+                r = final_radii[i]
+                x, y = final_centers[i]
+                if x < r: x = r
+                if x > 1 - r: x = 1 - r
+                if y < r: y = r
+                if y > 1 - r: y = 1 - r
+                final_centers[i] = [x, y]
+                if x < 0 or x > 1 or y < 0 or y > 1:
+                     max_r = min(max(0, x), max(0, 1-x), max(0, y), max(0, 1-y))
+                     if r > max_r:
+                         final_radii[i] = max_r
+
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii
+
+# Helper to run if tested standalone, though not required by prompt structure
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Min radius: {np.min(radii)}, Max radius: {np.max(radii)}")

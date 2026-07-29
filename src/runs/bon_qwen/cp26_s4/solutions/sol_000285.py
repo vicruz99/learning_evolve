@@ -1,0 +1,154 @@
+# sol_000285 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 0a16b6e7) state=bf8929b7 sum of radii=2.620268 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    N = 26
+    # Precompute indices for pairwise constraints to speed up evaluation
+    pair_idx = np.triu_indices(N, k=1)
+    
+    def objective(vars):
+        # Maximize sum of radii => minimize negative sum
+        return -np.sum(vars[2::3])
+        
+    def constraints(vars):
+        x = vars[0::3]
+        y = vars[1::3]
+        r = vars[2::3]
+        
+        # Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+        # Rewritten as x - r >= 0, etc. for 'ineq' type
+        c = np.concatenate([
+            x - r,
+            1.0 - x - r,
+            y - r,
+            1.0 - y - r
+        ])
+        
+        # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+        # Using precomputed indices for efficiency
+        dx = x[pair_idx[0]] - x[pair_idx[1]]
+        dy = y[pair_idx[0]] - y[pair_idx[1]]
+        dr = r[pair_idx[0]] + r[pair_idx[1]]
+        
+        dist_sq = dx**2 + dy**2
+        rad_sq = dr**2
+        
+        c = np.concatenate([c, dist_sq - rad_sq])
+        return c
+
+    cons = {'type': 'ineq', 'fun': constraints}
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    
+    best_sum = 0.0
+    best_vars = None
+    
+    # Helper to set initial radii to feasible values based on centers
+    def set_initial_radii(x0):
+        cx = x0[0::3].copy()
+        cy = x0[1::3].copy()
+        cr = np.zeros(N)
+        for i in range(N):
+            # Max radius allowed by boundaries
+            r_bound = min(cx[i], 1.0 - cx[i], cy[i], 1.0 - cy[i])
+            r_min = r_bound
+            # Check distance to all other centers
+            for j in range(N):
+                if i != j:
+                    d = np.hypot(cx[i]-cx[j], cy[i]-cy[j])
+                    if d < r_min * 2:
+                        r_min = d * 0.5
+            # Set to 95% of max feasible to ensure strict feasibility
+            cr[i] = max(1e-4, r_min * 0.95)
+        x0[2::3] = cr
+        return x0
+
+    # Generate diverse starting configurations
+    strategies = []
+    rng = np.random.RandomState(42)
+    
+    # 1. Random initializations
+    for seed in range(30):
+        rs = np.random.RandomState(seed)
+        x0 = rs.rand(3*N)
+        strategies.append(x0)
+        
+    # 2. Grid initializations with noise
+    pts = []
+    for i in range(6):
+        for j in range(5):
+            pts.append((0.1 + i*0.8/5, 0.1 + j*0.8/4))
+    pts = pts[:N]
+    for noise in [0.0, 0.02, 0.05]:
+        x0 = np.zeros(3*N)
+        for i, (px, py) in enumerate(pts):
+            x0[3*i] = px
+            x0[3*i+1] = py
+        if noise > 0:
+            x0[:2*N] += rng.normal(0, noise, (2*N))
+            x0[:2*N] = np.clip(x0[:2*N], 0.05, 0.95)
+        strategies.append(x0)
+        
+    # 3. Hexagonal initializations with noise
+    s = 0.22
+    pts = []
+    y_curr = 0.1
+    row = 0
+    while len(pts) < N:
+        x_start = 0.1 if row % 2 == 0 else 0.1 + s/2
+        x = x_start
+        while x <= 0.9 and len(pts) < N:
+            pts.append((x, y_curr))
+            x += s
+        y_curr += s * np.sqrt(3)/2
+        row += 1
+    pts = pts[:N]
+    for noise in [0.0, 0.02]:
+        x0 = np.zeros(3*N)
+        for i, (px, py) in enumerate(pts):
+            x0[3*i] = px
+            x0[3*i+1] = py
+        if noise > 0:
+            x0[:2*N] += rng.normal(0, noise, (2*N))
+            x0[:2*N] = np.clip(x0[:2*N], 0.05, 0.95)
+        strategies.append(x0)
+        
+    # Optimize from each strategy
+    for x0 in strategies:
+        x0 = set_initial_radii(x0)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                          options={'ftol': 1e-10, 'maxiter': 2000})
+            if -res.fun > best_sum:
+                vars = res.x
+                r = vars[2::3]
+                # Quick validation against constraints
+                if np.all(r >= 0) and np.all(vars[0::3] >= 0) and np.all(vars[0::3] <= 1) and \
+                   np.all(vars[1::3] >= 0) and np.all(vars[1::3] <= 1):
+                    x = vars[0::3]
+                    y = vars[1::3]
+                    dx = x[pair_idx[0]] - x[pair_idx[1]]
+                    dy = y[pair_idx[0]] - y[pair_idx[1]]
+                    dr = r[pair_idx[0]] + r[pair_idx[1]]
+                    # Check non-overlap with tolerance
+                    if np.all(dx**2 + dy**2 >= dr**2 - 1e-9):
+                        best_sum = -res.fun
+                        best_vars = vars.copy()
+        except:
+            continue
+            
+    if best_vars is None:
+        # Fallback to uniform small circles
+        best_vars = np.zeros(3*N)
+        best_vars[0::3] = 0.5
+        best_vars[1::3] = 0.5
+        best_vars[2::3] = 0.01
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    return centers, radii, np.sum(radii)

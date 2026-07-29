@@ -1,0 +1,209 @@
+
+
+<strategy>
+To improve the packing beyond the current 2.6306 sum of radii, we will:
+1. **Use a boundary-aware parameterization**: Map center coordinates `(x, y)` to `(r, u, v)` where `x = r + u*(1-2r)` and `y = r + v*(1-2r)` with `u, v in [0, 1]`. This automatically enforces boundary constraints, reducing the number of inequality constraints to only pairwise non-overlaps, which significantly stabilizes SLSQP convergence.
+2. **Diverse & Safe Initializations**: Generate multiple starting configurations including hexagonal lattices (with rotations), square grids (+1 center), and force-directed spreads. For each, compute strictly feasible initial radii using a safe margin (70% of min distance to walls/neighbors) to guarantee SLSQP starts in the feasible region.
+3. **Multi-phase Optimization**: 
+   - Phase 1: Run SLSQP from all diverse inits to find the best local optimum.
+   - Phase 2: Perturb the best solution's positions and radii, then re-optimize to escape shallow local minima.
+   - Phase 3: High-precision polish with tight tolerances (`ftol=1e-15`) to extract every last bit of radius sum.
+4. **Vectorized Constraint Evaluation**: Use NumPy broadcasting for distance calculations to keep constraint evaluations fast, allowing more optimization iterations and restarts within the time budget.
+5. **Strict Feasibility Checks**: Verify constraints are satisfied within numerical tolerance before accepting a new best solution.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+i_idx, j_idx = np.triu_indices(N, k=1)
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Computes inequality constraints g(vars_vec) >= 0.
+    Uses parameterization to automatically satisfy boundary constraints.
+    Only pairwise non-overlap constraints are enforced.
+    """
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is strictly inside [0,1]^2
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[i_idx, j_idx] - r_sum_sq[i_idx, j_idx]
+
+def compute_safe_radii(centers):
+    """Compute strictly feasible initial radii for given centers."""
+    r = np.zeros(N)
+    for i in range(N):
+        db = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        dp = 2.0
+        for j in range(N):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if d < dp:
+                    dp = d
+        r[i] = 0.7 * min(db, dp / 2.0)
+    return np.maximum(r, 1e-4)
+
+def map_to_vars(centers, r_vals):
+    """Map (centers, radii) to the (r, u, v) parameter space."""
+    denom = np.clip(1.0 - 2.0 * r_vals, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r_vals) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r_vals) / denom, 0.0, 1.0)
+    
+    vars0 = np.empty(3 * N)
+    vars0[0::3] = r_vals
+    vars0[1::3] = u
+    vars0[2::3] = v
+    return vars0
+
+def run_packing():
+    """
+    Solves the circle packing problem for N=26 in a unit square.
+    Returns (centers, radii, sum_radii).
+    """
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_vars = None
+    best_sum = -1.0
+    inits = []
+    
+    np.random.seed(42)
+    
+    # Phase 1: Generate diverse initial configurations
+    # Hexagonal lattice variations with rotations
+    for s in range(12):
+        pts = []
+        r_est = 0.10
+        y = r_est
+        row = 0
+        while len(pts) < N:
+            x_off = (row % 2) * r_est
+            x = r_est + x_off
+            while x <= 1.0 - r_est and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * r_est
+            y += np.sqrt(3.0) * r_est
+            row += 1
+        pts = np.array(pts[:N])
+        
+        # Rotate and perturb
+        angle = (s - 6) * 0.04
+        c, sin_a = np.cos(angle), np.sin(angle)
+        rot = np.array([[c, -sin_a], [sin_a, c]])
+        pts = (pts - 0.5) @ rot.T + 0.5
+        pts += np.random.uniform(-0.02, 0.02, pts.shape)
+        pts = np.clip(pts, 0.02, 0.98)
+        inits.append(map_to_vars(pts, compute_safe_radii(pts)))
+        
+    # Grid variations (+1 center)
+    for s in range(8):
+        pts = []
+        for i in range(5):
+            for j in range(5):
+                pts.append([0.08 + 0.18 * i, 0.08 + 0.18 * j])
+        pts.append([0.5, 0.5])
+        pts = np.array(pts[:N])
+        pts += np.random.uniform(-0.015, 0.015, pts.shape)
+        pts = np.clip(pts, 0.02, 0.98)
+        inits.append(map_to_vars(pts, compute_safe_radii(pts)))
+        
+    # Force-directed spread variations
+    for s in range(8):
+        np.random.seed(s)
+        pts = np.random.rand(N, 2)
+        for _ in range(200):
+            forces = np.zeros_like(pts)
+            diff = pts[:, None, :] - pts[None, :, :]
+            dists = np.sqrt(np.sum(diff**2, axis=2))
+            dists = np.maximum(dists, 0.02)
+            f = diff / (dists**2 * dists[:, :, None])
+            forces += np.sum(f, axis=1)
+            for d in range(2):
+                mask_low = pts[:, d] < 0.05
+                mask_high = pts[:, d] > 0.95
+                forces[mask_low, d] += 40.0 * (0.05 - pts[mask_low, d])
+                forces[mask_high, d] -= 40.0 * (pts[mask_high, d] - 0.95)
+            pts += 0.004 * forces
+            pts = np.clip(pts, 0.02, 0.98)
+        inits.append(map_to_vars(pts, compute_safe_radii(pts)))
+        
+    # Optimization Loop over all inits
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraint_func(res.x)) >= -1e-7:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_vars is None:
+        best_vars = inits[0]
+        
+    # Phase 2: Perturbation phase to escape local minima
+    for k in range(50):
+        x0 = best_vars.copy()
+        pert = np.random.randn(3 * N)
+        # Perturb positions more than radii to explore topology changes
+        x0[0::3] += pert[0::3] * 0.005
+        x0[1::3] += pert[1::3] * 0.04
+        x0[2::3] += pert[2::3] * 0.04
+        x0[0::3] = np.clip(x0[0::3], 1e-6, 0.5)
+        x0[1::3] = np.clip(x0[1::3], 0.0, 1.0)
+        x0[2::3] = np.clip(x0[2::3], 0.0, 1.0)
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraint_func(res.x)) >= -1e-7:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 3: High-precision polish
+    try:
+        res = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': 8000, 'ftol': 1e-15, 'disp': False})
+        if np.min(constraint_func(res.x)) >= -1e-7:
+            best_vars = res.x
+            best_sum = -res.fun
+    except Exception:
+        pass
+        
+    # Reconstruct centers from optimized parameters
+    r_opt = best_vars[0::3]
+    u_opt = best_vars[1::3]
+    v_opt = best_vars[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    radii = r_opt
+    
+    return centers, radii, float(best_sum)
+```

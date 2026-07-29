@@ -1,101 +1,211 @@
 # sol_000186 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9afef83a) state=9fb020d6 sum of radii=0.130567 correctness=1.0
+# generation=0 parent=seed (state 5c6e3651) state=0cb4c1c3 sum of radii=2.515681 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 
-def _objective(vars):
-    """Maximize radius r (minimize -r)"""
-    return -vars[-1]
-
-def _constraints(vars):
-    """
-    Inequality constraints: g(vars) >= 0
-    - Boundary constraints for each circle
-    - Non-overlap constraints for each pair
-    """
-    n = 26
-    cx = vars[:2*n].reshape(n, 2)
-    r = vars[2*n]
-    
-    res = []
-    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, same for y
-    res.append(cx[:, 0] - r)
-    res.append(1.0 - cx[:, 0] - r)
-    res.append(cx[:, 1] - r)
-    res.append(1.0 - cx[:, 1] - r)
-    
-    # Non-overlap constraints: distance >= 2r
-    diff = cx[:, np.newaxis, :] - cx[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    res.append(dists[np.triu_indices(n, 1)] - 2.0 * r)
-    
-    return np.concatenate(res)
-
-def _generate_initial_guess(n):
-    """Generate a hexagonal-like initial configuration"""
-    pts = []
-    for i in range(12):
-        for j in range(12):
-            x = j * 0.14 + (i % 2) * 0.07
-            y = i * 0.125
-            pts.append([x, y])
-        if len(pts) >= n:
-            break
-            
-    pts = np.array(pts[:n])
-    # Normalize to fit comfortably inside [0,1]^2
-    pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.7 + 0.15
-    return pts
+def get_optimal_radii(centers):
+    """Calculates the maximum valid radius for each circle given fixed centers."""
+    n = centers.shape[0]
+    radii = np.zeros(n)
+    for i in range(n):
+        x, y = centers[i]
+        # Max radius based on boundaries
+        r_boundary = min(x, 1 - x, y, 1 - y)
+        r_min = r_boundary
+        
+        # Check distances to all other centers
+        # dist_ij / 2 must be <= r_i
+        # We compute min dist / 2
+        dists = np.linalg.norm(centers - centers[i], axis=1)
+        # Ignore self (distance 0)
+        dists[i] = np.inf
+        min_dist = np.min(dists)
+        r_neighbors = min_dist / 2.0
+        
+        radii[i] = min(r_min, r_neighbors)
+    return radii
 
 def run_packing():
     n = 26
-    best_r = 0.0
+    
+    # --- Initialization ---
+    # We try a few different starting configurations
+    best_sum = -1.0
     best_centers = None
+    best_radii = None
     
-    # Try multiple random seeds to escape local optima
-    for seed in [42, 123, 456, 789, 1024]:
-        np.random.seed(seed)
-        pts = _generate_initial_guess(n)
+    # Strategy 1: Hexagonal Grid
+    # Estimate spacing to fit 26 circles. 
+    # Area approx 1. 26 * pi * r^2 approx 1 => r approx 0.11
+    # Let's place them densely
+    centers_init = np.zeros((n, 2))
+    
+    # Hexagonal pattern generation
+    idx = 0
+    r_est = 0.1 # Initial estimated radius for spacing
+    spacing = 2 * r_est
+    h_spacing = np.sqrt(3) * r_est
+    
+    # Adjust to fill square roughly
+    # We can just generate a list of points and pick the first 26
+    pts = []
+    for row in range(10):
+        for col in range(10):
+            x = 0.05 + col * spacing
+            y = 0.05 + row * h_spacing
+            if row % 2 == 1:
+                x += r_est
+            if x <= 0.95 and y <= 0.95:
+                pts.append([x, y])
+    
+    # If not enough points, fill with grid
+    if len(pts) < n:
+        for row in range(10):
+            for col in range(10):
+                x = 0.05 + col * 0.1
+                y = 0.05 + row * 0.1
+                if [x, y] not in pts:
+                    pts.append([x, y])
+    
+    pts = np.array(pts[:n])
+    
+    # Strategy 2: Random perturbations of grid
+    grid_pts = []
+    for r in range(6):
+        for c in range(6):
+            if len(grid_pts) < n:
+                grid_pts.append([0.1 + c * 0.15, 0.1 + r * 0.15])
+    grid_pts = np.array(grid_pts[:n])
+    
+    configs = [pts, grid_pts]
+    
+    # Add some randomness
+    for _ in range(3):
+        rand_pts = np.random.rand(n, 2) * 0.8 + 0.1 # Keep away from edges initially
+        configs.append(rand_pts)
+
+    # --- Optimization Loop ---
+    # For each config, run force-directed optimization
+    for config in configs:
+        centers = config.copy()
         
-        # Add small perturbation
-        pts += np.random.randn(n, 2) * 0.002
-        pts = np.clip(pts, 0.05, 0.95)
+        # Simulation parameters
+        step_size = 0.01
+        decay = 0.995
+        max_iter = 2000
         
-        x0 = np.concatenate([pts.flatten(), [0.045]])
-        bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)]
-        cons = {'type': 'ineq', 'fun': _constraints}
+        # Compute initial radii
+        radii = get_optimal_radii(centers)
+        current_sum = np.sum(radii)
         
-        try:
-            res = minimize(_objective, x0, bounds=bounds, constraints=cons,
-                           method='SLSQP', options={'maxiter': 400, 'ftol': 1e-10})
-            if res.x[-1] > best_r:
-                best_r = res.x[-1]
-                best_centers = res.x[:2*n].reshape(n, 2)
-        except Exception:
-            continue
+        # If initial config is invalid (overlap), shrink radii to fix?
+        # get_optimal_radii handles overlap by taking min(dist/2), so it's always valid.
+        
+        for iteration in range(max_iter):
+            # Compute gradients (forces)
+            # We want to move centers to increase sum of radii.
+            # Gradient of r_i wrt c_i is vector away from bottleneck.
+            # Gradient of r_i wrt c_j (neighbor) is vector away from c_j?
+            # Actually, if r_i is constrained by c_j, moving c_i away from c_j increases r_i.
+            # Moving c_j away from c_i also increases r_i.
             
-    # Fallback if optimization fails
-    if best_centers is None:
-        best_centers = _generate_initial_guess(n)
-        best_r = 0.045
-        
-    # Numerical safety margin to strictly satisfy validation constraints
-    dists = np.sqrt(np.sum((best_centers[:, None, :] - best_centers[None, :, :])**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    min_pair_dist = np.min(dists)
+            forces = np.zeros_like(centers)
+            
+            # For each circle, find the constraint limiting its radius
+            for i in range(n):
+                x, y = centers[i]
+                r = radii[i]
+                
+                # Identify active constraint
+                # Check boundaries
+                active_boundary = None
+                if abs(x - r) < 1e-6: active_boundary = 0 # Left
+                elif abs((1 - x) - r) < 1e-6: active_boundary = 1 # Right
+                elif abs(y - r) < 1e-6: active_boundary = 2 # Bottom
+                elif abs((1 - y) - r) < 1e-6: active_boundary = 3 # Top
+                
+                # Check neighbors
+                dists = np.linalg.norm(centers - centers[i], axis=1)
+                dists[i] = np.inf
+                min_dist_idx = np.argmin(dists)
+                min_dist = dists[min_dist_idx]
+                
+                active_neighbor = -1
+                if abs((min_dist / 2.0) - r) < 1e-6:
+                    active_neighbor = min_dist_idx
+                
+                # Determine force for circle i to increase its own radius
+                if active_boundary is not None:
+                    # Move away from boundary
+                    if active_boundary == 0: forces[i] += [step_size, 0]
+                    elif active_boundary == 1: forces[i] += [-step_size, 0]
+                    elif active_boundary == 2: forces[i] += [0, step_size]
+                    elif active_boundary == 3: forces[i] += [0, -step_size]
+                elif active_neighbor != -1:
+                    # Move away from neighbor
+                    vec = centers[i] - centers[active_neighbor]
+                    norm = np.linalg.norm(vec)
+                    if norm > 1e-9:
+                        forces[i] += (step_size / norm) * vec
+                
+                # Determine force for the bottleneck neighbor to increase r_i
+                # If i is constrained by j, moving j away from i increases r_i
+                if active_neighbor != -1:
+                    j = active_neighbor
+                    vec = centers[j] - centers[i] # Vector from i to j
+                    norm = np.linalg.norm(vec)
+                    if norm > 1e-9:
+                        # j should move in direction of vec (away from i)
+                        # But this is the gradient of r_i wrt c_j
+                        # Wait, r_i = 0.5 * ||c_i - c_j||
+                        # dr_i/dc_j = 0.5 * (c_j - c_i) / ||...||
+                        # So j should move away from i.
+                        forces[j] += (step_size / norm) * vec 
+                        # Note: step_size scaling here is heuristic. 
+                        # Ideally we sum gradients, but step_size handles magnitude.
+                        # We apply half strength to neighbor to balance? 
+                        # Actually, gradient of sum is sum of gradients.
+                        # So full strength is correct for the sum objective.
+                
+                # Also, if j is constrained by i, we already handled it when loop reaches j.
+                # But we need to ensure we don't double count or under count.
+                # The logic above adds force to i based on i's constraint.
+                # And adds force to j based on i's constraint (if j is the bottleneck).
+                # When loop reaches j, it will add force to j based on j's constraint.
+                # If j is constrained by i, it will add force to j away from i, and force to i away from j.
+                # This seems consistent.
+
+            # Update centers
+            centers += forces
+            
+            # Clamp to square
+            centers = np.clip(centers, 0, 1)
+            
+            # Recalculate radii
+            radii = get_optimal_radii(centers)
+            new_sum = np.sum(radii)
+            
+            # If sum decreased significantly, maybe step size was too big?
+            # But for maximization, we expect increase.
+            # However, discrete jumps in bottleneck can cause fluctuations.
+            
+            # Adaptive step size?
+            # Just decay step size slowly
+            step_size *= decay
+            
+            if new_sum > best_sum:
+                best_sum = new_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+
+    # Final cleanup and precise calculation
+    # Sometimes floating point errors might cause slight overlap in final get_optimal_radii if not careful
+    # But get_optimal_radii is robust.
     
-    min_coord = np.min(best_centers)
-    max_coord = np.max(best_centers)
-    min_boundary_dist = min(min_coord, 1.0 - max_coord)
+    # One final optimization pass with very small steps to settle?
+    # The loop above runs 2000 times, should be enough.
     
-    # Clamp radius to ensure strict validity
-    safety = 1e-7
-    best_r = min(best_r, min_pair_dist / 2.0 - safety, min_boundary_dist - safety)
-    
-    radii = np.full(n, best_r)
-    return best_centers, radii, best_r * n
+    return best_centers, best_radii, best_sum

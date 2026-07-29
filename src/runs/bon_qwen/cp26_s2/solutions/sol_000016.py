@@ -1,0 +1,192 @@
+# sol_000016 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b5cb09ab) state=c400fc23 sum of radii=1.853774 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a hexagonal initialization followed by an iterative expansion
+    with repulsive forces optimization.
+    """
+    n = 26
+    
+    # --- 1. Initialization: Hexagonal Grid ---
+    # We attempt to fit a hexagonal lattice.
+    # A rough estimate for r is around 0.105.
+    # We initialize with a slightly smaller r to ensure validity.
+    r = 0.08
+    
+    centers = []
+    
+    # Generate points in a hexagonal pattern
+    # We iterate through rows. In a hexagonal packing, rows are shifted.
+    # Vertical spacing between rows: r * sqrt(3)
+    # Horizontal spacing in row: 2r
+    # Shift for alternating rows: r
+    
+    # We need to fit 26 points.
+    # Let's try to fill the square row by row.
+    # Estimated rows needed: 1 / (r * sqrt(3)) ~ 1 / 0.14 ~ 7 rows?
+    # But with 26 points, maybe 5 or 6 rows.
+    
+    # Let's generate a dense set of hex points and pick first 26?
+    # Or just construct rows.
+    
+    row_idx = 0
+    while len(centers) < n:
+        # y coordinate for this row
+        y = r + row_idx * r * math.sqrt(3)
+        
+        # If y is out of bounds (plus radius), stop
+        if y + r > 1.0 + 1e-9:
+            break
+            
+        # Determine x start
+        # Even rows start at r, odd rows at 2r (shifted by r)
+        # Actually, standard hex packing:
+        # Row 0: r, 3r, 5r...
+        # Row 1: 2r, 4r, 6r...
+        # But we can center them or adjust.
+        # Let's just place them starting from left.
+        
+        if row_idx % 2 == 0:
+            x_start = r
+        else:
+            x_start = 2 * r # Shifted by r relative to even rows (which start at r)
+            # Wait, distance between (r, y) and (2r, y+dy) should be 2r.
+            # dx = r, dy = r*sqrt(3). dist^2 = r^2 + 3r^2 = 4r^2. Correct.
+            
+        # Add points in this row
+        x = x_start
+        while x + r <= 1.0 + 1e-9:
+            if len(centers) < n:
+                centers.append([x, y])
+            x += 2 * r
+        
+        row_idx += 1
+        
+    centers = np.array(centers)
+    if len(centers) < n:
+        # Fallback to random if grid generation fails (unlikely)
+        centers = np.random.rand(n, 2)
+
+    # --- 2. Optimization: Expansion with Repulsive Forces ---
+    
+    # Initial radius for optimization start
+    opt_r = r
+    
+    # Optimization parameters
+    max_steps = 3000
+    r_increment = 0.0005 # Small steps for smooth expansion
+    force_multiplier = 0.5 # How much to move per step
+    r_max_target = 0.11 # Upper bound search (theoretical limit approx 0.112)
+    
+    for step in range(max_steps):
+        # 1. Try to increase radius
+        if step > 100: # Stabilize first
+             opt_r += r_increment
+        
+        # Cap radius to prevent divergence
+        if opt_r > r_max_target:
+            opt_r = r_max_target
+            # If we hit cap and still have overlaps, we might be stuck or done.
+            # But we want to maximize, so maybe keep increasing?
+            # Let's just let it float but check validity later.
+        
+        # 2. Compute Forces
+        forces = np.zeros_like(centers)
+        
+        # Pairwise repulsion
+        # We iterate all pairs. O(N^2) is fine for N=26 (676 pairs).
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist_sq = np.sum(diff**2)
+                dist = math.sqrt(dist_sq)
+                
+                min_dist = 2 * opt_r
+                
+                if dist < min_dist and dist > 1e-10:
+                    # Overlap detected
+                    # Force proportional to overlap amount
+                    overlap = min_dist - dist
+                    # Unit vector from j to i
+                    direction = diff / dist
+                    # Apply force
+                    f = overlap * direction
+                    forces[i] += f
+                    forces[j] -= f
+                elif dist < 1e-10:
+                    # Same position, push randomly
+                    forces[i] += np.random.rand(2) * 0.1
+                    forces[j] -= np.random.rand(2) * 0.1
+
+        # Boundary repulsion
+        for i in range(n):
+            x, y = centers[i]
+            # Left
+            if x < opt_r:
+                forces[i, 0] += (opt_r - x)
+            # Right
+            if x > 1.0 - opt_r:
+                forces[i, 0] -= (x - (1.0 - opt_r))
+            # Bottom
+            if y < opt_r:
+                forces[i, 1] += (opt_r - y)
+            # Top
+            if y > 1.0 - opt_r:
+                forces[i, 1] -= (y - (1.0 - opt_r))
+        
+        # 3. Update Positions
+        # Adaptive step size: if overlaps are large, move more?
+        # Simple constant step for stability
+        centers += force_multiplier * forces
+        
+        # Ensure centers stay within [0, 1] roughly to avoid numerical explosion
+        # The forces push them in, but clamping is safe
+        centers = np.clip(centers, 0, 1)
+
+    # --- 3. Final Adjustment ---
+    # The radius 'opt_r' might be slightly too large due to the loop finishing
+    # before full relaxation. We need to find the largest valid r.
+    # We can do a binary search or just shrink slightly.
+    
+    # Check current validity and shrink if needed
+    current_r = opt_r
+    
+    # Simple shrink loop
+    valid = False
+    while not valid:
+        valid = True
+        for i in range(n):
+            x, y = centers[i]
+            if x < current_r or x > 1 - current_r or y < current_r or y > 1 - current_r:
+                valid = False
+                break
+        if valid:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                    if dist < 2 * current_r:
+                        valid = False
+                        break
+                if not valid: break
+        
+        if not valid:
+            current_r -= 0.0001
+    
+    # Ensure strict validity with tolerance
+    # Re-check with tolerance used in validation
+    # The validation uses 1e-12, so we should be safe if we shrink a bit more.
+    current_r -= 1e-6 
+    
+    # Construct output
+    radii = np.full(n, current_r)
+    sum_radii = float(np.sum(radii))
+    
+    return centers, radii, sum_radii

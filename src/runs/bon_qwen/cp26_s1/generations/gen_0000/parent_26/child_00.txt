@@ -1,196 +1,110 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we treat this as a constrained optimization problem. The objective $\sum r_i$ is maximized when circles are as large as possible, which occurs when they are packed densely.
+To maximize the sum of radii for 26 circles in a unit square, we face a non-convex optimization problem with many inequality constraints (boundary and pairwise non-overlap). A robust approach is:
 
-The strategy involves a two-stage optimization:
-1. **LP-based Radius Calculation**: For any fixed set of centers, the maximum radii are determined by a Linear Programming (LP) problem. We maximize $\sum r_i$ subject to boundary constraints ($r_i \le x_i, r_i \le 1-x_i, \dots$) and non-overlap constraints ($r_i + r_j \le \text{distance}_{ij}$).
-2. **Derivative-Free Center Search**: We use a hybrid search to find the optimal centers. We start with multiple random restarts and apply a local optimization (Nelder-Mead) to "spread" the centers apart, which relaxes the pairwise constraints and allows the radii to grow.
+1. **Initialization**: Start with a structured grid (5×5) plus one extra circle placed in a likely gap. Add small deterministic noise to break symmetry and help escape saddle points. Set initial radii slightly below the grid limit (0.09) to allow growth.
+2. **Optimization**: Use `scipy.optimize.minimize` with the `L-BFGS-B` method. Instead of handling 325+ explicit constraints, we employ a **smooth penalty method**. The objective function minimizes `-sum(radii) + W * (boundary_violations^2 + overlap_violations^2)`. This converts constraints into differentiable terms that the optimizer can efficiently navigate.
+3. **Vectorization**: Pairwise distances and overlaps are computed using NumPy broadcasting for speed, making each gradient step very fast.
+4. **Post-processing Safety Net**: Penalty methods sometimes leave microscopic violations. We compute the exact maximum feasible radius for each circle given the optimized centers and other radii, clamping radii to these limits. This guarantees strict validity without significantly hurting the sum.
+5. **Robustness**: High penalty weight, sufficient iterations, and bounds on variables ensure convergence to a tight, valid packing.
 
-To ensure we meet the target sum of 2.636, we initialize with several heuristics:
-- A **dense hexagonal grid** which is the densest known circle packing.
-- A **perturbed 5x5 grid** to utilize the square boundaries effectively.
-- Multiple **random restarts** to escape local minima.
-
-The final solution aggregates the best valid result found during these iterations.
+This combination of heuristic initialization, gradient-based penalty optimization, and strict feasibility correction reliably pushes the sum of radii beyond the 2.5 baseline of a naive grid, targeting the 2.636 goal.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import linprog, minimize
-import itertools
+from scipy.optimize import minimize
 
-def compute_max_radii(centers):
+N = 26
+
+def compute_loss(vars, N):
     """
-    Solves the LP to maximize the sum of radii given fixed centers.
+    Computes a penalized objective: -sum(radii) + penalty for overlaps and boundary violations.
     """
-    n = centers.shape[0]
-    # Objective: Maximize sum(r_i) => Minimize -sum(r_i)
-    c = -np.ones(n)
-
-    # Constraints matrix A_ub * r <= b_ub
-    constraints = []
-    bounds_val = []
-
-    # 1. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-    for i in range(n):
-        # r_i <= x_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        constraints.append(row)
-        bounds_val.append(centers[i, 0])
-
-        # r_i <= 1 - x_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        constraints.append(row)
-        bounds_val.append(1.0 - centers[i, 0])
-
-        # r_i <= y_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        constraints.append(row)
-        bounds_val.append(centers[i, 1])
-
-        # r_i <= 1 - y_i
-        row = np.zeros(n)
-        row[i] = 1.0
-        constraints.append(row)
-        bounds_val.append(1.0 - centers[i, 1])
-
-    # 2. Pairwise constraints: r_i + r_j <= distance(i, j)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            row = np.zeros(n)
-            row[i] = 1.0
-            row[j] = 1.0
-            constraints.append(row)
-            bounds_val.append(dist)
-
-    A_ub = np.array(constraints)
-    b_ub = np.array(bounds_val)
+    centers = vars[:2*N].reshape(N, 2)
+    radii = vars[2*N:]
     
-    # Bounds for radii: r_i >= 0
-    bounds_r = [(0, None) for _ in range(n)]
-
-    try:
-        # Use high-performance method; 'highs' is standard in modern scipy
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
-        if res.success:
-            return -res.fun, res.x
-        else:
-            return 0.0, np.zeros(n)
-    except Exception:
-        return 0.0, np.zeros(n)
-
-def objective_wrapper(x_flat):
-    """
-    Wrapper for scipy optimizer.
-    x_flat is the flattened centers array.
-    Returns negative sum of radii (for minimization).
-    """
-    n = 26
-    centers = x_flat.reshape(n, 2)
-    # Clamp centers to [0, 1] to prevent invalid distances or boundary issues
-    centers = np.clip(centers, 1e-5, 1 - 1e-5)
-    sum_radii, radii = compute_max_radii(centers)
-    return -sum_radii
-
-def generate_hexagonal_init():
-    """Generates a hexagonal packing initialization."""
-    centers = []
-    r_est = 0.09
-    rows = 6
-    cols = 5
-    y_step = np.sqrt(3) * r_est
+    # Boundary penalties
+    b_pen = 0.0
+    for i in range(N):
+        x, y = centers[i]
+        r = radii[i]
+        if r > x: b_pen += (r - x)**2
+        if r > 1.0 - x: b_pen += (r - (1.0 - x))**2
+        if r > y: b_pen += (r - y)**2
+        if r > 1.0 - y: b_pen += (r - (1.0 - y))**2
+        
+    # Overlap penalties (vectorized)
+    diff = centers[:, None, :] - centers[None, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    sum_r = radii[:, None] + radii[None, :]
+    overlap = sum_r - dist
     
-    y = r_est
-    for row in range(rows):
-        x = r_est
-        num_cols = cols if row % 2 == 0 else cols - 1
-        for col in range(num_cols):
-            if len(centers) < 26:
-                centers.append([x, y])
-                x += 2 * r_est
-        y += y_step
-    centers = np.array(centers)
-    return centers
+    # Only penalize positive overlaps
+    o_pen = np.sum(np.maximum(overlap, 0.0)**2)
+    
+    # High weight to strongly discourage violations
+    penalty_weight = 1000.0
+    return -np.sum(radii) + penalty_weight * (b_pen + o_pen)
 
-def generate_perturbed_grid():
-    """Generates a 5x5 grid plus one extra, perturbed."""
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # Deterministic seed for reproducibility
+    np.random.seed(42)
+    
+    # Initial layout: 5x5 grid + 1 extra circle in a gap
     centers = []
     for i in range(5):
         for j in range(5):
-            centers.append([0.1 + i * 0.2, 0.1 + j * 0.2])
-    # Add 26th in center of a hole or random
-    centers.append([0.5, 0.5])
+            centers.append([0.1 + i*0.2, 0.1 + j*0.2])
+    centers.append([0.5, 0.95])
     centers = np.array(centers)
-    # Perturb
-    centers += np.random.normal(0, 0.02, centers.shape)
-    return centers
-
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    np.random.seed(42)
-    n_circles = 26
     
-    best_sum = 0.0
-    best_centers = None
-    best_radii = None
+    # Break symmetry with small perturbation
+    centers += np.random.uniform(-0.005, 0.005, centers.shape)
+    np.clip(centers, 0.0, 1.0, out=centers)
     
-    # List of initial configurations to try
-    inits = []
+    # Initial radii slightly below grid capacity to allow optimization to expand them
+    radii = np.full(N, 0.09)
+    x0 = np.concatenate([centers.flatten(), radii])
     
-    # 1. Hexagonal packing
-    inits.append(generate_hexagonal_init())
+    # Variable bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = [(0, 1)] * (2*N) + [(0, 0.5)] * N
     
-    # 2. Perturbed Grid
-    inits.append(generate_perturbed_grid())
+    # Optimize
+    res = minimize(
+        compute_loss, 
+        x0, 
+        args=(N,), 
+        method='L-BFGS-B', 
+        bounds=bounds,
+        options={'maxiter': 3000, 'ftol': 1e-13, 'gtol': 1e-10}
+    )
     
-    # 3. Random dense packing
-    for _ in range(3):
-        centers = np.random.uniform(0.1, 0.9, (n_circles, 2))
-        inits.append(centers)
+    if res.success:
+        c_opt = res.x[:2*N].reshape(N, 2)
+        r_opt = res.x[2*N:]
+    else:
+        # Fallback to perturbed initial guess
+        c_opt = centers
+        r_opt = radii
         
-    # 4. Corner-packed initialization
-    centers_corner = []
-    # 4 corners
-    for x in [0.15, 0.85]:
-        for y in [0.15, 0.85]:
-            centers_corner.append([x, y])
-    # Fill rest randomly
-    while len(centers_corner) < n_circles:
-        centers_corner.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)])
-    inits.append(np.array(centers_corner))
-
-    for init_centers in inits:
-        x0 = init_centers.flatten()
+    # Post-processing: Strictly enforce validity by clamping radii to geometric limits
+    r_orig = r_opt.copy()
+    r_final = np.zeros(N)
+    for i in range(N):
+        max_r = 0.5
+        # Boundary limits
+        max_r = min(max_r, c_opt[i,0], 1.0 - c_opt[i,0], c_opt[i,1], 1.0 - c_opt[i,1])
+        # Overlap limits with all other circles
+        for j in range(N):
+            if i == j: continue
+            d = np.sqrt(np.sum((c_opt[i] - c_opt[j])**2))
+            # Ensure non-negative limit
+            max_r = min(max_r, max(0.0, d - r_orig[j]))
+            
+        r_final[i] = min(r_orig[i], max_r)
         
-        # Local optimization to maximize sum of radii
-        # Nelder-Mead is good for non-smooth objectives
-        try:
-            res = minimize(objective_wrapper, x0, method='Nelder-Mead', 
-                           options={'xatol': 1e-4, 'fatol': 1e-4, 'maxiter': 500})
-            current_centers = res.x.reshape(n_circles, 2)
-            
-            # Ensure centers are strictly within (0, 1) for validation safety
-            current_centers = np.clip(current_centers, 1e-5, 1 - 1e-5)
-            
-            sum_rad, rad = compute_max_radii(current_centers)
-            
-            if sum_rad > best_sum:
-                best_sum = sum_rad
-                best_centers = current_centers.copy()
-                best_radii = rad.copy()
-        except Exception as e:
-            continue
-
-    # Final validation check (internal)
-    # The LP guarantees constraints, but we double-check numerical stability
-    if best_centers is not None:
-        # Ensure no NaNs
-        if np.isnan(best_centers).any() or np.isnan(best_radii).any():
-            return np.zeros((26, 2)), np.zeros(26), 0.0
-            
-    return best_centers, best_radii, best_sum
+    total_sum = float(np.sum(r_final))
+    return c_opt, r_final, total_sum
 ```

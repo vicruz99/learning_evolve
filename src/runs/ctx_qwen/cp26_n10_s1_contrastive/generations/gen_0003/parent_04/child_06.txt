@@ -1,0 +1,169 @@
+
+
+<strategy>
+To improve upon the ~2.63 sum of radii, we need to escape local minima that trap standard SLSQP runs from structured initializations. The key insight is that for fixed centers, the optimal radii are given by a linear program (LP). This decouples the problem into two stages:
+1. **Global Center Optimization**: Use Differential Evolution (DE) to search the 52-dimensional center space. The objective function is the negative of the LP-computed sum of radii. DE handles the non-smooth, multi-modal landscape well and doesn't require gradients.
+2. **Joint Local Refinement**: Take the best centers from DE, compute their optimal LP radii, and feed them into SLSQP for joint optimization of (x, y, r). This fine-tunes both positions and sizes simultaneously, respecting the squared-distance constraints.
+3. **Perturbation & Polish**: Run multiple perturbed restarts from the best SLSQP solution to break residual symmetries, followed by a high-precision polish. A final safety clipping step guarantees strict feasibility against numerical tolerance.
+
+This two-phase LP+DE strategy is a proven technique in computational geometry for circle packing and consistently outperforms direct non-linear optimization from random/hex starts.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+N_CIRCLES = 26
+
+def get_optimal_radii_lp(centers):
+    """Solve LP to maximize sum(r_i) given fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    n_constr = 4 * n + n * (n - 1) // 2
+    A_ub = np.zeros((n_constr, n))
+    b_ub = np.zeros(n_constr)
+    
+    row_idx = 0
+    for i in range(n):
+        x, y = centers[i]
+        for b in (x, 1.0 - x, y, 1.0 - y):
+            A_ub[row_idx, i] = 1.0
+            b_ub[row_idx] = b
+            row_idx += 1
+            
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[row_idx, i] = 1.0
+            A_ub[row_idx, j] = 1.0
+            b_ub[row_idx] = dists[i, j]
+            row_idx += 1
+            
+    bounds = [(0.0, None)] * n
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    if res.success:
+        return res.x, -res.fun
+    return np.zeros(n), 0.0
+
+def lp_objective(centers_flat):
+    centers = centers_flat.reshape(N_CIRCLES, 2)
+    _, s = get_optimal_radii_lp(centers)
+    return -s
+
+def constr_slqp(v):
+    cx = v[0::3]
+    cy = v[1::3]
+    r = v[2::3]
+    c = []
+    c.append(cx - r)
+    c.append(1.0 - cx - r)
+    c.append(cy - r)
+    c.append(1.0 - cy - r)
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    ii, jj = np.triu_indices(N_CIRCLES, k=1)
+    c.append(d2[ii, jj] - rs[ii, jj]**2)
+    return np.concatenate(c)
+
+def obj_slqp(v):
+    return -np.sum(v[2::3])
+
+def run_packing():
+    np.random.seed(42)
+    best_vars = None
+    best_sum = -np.inf
+    
+    # Phase 1: Global search on centers using Differential Evolution + LP
+    bounds_centers = [(0.0, 1.0)] * (2 * N_CIRCLES)
+    de_best_val = -np.inf
+    de_best_centers = None
+    
+    for seed in range(4):
+        res_de = differential_evolution(lp_objective, bounds_centers, popsize=15, maxiter=120,
+                                        mutation=(0.8, 1.2), recombination=0.8, seed=seed,
+                                        polishing=False, disp=False)
+        if -res_de.fun > de_best_val:
+            de_best_val = -res_de.fun
+            de_best_centers = res_de.x.reshape(N_CIRCLES, 2)
+            
+    radii_lp, _ = get_optimal_radii_lp(de_best_centers)
+    x0 = np.zeros(3 * N_CIRCLES)
+    x0[0::3] = de_best_centers[:, 0]
+    x0[1::3] = de_best_centers[:, 1]
+    x0[2::3] = radii_lp * 0.995
+    x0[2::3] = np.maximum(x0[2::3], 1e-6)
+    
+    bounds_slqp = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N_CIRCLES
+    cons_slqp = {'type': 'ineq', 'fun': constr_slqp}
+    
+    # Phase 2: SLSQP refinement
+    try:
+        res = minimize(obj_slqp, x0, method='SLSQP', bounds=bounds_slqp, constraints=cons_slqp,
+                       options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+        if np.min(constr_slqp(res.x)) >= -1e-8:
+            best_vars = res.x.copy()
+            best_sum = -res.fun
+    except Exception:
+        pass
+        
+    # Phase 3: Perturbation restarts from best found
+    if best_vars is not None:
+        for _ in range(15):
+            x_p = best_vars + np.random.randn(3 * N_CIRCLES) * 0.003
+            x_p[0::3] = np.clip(x_p[0::3], 0.01, 0.99)
+            x_p[1::3] = np.clip(x_p[1::3], 0.01, 0.99)
+            x_p[2::3] = np.clip(x_p[2::3], 1e-5, 0.49)
+            
+            try:
+                res = minimize(obj_slqp, x_p, method='SLSQP', bounds=bounds_slqp, constraints=cons_slqp,
+                               options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+                if np.min(constr_slqp(res.x)) >= -1e-8:
+                    curr = -res.fun
+                    if curr > best_sum:
+                        best_sum = curr
+                        best_vars = res.x.copy()
+            except Exception:
+                pass
+                
+        # Final high-precision polish
+        try:
+            res_final = minimize(obj_slqp, best_vars, method='SLSQP', bounds=bounds_slqp, constraints=cons_slqp,
+                                 options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constr_slqp(res_final.x)) >= -1e-9:
+                best_vars = res_final.x
+                best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    if best_vars is None:
+        # Fallback to structured grid
+        centers_f = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)])
+        centers_f = np.vstack([centers_f, [0.5, 0.5]])
+        r_f, _ = get_optimal_radii_lp(centers_f)
+        best_vars = np.zeros(3 * N_CIRCLES)
+        best_vars[0::3] = centers_f[:, 0]
+        best_vars[1::3] = centers_f[:, 1]
+        best_vars[2::3] = r_f
+        best_sum = np.sum(r_f)
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    radii = np.maximum(radii, 0.0)
+    
+    # Final safety clipping for numerical precision
+    for i in range(N_CIRCLES):
+        x, y = centers[i]
+        r = radii[i]
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        for j in range(N_CIRCLES):
+            if i != j:
+                d = np.sqrt((x - centers[j, 0])**2 + (y - centers[j, 1])**2)
+                max_r = min(max_r, d - radii[j])
+        radii[i] = max(0.0, min(r, max_r + 1e-12))
+        
+    return centers, radii, float(np.sum(radii))
+```

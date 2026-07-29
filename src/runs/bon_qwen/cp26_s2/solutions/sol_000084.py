@@ -1,0 +1,247 @@
+# sol_000084 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 391a5ee9) state=f100a86f sum of radii=2.589318 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    """
+    n = 26
+    
+    # --- 1. Initialization ---
+    # We start with a hexagonal lattice configuration to provide a good feasible starting point.
+    # We aim for a radius around 0.08 initially.
+    r_init = 0.08
+    
+    centers = []
+    radii = []
+    
+    # Generate hexagonal grid points
+    # Row 0 (even): x = r, 3r, 5r, ...
+    # Row 1 (odd):  x = 2r, 4r, 6r, ...
+    # y step = r * sqrt(3)
+    
+    row_idx = 0
+    count = 0
+    while count < n:
+        y = r_init + row_idx * r_init * np.sqrt(3)
+        if y + r_init > 1.0:
+            break # Row doesn't fit vertically
+        
+        # Determine starting x based on row parity
+        if row_idx % 2 == 0:
+            x_start = r_init
+        else:
+            x_start = 2 * r_init # Offset by r_init relative to even rows centers? 
+            # Actually hex lattice offset is r (half spacing). 
+            # Even row centers: r, 3r, 5r... (spacing 2r)
+            # Odd row centers: 2r, 4r, 6r... (spacing 2r)
+            # Distance between (r, y) and (2r, y+h) is sqrt(r^2 + 3r^2) = 2r. Correct.
+        
+        x = x_start
+        while x + r_init <= 1.0 and count < n:
+            centers.append([x, y])
+            radii.append(r_init)
+            count += 1
+            x += 2 * r_init
+        row_idx += 1
+        
+    # If we didn't get enough circles (should not happen with r=0.08), fill randomly
+    while len(centers) < n:
+        # Random placement with small radius to ensure feasibility
+        cx = np.random.uniform(0.1, 0.9)
+        cy = np.random.uniform(0.1, 0.9)
+        centers.append([cx, cy])
+        radii.append(0.05)
+
+    centers = np.array(centers[:n])
+    radii = np.array(radii[:n])
+
+    # Flatten variables: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+
+    # --- 2. Objective Function and Jacobian ---
+    def objective(Z):
+        # Z indices: 3i, 3i+1, 3i+2 for x, y, r
+        radii_vec = Z[2::3]
+        return -np.sum(radii_vec)
+
+    def objective_jac(Z):
+        jac = np.zeros(3 * n)
+        # d(-sum(r))/dr_i = -1
+        for i in range(n):
+            jac[3*i + 2] = -1.0
+        return jac
+
+    # --- 3. Constraints ---
+    # We define a function that returns a vector of constraint values (must be >= 0)
+    # and its Jacobian matrix.
+    
+    # Precompute indices for overlap constraints to avoid loops in constraint eval if possible,
+    # but for 26 circles, a loop is acceptable.
+    
+    # Constraint indices mapping:
+    # 0 to 4n-1: Boundary constraints
+    # 4n to 4n + n*(n-1)/2 - 1: Overlap constraints
+    
+    n_boundary = 4 * n
+    n_overlap = n * (n - 1) // 2
+    total_constraints = n_boundary + n_overlap
+    
+    # List of (index, type) for boundary constraints to build Jacobian efficiently
+    # Types: 0: x-r>=0, 1: 1-x-r>=0, 2: y-r>=0, 3: 1-y-r>=0
+    
+    def constraints_fun(Z):
+        c = np.zeros(total_constraints)
+        
+        # Unpack
+        xs = Z[0::3]
+        ys = Z[1::3]
+        rs = Z[2::3]
+        
+        # Boundary constraints
+        for i in range(n):
+            idx = 3 * i # base index for circle i in Z
+            
+            # x - r >= 0
+            c[i] = xs[i] - rs[i]
+            # 1 - x - r >= 0
+            c[n + i] = 1.0 - xs[i] - rs[i]
+            # y - r >= 0
+            c[2 * n + i] = ys[i] - rs[i]
+            # 1 - y - r >= 0
+            c[3 * n + i] = 1.0 - ys[i] - rs[i]
+            
+        # Overlap constraints
+        k = 4 * n
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = xs[i] - xs[j]
+                dy = ys[i] - ys[j]
+                dist_sq = dx*dx + dy*dy
+                sum_r = rs[i] + rs[j]
+                # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+                c[k] = dist_sq - sum_r**2
+                k += 1
+                
+        return c
+
+    def constraints_jac(Z):
+        jac = np.zeros((total_constraints, 3 * n))
+        
+        xs = Z[0::3]
+        ys = Z[1::3]
+        rs = Z[2::3]
+        
+        # Boundary Jacobian
+        for i in range(n):
+            idx = 3 * i
+            # c[i] = x_i - r_i
+            # d/dx_i = 1, d/dr_i = -1
+            jac[i, idx] = 1.0
+            jac[i, idx + 2] = -1.0
+            
+            # c[n+i] = 1 - x_i - r_i
+            # d/dx_i = -1, d/dr_i = -1
+            jac[n + i, idx] = -1.0
+            jac[n + i, idx + 2] = -1.0
+            
+            # c[2n+i] = y_i - r_i
+            # d/dy_i = 1, d/dr_i = -1
+            jac[2 * n + i, idx + 1] = 1.0
+            jac[2 * n + i, idx + 2] = -1.0
+            
+            # c[3n+i] = 1 - y_i - r_i
+            # d/dy_i = -1, d/dr_i = -1
+            jac[3 * n + i, idx + 1] = -1.0
+            jac[3 * n + i, idx + 2] = -1.0
+
+        # Overlap Jacobian
+        # c_k = (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2
+        # Derivatives:
+        # dx_i: 2(x_i - x_j)
+        # dx_j: -2(x_i - x_j) = 2(x_j - x_i)
+        # dy_i: 2(y_i - y_j)
+        # dy_j: 2(y_j - y_i)
+        # dr_i: -2(r_i + r_j)
+        # dr_j: -2(r_i + r_j)
+        
+        k = 4 * n
+        for i in range(n):
+            for j in range(i + 1, n):
+                idx_i = 3 * i
+                idx_j = 3 * j
+                
+                dx = xs[i] - xs[j]
+                dy = ys[i] - ys[j]
+                sum_r = rs[i] + rs[j]
+                
+                jac[k, idx_i] = 2 * dx
+                jac[k, idx_j] = -2 * dx
+                jac[k, idx_i + 1] = 2 * dy
+                jac[k, idx_j + 1] = -2 * dy
+                jac[k, idx_i + 2] = -2 * sum_r
+                jac[k, idx_j + 2] = -2 * sum_r
+                
+                k += 1
+                
+        return jac
+
+    # Define constraint dictionary for scipy
+    constraint = {
+        'type': 'ineq',
+        'fun': constraints_fun,
+        'jac': constraints_jac
+    }
+
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((1e-6, 0.5)) # r (small positive lower bound)
+
+    # --- 4. Optimization ---
+    # Use SLSQP method
+    # We might need to run this a few times or with a good start. 
+    # The hex grid start should be sufficient.
+    
+    res = minimize(
+        objective,
+        x0,
+        method='SLSQP',
+        jac=objective_jac,
+        bounds=bounds,
+        constraints=constraint,
+        options={'maxiter': 1000, 'ftol': 1e-12}
+    )
+    
+    # Extract results
+    Z_opt = res.x
+    centers_opt = np.zeros((n, 2))
+    radii_opt = np.zeros(n)
+    
+    for i in range(n):
+        centers_opt[i, 0] = Z_opt[3*i]
+        centers_opt[i, 1] = Z_opt[3*i+1]
+        radii_opt[i] = Z_opt[3*i+2]
+        
+    sum_radii = np.sum(radii_opt)
+    
+    # Ensure validity (clamp small negatives to 0 just in case, though bounds handle it)
+    radii_opt = np.maximum(radii_opt, 0)
+    
+    # Validation check (local)
+    # Not strictly required to run validate_packing inside, but good for debug
+    # However, we must return the result.
+    
+    return centers_opt, radii_opt, sum_radii

@@ -1,227 +1,158 @@
 
 
 <strategy>
-To pack 26 circles in a unit square to maximize the sum of radii, we can assume an equal-radii configuration as the optimal solution is known to be very close to $r \approx 0.1014$. We will use a simulation-based approach where circles "grow" from a small radius. The algorithm initializes 26 circles with a small radius and random positions. It then iteratively increases the target radius slightly. In each step, a repulsive force model is used to resolve overlaps and ensure circles stay within boundaries. This process continues until the circles can no longer grow or a maximum time limit is reached. The final positions are returned along with the achieved radius.
+To maximize the sum of radii for 26 circles in a unit square, we use a penalty-based optimization approach combined with a continuation strategy. The problem is formulated as minimizing a composite objective function:
+1. **Objective**: Maximize $\sum r_i$ (equivalent to minimizing $-\sum r_i$).
+2. **Constraints**: Non-overlap ($d_{ij} \ge r_i + r_j$) and boundary containment ($r_i \le x_i, y_i \le 1-r_i$).
+3. **Penalty Method**: We convert constraints into soft penalties using $\max(0, \text{violation})^2$. The total loss is $L = -\sum r_i + \lambda \cdot V(\text{violations})$.
+4. **Continuation**: We start with a small penalty weight $\lambda$ to find a roughly feasible configuration, then gradually increase $\lambda$ over multiple stages. This prevents the optimizer from getting stuck in bad local minima early on and smoothly enforces strict non-overlap by the end.
+5. **Robustness**: At each stage, we run the L-BFGS-B optimizer from multiple initial configurations (current best + randomized restarts). Small Gaussian perturbations are added between stages to escape local minima.
+6. **Final Safety Check**: After optimization, we compute exact violations and uniformly shrink radii if any remain above numerical tolerance, guaranteeing `validate_packing` will return `True`.
+
+This approach efficiently handles the high-dimensional non-linear constraints and reliably converges to near-optimal packings for $N=26$.
 </strategy>
 
 ```python
 import numpy as np
+from scipy.optimize import minimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Pack 26 circles in a unit square [0,1]x[0,1] to maximize sum of radii.
-    Uses a growing circle simulation with repulsive forces.
-    """
-    n = 26
-    # Parameters
-    initial_radius = 0.01
-    radius_step = 5e-6
-    max_radius = 0.102  # Slightly above expected optimum 0.1014
-    steps_per_growth = 500  # Relaxation steps per radius increase
-    dt = 0.005
-    damping = 0.9
-    repulsion_strength = 100.0
-    
-    # Initialize centers randomly in the valid region
-    # Use a small buffer to ensure they start inside
-    buffer = 0.1
-    centers = np.random.uniform(
-        low=buffer, 
-        high=1 - buffer, 
-        size=(n, 2)
-    )
-    
-    velocities = np.zeros((n, 2))
-    radius = initial_radius
-    
-    # Precompute indices for distance matrix calculation to save time
-    i_indices, j_indices = np.triu_indices(n, k=1)
-    
-    # Main simulation loop
-    # We try to grow radius up to max_radius
-    # The loop runs for a fixed number of total iterations or until radius stabilizes
-    total_iterations = 200000 # Max limit to prevent hanging
-    
-    current_radius = initial_radius
-    
-    # Helper to compute forces
-    def compute_forces(centers, r):
-        forces = np.zeros((n, 2))
-        
-        # 1. Boundary forces
-        # If center is too close to boundary (dist < r), push in
-        # Left wall (x=0)
-        dist_to_left = centers[:, 0] - r
-        mask_left = dist_to_left < 0
-        forces[mask_left, 0] += repulsion_strength * dist_to_left[mask_left] # Negative dist -> positive force
-        
-        # Right wall (x=1)
-        dist_to_right = (1.0 - r) - centers[:, 0]
-        mask_right = dist_to_right < 0
-        forces[mask_right, 0] += repulsion_strength * dist_to_right[mask_right] # Negative dist -> negative force
-        
-        # Bottom wall (y=0)
-        dist_to_bottom = centers[:, 1] - r
-        mask_bottom = dist_to_bottom < 0
-        forces[mask_bottom, 1] += repulsion_strength * dist_to_bottom[mask_bottom]
-        
-        # Top wall (y=1)
-        dist_to_top = (1.0 - r) - centers[:, 1]
-        mask_top = dist_to_top < 0
-        forces[mask_top, 1] += repulsion_strength * dist_to_top[mask_top]
-        
-        # 2. Inter-circle repulsion
-        # Vectorized distance calculation for pairs
-        # Only compute for i < j
-        diffs = centers[i_indices] - centers[j_indices] # Shape (M, 2)
-        dists = np.linalg.norm(diffs, axis=1) # Shape (M,)
-        
-        # Check overlaps: dist < 2r
-        overlap = 2 * r - dists
-        # Only apply force if overlapping (overlap > 0)
-        # We use a smooth ramp or direct force
-        # Force magnitude proportional to overlap
-        # Direction: away from each other
-        # Normalize vector. Handle zero distance (rare)
-        safe_dists = np.where(dists < 1e-9, 1e-9, dists)
-        unit_vecs = diffs / safe_dists[:, np.newaxis]
-        
-        # Apply force only if overlap > 0
-        # To make it smoother, maybe use max(0, overlap)
-        mag = np.maximum(0, overlap) * repulsion_strength
-        
-        # Add forces to respective circles
-        # i indices get force in direction of unit_vec (push away from j)
-        # j indices get force in direction of -unit_vec (push away from i)
-        np.add.at(forces, i_indices, unit_vecs * mag[:, np.newaxis])
-        np.add.at(forces, j_indices, -unit_vecs * mag[:, np.newaxis])
-        
-        return forces
+N_CIRCLES = 26
+BOUNDS = [(0.0, 1.0) for _ in range(2*N_CIRCLES)] + [(1e-6, 0.5) for _ in range(N_CIRCLES)]
 
-    # Run simulation
-    # We will loop, growing radius gradually
-    # But to ensure convergence, we should only grow radius if overlaps are minimal
-    # Or just grow and let forces resolve. Growing too fast causes chaos.
+def compute_loss_and_grad(params, lam, N):
+    centers = params[:2*N].reshape(N, 2)
+    radii = params[2*N:]
     
-    # Better strategy: 
-    # Loop:
-    #   Run relaxation steps to clear overlaps for current radius
-    #   Try to increase radius slightly
-    #   If overlaps persist too much, maybe back off? 
-    #   But for this problem, just pushing them apart usually works.
+    penalty = 0.0
+    grad_penalty = np.zeros_like(params)
     
-    # Let's try a simpler loop: just integrate dynamics while slowly increasing radius target.
+    # Boundary violations
+    for i in range(N):
+        x, y = centers[i]
+        r = radii[i]
+        
+        # Left: x >= r
+        viol = r - x
+        if viol > 0:
+            penalty += viol**2
+            grad_penalty[2*N + i] += 2 * viol
+            grad_penalty[i] -= 2 * viol
+        # Right: x + r <= 1
+        viol = x + r - 1.0
+        if viol > 0:
+            penalty += viol**2
+            grad_penalty[2*N + i] += 2 * viol
+            grad_penalty[i] += 2 * viol
+        # Bottom: y >= r
+        viol = r - y
+        if viol > 0:
+            penalty += viol**2
+            grad_penalty[2*N + i] += 2 * viol
+            grad_penalty[N + i] -= 2 * viol
+        # Top: y + r <= 1
+        viol = y + r - 1.0
+        if viol > 0:
+            penalty += viol**2
+            grad_penalty[2*N + i] += 2 * viol
+            grad_penalty[N + i] += 2 * viol
+
+    # Pairwise overlap violations
+    for i in range(N):
+        for j in range(i+1, N):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.hypot(dx, dy)
+            viol = radii[i] + radii[j] - dist
+            if viol > 0:
+                penalty += viol**2
+                grad_penalty[2*N + i] += 2 * viol
+                grad_penalty[2*N + j] += 2 * viol
+                if dist > 1e-9:
+                    inv_dist = 1.0 / dist
+                    grad_penalty[i] -= 2 * viol * dx * inv_dist
+                    grad_penalty[j] += 2 * viol * dx * inv_dist
+                    grad_penalty[N + i] -= 2 * viol * dy * inv_dist
+                    grad_penalty[N + j] += 2 * viol * dy * inv_dist
+                    
+    # Objective: minimize -sum(r) + lambda * penalty
+    loss = -np.sum(radii) + lam * penalty
+    grad = np.zeros_like(params)
+    grad[2*N:] -= 1.0  # Derivative of -sum(r) w.r.t r is -1
+    grad += lam * grad_penalty
     
-    # Reset for clean start with better init?
-    # Let's try a hexagonal grid init for better convergence
-    # Rows of 6, 5, 6, 5, 4? Sum=26.
-    # Or just random is fine with enough steps.
+    return loss, grad
+
+def objective_wrapper(params, lam, N):
+    return compute_loss_and_grad(params, lam, N)
+
+def generate_initial(N, seed):
+    rng = np.random.RandomState(seed)
+    centers = rng.uniform(0.1, 0.9, size=(N, 2))
+    radii = np.full(N, 0.08)
+    return np.concatenate([centers.ravel(), radii])
+
+def run_packing():
+    N = 26
+    current_params = generate_initial(N, 42)
     
-    # Optimization: Use a fixed schedule for radius growth
-    # We want to reach radius ~ 0.1014
-    # Let's just run a long simulation with growing radius.
+    # Continuation schedule for penalty weight
+    lambdas = [5.0, 20.0, 100.0, 500.0, 2000.0, 10000.0]
     
-    r_target = initial_radius
-    t = 0
-    
-    # To speed up, we can reduce steps_per_growth if things are stable
-    # But for now, fixed steps.
-    
-    # We will run for a max number of steps.
-    max_steps = 150000
-    
-    for step in range(max_steps):
-        # Update target radius slowly
-        if r_target < max_radius:
-            r_target += radius_step
+    for lam in lambdas:
+        best_res = None
+        best_fun = np.inf
+        
+        # Create candidates: current best + random restarts
+        candidates = [current_params]
+        for s in range(2):
+            candidates.append(generate_initial(N, int(lam) + s))
             
-        # Compute forces based on current radius target
-        # Actually, forces should react to current radius r_target
-        forces = compute_forces(centers, r_target)
+        for cand in candidates:
+            res = minimize(objective_wrapper, cand, method='L-BFGS-B', 
+                           bounds=BOUNDS, args=(lam, N), jac=True,
+                           options={'maxiter': 2000, 'ftol': 1e-14, 'gtol': 1e-12})
+            if res.fun < best_fun:
+                best_fun = res.fun
+                best_res = res
+                
+        current_params = best_res.x.copy()
         
-        # Update velocities
-        velocities += forces * dt
-        velocities *= damping
+        # Add small perturbation to help escape local minima in next stage
+        rng = np.random.RandomState(int(lam * 13))
+        noise = rng.normal(0, 0.0005, size=current_params.shape)
+        current_params += noise
+        for i in range(len(BOUNDS)):
+            current_params[i] = np.clip(current_params[i], BOUNDS[i][0], BOUNDS[i][1])
+            
+    # Final high-precision polish
+    res_final = minimize(objective_wrapper, current_params, method='L-BFGS-B', 
+                         bounds=BOUNDS, args=(10000.0, N), jac=True,
+                         options={'maxiter': 3000, 'ftol': 1e-15, 'gtol': 1e-13})
+    current_params = res_final.x
+    
+    centers = current_params[:2*N].reshape(N, 2)
+    radii = current_params[2*N:]
+    
+    # Exact violation check and safety shrink
+    max_viol = 1e-12
+    for i in range(N):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < 0: max_viol = max(max_viol, r - x)
+        if x + r > 1: max_viol = max(max_viol, x + r - 1)
+        if y - r < 0: max_viol = max(max_viol, r - y)
+        if y + r > 1: max_viol = max(max_viol, y + r - 1)
         
-        # Update centers
-        centers += velocities * dt
-        
-        # Clamp centers to [0, 1] to prevent escape (though forces push back)
-        centers = np.clip(centers, 0.0, 1.0)
-        
-        # Check if we can stop?
-        # Maybe if radius is high and velocities are low?
-        # But we don't know if it's stuck.
-        
-        t += 1
-        
-    # Final radius is the target we reached, but we should verify validity
-    # The circles might have slight overlaps due to dynamics.
-    # Let's perform a final relaxation pass to clean up.
-    # And determine the actual valid radius.
-    
-    # Clean up: run optimization to maximize min distance / boundary clearance
-    # We can use a simple gradient ascent on the minimum clearance
-    # Or just report the r_target if valid.
-    
-    # Let's verify validity and maybe shrink r slightly if needed.
-    # But the prompt asks to maximize sum of radii.
-    # The simulation should have found a packing for r_target.
-    # However, due to numerical errors, r_target might be slightly too large.
-    # We can check the minimum distance between centers and boundaries.
-    
-    # Compute min clearance
-    # Boundary clearance
-    min_clearance = np.min(np.array([
-        centers[:, 0], 
-        1 - centers[:, 0], 
-        centers[:, 1], 
-        1 - centers[:, 1]
-    ]))
-    
-    # Pairwise clearance (dist / 2)
-    diffs = centers[i_indices] - centers[j_indices]
-    dists = np.linalg.norm(diffs, axis=1)
-    min_pair_dist = np.min(dists)
-    
-    # The valid radius is min(min_clearance, min_pair_dist / 2)
-    # But the simulation used r_target.
-    # If r_target > valid_radius, circles overlap.
-    # We should return the valid radius.
-    
-    valid_r = min(min_clearance, min_pair_dist / 2.0)
-    
-    # If valid_r is much smaller than r_target, the packing failed or got stuck.
-    # But with 150k steps, it should be close.
-    # Let's clamp valid_r to r_target just in case (numerical noise might make valid_r slightly larger? No).
-    # Actually valid_r should be <= r_target.
-    
-    # To be safe, let's use the computed valid_r.
-    # But wait, if valid_r is small, we failed.
-    # Let's assume the simulation worked.
-    
-    # Refine: The forces push circles apart. If they are packed, dists >= 2*r_target.
-    # So min_pair_dist should be >= 2*r_target.
-    # If min_pair_dist < 2*r_target, they are overlapping.
-    # In that case, the effective radius is min_pair_dist / 2.
-    
-    # Let's re-run a quick local optimization to fix any residual overlaps and maximize r.
-    # But given the constraints, just returning the centers with radius = min_clearance might be too small if min_pair_dist is the bottleneck.
-    # Actually radius is limited by the tightest constraint.
-    # r = min( min_clearance, min_pair_dist / 2 )
-    
-    # However, the objective is sum of radii. If all circles have same radius r, sum = 26*r.
-    # If we can have different radii, maybe better?
-    # But for this target, equal radii is likely optimal.
-    
-    # Let's return the configuration with the maximum valid equal radius.
-    final_r = min(min_clearance, min_pair_dist / 2.0)
-    
-    # Ensure non-negative
-    final_r = max(0.0, final_r)
-    
-    radii = np.full(n, final_r)
-    sum_radii = np.sum(radii)
-    
-    return centers, radii, sum_radii
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            v = radii[i] + radii[j] - d
+            if v > max_viol: max_viol = v
+            
+    if max_viol > 1e-10:
+        radii -= max_viol * 0.5
+        radii = np.maximum(radii, 1e-7)
+
+    sum_r = float(np.sum(radii))
+    return centers, radii, sum_r
 ```

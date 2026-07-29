@@ -1,5 +1,5 @@
 # sol_000103 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state bf51a1cd) state=e76a4f5d sum of radii=2.197401 correctness=1.0
+# generation=0 parent=seed (state 15bab5cf) state=55c0b72e sum of radii=2.459437 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,97 +7,100 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def objective_function(params, n):
+N_CIRCLES = 26
+ALPHA = 1500.0
+
+def objective(params):
     """
-    Objective function to maximize the minimum radius r.
-    params: 1D array of size 2*n (x1, y1, ..., xn, yn)
-    n: number of circles
-    
-    The function returns -min_r, so minimizing this function maximizes min_r.
+    Objective function: maximize sum of radii subject to non-overlap and boundary constraints.
+    Uses a penalty method with squared violation terms.
     """
-    centers = params.reshape(n, 2)
-    
-    # Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
-    # This is equivalent to r <= min(x, 1-x, y, 1-y)
-    xs = centers[:, 0]
-    ys = centers[:, 1]
-    # Distance to the nearest boundary
-    # If a center is outside [0,1], this distance becomes negative.
-    dist_to_bound = np.minimum(np.minimum(xs, 1.0 - xs), np.minimum(ys, 1.0 - ys))
-    min_r_bound = np.min(dist_to_bound)
-    
-    # Pairwise constraints: 2r <= distance between centers => r <= distance / 2
-    # Compute pairwise distances efficiently
-    # (N, 1, 2) - (1, N, 2) -> (N, N, 2) difference matrix
+    centers = params[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = params[2*N_CIRCLES:]
+
+    # Pairwise distances (N x N matrix)
     diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
     dists = np.sqrt(np.sum(diff**2, axis=2))
-    
-    # Consider only unique pairs (i < j) to avoid self-distance and double counting
-    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
-    pairwise_dists = dists[mask]
-    min_pairwise_r = np.min(pairwise_dists) / 2.0
-    
-    # The maximum possible radius for this configuration is limited by the tightest constraint
-    min_r = min(min_r_bound, min_pairwise_r)
-    
-    # We want to maximize min_r, so we minimize -min_r
-    return -min_r
+    np.fill_diagonal(dists, 1.0)  # Ignore self-distances
+
+    # Overlap penalty: max(0, r_i + r_j - d_ij)^2 summed over i < j
+    rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    overlaps = rad_sum - dists
+    triu_idx = np.triu_indices(N_CIRCLES, k=1)
+    overlap_pen = np.sum(np.maximum(0, overlaps[triu_idx])**2)
+
+    # Boundary penalties: max(0, r - dist_to_wall)^2
+    left_pen = np.sum(np.maximum(0, radii - centers[:, 0])**2)
+    right_pen = np.sum(np.maximum(0, radii - (1.0 - centers[:, 0]))**2)
+    bottom_pen = np.sum(np.maximum(0, radii - centers[:, 1])**2)
+    top_pen = np.sum(np.maximum(0, radii - (1.0 - centers[:, 1]))**2)
+
+    bound_pen = left_pen + right_pen + bottom_pen + top_pen
+
+    # Minimize negative sum of radii + penalty
+    return -np.sum(radii) + ALPHA * (overlap_pen + bound_pen)
+
 
 def run_packing():
-    n = 26
-    
-    best_min_r = 0.0
-    best_centers = None
-    
-    # Generate multiple starting configurations to avoid local minima
-    starts = []
-    
-    # 1. Grid based start (5x5 + 1)
-    # A 5x5 grid fits 25 circles of radius 0.1 exactly.
-    # We add a 26th circle and let the optimizer adjust.
-    grid_x = np.linspace(0.1, 0.9, 5)
-    grid_y = np.linspace(0.1, 0.9, 5)
-    gx, gy = np.meshgrid(grid_x, grid_y)
-    base_pts = np.vstack([gx.flatten(), gy.flatten()]).T
-    # Add a point in a gap, e.g., near (0.2, 0.2)
-    starts.append(np.vstack([base_pts, [0.2, 0.2]]).flatten())
-    
-    # 2. Random starts
-    rng = np.random.default_rng(42)
-    # Run several random restarts to explore the space
-    for _ in range(30):
-        starts.append(rng.uniform(0.1, 0.9, size=(n, 2)).flatten())
+    n = N_CIRCLES
+    best_params = None
+    best_loss = np.inf
 
-    # Optimize for each start configuration
-    for p0 in starts:
-        try:
-            # Nelder-Mead is suitable for non-smooth objectives (min function)
-            # maxiter is set high enough to converge
-            res = minimize(objective_function, p0, args=(n,), method='Nelder-Mead', 
-                           options={'maxiter': 5000, 'xatol': 1e-8, 'fatol': 1e-10, 'adaptive': True})
-            
-            current_r = -res.fun
-            # We are interested in valid packings where radius is positive
-            # However, the optimizer might explore invalid regions (negative r).
-            # We track the best positive radius found.
-            if current_r > best_min_r:
-                best_min_r = current_r
-                best_centers = res.x.reshape(n, 2)
-        except Exception:
-            pass
-            
-    # Fallback if optimization failed completely
-    if best_centers is None:
-        best_centers = np.random.rand(n, 2)
-        best_min_r = 0.0
-        
-    radii = np.full(n, best_min_r)
-    
-    # Safety clamp: ensure radius is non-negative
-    if best_min_r < 0:
-        best_min_r = 0.0
-        radii = np.zeros(n)
-        # Clamp centers to unit square just in case
-        best_centers = np.clip(best_centers, 0.0, 1.0)
-        
-    return best_centers, radii, np.sum(radii)
+    inits = []
+
+    # 1. Hexagonal lattice initialization (dense packing geometry)
+    pts = []
+    y = 0.1
+    row = 0
+    while y < 0.9 and len(pts) < n:
+        x = 0.1 + (0.08 if row % 2 == 1 else 0)
+        while x < 0.9 and len(pts) < n:
+            pts.append([x, y])
+            x += 0.16
+        y += 0.12
+        row += 1
+    while len(pts) < n:
+        pts.append([np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)])
+    pts = np.array(pts[:n])
+    inits.append(np.concatenate([pts.flatten(), np.ones(n) * 0.08]))
+
+    # 2. Random initialization
+    np.random.seed(42)
+    pts2 = np.random.rand(n, 2) * 0.6 + 0.2
+    inits.append(np.concatenate([pts2.flatten(), np.ones(n) * 0.08]))
+
+    # 3. Grid initialization
+    gs = np.linspace(0.15, 0.85, 6)
+    pts3 = np.array(np.meshgrid(gs, gs)).T.reshape(-1, 2)
+    pts3 = pts3[:n]
+    inits.append(np.concatenate([pts3.flatten(), np.ones(n) * 0.08]))
+
+    # Bounds: centers in [0,1], radii in [0, 0.5]
+    bounds = [(0.0, 1.0) for _ in range(2*n)] + [(0.0, 0.5) for _ in range(n)]
+
+    # Phase 1: Global search from multiple starts
+    for init in inits:
+        res = minimize(objective, init, method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 8000, 'ftol': 1e-12})
+        if res.fun < best_loss:
+            best_loss = res.fun
+            best_params = res.x.copy()
+
+    # Phase 2: Local refinement via perturbed restarts
+    for _ in range(4):
+        pert = best_params.copy()
+        pert[:2*n] += np.random.normal(0, 0.005, 2*n)
+        pert[:2*n] = np.clip(pert[:2*n], 0.01, 0.99)
+        res = minimize(objective, pert, method='L-BFGS-B', bounds=bounds,
+                       options={'maxiter': 4000, 'ftol': 1e-12})
+        if res.fun < best_loss:
+            best_loss = res.fun
+            best_params = res.x.copy()
+
+    centers = best_params[:2*n].reshape(n, 2)
+    radii = best_params[2*n:]
+
+    # Apply safety margin to strictly satisfy validator tolerance
+    radii *= 0.995
+
+    return centers, radii, float(np.sum(radii))

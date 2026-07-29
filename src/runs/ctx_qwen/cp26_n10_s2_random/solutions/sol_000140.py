@@ -1,0 +1,190 @@
+# sol_000140 | problem=circle_packing_26 entrypoint=run_packing
+# generation=6 parent=sol_000119 (state ab7c4e6b) state=c71504da sum of radii=2.609953 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(I_IDX)
+NUM_CONSTRAINTS = NUM_PAIRS + 4 * N
+
+# Precompute A_ub structure for LP to avoid reconstruction overhead
+A_ub_pre = np.zeros((NUM_CONSTRAINTS, N))
+for k in range(NUM_PAIRS):
+    A_ub_pre[k, I_IDX[k]] = 1.0
+    A_ub_pre[k, J_IDX[k]] = 1.0
+idx = NUM_PAIRS
+for i in range(N):
+    A_ub_pre[idx, i] = 1.0; idx += 1
+    A_ub_pre[idx, i] = 1.0; idx += 1
+    A_ub_pre[idx, i] = 1.0; idx += 1
+    A_ub_pre[idx, i] = 1.0; idx += 1
+
+def solve_lp(centers):
+    """Solves LP for radii given fixed centers. Returns radii, sum_radii, and dual marginals."""
+    b_ub = np.empty(NUM_CONSTRAINTS)
+    
+    dx = centers[I_IDX, 0] - centers[J_IDX, 0]
+    dy = centers[I_IDX, 1] - centers[J_IDX, 1]
+    b_ub[:NUM_PAIRS] = np.hypot(dx, dy)
+    
+    idx = NUM_PAIRS
+    for i in range(N):
+        b_ub[idx] = centers[i, 0]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        b_ub[idx] = centers[i, 1]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    c_obj = -np.ones(N)
+    bounds_r = [(0, None)] * N
+    
+    res = linprog(c_obj, A_ub=A_ub_pre, b_ub=b_ub, bounds=bounds_r, method='highs')
+    if res.success:
+        return res.x, -res.fun, res.ineqlin.marginals
+    return np.zeros(N), 0.0, np.zeros(NUM_CONSTRAINTS)
+
+def compute_gradient(centers, duals):
+    """Computes gradient of sum of radii w.r.t centers using LP dual variables."""
+    grad = np.zeros_like(centers)
+    
+    dx = centers[I_IDX, 0] - centers[J_IDX, 0]
+    dy = centers[I_IDX, 1] - centers[J_IDX, 1]
+    dists = np.hypot(dx, dy)
+    dists = np.maximum(dists, 1e-9)
+    
+    # Duals for minimization are <= 0. Negate to get positive "pressure" magnitudes.
+    lam = -duals[:NUM_PAIRS]
+    f = lam / dists
+    
+    for k in range(NUM_PAIRS):
+        grad[I_IDX[k], 0] += f[k] * dx[k]
+        grad[I_IDX[k], 1] += f[k] * dy[k]
+        grad[J_IDX[k], 0] -= f[k] * dx[k]
+        grad[J_IDX[k], 1] -= f[k] * dy[k]
+        
+    start = NUM_PAIRS
+    mu_L = -duals[start : start + N]
+    mu_R = -duals[start + N : start + 2 * N]
+    mu_B = -duals[start + 2 * N : start + 3 * N]
+    mu_T = -duals[start + 3 * N : start + 4 * N]
+    
+    grad[:, 0] += mu_L - mu_R
+    grad[:, 1] += mu_B - mu_T
+    
+    return grad
+
+def constraints_joint(v):
+    """Inequality constraints for SLSQP: must be >= 0."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = [
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ]
+    d = np.hypot(c[I_IDX, 0] - c[J_IDX, 0], c[I_IDX, 1] - c[J_IDX, 1])
+    con.append(d - (r[I_IDX] + r[J_IDX]))
+    return np.concatenate(con)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    # 1. Generate diverse initial configurations
+    inits = []
+    r0 = 0.10
+    centers_hex = []
+    y = r0
+    row = 0
+    while len(centers_hex) < N:
+        x = r0 if row % 2 == 0 else 2 * r0
+        while x + r0 <= 1.0 + 1e-9 and len(centers_hex) < N:
+            centers_hex.append([x, y])
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+    centers_hex = np.array(centers_hex[:N])
+    inits.append(centers_hex)
+    
+    # Perturbed hex grids
+    for _ in range(15):
+        c = centers_hex + np.random.normal(0, 0.012, (N, 2))
+        inits.append(np.clip(c, 0.02, 0.98))
+        
+    # Random starts
+    for _ in range(10):
+        inits.append(np.random.uniform(0.15, 0.85, (N, 2)))
+        
+    # 2. Optimization Loop
+    for init_c in inits:
+        centers = init_c.copy()
+        step_size = 0.025
+        
+        # Phase A: LP-Dual Gradient Ascent
+        for it in range(300):
+            radii, curr_sum, duals = solve_lp(centers)
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                
+            grad = compute_gradient(centers, duals)
+            grad_norm = np.linalg.norm(grad)
+            
+            if grad_norm > 1e-5:
+                # Normalize gradient for stable step control
+                move = centers + step_size * (grad / grad_norm)
+                centers = np.clip(move, 0.005, 0.995)
+            
+            # Adaptive step decay
+            step_size *= 0.994
+            
+        # Phase B: SLSQP Joint Refinement
+        if best_sum > 0:
+            v0 = np.concatenate([best_centers.flatten(), best_radii])
+            try:
+                res = minimize(
+                    lambda v: -np.sum(v[2*N:]), 
+                    v0, 
+                    method='SLSQP',
+                    bounds=[(0, 1)]*(2*N) + [(0, 0.5)]*N,
+                    constraints={'type': 'ineq', 'fun': constraints_joint},
+                    options={'maxiter': 6000, 'ftol': 1e-13, 'disp': False}
+                )
+                s = np.sum(res.x[2*N:])
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = res.x[:2*N].reshape(N, 2)
+                    best_radii = res.x[2*N:]
+            except Exception:
+                pass
+
+    # 3. Strict Numerical Repair
+    radii = best_radii.copy()
+    for _ in range(60):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    shrink = (radii[i] + radii[j] - d) / 2.0
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mx = min(best_centers[i,0], 1.0-best_centers[i,0], best_centers[i,1], 1.0-best_centers[i,1])
+            if radii[i] > mx + 1e-10:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return best_centers, radii, float(np.sum(radii))

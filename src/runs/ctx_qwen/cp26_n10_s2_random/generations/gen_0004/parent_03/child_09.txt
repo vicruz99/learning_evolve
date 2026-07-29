@@ -1,0 +1,215 @@
+
+
+<strategy>
+To improve upon the current sum of radii (~2.627) and approach the target of 2.636, we need a more robust optimization pipeline that can escape local minima and better exploit boundary packing. The strategy involves:
+
+1. **Smooth Constraint Formulation**: Use squared Euclidean distances for overlap constraints `(dx^2 + dy^2 - (r_i + r_j)^2 >= 0)` to improve differentiability and solver stability compared to raw distances.
+2. **Multi-Phase Optimization**:
+   - **Phase 1: Multi-Start SLSQP**: Initialize from diverse hexagonal lattices and random dense packings. Run SLSQP to find strong local optima.
+   - **Phase 2: Sequential Expansion**: Iteratively scale up radii by a decaying factor and re-optimize centers. This "pressure" method forces the configuration to densify, often breaking symmetry and finding tighter arrangements.
+   - **Phase 3: Center-Only Powell Optimization**: Temporarily fix the radius computation to `r_i = min(dist_to_boundary, 0.5 * dist_to_nearest_neighbor)` and optimize only the 52 center coordinates using Powell's method. This non-smooth but derivative-free approach excels at finding topological rearrangements that gradient-based methods miss.
+   - **Phase 4: Full Polish & Basin Hopping**: Feed the best center layout back into full SLSQP with explicit radius variables for fine-tuning. Follow with targeted random perturbations to escape residual local minima.
+3. **Strict Validation Repair**: Apply a deterministic shrinking/clamping procedure to guarantee the output satisfies the validator's tight tolerances without reducing the objective unnecessarily.
+
+This hybrid approach combines the precision of constrained gradient optimization with the topological search capabilities of coordinate descent and pressure-based expansion.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_full_constraints(vars_flat):
+    x = vars_flat[0::3]
+    y = vars_flat[1::3]
+    r = vars_flat[2::3]
+    c = [x - r, 1.0 - x - r, y - r, 1.0 - y - r]
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    mask = np.triu(np.ones((N, N)), k=1).astype(bool)
+    c.append((dx**2 + dy**2 - dr**2)[mask])
+    return np.concatenate(c)
+
+def compute_objective(vars_flat):
+    return -np.sum(vars_flat[2::3])
+
+def get_bounds():
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)])
+    return b
+
+def compute_radii_from_centers(centers):
+    x, y = centers[:, 0], centers[:, 1]
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)
+    r_pair = 0.5 * np.min(dist, axis=1)
+    return np.minimum(r_bound, r_pair)
+
+def obj_centers_only(v):
+    centers = v.reshape(N, 2)
+    radii = compute_radii_from_centers(centers)
+    return -np.sum(radii)
+
+def make_init_hex(seed):
+    rng = np.random.default_rng(seed)
+    centers = []
+    y = 0.08
+    dy = 0.14
+    dx = 0.16
+    row_idx = 0
+    patterns = [[5,5,5,5,5,1], [6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5]]
+    pat = patterns[seed % len(patterns)]
+    for count in pat:
+        shift = (0.5 if row_idx % 2 == 1 else 0.0) * dx
+        x = 0.08 + shift
+        for _ in range(count):
+            if len(centers) >= N: break
+            centers.append([x + rng.uniform(-0.005, 0.005), y + rng.uniform(-0.005, 0.005)])
+            x += dx
+        y += dy
+        row_idx += 1
+        if len(centers) >= N: break
+    return np.array(centers[:N])
+
+def make_init_random(seed):
+    rng = np.random.default_rng(seed)
+    centers = []
+    attempts = 0
+    while len(centers) < N and attempts < 2000:
+        pt = rng.uniform(0.1, 0.9, 2)
+        ok = True
+        for c in centers:
+            if np.hypot(pt[0]-c[0], pt[1]-c[1]) < 0.12:
+                ok = False
+                break
+        if ok:
+            centers.append(pt)
+        attempts += 1
+    while len(centers) < N:
+        centers.append(rng.uniform(0.1, 0.9, 2))
+    return np.array(centers[:N])
+
+def init_vars(centers, scale=0.85):
+    rs = compute_radii_from_centers(centers) * scale
+    v = np.zeros(3 * N)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = rs
+    return v
+
+def run_slsqp(v0, bounds, maxiter=2000):
+    cons = {'type': 'ineq', 'fun': compute_full_constraints}
+    try:
+        res = minimize(compute_objective, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': maxiter, 'ftol': 1e-12})
+        return res.x, res.success, res.fun
+    except Exception:
+        return v0, False, np.inf
+
+def repair_and_validate(centers, radii):
+    for i in range(N):
+        x, y, r = centers[i, 0], centers[i, 1], radii[i]
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        if r > max_r + 1e-9:
+            radii[i] = max_r
+            
+    for _ in range(10):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    overlap = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= overlap
+                    radii[j] -= overlap
+                    changed = True
+        if not changed:
+            break
+    radii = np.maximum(radii, 0.0)
+    return radii
+
+def run_packing():
+    np.random.seed(42)
+    bounds = get_bounds()
+    
+    best_v = None
+    best_sum = -1.0
+    
+    # Phase 1: Multi-start SLSQP
+    inits = []
+    for i in range(20):
+        inits.append(init_vars(make_init_hex(i)))
+    for i in range(15):
+        inits.append(init_vars(make_init_random(i)))
+        
+    for v0 in inits:
+        v_res, _, _ = run_slsqp(v0, bounds, maxiter=3000)
+        curr_sum = -np.sum(v_res[2::3])
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_v = v_res.copy()
+            
+    # Phase 2: Sequential Expansion (Pressure Method)
+    curr_v = best_v.copy()
+    for step in range(60):
+        factor = 1.0 + 0.005 * (1.0 - step / 60.0)
+        curr_v[2::3] *= factor
+        v_res, _, _ = run_slsqp(curr_v, bounds, maxiter=1500)
+        curr_sum = -np.sum(v_res[2::3])
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_v = v_res.copy()
+        curr_v = v_res.copy()
+        
+    # Phase 3: Center-only Powell optimization
+    centers_best = best_v[:2*N].reshape(N, 2)
+    for _ in range(30):
+        pert_c = centers_best + np.random.normal(0, 0.002, centers_best.shape)
+        pert_c = np.clip(pert_c, 0.01, 0.99)
+        try:
+            res_powell = minimize(obj_centers_only, pert_c.flatten(), method='Powell',
+                                  options={'maxiter': 2000, 'ftol': 1e-12, 'xtol': 1e-12})
+            if -res_powell.fun > best_sum:
+                best_sum = -res_powell.fun
+                centers_best = res_powell.x.reshape(N, 2)
+        except Exception:
+            pass
+            
+    # Phase 4: Full SLSQP polish from best centers
+    radii_best = compute_radii_from_centers(centers_best)
+    v0 = np.zeros(3*N)
+    v0[0::3] = centers_best[:, 0]
+    v0[1::3] = centers_best[:, 1]
+    v0[2::3] = radii_best * 0.99
+    v_res, _, _ = run_slsqp(v0, bounds, maxiter=4000)
+    curr_sum = -np.sum(v_res[2::3])
+    if curr_sum > best_sum:
+        best_sum = curr_sum
+        best_v = v_res.copy()
+        
+    # Phase 5: Basin hopping / Perturbation refinement
+    for _ in range(50):
+        pert_v = best_v.copy()
+        pert_v[0::3] += np.random.normal(0, 0.001, N)
+        pert_v[1::3] += np.random.normal(0, 0.001, N)
+        pert_v[0::3] = np.clip(pert_v[0::3], 0.01, 0.99)
+        pert_v[1::3] = np.clip(pert_v[1::3], 0.01, 0.99)
+        v_res, _, _ = run_slsqp(pert_v, bounds, maxiter=2000)
+        curr_sum = -np.sum(v_res[2::3])
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_v = v_res.copy()
+            
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:].copy()
+    radii = repair_and_validate(centers, radii)
+    final_sum = float(np.sum(radii))
+    
+    return centers, radii, final_sum
+```

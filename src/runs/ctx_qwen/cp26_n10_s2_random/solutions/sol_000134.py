@@ -1,0 +1,193 @@
+# sol_000134 | problem=circle_packing_26 entrypoint=run_packing
+# generation=6 parent=sol_000124 (state e4120b9c) state=481e06aa sum of radii=2.215614 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+N = 26
+
+def solve_lp_and_grad(centers):
+    """
+    Solves LP to maximize sum of radii for fixed centers,
+    and returns the gradient of the optimal objective w.r.t centers.
+    """
+    n = centers.shape[0]
+    # Upper bounds from distance to square boundaries
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    # Pairwise distances
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dists, 0.0)
+    
+    # LP: min -sum(r)  s.t.  r_i + r_j <= dists[i,j],  r_i <= ub[i],  r >= 0
+    num_pairs = n*(n-1)//2
+    A_ub = np.zeros((num_pairs + n, n))
+    b_ub = np.zeros(num_pairs + n)
+    
+    pair_idx = []
+    idx = 0
+    for i in range(n):
+        for j in range(i+1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            pair_idx.append((i, j))
+            idx += 1
+            
+    for i in range(n):
+        A_ub[idx, i] = 1.0
+        b_ub[idx] = ub[i]
+        idx += 1
+        
+    res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)]*n, method='highs')
+    
+    if not res.success:
+        return 0.0, np.zeros(n), np.zeros((n, 2))
+        
+    radii = res.x
+    total_sum = -res.fun
+    grad = np.zeros((n, 2))
+    
+    # Compute gradient using LP dual variables (marginals)
+    m = res.ineqlin.marginals
+    idx = 0
+    for i, j in pair_idx:
+        lam = -m[idx]  # Sensitivity w.r.t. distance constraint
+        if lam > 1e-8:
+            d = dists[i, j]
+            if d > 1e-8:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        idx += 1
+        
+    for i in range(n):
+        mu = -m[idx]  # Sensitivity w.r.t. boundary constraint
+        if mu > 1e-8:
+            x, y = centers[i]
+            # Direction of increasing boundary distance
+            if x <= 1e-7: grad[i, 0] += mu
+            elif x >= 1.0 - 1e-7: grad[i, 0] -= mu
+            elif y <= 1e-7: grad[i, 1] += mu
+            elif y >= 1.0 - 1e-7: grad[i, 1] -= mu
+        idx += 1
+        
+    return total_sum, radii, grad
+
+def optimize_start(centers, rng):
+    """Gradient ascent on centers to maximize sum of radii."""
+    best_c = centers.copy()
+    best_s = 0.0
+    lr = 0.02
+    
+    for step in range(250):
+        s, _, g = solve_lp_and_grad(best_c)
+        best_s = max(best_s, s)
+        
+        g_norm = np.linalg.norm(g)
+        if g_norm < 1e-10:
+            break
+            
+        # Adaptive step size
+        step_size = lr * min(1.0, g_norm)
+        best_c += step_size * (g / g_norm)
+        best_c = np.clip(best_c, 1e-5, 1.0 - 1e-5)
+        
+        # Occasional random jitter to escape plateaus
+        if step % 60 == 0:
+            best_c += rng.normal(0, 0.003, (N, 2))
+            best_c = np.clip(best_c, 0.02, 0.98)
+            
+        lr *= 0.99
+        
+    return best_c, best_s
+
+def generate_hex(pat, r0=0.095):
+    """Generates a hexagonal lattice configuration from a row-count pattern."""
+    pts = []
+    y = r0
+    row = 0
+    for cnt in pat:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        for _ in range(cnt):
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += r0 * np.sqrt(3)
+        row += 1
+    return np.array(pts[:N])
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_sum = 0.0
+    
+    # Diverse hexagonal patterns summing to 26
+    patterns = [
+        [5,6,5,6,4], [6,5,6,5,4], [5,5,5,5,6], [4,6,6,6,4],
+        [6,6,5,5,4], [5,4,6,5,6], [4,5,6,6,5], [5,5,6,5,5],
+        [6,4,6,5,5], [5,6,4,5,6], [4,5,5,6,6]
+    ]
+    
+    starts = []
+    for p in patterns:
+        starts.append(generate_hex(p))
+        
+    # Random starts
+    for _ in range(20):
+        starts.append(rng.uniform(0.05, 0.95, (N, 2)))
+        
+    # Force-repulsion spread start
+    c = rng.uniform(0.2, 0.8, (N, 2))
+    for _ in range(800):
+        forces = np.zeros_like(c)
+        diff = c[:, None, :] - c[None, :, :]
+        d = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(d, 1.0)
+        f = diff / (d[:, :, None]**2)
+        forces += f.sum(axis=1)
+        c += 0.001 * forces
+        c = np.clip(c, 0.05, 0.95)
+    starts.append(c)
+    
+    # Optimize each start
+    for init_c in starts:
+        c_pert = init_c + rng.normal(0, 0.005, (N, 2))
+        c_pert = np.clip(c_pert, 0.02, 0.98)
+        
+        opt_c, opt_s = optimize_start(c_pert, rng)
+        if opt_s > best_sum:
+            best_sum = opt_s
+            best_c = opt_c.copy()
+            
+    # Exact LP solve for final radii
+    _, radii, _ = solve_lp_and_grad(best_c)
+    
+    # Strict numerical repair to guarantee validation tolerances
+    for _ in range(60):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.linalg.norm(best_c[i] - best_c[j])
+                if d < radii[i] + radii[j] - 1e-10:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            x, y, r = best_c[i, 0], best_c[i, 1], radii[i]
+            max_r = min(x, 1.0-x, y, 1.0-y)
+            if r > max_r + 1e-10:
+                radii[i] = max_r
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return best_c, radii, float(np.sum(radii))

@@ -1,0 +1,196 @@
+# sol_000162 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000086 (state e307a773) state=199cb654 sum of radii=2.625313 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and squared non-overlap."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    # Boundary constraints
+    c_bound = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    dist_sq = dx**2 + dy**2
+    r_sum_sq = (r[PAIR_I] + r[PAIR_J])**2
+    
+    return np.concatenate([c_bound, dist_sq - r_sum_sq])
+
+def make_feasible(v):
+    """Adjusts radii to guarantee strict feasibility for a given center configuration."""
+    x = v[:N].copy()
+    y = v[N:2*N].copy()
+    r = v[2*N:].copy()
+    
+    # Enforce boundary constraints
+    r = np.minimum(r, np.minimum(x, 1.0 - x))
+    r = np.minimum(r, np.minimum(y, 1.0 - y))
+    
+    # Enforce non-overlap iteratively
+    for _ in range(15):
+        dx = x[PAIR_I] - x[PAIR_J]
+        dy = y[PAIR_I] - y[PAIR_J]
+        d = np.sqrt(dx**2 + dy**2)
+        overlap = (r[PAIR_I] + r[PAIR_J]) - d
+        
+        if np.max(overlap) < 1e-9:
+            break
+            
+        shrink = np.maximum(0.0, overlap) / 2.0 + 1e-9
+        r[PAIR_I] = np.maximum(0.0, r[PAIR_I] - shrink)
+        r[PAIR_J] = np.maximum(0.0, r[PAIR_J] - shrink)
+        
+    return np.concatenate([x, y, r])
+
+def generate_initial_configs():
+    """Generates a diverse set of high-quality initial configurations."""
+    configs = []
+    np.random.seed(42)
+    
+    # 1. Hexagonal lattice variations
+    patterns = [[6,5,6,5,4], [5,6,5,6,4], [4,6,6,6,4], [7,5,5,5,4], [6,6,5,5,4]]
+    for pat in patterns:
+        for sp in np.linspace(0.085, 0.115, 7):
+            for ang in [0.0, 0.15, 0.3, -0.15, -0.3]:
+                pts = []
+                y = sp
+                row = 0
+                for count in pat:
+                    x_start = sp if row % 2 == 0 else 2.0 * sp
+                    for _ in range(count):
+                        pts.append([x_start, y])
+                        x_start += 2.0 * sp
+                    y += np.sqrt(3) * sp
+                    row += 1
+                pts = np.array(pts[:N])
+                if len(pts) < N:
+                    continue
+                    
+                # Rotate around center
+                if ang != 0.0:
+                    c, s = np.cos(ang), np.sin(ang)
+                    pts -= pts.mean(axis=0)
+                    pts = pts @ np.array([[c, -s], [s, c]])
+                    pts += pts.mean(axis=0)
+                
+                # Normalize to fit comfortably inside [0.05, 0.95]
+                pts_min = pts.min(axis=0)
+                pts_max = pts.max(axis=0)
+                spread = pts_max - pts_min + 1e-9
+                pts = (pts - pts_min) / spread * 0.85 + 0.075
+                pts = np.clip(pts, 0.05, 0.95)
+                
+                configs.append(np.concatenate([pts[:,0], pts[:,1], np.full(N, 0.04)]))
+                
+    # 2. Corner-focused placements
+    for seed in range(10):
+        np.random.seed(seed + 1000)
+        c_corners = np.array([[0.14, 0.14], [0.86, 0.14], [0.14, 0.86], [0.86, 0.86]])
+        c_rest = np.random.uniform(0.25, 0.75, (N-4, 2))
+        pts = np.vstack([c_corners, c_rest])
+        configs.append(np.concatenate([pts[:,0], pts[:,1], np.full(N, 0.03)]))
+        
+    # 3. Random dense scatter
+    for seed in range(15):
+        np.random.seed(seed + 2000)
+        pts = np.random.uniform(0.1, 0.9, (N, 2))
+        configs.append(np.concatenate([pts[:,0], pts[:,1], np.full(N, 0.025)]))
+        
+    return configs
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-5, 0.35)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    configs = generate_initial_configs()
+    
+    # Phase 1: Multi-start optimization
+    for x0 in configs:
+        x0 = make_feasible(x0)
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 10000, 'ftol': 1e-12, 'disp': False})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                # Accept if sufficiently feasible
+                if np.min(constraints(res.x)) >= -1e-6:
+                    best_sum = curr_sum
+                    best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_v is None:
+        best_v = make_feasible(configs[0])
+        
+    # Phase 2: Perturbation & Refinement to escape local minima
+    curr_v = best_v.copy()
+    for step in range(40):
+        pert = curr_v.copy()
+        # Perturb centers
+        pert[:2*N] += np.random.uniform(-0.003, 0.003, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        # Shrink radii to guarantee feasibility after perturbation
+        pert[2*N:] *= 0.95
+        pert = make_feasible(pert)
+        
+        try:
+            res = minimize(objective, pert, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-12, 'disp': False})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                if np.min(constraints(res.x)) >= -1e-6:
+                    best_sum = curr_sum
+                    best_v = res.x.copy()
+                    curr_v = best_v.copy()
+        except Exception:
+            continue
+            
+    # Extract results
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Phase 3: Strict post-processing to guarantee validator compliance
+    # 1. Enforce boundary constraints strictly
+    for i in range(N):
+        cr[i] = min(cr[i], centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+        
+    # 2. Enforce non-overlap strictly with iterative shrinkage
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if cr[i] + cr[j] > d - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    return centers, cr, float(np.sum(cr))

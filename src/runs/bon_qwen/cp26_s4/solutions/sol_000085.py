@@ -1,0 +1,135 @@
+# sol_000085 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state aba87625) state=90e55cb3 sum of radii=2.590808 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+N_CIRCLES = 26
+
+def compute_constraints(v):
+    """
+    Compute all inequality constraints for the packing problem.
+    Returns an array where each element must be >= 0.
+    """
+    centers = v[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = v[2*N_CIRCLES:]
+    
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    # x - r >= 0, 1 - x - r >= 0, same for y
+    bnd = np.concatenate([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ])
+    
+    # Overlap constraints: distance squared >= (r_i + r_j)^2
+    i, j = np.tril_indices(N_CIRCLES, -1)
+    dx = centers[i, 0] - centers[j, 0]
+    dy = centers[i, 1] - centers[j, 1]
+    dist_sq = dx**2 + dy**2
+    r_sum = radii[i] + radii[j]
+    overlap = dist_sq - r_sum**2
+    
+    return np.concatenate([bnd, overlap])
+
+def objective(v):
+    """Objective function: minimize negative sum of radii"""
+    return -np.sum(v[2*N_CIRCLES:])
+
+def relax_initial_positions(iterations=200):
+    """
+    Place points in a grid and relax them using repulsive forces
+    to achieve a well-spread initial configuration.
+    """
+    cols = int(math.ceil(math.sqrt(N_CIRCLES)))
+    rows = int(math.ceil(N_CIRCLES / cols))
+    pts = np.zeros((N_CIRCLES, 2))
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            if idx >= N_CIRCLES:
+                break
+            pts[idx, 0] = (c + 0.5) / cols
+            pts[idx, 1] = (r + 0.5) / rows
+            idx += 1
+        if idx >= N_CIRCLES:
+            break
+            
+    step_size = 0.025
+    for _ in range(iterations):
+        forces = np.zeros_like(pts)
+        for i in range(N_CIRCLES):
+            for j in range(i+1, N_CIRCLES):
+                diff = pts[i] - pts[j]
+                dist = np.linalg.norm(diff)
+                if dist < 0.001:
+                    dist = 0.001
+                # Inverse-square repulsion
+                repulsion = 0.01 / (dist**2)
+                dir_vec = diff / dist
+                forces[i] += dir_vec * repulsion
+                forces[j] -= dir_vec * repulsion
+                
+        pts += forces * step_size
+        pts = np.clip(pts, 0.02, 0.98)
+        step_size *= 0.97
+        
+    return pts
+
+def run_packing():
+    # 1. Initial placement via force relaxation
+    centers_init = relax_initial_positions()
+    
+    # 2. Compute a strictly feasible initial radius
+    min_dist = 2.0
+    for i in range(N_CIRCLES):
+        d_bnd = min(centers_init[i, 0], 1.0 - centers_init[i, 0], 
+                    centers_init[i, 1], 1.0 - centers_init[i, 1])
+        if d_bnd < min_dist:
+            min_dist = d_bnd
+        for j in range(i+1, N_CIRCLES):
+            d = np.linalg.norm(centers_init[i] - centers_init[j])
+            if d < min_dist:
+                min_dist = d
+                
+    r_init = max(0.01, min_dist / 2.0 - 0.005)
+    radii_init = np.full(N_CIRCLES, r_init)
+    
+    vars_init = np.concatenate([centers_init.flatten(), radii_init])
+    
+    # 3. Setup optimization
+    bounds = [(0.0, 1.0)] * (2*N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+    cons = [{'type': 'ineq', 'fun': compute_constraints}]
+    
+    res = minimize(objective, vars_init, method='SLSQP', 
+                   bounds=bounds, constraints=cons,
+                   options={'maxiter': 3000, 'ftol': 1e-10, 'disp': False})
+                   
+    best_centers = res.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+    best_radii = res.x[2*N_CIRCLES:]
+    
+    # 4. Post-processing for strict validity against numerical drift
+    best_radii = np.maximum(best_radii, 1e-7)
+    
+    # Enforce boundary constraints strictly
+    for i in range(N_CIRCLES):
+        x, y = best_centers[i]
+        r = best_radii[i]
+        best_radii[i] = min(r, x, 1.0-x, y, 1.0-y)
+        
+    # Enforce non-overlap strictly
+    for i in range(N_CIRCLES):
+        for j in range(i+1, N_CIRCLES):
+            dist = np.linalg.norm(best_centers[i] - best_centers[j])
+            required = best_radii[i] + best_radii[j]
+            if dist < required:
+                scale = (dist / required) * 0.99995
+                best_radii[i] *= math.sqrt(scale)
+                best_radii[j] *= math.sqrt(scale)
+                
+    return best_centers, best_radii, float(np.sum(best_radii))

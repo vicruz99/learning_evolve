@@ -1,0 +1,413 @@
+# sol_000139 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 24d569ae) state=9604fc42 sum of radii=2.510754 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def run_packing():
+    n_circles = 26
+    
+    # Helper to compute gradient of the objective function
+    # Objective: minimize -sum(radii) -> gradient is 0 for x,y, -1 for r
+    def objective_grad(params):
+        grad = np.zeros_like(params)
+        # params layout: [x0, y0, r0, x1, y1, r1, ...]
+        # r indices are 2, 5, 8, ...
+        for i in range(n_circles):
+            grad[i*3 + 2] = -1.0
+        return grad
+
+    # Helper to compute value and gradient of boundary constraints
+    # Constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    # Converted to: x - r >= 0, 1 - x - r >= 0, etc.
+    def boundary_constraints(params):
+        con = []
+        jac = []
+        for i in range(n_circles):
+            idx_x = i*3
+            idx_y = i*3 + 1
+            idx_r = i*3 + 2
+            
+            x = params[idx_x]
+            y = params[idx_y]
+            r = params[idx_r]
+            
+            # 1. x - r >= 0
+            con.append({'type': 'ineq', 'fun': lambda p, i=i: p[i*3] - p[i*3+2], 
+                        'jac': lambda p, i=i: np.array([1, 0, -1] if j==i else np.zeros(3) for j in range(n_circles)).flatten()})
+            # 2. 1 - x - r >= 0
+            con.append({'type': 'ineq', 'fun': lambda p, i=i: 1 - p[i*3] - p[i*3+2], 
+                        'jac': lambda p, i=i: np.array([-1, 0, -1] if j==i else np.zeros(3) for j in range(n_circles)).flatten()})
+            # 3. y - r >= 0
+            con.append({'type': 'ineq', 'fun': lambda p, i=i: p[i*3+1] - p[i*3+2], 
+                        'jac': lambda p, i=i: np.array([0, 1, -1] if j==i else np.zeros(3) for j in range(n_circles)).flatten()})
+            # 4. 1 - y - r >= 0
+            con.append({'type': 'ineq', 'fun': lambda p, i=i: 1 - p[i*3+1] - p[i*3+2], 
+                        'jac': lambda p, i=i: np.array([0, -1, -1] if j==i else np.zeros(3) for j in range(n_circles)).flatten()})
+        return con, jac
+
+    # Helper to compute value and gradient of overlap constraints
+    # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+    def overlap_constraints(params):
+        con = []
+        # We can compute jacobian analytically
+        # dg/dx_i = 2(xi - xj)
+        # dg/dx_j = -2(xi - xj)
+        # dg/dr_i = -2(ri + rj)
+        # dg/dr_j = -2(ri + rj)
+        
+        # To avoid creating too many lambda closures, we implement a function that returns the vector and jacobian
+        # But SLSQP expects list of dicts or functions. 
+        # Given N=26, ~325 constraints. List of dicts is fine.
+        
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                def fun_val(p, i=i, j=j):
+                    dx = p[i*3] - p[j*3]
+                    dy = p[i*3+1] - p[j*3+1]
+                    dr = p[i*3+2] + p[j*3+2]
+                    return dx*dx + dy*dy - dr*dr
+                
+                def jac_vec(p, i=i, j=j):
+                    grad = np.zeros(3 * n_circles)
+                    dx = p[i*3] - p[j*3]
+                    dy = p[i*3+1] - p[j*3+1]
+                    dr = p[i*3+2] + p[j*3+2]
+                    
+                    # i indices
+                    grad[i*3] = 2 * dx
+                    grad[i*3+1] = 2 * dy
+                    grad[i*3+2] = -2 * dr
+                    
+                    # j indices
+                    grad[j*3] = -2 * dx
+                    grad[j*3+1] = -2 * dy
+                    grad[j*3+2] = -2 * dr
+                    return grad
+
+                con.append({'type': 'ineq', 'fun': fun_val, 'jac': jac_vec})
+        return con
+
+    # Generate initial configurations
+    best_result = None
+    best_sum = -np.inf
+
+    # Try a few initializations
+    seeds = [
+        # 1. Grid initialization with slight perturbation
+        lambda: generate_grid_initialization(n_circles, 0.1, noise=0.02),
+        # 2. Random initialization
+        lambda: generate_random_initialization(n_circles),
+        # 3. Hexagonal-like initialization
+        lambda: generate_hex_initialization(n_circles)
+    ]
+
+    # Prepare constraints once (structure doesn't change, but functions capture nothing, so it's safe)
+    # Actually, creating 325+ dicts every time is costly? 
+    # Let's create them once. But the lambda closures capture i, j correctly.
+    # However, creating 430 constraints objects is fine.
+    
+    b_cons, _ = boundary_constraints(np.zeros(3*n_circles))
+    o_cons = overlap_constraints(np.zeros(3*n_circles))
+    all_constraints = b_cons + o_cons
+
+    bounds = [(0, 1)] * n_circles + [(0, 1)] * n_circles + [(0, 0.5)] * n_circles
+
+    for gen_func in seeds:
+        try:
+            x0 = gen_func()
+            res = minimize(objective, x0, method='SLSQP', jac=objective_grad,
+                           bounds=bounds, constraints=all_constraints,
+                           options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+            
+            if res.success:
+                sum_r = -res.fun
+                if sum_r > best_sum:
+                    best_sum = sum_r
+                    best_result = res
+            else:
+                # Even if not successful, check if it improved
+                sum_r = -res.fun
+                if sum_r > best_sum:
+                    best_sum = sum_r
+                    best_result = res
+        except Exception as e:
+            print(f"Optimization error: {e}")
+            continue
+
+    if best_result is None:
+        # Fallback
+        centers = np.zeros((n_circles, 2))
+        radii = np.zeros(n_circles)
+        return centers, radii, 0.0
+
+    params = best_result.x
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    for i in range(n_circles):
+        centers[i, 0] = params[i*3]
+        centers[i, 1] = params[i*3+1]
+        radii[i] = params[i*3+2]
+
+    return centers, radii, sum(radii)
+
+def generate_grid_initialization(n, r_init, noise):
+    params = np.zeros(3 * n)
+    # 5x5 grid is 25, we need 26.
+    # Let's place 25 in a 5x5 grid and 1 in the center or random?
+    # Actually, let's just spread them out.
+    # 6 columns, 5 rows? 30 spots. Pick 26.
+    cols = 6
+    rows = 5
+    x_step = 1.0 / (cols + 1) # padding
+    y_step = 1.0 / (rows + 1)
+    
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            if idx >= n: break
+            x = (c + 1) * x_step
+            y = (r + 1) * y_step
+            params[idx*3] = x + np.random.uniform(-noise, noise)
+            params[idx*3+1] = y + np.random.uniform(-noise, noise)
+            params[idx*3+2] = r_init # Initial radius
+            idx += 1
+    # If we didn't fill all (shouldn't happen with 6x5=30), fill remaining
+    while idx < n:
+        params[idx*3] = np.random.uniform(0.2, 0.8)
+        params[idx*3+1] = np.random.uniform(0.2, 0.8)
+        params[idx*3+2] = r_init
+        idx += 1
+    return params
+
+def generate_random_initialization(n):
+    params = np.zeros(3 * n)
+    for i in range(n):
+        params[i*3] = np.random.uniform(0.2, 0.8)
+        params[i*3+1] = np.random.uniform(0.2, 0.8)
+        params[i*3+2] = 0.05 # Small radius to start valid
+    return params
+
+def generate_hex_initialization(n):
+    params = np.zeros(3 * n)
+    # Hexagonal packing approximation
+    # Row height sqrt(3)/2 * diameter
+    # Let's try to fit in a rectangle
+    r_est = 0.1
+    h = math.sqrt(3)/2 * 2 * r_est
+    w = 2 * r_est
+    
+    y = 0.15
+    row_count = 0
+    idx = 0
+    
+    while idx < n and y + 0.15 <= 1.0:
+        # Determine number of circles in row
+        # If row is odd (0-indexed), maybe fewer?
+        # Standard hex: rows shifted by r
+        offset = (row_count % 2) * r_est
+        
+        # Max x
+        max_x = 1.0 - 0.15
+        x = 0.15 + offset
+        
+        while x + 0.15 <= 1.0 and idx < n:
+            params[idx*3] = x + np.random.uniform(-0.02, 0.02)
+            params[idx*3+1] = y + np.random.uniform(-0.02, 0.02)
+            params[idx*3+2] = r_est
+            x += w
+            idx += 1
+        
+        y += h
+        row_count += 1
+        
+    while idx < n:
+        params[idx*3] = np.random.uniform(0.1, 0.9)
+        params[idx*3+1] = np.random.uniform(0.1, 0.9)
+        params[idx*3+2] = r_est
+        idx += 1
+        
+    return params
+
+def objective(params):
+    # Sum of radii is to be maximized, so we minimize negative sum
+    sum_r = 0.0
+    for i in range(26): # Hardcoded n for speed inside loop if needed, but n_circles is global? No, define locally or pass
+         sum_r += params[i*3 + 2]
+    return -sum_r
+
+# Redefine objective to not depend on global n_circles if possible, but n is fixed 26.
+# Actually, the inner functions in strategy need to be consistent.
+# Let's fix n=26 everywhere for simplicity in the final code block.
+
+# Re-defining the functions cleanly for the final output
+def run_packing():
+    n = 26
+    
+    def objective(params):
+        return -np.sum(params[2::3])
+
+    def objective_grad(params):
+        grad = np.zeros_like(params)
+        grad[2::3] = -1.0
+        return grad
+
+    def create_constraints():
+        constraints = []
+        # Boundary constraints
+        for i in range(n):
+            # x - r >= 0
+            def fun1(p, i=i): return p[i*3] - p[i*3+2]
+            def jac1(p, i=i):
+                g = np.zeros(3*n)
+                g[i*3] = 1.0
+                g[i*3+2] = -1.0
+                return g
+            constraints.append({'type': 'ineq', 'fun': fun1, 'jac': jac1})
+
+            # 1 - x - r >= 0
+            def fun2(p, i=i): return 1.0 - p[i*3] - p[i*3+2]
+            def jac2(p, i=i):
+                g = np.zeros(3*n)
+                g[i*3] = -1.0
+                g[i*3+2] = -1.0
+                return g
+            constraints.append({'type': 'ineq', 'fun': fun2, 'jac': jac2})
+
+            # y - r >= 0
+            def fun3(p, i=i): return p[i*3+1] - p[i*3+2]
+            def jac3(p, i=i):
+                g = np.zeros(3*n)
+                g[i*3+1] = 1.0
+                g[i*3+2] = -1.0
+                return g
+            constraints.append({'type': 'ineq', 'fun': fun3, 'jac': jac3})
+
+            # 1 - y - r >= 0
+            def fun4(p, i=i): return 1.0 - p[i*3+1] - p[i*3+2]
+            def jac4(p, i=i):
+                g = np.zeros(3*n)
+                g[i*3+1] = -1.0
+                g[i*3+2] = -1.0
+                return g
+            constraints.append({'type': 'ineq', 'fun': fun4, 'jac': jac4})
+
+        # Overlap constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                def fun_overlap(p, i=i, j=j):
+                    dx = p[i*3] - p[j*3]
+                    dy = p[i*3+1] - p[j*3+1]
+                    dr = p[i*3+2] + p[j*3+2]
+                    return dx*dx + dy*dy - dr*dr
+                
+                def jac_overlap(p, i=i, j=j):
+                    g = np.zeros(3*n)
+                    dx = p[i*3] - p[j*3]
+                    dy = p[i*3+1] - p[j*3+1]
+                    dr = p[i*3+2] + p[j*3+2]
+                    
+                    g[i*3] = 2*dx
+                    g[i*3+1] = 2*dy
+                    g[i*3+2] = -2*dr
+                    
+                    g[j*3] = -2*dx
+                    g[j*3+1] = -2*dy
+                    g[j*3+2] = -2*dr
+                    return g
+                
+                constraints.append({'type': 'ineq', 'fun': fun_overlap, 'jac': jac_overlap})
+        
+        return constraints
+
+    bounds = [(0, 1)] * n + [(0, 1)] * n + [(0, 0.5)] * n
+    constraints = create_constraints()
+    
+    best_x = None
+    best_val = np.inf
+    
+    # Initialization strategies
+    inits = []
+    
+    # 1. Grid
+    x0 = np.zeros(3*n)
+    for i in range(n):
+        r = 5
+        c = 5
+        xi = i // c
+        yi = i % c
+        x0[i*3] = 0.1 + yi * 0.2
+        x0[i*3+1] = 0.1 + xi * 0.2
+        x0[i*3+2] = 0.09 # Slightly less than 0.1 to be safe
+    inits.append(x0)
+    
+    # 2. Random
+    x0_rand = np.zeros(3*n)
+    np.random.seed(42)
+    for i in range(n):
+        x0_rand[i*3] = np.random.uniform(0.2, 0.8)
+        x0_rand[i*3+1] = np.random.uniform(0.2, 0.8)
+        x0_rand[i*3+2] = 0.02
+    inits.append(x0_rand)
+
+    # 3. Hex-like
+    x0_hex = np.zeros(3*n)
+    r_est = 0.1
+    h = r_est * math.sqrt(3)
+    y = 0.15
+    row = 0
+    idx = 0
+    while idx < n:
+        offset = (row % 2) * r_est
+        x = 0.15 + offset
+        col = 0
+        while x <= 0.85 and idx < n:
+            x0_hex[idx*3] = x
+            x0_hex[idx*3+1] = y
+            x0_hex[idx*3+2] = 0.08
+            x += 2 * r_est
+            col += 1
+            idx += 1
+        y += h
+        row += 1
+    # Fill remaining if any
+    while idx < n:
+        x0_hex[idx*3] = 0.5
+        x0_hex[idx*3+1] = 0.5
+        x0_hex[idx*3+2] = 0.01
+        idx += 1
+    inits.append(x0_hex)
+
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', jac=objective_grad,
+                           bounds=bounds, constraints=constraints,
+                           options={'maxiter': 2000, 'ftol': 1e-10})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_x = res.x
+        except:
+            pass
+
+    if best_x is None:
+        # Fallback to valid trivial solution
+        centers = np.zeros((n, 2))
+        radii = np.zeros(n)
+        for i in range(n):
+            centers[i,0] = 0.5
+            centers[i,1] = 0.5
+            radii[i] = 0.0
+        return centers, radii, 0.0
+
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    for i in range(n):
+        centers[i, 0] = best_x[i*3]
+        centers[i, 1] = best_x[i*3+1]
+        radii[i] = best_x[i*3+2]
+        
+    return centers, radii, sum(radii)

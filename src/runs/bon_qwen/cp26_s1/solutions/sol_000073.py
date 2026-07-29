@@ -1,189 +1,231 @@
 # sol_000073 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state dfef56bb) state=9d6f9f0f sum of radii=1.182398 correctness=1.0
+# generation=0 parent=seed (state ed1177e6) state=c8904ee5 sum of radii=1.780575 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize as opt
+from scipy.optimize import linprog, minimize
 
-def solve_packing(n_circles, max_iter=200, step_size=0.005, n_restarts=10):
+def generate_initial_centers(n):
     """
-    Optimizes circle packing to maximize sum of radii.
+    Generates a staggered hexagonal-like initial guess for n centers.
     """
-    best_centers = None
-    best_radii = None
-    best_sum = -1.0
-
-    # Indices for constraints to map duals back
-    # We will construct the LP inside the loop
+    centers = []
+    # Approximate number of rows
+    # For n=26, we can try a pattern like 6, 5, 6, 5, 4
+    rows = [6, 5, 6, 5, 4]
+    current_n = 0
     
-    for restart in range(n_restarts):
-        # Initialize centers randomly
-        # Place them with some margin to start valid
-        centers = np.random.uniform(0.2, 0.8, size=(n_circles, 2))
+    y_spacing = 1.0 / 6.0
+    y_current = y_spacing # Start a bit away from bottom
+    
+    for i, count in enumerate(rows):
+        x_spacing = 1.0 / (count + 1)
+        # Stagger offset
+        offset = 0.0 if i % 2 == 0 else x_spacing / 2.0
         
-        # Step size for gradient ascent
-        lr = step_size
-        
-        for iteration in range(max_iter):
-            # --- Step 1: Solve LP for Radii ---
-            # Variables: r_0, ..., r_{n-1}
-            # Maximize sum(r_i) => Minimize -sum(r_i)
-            c_obj = -np.ones(n_circles)
-            
-            # Constraints: A_ub @ r <= b_ub
-            # 1. r_i + r_j <= dist(i, j)
-            # 2. r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-            # 3. r_i >= 0 (handled by bounds)
-            
-            m_pairs = n_circles * (n_circles - 1) // 2
-            m_bounds = 4 * n_circles
-            total_constraints = m_pairs + m_bounds
-            
-            A_ub = np.zeros((total_constraints, n_circles))
-            b_ub = np.zeros(total_constraints)
-            
-            # Pairwise distance constraints
-            idx = 0
-            for i in range(n_circles):
-                for j in range(i + 1, n_circles):
-                    dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                    A_ub[idx, i] = 1.0
-                    A_ub[idx, j] = 1.0
-                    b_ub[idx] = dist
-                    idx += 1
-            
-            # Boundary constraints
-            for i in range(n_circles):
-                x, y = centers[i]
-                # r <= x
-                A_ub[idx, i] = 1.0
-                b_ub[idx] = x
-                idx += 1
-                # r <= 1 - x
-                A_ub[idx, i] = 1.0
-                b_ub[idx] = 1.0 - x
-                idx += 1
-                # r <= y
-                A_ub[idx, i] = 1.0
-                b_ub[idx] = y
-                idx += 1
-                # r <= 1 - y
-                A_ub[idx, i] = 1.0
-                b_ub[idx] = 1.0 - y
-                idx += 1
-            
-            # Bounds: r >= 0
-            bounds = [(0, None) for _ in range(n_circles)]
-            
-            # Solve LP
-            try:
-                res = opt.linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-                if not res.success:
-                    # If LP fails, break or reset? 
-                    # Usually shouldn't happen if centers are valid.
-                    break
-                
-                current_radii = res.x
-                current_sum = np.sum(current_radii)
-                
-                # Store best
-                if current_sum > best_sum:
-                    best_sum = current_sum
-                    best_centers = centers.copy()
-                    best_radii = current_radii.copy()
-                
-                # --- Step 2: Update Centers using Dual Variables ---
-                # Dual variables (marginals) correspond to inequality constraints A_ub @ r <= b_ub
-                # Since we minimized -sum(r), the duals relate to the objective increase.
-                # For max problem, duals indicate sensitivity of optimal value to RHS (b_ub).
-                # If b_ub increases (distance increases), objective (sum r) increases.
-                # Dual value y_k >= 0 means increasing b_k by 1 increases obj by y_k.
-                
-                try:
-                    duals = res.ineqlin.marginals
-                except AttributeError:
-                    # Fallback if attribute missing or version issue
-                    duals = np.zeros(total_constraints)
-
-                # Compute gradient for centers
-                grad_centers = np.zeros_like(centers)
-                
-                # Contribution from pairwise constraints
-                idx = 0
-                for i in range(n_circles):
-                    for j in range(i + 1, n_circles):
-                        dual_val = duals[idx]
-                        if dual_val > 1e-9: # Only active constraints matter
-                            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                            if dist > 1e-9:
-                                # Gradient of dist w.r.t centers[i] is (centers[i] - centers[j]) / dist
-                                # Increasing dist increases b_ub, which increases objective by dual_val
-                                # So we want to move centers[i] away from centers[j]
-                                dir_vec = (centers[i] - centers[j]) / dist
-                                grad_centers[i] += dual_val * dir_vec
-                                grad_centers[j] -= dual_val * dir_vec # Move j away from i
-                        idx += 1
-                
-                # Contribution from boundary constraints
-                # Constraints order: x, 1-x, y, 1-y for each i
-                # r <= x => b = x. Gradient of b w.r.t x is 1. 
-                # Increasing x helps. Force in +x direction.
-                # r <= 1-x => b = 1-x. Gradient of b w.r.t x is -1.
-                # Decreasing x helps. Force in -x direction.
-                
-                idx = m_pairs
-                for i in range(n_circles):
-                    # r <= x_i
-                    grad_centers[i, 0] += duals[idx] 
-                    idx += 1
-                    # r <= 1 - x_i
-                    grad_centers[i, 0] -= duals[idx]
-                    idx += 1
-                    # r <= y_i
-                    grad_centers[i, 1] += duals[idx]
-                    idx += 1
-                    # r <= 1 - y_i
-                    grad_centers[i, 1] -= duals[idx]
-                    idx += 1
-                
-                # Normalize gradient to prevent huge steps
-                grad_norm = np.linalg.norm(grad_centers)
-                if grad_norm > 1e-9:
-                    grad_centers = grad_centers / grad_norm
-                
-                # Update centers
-                centers += lr * grad_centers
-                
-                # Project centers to [0, 1]
-                # Actually, strict projection to [0,1] is needed.
-                # But we also need to ensure centers are not "too close" to boundaries if radii are large?
-                # No, the LP handles radii limits. Centers just need to be in [0,1].
-                # However, if center moves outside [0,1], LP might become infeasible or r=0.
-                # Let's clamp centers to [0, 1].
-                centers = np.clip(centers, 0.0, 1.0)
-                
-                # Decay learning rate slightly?
-                # lr *= 0.999 
-                
-            except Exception as e:
-                # If LP fails or other error, stop this restart
+        for j in range(count):
+            if current_n >= n:
                 break
+            x = (j + 1) * x_spacing + offset
+            # Keep within [0,1]
+            x = np.clip(x, 0.1, 0.9)
+            y = y_current
+            centers.append([x, y])
+            current_n += 1
+        y_current += y_spacing * 1.5 # Vertical spacing for staggered rows
+        
+    if len(centers) < n:
+        # Fill remaining randomly if pattern fell short
+        while len(centers) < n:
+            centers.append([np.random.rand(), np.random.rand()])
+            
+    return np.array(centers[:n])
 
-    return best_centers, best_radii, best_sum
+def solve_radii_lp(centers):
+    """
+    Given fixed centers, solve the LP to maximize sum of radii.
+    Maximize sum(r_i)
+    Subject to:
+    r_i >= 0
+    r_i <= x_i
+    r_i <= 1 - x_i
+    r_i <= y_i
+    r_i <= 1 - y_i
+    r_i + r_j <= ||c_i - c_j|| for all i < j
+    """
+    n = centers.shape[0]
+    
+    # Variables: r_0, ..., r_{n-1}
+    # Objective: Maximize sum(r) => Minimize -sum(r)
+    c_obj = -np.ones(n)
+    
+    # Inequality constraints: A_ub @ r <= b_ub
+    # We need to collect all linear constraints.
+    
+    rows_A = []
+    rows_b = []
+    
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        # r_i <= x  => r_i - x <= 0
+        row = np.zeros(n)
+        row[i] = 1.0
+        rows_A.append(row)
+        rows_b.append(x)
+        
+        # r_i <= 1-x => r_i <= 1-x
+        rows_A.append(row)
+        rows_b.append(1.0 - x)
+        
+        # r_i <= y
+        rows_A.append(row)
+        rows_b.append(y)
+        
+        # r_i <= 1-y
+        rows_A.append(row)
+        rows_b.append(1.0 - y)
+        
+    # Pairwise constraints: r_i + r_j <= dist_ij
+    # Precompute distances to avoid recomputing in loop if possible, 
+    # but for n=26 it's fast enough to do on fly or precompute.
+    dists = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            dists[i, j] = d
+            dists[j, i] = d
+            
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            rows_A.append(row)
+            rows_b.append(d)
+            
+    A_ub = np.array(rows_A)
+    b_ub = np.array(rows_b)
+    
+    # Bounds for r_i >= 0
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    # method='highs' is robust
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        return -res.fun, res.x # Return sum of radii and radii
+    else:
+        # Fallback to small radii if LP fails (shouldn't happen)
+        return 0.0, np.zeros(n)
+
+def compute_force_gradient(centers, radii):
+    """
+    Computes a heuristic force to move centers to increase the sum of radii.
+    The idea: if r_i is constrained by neighbor j, moving i away from j helps.
+    Force is sum of vectors pointing away from active constraints.
+    """
+    n = centers.shape[0]
+    forces = np.zeros_like(centers)
+    
+    # Soften tolerance for active constraints
+    tol = 1e-4
+    
+    for i in range(n):
+        # Boundary gradients
+        # If r_i is close to boundary constraint, push away from boundary
+        x, y = centers[i]
+        r = radii[i]
+        
+        # Check lower x
+        if r > x - tol:
+            forces[i, 0] -= 1.0
+        # Check upper x
+        if r > (1.0 - x) - tol:
+            forces[i, 0] += 1.0
+        # Check lower y
+        if r > y - tol:
+            forces[i, 1] -= 1.0
+        # Check upper y
+        if r > (1.0 - y) - tol:
+            forces[i, 1] += 1.0
+            
+        # Pairwise gradients
+        for j in range(n):
+            if i == j: continue
+            # Constraint: r_i + r_j <= dist
+            # If active, force i away from j
+            # Distance
+            diff = centers[i] - centers[j]
+            dist = np.sqrt(np.sum(diff**2))
+            if dist < 1e-9: dist = 1e-9
+            unit_vec = diff / dist
+            
+            if (radii[i] + radii[j]) > dist - tol:
+                # Repel
+                forces[i] += unit_vec
+                
+    return forces
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Main function to run the packing optimization.
+    Packs 26 circles in a unit square to maximize sum of radii.
     """
     n = 26
-    # Use a larger number of iterations and restarts for better solution
-    centers, radii, sum_radii = solve_packing(n, max_iter=300, step_size=0.01, n_restarts=15)
     
-    # Final validation check (optional, but good for safety)
-    # If radii are valid, return. 
-    # Note: The LP ensures r_i + r_j <= dist, so no overlap.
-    # The LP ensures r_i <= dist_to_boundary, so inside square.
+    # 1. Initial Configuration
+    centers = generate_initial_centers(n)
     
-    return centers, radii, float(sum_radii)
+    # 2. Iterative Optimization
+    # We perform a loop of: Solve LP for radii -> Compute Forces -> Update Centers
+    best_sum_r = 0.0
+    best_centers = centers.copy()
+    best_radii = np.zeros(n)
+    
+    # Parameters for optimization
+    lr = 0.01 # Learning rate for position updates
+    max_iter = 200
+    
+    for step in range(max_iter):
+        # Solve for optimal radii given current centers
+        sum_r, radii = solve_radii_lp(centers)
+        
+        if sum_r > best_sum_r:
+            best_sum_r = sum_r
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            
+        # Compute forces to improve positions
+        forces = compute_force_gradient(centers, radii)
+        
+        # Apply forces (Gradient Ascent on sum of radii via position change)
+        # Normalize forces to prevent exploding steps
+        max_f = np.max(np.abs(forces))
+        if max_f > 1e-6:
+            forces = forces / max_f
+            
+        centers += forces * lr
+        
+        # Keep centers strictly inside [0, 1] with some margin to allow radii
+        # But actually centers can be anywhere, LP handles radii limits.
+        # However, to keep radii positive, centers shouldn't be exactly at boundary if radius > 0.
+        # We clip to [epsilon, 1-epsilon]
+        eps = 1e-4
+        centers = np.clip(centers, eps, 1.0 - eps)
+        
+        # Decay learning rate
+        lr *= 0.98
+        
+    # Final verification and cleanup
+    # Ensure radii are valid for the final centers (LP guarantees this, but numerical noise exists)
+    final_sum, final_radii = solve_radii_lp(best_centers)
+    
+    # Sanity check and fix for any tiny violations
+    # If LP was solved correctly, violations shouldn't exist.
+    
+    return best_centers, final_radii, final_sum
+
+# Helper to ensure no closures
+def dummy_helper():
+    pass

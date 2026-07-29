@@ -1,0 +1,217 @@
+# sol_000085 | problem=circle_packing_26 entrypoint=run_packing
+# generation=3 parent=sol_000063 (state 0dfa75ae) state=80b32bc6 sum of radii=2.627564 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+IDX_I, IDX_J = np.triu_indices(N, k=1)
+
+def compute_constraints(vars_flat):
+    """Computes all boundary and non-overlap constraints as >= 0."""
+    x = vars_flat[0::3]
+    y = vars_flat[1::3]
+    r = vars_flat[2::3]
+    
+    c = []
+    # Boundary constraints
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Overlap constraints
+    xi, xj = x[IDX_I], x[IDX_J]
+    yi, yj = y[IDX_I], y[IDX_J]
+    ri, rj = r[IDX_I], r[IDX_J]
+    
+    dx = xi - xj
+    dy = yi - yj
+    dist = np.sqrt(dx*dx + dy*dy)
+    c.append(dist - (ri + rj))
+    
+    return np.concatenate(c)
+
+def compute_objective(vars_flat):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars_flat[2::3])
+
+def get_bounds():
+    """Returns variable bounds for x, y in [0,1] and r in [1e-6, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)])
+    return b
+
+def make_init_from_centers(centers, scale=0.90):
+    """Assigns feasible initial radii to centers based on distances."""
+    rs = np.zeros(N)
+    for i in range(N):
+        d_bound = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        d_neighbor = np.inf
+        for j in range(N):
+            if i != j:
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < d_neighbor:
+                    d_neighbor = d
+        rs[i] = min(d_bound, d_neighbor / 2.0) * scale
+        
+    v = np.zeros(3 * N)
+    v[0::3] = centers[:, 0]
+    v[1::3] = centers[:, 1]
+    v[2::3] = rs
+    return v
+
+def generate_hex_init(seed, scale=0.90):
+    """Generates initial configuration from a perturbed hexagonal lattice."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    patterns = [[5,5,5,5,5,1], [6,5,6,5,4], [5,6,5,6,4], [5,5,6,5,5], [4,6,6,6,4], [6,6,5,5,4], [5,5,5,6,5], [4,5,6,5,6]]
+    pat = patterns[seed % len(patterns)]
+    
+    y = 0.08
+    dy = 0.14
+    dx = 0.16
+    row_idx = 0
+    for count in pat:
+        shift = (0.5 if row_idx % 2 == 1 else 0.0) * dx
+        x = 0.08 + shift
+        for _ in range(count):
+            centers.append([x + rng.uniform(-0.005, 0.005), y + rng.uniform(-0.005, 0.005)])
+            x += dx
+        y += dy
+        row_idx += 1
+        
+    centers = np.array(centers[:N])
+    return make_init_from_centers(centers, scale)
+
+def generate_random_init(seed, scale=0.90):
+    """Generates initial configuration using rejection sampling."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    attempts = 0
+    while len(centers) < N and attempts < 5000:
+        pt = rng.uniform(0.1, 0.9, 2)
+        ok = True
+        for c in centers:
+            if np.hypot(pt[0]-c[0], pt[1]-c[1]) < 0.15:
+                ok = False
+                break
+        if ok:
+            centers.append(pt)
+        attempts += 1
+        
+    while len(centers) < N:
+        centers.append(rng.uniform(0.1, 0.9, 2))
+        
+    return make_init_from_centers(np.array(centers[:N]), scale)
+
+def run_packing():
+    np.random.seed(42)
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_v = None
+    best_val = -np.inf
+    
+    # Phase 1: Multi-start optimization with diverse configurations
+    inits = []
+    for i in range(30):
+        inits.append(generate_hex_init(i))
+    for i in range(20):
+        inits.append(generate_random_init(i))
+        
+    for x0 in inits:
+        try:
+            res = minimize(compute_objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-6):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        best_v = inits[0]
+        
+    # Phase 2: Sequential Expansion
+    # Iteratively grow radii and re-optimize positions to push density limits
+    curr_v = best_v.copy()
+    for step in range(80):
+        # Adaptive expansion factor that decays over time
+        factor = 1.0 + 0.003 * (1.0 - step / 80.0)
+        curr_v[2::3] *= factor
+        
+        try:
+            res = minimize(compute_objective, curr_v, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-6):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_v = res.x.copy()
+                curr_v = res.x.copy()
+            else:
+                # If infeasible, backtrack radii slightly and perturb centers to escape
+                curr_v[2::3] /= 1.01
+                curr_v[0::3] += np.random.normal(0, 0.002, N)
+                curr_v[1::3] += np.random.normal(0, 0.002, N)
+                curr_v[0::3] = np.clip(curr_v[0::3], 0.01, 0.99)
+                curr_v[1::3] = np.clip(curr_v[1::3], 0.01, 0.99)
+        except Exception:
+            pass
+            
+    # Phase 3: Perturbation Refinement (Basin Hopping)
+    for _ in range(40):
+        pert_v = best_v.copy()
+        pert_v[0::3] += np.random.normal(0, 0.001, N)
+        pert_v[1::3] += np.random.normal(0, 0.001, N)
+        pert_v[0::3] = np.clip(pert_v[0::3], 0.01, 0.99)
+        pert_v[1::3] = np.clip(pert_v[1::3], 0.01, 0.99)
+        
+        try:
+            res = minimize(compute_objective, pert_v, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
+            if np.all(compute_constraints(res.x) >= -1e-6):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Extract final centers and radii
+    centers = best_v.reshape(N, 3)[:, :2]
+    radii = best_v.reshape(N, 3)[:, 2].copy()
+    
+    # Phase 4: Deterministic Repair for Strict Validation Compliance
+    for _ in range(20):
+        changed = False
+        # Clamp to boundaries
+        for i in range(N):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            if r > max_r + 1e-9:
+                radii[i] = max_r
+                changed = True
+                
+        # Resolve overlaps by proportional shrinking
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    overlap = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= overlap
+                    radii[j] -= overlap
+                    changed = True
+                    
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))

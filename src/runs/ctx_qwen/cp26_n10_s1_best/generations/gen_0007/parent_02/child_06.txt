@@ -1,0 +1,267 @@
+
+
+<strategy>
+The previous approaches relied heavily on SLSQP optimizing both centers and radii simultaneously. This often gets trapped in local minima because the squared-distance constraints create a highly non-convex landscape. 
+
+To break through the ~2.634 barrier, I will decouple the problem:
+1. **LP-Radii Subproblem**: For any fixed set of centers, finding the radii that maximize $\sum r_i$ is a linear program (constraints: $r_i + r_j \le \|c_i - c_j\|$ and boundary limits). This can be solved exactly and efficiently using `scipy.optimize.linprog`.
+2. **Center Optimization**: We treat the maximum sum of radii as a black-box objective function of the centers. We optimize centers using `Powell`'s method, which is robust for derivative-free, multi-modal landscapes.
+3. **Local Hill-Climbing**: After finding a good configuration, we perform iterative random moves of individual circles, accepting only moves that improve the LP-derived sum of radii. This helps escape flat regions and symmetries.
+4. **SLSQP Polish**: Finally, we feed the best found (centers, radii) into SLSQP to micro-adjust and satisfy strict boundary/contact tolerances.
+
+This hybrid approach leverages exact LP solving for radii while using global/local search techniques on the continuous center space, significantly improving the chance of finding denser packings.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, Powell
+
+N = 26
+
+# Precompute LP constraint matrix A_ub
+# Constraints: r_i <= bound_i (N constraints), r_i + r_j <= dist_ij (N*(N-1)/2 constraints)
+def get_lp_matrix():
+    n_ineq = N + N * (N - 1) // 2
+    A = np.zeros((n_ineq, N))
+    idx = 0
+    for i in range(N):
+        A[idx, i] = 1.0
+        idx += 1
+    for i in range(N):
+        for j in range(i + 1, N):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            idx += 1
+    return A
+
+A_LP = get_lp_matrix()
+LP_BOUNDS = [(0.0, None)] * N
+LP_C_OBJ = -np.ones(N)
+
+def solve_lp_radii(centers):
+    """Solves LP to maximize sum of radii given fixed centers."""
+    n_ineq = N + N * (N - 1) // 2
+    b = np.zeros(n_ineq)
+    
+    idx = 0
+    for i in range(N):
+        x, y = centers[i]
+        b[idx] = min(x, 1.0 - x, y, 1.0 - y)
+        idx += 1
+        
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            b[idx] = np.hypot(dx, dy)
+            idx += 1
+            
+    try:
+        res = linprog(LP_C_OBJ, A_ub=A_LP, b_ub=b, bounds=LP_BOUNDS, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return None
+
+def eval_sum_radii(c_flat):
+    """Objective for center optimization: negative sum of radii from LP."""
+    centers = c_flat.reshape(N, 2)
+    centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    r = solve_lp_radii(centers)
+    if r is not None:
+        return -np.sum(r), r
+    return 1e9, None
+
+def optimize_centers(c_init, maxiter=800):
+    """Optimize centers using Powell to maximize sum of radii."""
+    c_flat = c_init.flatten()
+    
+    def obj(x):
+        val, _ = eval_sum_radii(x)
+        return val
+        
+    try:
+        res = minimize(obj, c_flat, method='Powell', 
+                       options={'maxiter': maxiter, 'xtol': 1e-10, 'ftol': 1e-12})
+        best_c = res.x.reshape(N, 2)
+        best_r = solve_lp_radii(best_c)
+        return best_c, best_r
+    except Exception:
+        return None, None
+
+def hex_init(r0, angle, scale=1.0):
+    """Generates a hexagonal lattice initialization."""
+    centers = np.zeros((N, 2))
+    idx = 0
+    y = r0 * scale
+    row = 0
+    while idx < N and y + r0 * scale <= 1.0:
+        x = r0 * scale if row % 2 == 0 else 2.0 * r0 * scale
+        while idx < N and x + r0 * scale <= 1.0:
+            centers[idx] = [x, y]
+            idx += 1
+            x += 2.0 * r0 * scale
+        y += np.sqrt(3.0) * r0 * scale
+        row += 1
+    while idx < N:
+        centers[idx] = np.random.uniform(0.1, 0.9, 2)
+        idx += 1
+        
+    if angle != 0.0:
+        c, s = np.cos(angle), np.sin(angle)
+        cx, cy = 0.5, 0.5
+        dx = centers[:, 0] - cx
+        dy = centers[:, 1] - cy
+        centers[:, 0] = dx * c - dy * s + cx
+        centers[:, 1] = dx * s + dy * c + cy
+        
+    return centers
+
+def force_init(seed, steps=300):
+    """Force-directed layout initialization."""
+    np.random.seed(seed)
+    pts = np.random.uniform(0.15, 0.85, (N, 2))
+    for step in range(steps):
+        f = np.zeros_like(pts)
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pts[j] - pts[i]
+                d = np.hypot(dx[0], dx[1])
+                if d < 0.3 and d > 1e-5:
+                    rep = 0.02 / (d**2 + 0.001)
+                    f[i] -= rep * dx
+                    f[j] += rep * dx
+            for dim in range(2):
+                if pts[i, dim] < 0.15:
+                    f[i, dim] += 0.06
+                elif pts[i, dim] > 0.85:
+                    f[i, dim] -= 0.06
+        lr = 0.05 * (1.0 - step / steps)
+        pts += f * lr
+        pts = np.clip(pts, 0.05, 0.95)
+    return pts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    # Phase 1: Diverse starts with Powell center optimization
+    inits = []
+    for r0 in [0.07, 0.08, 0.09, 0.10, 0.11, 0.12]:
+        for ang in [0.0, 0.15, -0.15, 0.3, -0.3, 0.45, -0.45, 0.6]:
+            inits.append(hex_init(r0, ang))
+            
+    for s in range(12):
+        inits.append(force_init(s))
+        
+    for c_init in inits:
+        try:
+            c_opt, r_opt = optimize_centers(c_init)
+            if r_opt is not None:
+                s_r = np.sum(r_opt)
+                if s_r > best_sum:
+                    best_sum = s_r
+                    best_c = c_opt.copy()
+                    best_r = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local Hill Climbing on Centers
+    if best_c is not None:
+        current_c = best_c.copy()
+        current_r = best_r.copy()
+        current_sum = best_sum
+        
+        for it in range(3000):
+            # Randomly pick a circle to move
+            idx = np.random.randint(N)
+            old_pos = current_c[idx].copy()
+            
+            # Try a few random moves for this circle
+            improved = False
+            for _ in range(5):
+                new_pos = np.random.uniform(0.02, 0.98, 2)
+                current_c[idx] = new_pos
+                
+                new_r = solve_lp_radii(current_c)
+                if new_r is not None:
+                    new_sum = np.sum(new_r)
+                    if new_sum > current_sum:
+                        current_sum = new_sum
+                        current_r = new_r
+                        improved = True
+                        if new_sum > best_sum:
+                            best_sum = new_sum
+                            best_c = current_c.copy()
+                            best_r = current_r.copy()
+                        break
+            if not improved:
+                current_c[idx] = old_pos
+                
+    # Phase 3: SLSQP Polish on full variables (x, y, r)
+    if best_c is not None:
+        x0 = np.zeros(3 * N)
+        x0[0::3] = best_c[:, 0]
+        x0[1::3] = best_c[:, 1]
+        x0[2::3] = best_r
+        
+        def obj_sl(x): return -np.sum(x[2::3])
+        def constr_sl(x):
+            cx, cy, r = x[0::3], x[1::3], x[2::3]
+            c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+            dx = cx[:, None] - cx[None, :]
+            dy = cy[:, None] - cy[None, :]
+            dr = r[:, None] + r[None, :]
+            i_idx, j_idx = np.tril_indices(N, -1)
+            c = np.concatenate([c, dx[i_idx, j_idx]**2 + dy[i_idx, j_idx]**2 - dr[i_idx, j_idx]**2])
+            return c
+            
+        bounds_sl = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+        cons_sl = {'type': 'ineq', 'fun': constr_sl}
+        
+        try:
+            res = minimize(obj_sl, x0, method='SLSQP', bounds=bounds_sl, constraints=cons_sl,
+                           options={'maxiter': 15000, 'ftol': 1e-13})
+            if not np.isnan(res.fun):
+                c_polish = res.x[0::3].reshape(N, 2)
+                r_polish = res.x[2::3]
+                # Re-solve LP to ensure consistency and potentially better radii
+                r_lp = solve_lp_radii(c_polish)
+                if r_lp is not None and np.sum(r_lp) > best_sum:
+                    best_c = c_polish
+                    best_r = r_lp
+                    best_sum = np.sum(r_lp)
+        except Exception:
+            pass
+
+    # Final strict validity adjustment against 1e-12 tolerance
+    for _ in range(100):
+        valid = True
+        for i in range(N):
+            if best_r[i] < 0 or best_c[i, 0] < best_r[i] - 1e-10 or best_c[i, 0] > 1.0 - best_r[i] + 1e-10 or \
+               best_c[i, 1] < best_r[i] - 1e-10 or best_c[i, 1] > 1.0 - best_r[i] + 1e-10:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+                    if d < best_r[i] + best_r[j] - 1e-10:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+            
+        # Minimal shrinkage to recover strict feasibility
+        best_r *= 0.9995
+        best_c[:, 0] = np.clip(best_c[:, 0], best_r, 1.0 - best_r)
+        best_c[:, 1] = np.clip(best_c[:, 1], best_r, 1.0 - best_r)
+        
+    return best_c, best_r, float(np.sum(best_r))
+```

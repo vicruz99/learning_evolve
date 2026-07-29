@@ -1,0 +1,216 @@
+# sol_000140 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 466799c7) state=6ecf23e8 sum of radii=2.586472 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def get_constraints(centers, radii):
+    """
+    Helper to calculate constraint violations.
+    Returns a list of values. For a valid packing, all should be >= 0.
+    """
+    n = len(radii)
+    constraints = []
+    
+    # Box constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+    # x - r >= 0 => x - r
+    # 1 - x - r >= 0
+    # y - r >= 0
+    # 1 - y - r >= 0
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        constraints.append(x - r)
+        constraints.append(1 - x - r)
+        constraints.append(y - r)
+        constraints.append(1 - y - r)
+        
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    # dist^2 - (r_i + r_j)^2 >= 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i][0] - centers[j][0]
+            dy = centers[i][1] - centers[j][1]
+            dist_sq = dx*dx + dy*dy
+            r_sum = radii[i] + radii[j]
+            constraints.append(dist_sq - r_sum*r_sum)
+            
+    return np.array(constraints)
+
+def objective(params):
+    """
+    Objective function to minimize: -sum(radii)
+    params: [x_1...x_n, y_1...y_n, r_1...r_n]
+    """
+    n = 26
+    radii = params[2*n:]
+    return -np.sum(radii)
+
+def constraint_fun_ineq(params):
+    """
+    Returns an array of constraint values >= 0.
+    """
+    n = 26
+    centers_x = params[:n]
+    centers_y = params[n:2*n]
+    radii = params[2*n:]
+    
+    centers = np.column_stack((centers_x, centers_y))
+    
+    # We can compute constraints manually here for speed or call helper
+    # Helper is cleaner but might be slightly slower due to overhead.
+    # Given N=26, overhead is negligible.
+    return get_constraints(centers, radii)
+
+def solve_lp_radii(centers):
+    """
+    Given fixed centers, solve LP to find radii maximizing sum.
+    Maximize sum(r_i) subject to:
+      r_i <= x_i, 1-x_i, y_i, 1-y_i
+      r_i + r_j <= dist(i,j)
+      r_i >= 0
+    """
+    n = centers.shape[0]
+    c_obj = -np.ones(n) # Minimize -sum(r)
+    
+    # Constraints: A_ub @ r <= b_ub
+    A_ub = []
+    b_ub = []
+    
+    # Boundary constraints: 1*r_i <= limit
+    limits = np.zeros((4*n, n))
+    b_limits = np.zeros(4*n)
+    for i in range(n):
+        x, y = centers[i]
+        limits[i, i] = 1.0
+        b_limits[i] = x
+        limits[n+i, i] = 1.0
+        b_limits[n+i] = 1.0 - x
+        limits[2*n+i, i] = 1.0
+        b_limits[2*n+i] = y
+        limits[3*n+i, i] = 1.0
+        b_limits[3*n+i] = 1.0 - y
+    
+    A_ub.append(limits)
+    b_ub.append(b_limits)
+    
+    # Pairwise constraints: r_i + r_j <= dist
+    # Number of pairs
+    num_pairs = n * (n - 1) // 2
+    A_pairs = np.zeros((num_pairs, n))
+    b_pairs = np.zeros(num_pairs)
+    
+    idx = 0
+    dists = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+            dists[i, j] = d
+            A_pairs[idx, i] = 1.0
+            A_pairs[idx, j] = 1.0
+            b_pairs[idx] = d
+            idx += 1
+            
+    A_ub.append(A_pairs)
+    b_ub.append(b_pairs)
+    
+    A_ub_full = np.vstack(A_ub)
+    b_ub_full = np.hstack(b_ub)
+    
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    res = linprog(c_obj, A_ub=A_ub_full, b_ub=b_ub_full, bounds=bounds, method='highs')
+    
+    if res.success:
+        return res.x
+    else:
+        # Fallback to small radii
+        return np.full(n, 0.01)
+
+def run_packing():
+    n = 26
+    
+    # 1. Initialization: 6x5 grid (30 points), remove 4 to get 26
+    # Grid points
+    x_coords = np.linspace(0.1, 0.9, 6) # 6 points
+    y_coords = np.linspace(0.1, 0.9, 5) # 5 points
+    
+    points = []
+    for y in y_coords:
+        for x in x_coords:
+            points.append([x, y])
+            
+    points = np.array(points)
+    # Remove 4 points (e.g., last 4) to get 26
+    # Removing corners might be better, but random is okay for start
+    # Let's just take first 26
+    initial_centers = points[:n]
+    
+    # 2. Solve LP for initial radii
+    initial_radii = solve_lp_radii(initial_centers)
+    
+    # Flatten variables for optimizer
+    # [x_1..x_26, y_1..y_26, r_1..r_26]
+    x0 = np.hstack([initial_centers[:, 0], initial_centers[:, 1], initial_radii])
+    
+    # Bounds
+    # x, y in [0, 1]
+    # r >= 0 (upper bound not strictly needed but 0.5 is safe)
+    bounds = []
+    for _ in range(n):
+        bounds.append((0, 1)) # x
+    for _ in range(n):
+        bounds.append((0, 1)) # y
+    for _ in range(n):
+        bounds.append((0, 0.5)) # r
+        
+    # Constraints for SLSQP (inequality: fun(x) >= 0)
+    cons = {'type': 'ineq', 'fun': constraint_fun_ineq}
+    
+    # 3. Optimize
+    # SLSQP might be slow with many constraints, but for 26 it's manageable.
+    # We can try to run it.
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                   options={'maxiter': 1000, 'ftol': 1e-9})
+    
+    # Extract results
+    best_x = res.x[:n]
+    best_y = res.x[n:2*n]
+    best_r = res.x[2*n:]
+    
+    best_centers = np.column_stack((best_x, best_y))
+    best_radii = best_r
+    
+    sum_radii = np.sum(best_radii)
+    
+    # Validation check (internal)
+    # In a real scenario, we would ensure validity. 
+    # The optimizer should respect constraints, but numerical issues might occur.
+    # We clip radii to be non-negative just in case.
+    best_radii = np.maximum(best_radii, 0)
+    
+    return best_centers, best_radii, sum_radii
+
+# For testing/verification locally (not part of run_packing output logic)
+if __name__ == "__main__":
+    centers, radii, total_r = run_packing()
+    print(f"Sum of radii: {total_r}")
+    # print(f"Radii range: {radii.min()} - {radii.max()}")
+    
+    # Simple validation
+    valid = True
+    for i in range(26):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-7 or x + r > 1 + 1e-7 or y - r < -1e-7 or y + r > 1 + 1e-7:
+            valid = False
+    for i in range(26):
+        for j in range(i+1, 26):
+            dist = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            if dist < radii[i] + radii[j] - 1e-7:
+                valid = False
+    print(f"Valid: {valid}")

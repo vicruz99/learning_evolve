@@ -1,234 +1,256 @@
 
 
+Looking at this circle packing problem, I need to pack 26 circles in a unit square to maximize the sum of radii, targeting 2.636.
+
 <strategy>
-To solve the problem of packing 26 circles in a unit square to maximize the sum of radii, we will employ a two-phase numerical optimization strategy:
+**Key Insights:**
 
-1.  **Initialization (Force-Directed Layout):**
-    *   We start by placing 26 points in the unit square using a randomized grid to ensure good initial coverage.
-    *   We then run a force-directed simulation (repulsion between points and boundary repulsion) for several iterations. This spreads the centers out, maximizing the available space between them.
-    *   Radii are initialized to a small value (e.g., 0.05) to ensure the starting configuration is valid.
+1. **For fixed centers, computing optimal radii is a Linear Program**: The problem becomes: maximize Σr_i subject to boundary constraints (r_i ≤ distance to each edge) and pairwise constraints (r_i + r_j ≤ ||c_i - c_j||).
 
-2.  **Constrained Non-Linear Optimization:**
-    *   We use `scipy.optimize.minimize` with the `SLSQP` (Sequential Least Squares Programming) algorithm, which handles non-linear inequality constraints effectively.
-    *   **Objective:** Maximize $\sum r_i$ (implemented as minimizing $-\sum r_i$).
-    *   **Variables:** The vector consists of all $x, y$ coordinates and all radii ($r_i$).
-    *   **Constraints:**
-        *   **Boundary:** Each circle must be within $[0, 1] \times [0, 1]$, i.e., $r \le x \le 1-r$ and $r \le y \le 1-r$.
-        *   **Non-Overlap:** For every pair of circles $(i, j)$, the distance between centers must be at least the sum of their radii: $\sqrt{(x_i-x_j)^2 + (y_i-y_j)^2} \ge r_i + r_j$. We use the squared form to avoid square roots: $(x_i-x_j)^2 + (y_i-y_j)^2 \ge (r_i + r_j)^2$.
-    *   **Bounds:** Centers are bounded within $[0, 1]$ and radii within $[10^{-6}, 0.5]$.
+2. **Optimizing centers is non-convex**: I'll use Nelder-Mead from multiple starting points, with the LP solved at each evaluation.
 
-3.  **Refinement and Validation:**
-    *   The optimizer pushes radii to the maximum possible values allowed by the geometry.
-    *   We define the `run_packing` function to encapsulate this logic, returning the valid centers, radii, and the sum of radii.
+3. **Good initial arrangements matter**: I'll use hexagonal-like patterns with different row counts (4-6 rows) since hexagonal packing is the densest in 2D.
+
+4. **Varying radii helps**: The LP naturally assigns larger radii to circles with more space, and smaller to cramped ones. Corner circles can be larger.
+
+5. **Multi-start optimization**: Run Nelder-Mead from ~10 different initial configurations to avoid bad local optima.
+
+**Implementation Plan:**
+- `compute_radii()`: Solve LP using scipy's linprog (fast for this size)
+- `hex_init()`: Generate hexagonal initial arrangements  
+- `run_packing()`: Multi-start Nelder-Mead optimization with fallback
+- Use scipy.optimize.linprog with 'highs' method for fast LP solving
+- Clip centers to valid range to avoid infeasible LPs
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, linprog
 
-def run_packing():
+
+def compute_radii(centers):
+    """Compute optimal radii for given centers using LP.
+    
+    Maximizes sum of radii subject to:
+    - Each circle fits in unit square
+    - No two circles overlap
     """
-    Packs 26 circles in a unit square to maximize the sum of radii.
+    n = centers.shape[0]
     
-    Returns:
-        tuple: (centers, radii, sum_radii)
-    """
-    n = 26
+    # Objective: minimize -sum(r_i)  [equivalent to maximize sum(r_i)]
+    c_obj = -np.ones(n)
     
-    # --- Phase 1: Initialization and Force-Directed Layout ---
+    # Build constraint matrix A_ub @ r <= b_ub
+    n_boundary = 4 * n
+    n_pairwise = n * (n - 1) // 2
+    n_total = n_boundary + n_pairwise
     
-    # Initialize centers in a grid-like pattern with some randomness
-    # Using a 6x6 grid points to get 36 potential spots, we pick 26.
-    # Actually, let's just place them in a 5x5 grid plus one extra or similar.
-    # A simple dense grid is a good starting point for repulsion.
+    A = np.zeros((n_total, n))
+    b = np.zeros(n_total)
     
-    # Create a dense grid of points
-    grid_size = 6
-    xs = np.linspace(0.05, 0.95, grid_size)
-    ys = np.linspace(0.05, 0.95, grid_size)
-    grid_points = []
-    for x in xs:
-        for y in ys:
-            grid_points.append([x, y])
-    
-    # We need 26 points. Let's take the first 26 from the 36 grid points.
-    # This gives a fairly uniform distribution.
-    centers = np.array(grid_points[:n])
-    
-    # Initialize radii to a small valid value
-    radii = np.ones(n) * 0.05
-    
-    # Force-directed simulation to spread centers
-    # This helps the optimizer start from a configuration where circles are not overlapping
-    # and have room to grow.
-    n_iters = 500
-    dt = 0.005
-    repulsion_strength = 0.05
-    boundary_stiffness = 0.1
-    
-    current_centers = centers.copy()
-    
-    for _ in range(n_iters):
-        forces = np.zeros_like(current_centers)
-        
-        # Repulsion between circles
-        for i in range(n):
-            for j in range(i + 1, n):
-                diff = current_centers[i] - current_centers[j]
-                dist_sq = np.sum(diff**2)
-                dist = np.sqrt(dist_sq)
-                
-                # Avoid division by zero
-                if dist < 1e-6:
-                    dist = 1e-6
-                    diff = np.random.rand(2) * 1e-6 # Random nudge if exactly same
-                
-                # Repulsive force: F ~ 1/d^2
-                # We want to push them apart if they are too close
-                # "Too close" is subjective, let's say if dist < 0.2
-                if dist < 0.25:
-                    force_mag = repulsion_strength / (dist * dist)
-                    force_vec = (diff / dist) * force_mag
-                    forces[i] += force_vec
-                    forces[j] -= force_vec
-        
-        # Boundary repulsion (keep centers inside [0,1])
-        # If a center is close to boundary, push it in.
-        # We treat boundaries as repulsive walls.
-        margin = 0.05
-        for i in range(n):
-            c = current_centers[i]
-            # Left wall
-            if c[0] < margin:
-                forces[i, 0] += boundary_stiffness * (margin - c[0])
-            # Right wall
-            if c[0] > 1.0 - margin:
-                forces[i, 0] -= boundary_stiffness * (c[0] - (1.0 - margin))
-            # Bottom wall
-            if c[1] < margin:
-                forces[i, 1] += boundary_stiffness * (margin - c[1])
-            # Top wall
-            if c[1] > 1.0 - margin:
-                forces[i, 1] -= boundary_stiffness * (c[1] - (1.0 - margin))
-        
-        # Update positions
-        current_centers += dt * forces
-        
-        # Clamp to valid range [0, 1] just in case
-        current_centers = np.clip(current_centers, 0.0, 1.0)
-        
-    # Update centers with the result of simulation
-    centers = current_centers
-    # Reset radii to small value for the optimizer to scale up
-    radii = np.ones(n) * 0.01
-    
-    # --- Phase 2: Optimization ---
-    
-    # Prepare variables: [x1, y1, r1, x2, y2, r2, ...]
-    # Flattened vector of size 3*n
-    x0 = np.concatenate([centers.flatten(), radii])
-    
-    # Bounds for variables
-    # x, y in [0, 1]
-    # r in [1e-6, 0.5] (radius must be positive, max 0.5)
-    bounds = []
-    for _ in range(n):
-        bounds.append((0.0, 1.0)) # x
-        bounds.append((0.0, 1.0)) # y
-        bounds.append((1e-6, 0.5)) # r
-    
-    # Objective function: Minimize -sum(radii)
-    def objective(vars_flat):
-        r = vars_flat[2::3] # radii are at indices 2, 5, 8...
-        return -np.sum(r)
-    
-    # Constraints
-    # 1. Boundary constraints: 
-    #    x - r >= 0  => r - x <= 0  (Standard form: g(x) <= 0 for inequality in scipy? 
-    #    Wait, scipy minimize constraints:
-    #    type 'ineq' means fun(x) >= 0.
-    #    So we need fun(x) >= 0.
-    #    x - r >= 0
-    #    1 - (x + r) >= 0
-    #    y - r >= 0
-    #    1 - (y + r) >= 0
-    
-    # 2. Overlap constraints:
-    #    dist^2 - (r_i + r_j)^2 >= 0
-    
-    cons = []
-    
-    # Add boundary constraints
+    idx = 0
     for i in range(n):
-        idx_x = 3 * i
-        idx_y = 3 * i + 1
-        idx_r = 3 * i + 2
-        
-        # x - r >= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: v[idx_x] - v[idx_r]
-        })
-        # 1 - x - r >= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: 1.0 - v[idx_x] - v[idx_r]
-        })
-        # y - r >= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: v[idx_y] - v[idx_r]
-        })
-        # 1 - y - r >= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: 1.0 - v[idx_y] - v[idx_r]
-        })
-        
-    # Add overlap constraints
+        x, y = centers[i]
+        # r_i <= x (left boundary)
+        A[idx, i] = 1.0
+        b[idx] = x
+        idx += 1
+        # r_i <= 1 - x (right boundary)
+        A[idx, i] = 1.0
+        b[idx] = 1.0 - x
+        idx += 1
+        # r_i <= y (bottom boundary)
+        A[idx, i] = 1.0
+        b[idx] = y
+        idx += 1
+        # r_i <= 1 - y (top boundary)
+        A[idx, i] = 1.0
+        b[idx] = 1.0 - y
+        idx += 1
+    
     for i in range(n):
         for j in range(i + 1, n):
-            idx_xi = 3 * i
-            idx_yi = 3 * i + 1
-            idx_ri = 3 * i + 2
-            
-            idx_xj = 3 * j
-            idx_yj = 3 * j + 1
-            idx_rj = 3 * j + 2
-            
-            # Constraint: (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
-            cons.append({
-                'type': 'ineq',
-                'fun': lambda v, i=i, j=j: \
-                    (v[idx_xi] - v[idx_xj])**2 + (v[idx_yi] - v[idx_yj])**2 - (v[idx_ri] + v[idx_rj])**2
-            })
-
-    # Run optimization
-    # Method SLSQP is good for constrained non-linear problems
-    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
-                      options={'maxiter': 1000, 'ftol': 1e-9, 'disp': False})
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = dist
+            idx += 1
     
-    if not result.success:
-        # If optimization fails, try to recover or return best found
-        # But usually it converges to a local optimum
-        pass
+    bounds = [(0.0, None)] * n
+    
+    res = linprog(c_obj, A_ub=A, b_ub=b, bounds=bounds, method='highs')
+    
+    if res.success:
+        return np.maximum(res.x, 0.0)
+    else:
+        # Fallback: use boundary distances only
+        radii = np.array([
+            min(x, 1.0 - x, y, 1.0 - y) for x, y in centers
+        ])
+        return np.maximum(radii, 0.0)
+
+
+def neg_sum_radii(params, n=26):
+    """Objective function: negative sum of radii (to be minimized)."""
+    centers = np.array(params, dtype=np.float64).reshape((n, 2))
+    centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    radii = compute_radii(centers)
+    return -np.sum(radii)
+
+
+def hex_init(n, num_rows):
+    """Create a hexagonal-like initial arrangement with given number of rows."""
+    # Distribute n circles across num_rows rows
+    base_count = n // num_rows
+    remainder = n % num_rows
+    
+    counts = [base_count] * num_rows
+    for i in range(remainder):
+        counts[i] += 1
+    
+    positions = []
+    
+    if num_rows == 1:
+        y = 0.5
+        x_spacing = 1.0 / (counts[0] + 1)
+        for j in range(counts[0]):
+            x = x_spacing * (j + 1)
+            positions.append([x, y])
+    else:
+        y_spacing = 0.85 / (num_rows - 1)
         
-    # Extract results
-    final_vars = result.x
-    final_centers = final_vars[:2*n].reshape((n, 2))
-    final_radii = final_vars[2*n:]
+        for i, count in enumerate(counts):
+            if count == 0:
+                continue
+            y = 0.075 + i * y_spacing
+            x_spacing = 0.85 / max(count - 1, 1)
+            x_start = (1.0 - (count - 1) * x_spacing) / 2.0
+            
+            # Stagger odd rows for hexagonal pattern
+            if i % 2 == 1:
+                x_start += x_spacing / 2.0
+            
+            for j in range(count):
+                x = x_start + j * x_spacing
+                positions.append([x, y])
     
-    # Ensure radii are non-negative (clipping)
-    final_radii = np.maximum(final_radii, 0.0)
-    
-    # Ensure centers are within bounds (clipping, though constraints should handle it)
-    final_centers = np.clip(final_centers, 0.0, 1.0)
-    
-    # Calculate sum of radii
-    sum_radii = np.sum(final_radii)
-    
-    return final_centers, final_radii, sum_radii
+    return np.array(positions[:n]).flatten()
 
-# Validation function provided in prompt (for reference, not to be modified)
-# def validate_packing(centers, radii): ...
+
+def grid_init(n, nx, ny):
+    """Create a grid-like initial arrangement."""
+    x_vals = np.linspace(0.12, 0.88, nx)
+    y_vals = np.linspace(0.12, 0.88, ny)
+    
+    positions = []
+    for y in y_vals:
+        for x in x_vals:
+            if len(positions) < n:
+                positions.append([x, y])
+    
+    while len(positions) < n:
+        positions.append([0.5, 0.5])
+    
+    return np.array(positions[:n]).flatten()
+
+
+def random_init(n, seed):
+    """Create a random initial arrangement."""
+    rng = np.random.RandomState(seed)
+    x = rng.uniform(0.15, 0.85, n)
+    y = rng.uniform(0.15, 0.85, n)
+    return np.column_stack([x, y]).flatten()
+
+
+def run_packing():
+    """Pack 26 circles in unit square to maximize sum of radii."""
+    n = 26
+    
+    best_obj = float('inf')
+    best_params = None
+    
+    # Generate diverse initial configurations
+    initial_configs = []
+    
+    # Hexagonal patterns with different row counts
+    for num_rows in [4, 5, 6, 7]:
+        try:
+            initial_configs.append(hex_init(n, num_rows))
+        except Exception:
+            pass
+    
+    # Grid patterns
+    for nx, ny in [(5, 6), (6, 5), (4, 7), (7, 4)]:
+        try:
+            initial_configs.append(grid_init(n, nx, ny))
+        except Exception:
+            pass
+    
+    # Random patterns
+    for seed in [42, 123, 456, 789, 101]:
+        try:
+            initial_configs.append(random_init(n, seed))
+        except Exception:
+            pass
+    
+    # Perturb hex initial configs
+    for i in range(0, len(initial_configs), 2):
+        try:
+            perturbed = initial_configs[i].copy()
+            rng = np.random.RandomState(i * 100)
+            perturbed += rng.normal(0, 0.02, perturbed.shape)
+            perturbed = np.clip(perturbed, 0.05, 0.95)
+            initial_configs.append(perturbed)
+        except Exception:
+            pass
+    
+    # Optimize from each initial configuration
+    for init in initial_configs:
+        if len(init) != 2 * n:
+            continue
+        
+        try:
+            result = minimize(
+                neg_sum_radii,
+                init,
+                args=(n,),
+                method='Nelder-Mead',
+                options={
+                    'maxiter': 20000,
+                    'xatol': 1e-9,
+                    'fatol': 1e-12,
+                    'adaptive': True
+                }
+            )
+            
+            if result.success or result.fun < best_obj:
+                if result.fun < best_obj:
+                    best_obj = result.fun
+                    best_params = result.x.copy()
+        except Exception:
+            continue
+    
+    # If no optimization succeeded, use best initial config
+    if best_params is None:
+        best_obj = float('inf')
+        for init in initial_configs:
+            if len(init) == 2 * n:
+                obj = neg_sum_radii(init, n)
+                if obj < best_obj:
+                    best_obj = obj
+                    best_params = init.copy()
+    
+    # Compute final centers and radii
+    if best_params is not None:
+        centers = np.clip(best_params.reshape((n, 2)), 1e-6, 1.0 - 1e-6)
+    else:
+        centers = hex_init(n, 5).reshape((n, 2))
+        centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    
+    radii = compute_radii(centers)
+    total = np.sum(radii)
+    
+    return centers, radii, total
 ```

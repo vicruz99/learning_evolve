@@ -1,0 +1,256 @@
+# sol_000128 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 873af2c6) state=3be4a162 sum of radii=0.000026 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a physics-based simulation (growing circles) to find a dense packing.
+    """
+    n = 26
+    
+    # Constants for simulation
+    iterations = 5000
+    # Initial small radius
+    r = 0.02 
+    # Growth step per iteration
+    dr = 0.00005 
+    # Repulsion strength
+    k_repulsion = 100.0
+    # Wall repulsion strength
+    k_wall = 200.0
+    # Damping for position updates (momentum)
+    damping = 0.8
+    # Initial step size for movement
+    step_size = 0.01
+    
+    # Set seed for reproducibility
+    np.random.seed(42)
+    
+    # Initialize centers randomly within valid bounds for initial r
+    # Bounds: [r, 1-r]
+    low = r
+    high = 1.0 - r
+    
+    # We place them in a grid first to avoid immediate heavy overlaps
+    # A 5x5 grid is 25, we need 26. 
+    # Let's try a dense random placement but ensure no initial overlaps if possible
+    # Or just random and let simulation fix it.
+    
+    centers = np.random.uniform(low=low, high=high, size=(n, 2))
+    # radii are assumed equal
+    radii = np.full(n, r)
+    
+    # Velocity for momentum
+    velocity = np.zeros((n, 2))
+    
+    # Main simulation loop
+    for step in range(iterations):
+        # Increase radius slightly
+        # We might want to slow down growth as we get denser
+        current_growth = dr
+        # Adaptive growth? Maybe keep constant for simplicity
+        
+        # Update radii
+        radii += current_growth
+        current_r = radii[0] # Assuming equal
+        
+        # Calculate forces
+        forces = np.zeros_like(centers)
+        
+        # 1. Pairwise repulsion
+        # O(n^2) check. n=26 is small (26*25/2 = 325 pairs).
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist_sq = np.dot(diff, diff)
+                dist = np.sqrt(dist_sq)
+                
+                # Minimum distance required
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist and dist > 1e-9:
+                    # Overlap detected
+                    # Force proportional to overlap depth
+                    # Vector direction: diff / dist
+                    overlap = min_dist - dist
+                    force_mag = overlap * k_repulsion
+                    
+                    # Direction from j to i
+                    direction = diff / dist
+                    
+                    forces[i] += direction * force_mag
+                    forces[j] -= direction * force_mag
+                elif dist < 1e-9:
+                    # Coincident centers, push apart randomly
+                    rand_dir = np.random.rand(2) * 2 - 1
+                    rand_dir /= (np.linalg.norm(rand_dir) + 1e-9)
+                    forces[i] += rand_dir * 10.0
+                    forces[j] -= rand_dir * 0.0
+
+        # 2. Boundary repulsion
+        # Check x boundaries
+        # Left wall: x - r < 0 => violation
+        # We want x >= r. If x < r, force right.
+        # If x > 1-r, force left.
+        
+        # Vectorized boundary checks
+        # x
+        x = centers[:, 0]
+        y = centers[:, 1]
+        
+        # Left
+        violation_left = np.maximum(0, current_r - x)
+        forces[:, 0] += violation_left * k_wall
+        
+        # Right
+        violation_right = np.maximum(0, x - (1.0 - current_r))
+        forces[:, 0] -= violation_right * k_wall
+        
+        # Bottom
+        violation_bottom = np.maximum(0, current_r - y)
+        forces[:, 1] += violation_bottom * k_wall
+        
+        # Top
+        violation_top = np.maximum(0, y - (1.0 - current_r))
+        forces[:, 1] -= violation_top * k_wall
+        
+        # Update velocities and positions
+        # Simple Euler integration with damping
+        velocity = velocity * damping + forces * step_size
+        centers += velocity
+        
+        # Ensure centers stay strictly within [0, 1] roughly
+        # Clamp to valid range to prevent explosion if forces are huge
+        # But we want them to respect radius, so clamp to [r, 1-r]
+        # Actually, if they are pushed out by forces, we should clamp them back
+        # But the forces should pull them back in.
+        # Let's clamp just to keep numerical stability.
+        centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+        
+        # Decay step size over time for convergence
+        if step > 1000:
+            step_size *= 0.999
+            
+    # Final cleanup: ensure radii are consistent and valid
+    # If the simulation ended with overlaps, we might need to reduce radii slightly
+    # But we grew them incrementally. If overlaps remain, r is too big.
+    # Let's check validity and shrink if needed.
+    
+    def get_max_valid_r(centers, radii_guess):
+        # Check overlaps with current centers and a specific radius r
+        # This is a helper to find the true max r for the fixed centers
+        # But centers can move.
+        # Let's just check current state.
+        r = radii_guess
+        valid = True
+        # Check boundary
+        for i in range(n):
+            if centers[i, 0] < r - 1e-12 or centers[i, 0] > 1 - r + 1e-12:
+                return False
+            if centers[i, 1] < r - 1e-12 or centers[i, 1] > 1 - r + 1e-12:
+                return False
+        # Check overlaps
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if dist < 2*r - 1e-12:
+                    return False
+        return True
+
+    # The simulation grew radii until forces balanced.
+    # It's possible we are in a state with small overlaps if step size was too high at end.
+    # Let's do a binary search or reduction to find a valid packing from the current centers?
+    # No, centers should be adjusted during simulation.
+    # However, the 'growing' approach maintains validity if dt is small enough.
+    # Since we used forces, we might have slight violations.
+    # Let's compute the actual minimum gap and scale radii down if needed.
+    
+    # Calculate minimum distance between any pair and to boundaries
+    min_dist = float('inf')
+    
+    # Boundary distances
+    for i in range(n):
+        d_left = centers[i, 0]
+        d_right = 1.0 - centers[i, 0]
+        d_bottom = centers[i, 1]
+        d_top = 1.0 - centers[i, 1]
+        min_d = min(d_left, d_right, d_bottom, d_top)
+        if min_d < min_dist:
+            min_dist = min_d
+            
+    # Pairwise distances
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            if dist < min_dist:
+                min_dist = dist
+                
+    # The maximum equal radius we can support with these centers is min_dist / 2
+    # But we must also satisfy boundary: r <= min_dist_to_boundary
+    # Actually min_dist calculated above includes boundary distances (single radius constraint)
+    # Wait, boundary constraint is r <= x and r <= 1-x.
+    # So max r is min(x, 1-x, y, 1-y) for all i.
+    # And r <= dist(i,j)/2 for all pairs.
+    
+    # Let's compute strict constraints
+    r_limit = 1.0
+    for i in range(n):
+        r_limit = min(r_limit, centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            r_limit = min(r_limit, dist / 2.0)
+            
+    # Set radii to this limit
+    final_radii = np.full(n, r_limit)
+    
+    # Calculate sum
+    sum_radii = np.sum(final_radii)
+    
+    # If we want to try to optimize further, we could, but this should be a good valid packing.
+    # The physics simulation pushes circles to boundaries and packs them tightly.
+    
+    return centers, final_radii, sum_radii
+
+# To ensure the function is self-contained and meets requirements
+if __name__ == "__main__":
+    # Simple validation
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    print(f"Number of circles: {len(radii)}")
+    
+    # Quick check
+    import numpy as np
+    # Run the validation logic provided in prompt
+    n = centers.shape[0]
+    valid = True
+    
+    # Check NaN
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        valid = False
+        
+    # Check non-negative
+    for i in range(n):
+        if radii[i] < 0: valid = False
+        
+    # Check bounds
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            valid = False
+            
+    # Check overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                valid = False
+                
+    print(f"Valid: {valid}")

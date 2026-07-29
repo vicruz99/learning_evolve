@@ -1,0 +1,171 @@
+# sol_000086 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000042 (state 26164787) state=59b29825 sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(vars_vec):
+    """Objective function: maximize sum of radii <=> minimize negative sum."""
+    return -np.sum(vars_vec[2*N:])
+
+def constraints(vars_vec):
+    """
+    Computes inequality constraints g(vars) >= 0.
+    Includes boundary containment and pairwise non-overlap.
+    """
+    centers = vars_vec[:2*N].reshape(N, 2)
+    radii = vars_vec[2*N:]
+    
+    c = []
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c.append(centers[:, 0] - radii)
+    c.append(1.0 - centers[:, 0] - radii)
+    c.append(centers[:, 1] - radii)
+    c.append(1.0 - centers[:, 1] - radii)
+    
+    # Pairwise non-overlap: dist_sq >= (r_i + r_j)^2
+    dx = centers[:, 0, np.newaxis] - centers[:, 0]
+    dy = centers[:, 1, np.newaxis] - centers[:, 1]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Upper triangular indices to avoid duplicates and self-comparison
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    c.append(dist_sq[i_idx, j_idx] - r_sum[i_idx, j_idx]**2)
+    
+    return np.concatenate(c)
+
+def make_feasible_init(centers):
+    """Given centers, compute strictly feasible initial radii."""
+    radii = np.zeros(N)
+    for i in range(N):
+        d_wall = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        d_min = 2.0
+        for j in range(N):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if d < d_min:
+                    d_min = d
+        radii[i] = 0.5 * min(d_wall, 0.5 * d_min)
+    return np.concatenate([centers.flatten(), radii])
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_vars = None
+    best_sum = -1.0
+    
+    inits = []
+    
+    # 1. Hexagonal lattice inits with varying densities
+    for density in [0.08, 0.09, 0.10]:
+        pts = []
+        y = density
+        row = 0
+        while len(pts) < N:
+            x_start = density if row % 2 == 0 else 2.0 * density
+            x = x_start
+            while x <= 1.0 - density and len(pts) < N:
+                pts.append([x, y])
+                x += 2.0 * density
+            y += np.sqrt(3.0) * density
+            row += 1
+        pts = np.array(pts[:N])
+        inits.append(make_feasible_init(pts))
+        
+    # 2. 5x5 Grid + 1 center
+    g_pts = []
+    for i in range(5):
+        for j in range(5):
+            g_pts.append([0.1 + i*0.2, 0.1 + j*0.2])
+    g_pts.append([0.5, 0.5])
+    inits.append(make_feasible_init(np.array(g_pts)))
+    
+    # 3. Corner/Edge focused layout
+    c_pts = []
+    # Corners
+    c_pts.extend([[0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]])
+    # Edges
+    c_pts.extend([[0.5, 0.15], [0.15, 0.5], [0.85, 0.5], [0.5, 0.85]])
+    # Center region
+    c_pts.extend([[0.35, 0.35], [0.65, 0.35], [0.35, 0.65], [0.65, 0.65]])
+    # Fill rest randomly
+    np.random.seed(10)
+    while len(c_pts) < N:
+        c_pts.append(np.random.uniform(0.2, 0.8, 2))
+    inits.append(make_feasible_init(np.array(c_pts[:N])))
+    
+    # 4. Diverse random inits
+    np.random.seed(42)
+    for _ in range(12):
+        c = np.random.rand(N, 2) * 0.8 + 0.1
+        inits.append(make_feasible_init(c))
+        
+    # Phase 1: Initial optimization from diverse starts
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+            if np.min(constraints(res.x)) >= -1e-8:
+                curr_sum = np.sum(res.x[2*N:])
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Perturbation refinement to escape local minima
+    if best_vars is not None:
+        # Decreasing perturbation scales
+        for scale in [0.015, 0.008, 0.004, 0.002, 0.001]:
+            improved = True
+            while improved:
+                improved = False
+                for _ in range(8):
+                    x_pert = best_vars.copy()
+                    # Perturb centers
+                    x_pert[:2*N] += np.random.randn(2*N) * scale
+                    x_pert[:2*N] = np.clip(x_pert[:2*N], 0.01, 0.99)
+                    # Perturb radii
+                    x_pert[2*N:] += np.random.randn(N) * scale * 0.5
+                    x_pert[2*N:] = np.clip(x_pert[2*N:], 1e-6, 0.49)
+                    
+                    try:
+                        res = minimize(objective, x_pert, method='SLSQP', bounds=bounds,
+                                       constraints=cons, options={'maxiter': 2000, 'ftol': 1e-13, 'disp': False})
+                        if np.min(constraints(res.x)) >= -1e-8:
+                            curr_sum = np.sum(res.x[2*N:])
+                            if curr_sum > best_sum + 1e-6:
+                                best_sum = curr_sum
+                                best_vars = res.x.copy()
+                                improved = True
+                    except Exception:
+                        continue
+                        
+    # Phase 3: High-precision final polish
+    if best_vars is not None:
+        try:
+            res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                                 constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraints(res_final.x)) >= -1e-8:
+                best_vars = res_final.x
+        except Exception:
+            pass
+            
+    # Fallback safety
+    if best_vars is None:
+        best_vars = inits[0]
+        
+    centers = best_vars[:2*N].reshape(N, 2)
+    radii = best_vars[2*N:]
+    # Ensure non-negativity against numerical drift
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))

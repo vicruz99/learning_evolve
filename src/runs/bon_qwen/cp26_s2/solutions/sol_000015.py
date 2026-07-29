@@ -1,0 +1,549 @@
+# sol_000015 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b5cb09ab) state=2982ecab sum of radii=1.040000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def compute_violations(centers, radii):
+    """
+    Computes the sum of squared violations for all constraints.
+    Returns (penalty_value, violation_details)
+    """
+    n = centers.shape[0]
+    penalty = 0.0
+    
+    # Boundary constraints
+    # x - r >= 0  => violation if x < r
+    # x + r <= 1  => violation if x > 1 - r
+    # y - r >= 0
+    # y + r <= 1
+    
+    # Vectorized boundary checks
+    # Left
+    v_left = np.maximum(0, radii - centers[:, 0])
+    # Right
+    v_right = np.maximum(0, centers[:, 0] + radii - 1)
+    # Bottom
+    v_bottom = np.maximum(0, radii - centers[:, 1])
+    # Top
+    v_top = np.maximum(0, centers[:, 1] + radii - 1)
+    
+    boundary_pen = np.sum(v_left**2) + np.sum(v_right**2) + np.sum(v_bottom**2) + np.sum(v_top**2)
+    
+    # Overlap constraints
+    # dist(i, j) >= r_i + r_j
+    # violation if r_i + r_j > dist
+    
+    # Calculate pairwise distances
+    # Centers shape (n, 2)
+    # Using broadcasting for efficiency
+    # diff shape (n, n, 2)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Radii sum matrix
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Only consider upper triangle i < j to avoid double counting and self
+    # Create a mask for i < j
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    
+    # Compute violations for pairs
+    r_pair_sum = r_sum[idx_i, idx_j]
+    d_pair = dists[idx_i, idx_j]
+    
+    overlaps = np.maximum(0, r_pair_sum - d_pair)
+    overlap_pen = np.sum(overlaps**2)
+    
+    total_penalty = boundary_pen + overlap_pen
+    
+    return total_penalty
+
+def objective_function(params, n_circles):
+    """
+    Objective function to minimize.
+    params: 1D array of size 3*n_circles
+    [x1, y1, r1, x2, y2, r2, ...]
+    """
+    centers = params[0:2*n_circles].reshape((n_circles, 2))
+    radii = params[2*n_circles:]
+    
+    # Ensure radii are non-negative for penalty calculation stability, 
+    # though bounds handle it.
+    
+    # Penalty weight
+    W = 1000.0
+    
+    penalty = compute_violations(centers, radii)
+    
+    # We want to maximize sum(radii), so minimize -sum(radii)
+    obj = -np.sum(radii) + W * penalty
+    
+    return obj
+
+def generate_hexagonal_grid(n, square_size=1.0):
+    """
+    Generates a hexagonal grid layout for n circles.
+    Returns centers (n, 2).
+    """
+    centers = np.zeros((n, 2))
+    
+    # Estimate radius to fit n circles roughly
+    # Area density ~ 0.9. Area = n * pi * r^2 ~ 0.9 * 1
+    # r ~ sqrt(0.9 / (n * pi))
+    # For n=26, r ~ 0.105. But we can't fit 0.105 easily.
+    # Let's start with a safe radius, say 0.05 or derived from grid.
+    
+    # Let's try to fit them in rows
+    # Hexagonal packing row spacing dy = r * sqrt(3)
+    # Horizontal spacing dx = 2r
+    # Staggered rows
+    
+    # Let's estimate r based on fitting in square.
+    # If we have roughly sqrt(n) rows and cols.
+    # 26 circles -> maybe 5 or 6 rows.
+    # If 6 rows, height ~ r * (2 + 5*sqrt(3)) ~ 10.6r. r ~ 0.094.
+    # If 5 rows, height ~ r * (2 + 4*sqrt(3)) ~ 8.9r. r ~ 0.112.
+    # But width constraint for 5 circles is 10r <= 1 -> r <= 0.1.
+    # For 6 circles width 12r <= 1 -> r <= 0.083.
+    
+    # Let's pick a radius that allows a reasonable grid, e.g., r=0.08
+    # Then we can fit 6 circles in a row (width 0.96) and many rows.
+    
+    r_init = 0.08 
+    dy = r_init * np.sqrt(3)
+    dx = 2 * r_init
+    
+    count = 0
+    row = 0
+    
+    # We will fill rows. 
+    # Row 0 (unshifted): x starts at r, spacing 2r. Max circles floor((1 - 2r)/2r) + 1?
+    # Actually x in [r, 1-r]. Length 1-2r. 
+    # Number of intervals of size 2r is (1-2r)/2r = 1/(2r) - 1.
+    # Count = floor(1/(2r) - 1) + 1 = floor(1/(2r)).
+    # For r=0.08, 1/0.16 = 6.25 -> 6 circles.
+    
+    # Row 1 (shifted): x starts at 2r (since shifted by r). 
+    # Range [2r, 1-r]? No, left boundary r. 
+    # Center x >= r.
+    # If shifted by r, first center at 2r. Last center <= 1-r.
+    # Length available 1-r - 2r = 1-3r.
+    # Count = floor((1-3r)/2r) + 1 = floor(1/(2r) - 1.5) + 1.
+    # For r=0.08, 6.25 - 1.5 = 4.75 -> 4 + 1 = 5 circles.
+    
+    # Pattern: 6, 5, 6, 5...
+    
+    y_curr = r_init
+    
+    while count < n:
+        if row % 2 == 0:
+            # Unshifted row
+            # Centers at r, 3r, 5r...
+            # x_k = r + k * 2r
+            # x_k <= 1 - r
+            # k * 2r <= 1 - 2r => k <= (1-2r)/2r = 1/(2r) - 1
+            # max k is integer. Number of items = max_k + 1.
+            max_k = int((1 - 2 * r_init) / (2 * r_init))
+            num_in_row = max_k + 1
+            
+            # But we might not need all if count reaches n
+            needed = n - count
+            num_place = min(num_in_row, needed)
+            
+            x_vals = np.linspace(r_init, 1 - r_init, num_place)
+            # Wait, linspace with num_place points from r to 1-r gives correct spacing?
+            # Distance between first and last is 1-2r.
+            # Spacing = (1-2r) / (num_place - 1).
+            # For hexagonal, spacing should be 2r.
+            # linspace might stretch it. We should use fixed spacing.
+            
+            # Fixed spacing logic
+            x_coords = []
+            for i in range(num_place):
+                x = r_init + i * (2 * r_init)
+                if x <= 1 - r_init + 1e-9: # Check bound
+                    x_coords.append(x)
+                else:
+                    break
+            # This logic is slightly redundant with num_place calculation but safe.
+            
+            # Actually, let's just generate based on spacing
+            x_coords = [r_init + i * (2 * r_init) for i in range(num_place)]
+            # Filter valid
+            x_coords = [x for x in x_coords if x <= 1 - r_init + 1e-9]
+            
+            for x in x_coords:
+                if count >= n: break
+                centers[count, 0] = x
+                centers[count, 1] = y_curr
+                count += 1
+        
+        else:
+            # Shifted row
+            # Shift by r. First center at 2r?
+            # Or align to fit in gaps. Gaps of row 0 are at 2r, 4r...
+            # Yes, 2r is good.
+            # x_k = 2r + k * 2r
+            # x_k <= 1 - r
+            # 2r + k*2r <= 1 - r => 3r + k*2r <= 1 => k*2r <= 1 - 3r
+            # k <= (1-3r)/2r = 1/(2r) - 1.5
+            
+            base_x = 2 * r_init
+            max_k = int((1 - base_x - r_init) / (2 * r_init)) # Wait, last center <= 1-r.
+            # base_x + k*2r <= 1-r
+            # k*2r <= 1 - r - base_x = 1 - 3r
+            # k <= (1-3r)/2r
+            
+            # Let's just iterate
+            x_coords = []
+            curr_x = base_x
+            while curr_x <= 1 - r_init + 1e-9:
+                x_coords.append(curr_x)
+                curr_x += 2 * r_init
+            
+            num_place = len(x_coords)
+            needed = n - count
+            num_use = min(num_place, needed)
+            
+            for i in range(num_use):
+                centers[count, 0] = x_coords[i]
+                centers[count, 1] = y_curr
+                count += 1
+        
+        y_curr += dy
+        row += 1
+        
+        # Safety break
+        if y_curr > 1 + 1e-5:
+            # If we run out of space in y, maybe we need smaller r or different layout.
+            # But for initial guess, it's okay.
+            break
+            
+    return centers
+
+def run_packing() -> tuple:
+    n = 26
+    
+    # We will try multiple random seeds / perturbations to find a good packing
+    best_sum_r = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Penalty weight
+    PENALTY_WEIGHT = 2000.0
+    
+    # Bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    # Number of restarts
+    N_RESTARTS = 10
+    
+    for restart in range(N_RESTARTS):
+        # 1. Generate initial guess
+        # Use hexagonal grid but with a small radius to ensure validity
+        centers_init = generate_hexagonal_grid(n, square_size=1.0)
+        
+        # Add some noise to centers to break symmetry and help optimization
+        # Noise scale 0.02
+        noise = np.random.normal(0, 0.02, centers_init.shape)
+        centers_noisy = centers_init + noise
+        # Clip to bounds
+        centers_noisy = np.clip(centers_noisy, 0.0, 1.0)
+        
+        # Initial radii: small valid radius. 
+        # Since centers are spread, radius 0.05 might be safe?
+        # Check distance between closest points in hex grid.
+        # dx=0.16, dy=0.138. Min dist 0.16? No, dist to neighbor in next row is 2r=0.16.
+        # So r=0.08 is tight. Let's start with r=0.05.
+        radii_init = np.full(n, 0.05)
+        
+        params0 = np.hstack([centers_noisy.flatten(), radii_init])
+        
+        # 2. Optimize
+        # We maximize sum(r) => minimize -sum(r) + penalty
+        # To handle penalty weight inside objective, we define a closure or pass it.
+        # Since we cannot use closures with free variables easily in top level functions for some solvers?
+        # Actually standard Python closures work.
+        # But to be safe and clean, we can pass weight or define it inside.
+        # The prompt says "Make all helper functions top level and have no closures from function nesting".
+        # This is a strict constraint.
+        # So I cannot define objective inside run_packing capturing W.
+        # I must pass W or make it global. 
+        # However, I can just use a fixed W in the top level function.
+        
+        # To adhere to "no closures", I will use a fixed penalty weight in the top level function 
+        # or pass parameters explicitly.
+        # But the objective function signature is fixed by scipy (x).
+        # So I will use a global variable or a class? 
+        # Or just define objective with a fixed large weight.
+        
+        # Let's use a large enough weight that works generally.
+        # 2000 seems reasonable.
+        
+        result = opt.minimize(
+            lambda p: objective_function(p, n), # This is a closure!
+            params0,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 500, 'ftol': 1e-9}
+        )
+        
+        # Wait, the constraint "no closures" applies to helper functions?
+        # "Make all helper functions top level and have no closures from function nesting."
+        # It might mean helper functions defined outside run_packing.
+        # Using a lambda inside run_packing creates a closure.
+        # To be strictly compliant, I should avoid lambda if possible, 
+        # or define the objective function to take n and maybe weight as args, 
+        # but minimize requires func(x).
+        # I can pass n via a global variable or just hardcode n=26 in objective?
+        # Hardcoding n=26 in objective_function is cleaner for compliance.
+        
+        # Let's rewrite objective_function to not take n, or use global.
+        # Actually, I will restructure code to be compliant.
+        pass
+
+    # Refined plan for compliance:
+    # 1. Define constants globally or inside run_packing but not captured by helper functions.
+    # 2. Helper functions like objective_function should take all necessary data as arguments 
+    #    or use global state. Since I can't pass extra args to minimize easily without wrapper,
+    #    and wrapper is a closure...
+    #    Maybe the rule implies "don't define helper functions *inside* run_packing".
+    #    Top level helpers are fine.
+    #    A lambda inside run_packing is technically a closure.
+    #    I will use a wrapper function defined at top level?
+    #    But the wrapper needs to know 'n'.
+    #    I can make 'n' a global variable set by run_packing.
+    
+    # Let's restart the code structure mentally.
+    
+    return best_centers, best_radii, best_sum_r
+
+# Global variables to store problem data for objective function
+_global_n = 26
+_global_weight = 2000.0
+
+def objective_function_compliant(params):
+    """
+    Objective function using global variables to avoid closures.
+    """
+    n = _global_n
+    centers = params[0:2*n].reshape((n, 2))
+    radii = params[2*n:]
+    
+    # Penalty
+    # Boundary
+    v_left = np.maximum(0, radii - centers[:, 0])
+    v_right = np.maximum(0, centers[:, 0] + radii - 1)
+    v_bottom = np.maximum(0, radii - centers[:, 1])
+    v_top = np.maximum(0, centers[:, 1] + radii - 1)
+    boundary_pen = np.sum(v_left**2) + np.sum(v_right**2) + np.sum(v_bottom**2) + np.sum(v_top**2)
+    
+    # Overlaps
+    # Vectorized pairwise
+    # dist matrix
+    # Using einsum or broadcasting
+    # diff = centers[:, None, :] - centers[None, :, :] # Shape (n, n, 2)
+    # dists = np.sqrt(np.sum(diff**2, axis=2))
+    # This creates a full matrix n x n. For n=26, 26x26 is small.
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Triangular indices
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    
+    overlaps = np.maximum(0, r_sum[idx_i, idx_j] - dists[idx_i, idx_j])
+    overlap_pen = np.sum(overlaps**2)
+    
+    total_penalty = boundary_pen + overlap_pen
+    
+    return -np.sum(radii) + _global_weight * total_penalty
+
+def run_packing() -> tuple:
+    global _global_n, _global_weight
+    _global_n = 26
+    _global_weight = 5000.0 # Increase weight
+    
+    n = 26
+    bounds = [(0.0, 1.0) for _ in range(2*n)] + [(0.0, 0.5) for _ in range(n)]
+    
+    best_sum_r = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Pre-allocate storage for best valid solution found
+    # We might find solutions with penalties, but we want the best valid one or best objective.
+    # Actually, if penalty is 0, it's valid.
+    # We track best valid sum_r.
+    
+    # If no valid solution found after optimization, we might return the best one found 
+    # even if slightly invalid? No, validation must pass.
+    # But optimization might not reach 0 penalty.
+    # We should prioritize validity.
+    
+    best_valid_centers = None
+    best_valid_radii = None
+    best_valid_sum = -1.0
+    
+    # Also track best objective value to guide restarts?
+    # Maybe just run fixed number of restarts.
+    
+    for restart in range(15):
+        # Initial guess: Hexagonal
+        centers_init = generate_hexagonal_grid(n, square_size=1.0)
+        
+        # Perturb
+        np.random.seed(restart)
+        noise = np.random.normal(0, 0.01, centers_init.shape)
+        centers_noisy = np.clip(centers_init + noise, 0.0, 1.0)
+        
+        # Initial radii: 0.04
+        radii_init = np.full(n, 0.04)
+        
+        params0 = np.hstack([centers_noisy.flatten(), radii_init])
+        
+        # Run optimizer
+        res = opt.minimize(
+            objective_function_compliant,
+            params0,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 1000, 'ftol': 1e-12}
+        )
+        
+        # Extract result
+        centers_res = res.x[0:2*n].reshape((n, 2))
+        radii_res = res.x[2*n:]
+        
+        # Check validity manually or via validation function?
+        # We can use a quick check.
+        # Compute penalty
+        # (Reusing logic)
+        # Let's just call the validation function if we think it's good?
+        # But validation is slow? No, n=26 is fast.
+        
+        # However, validation function is provided as read-only. 
+        # I can call it? "We will run the below validation function...". 
+        # It implies I should produce output that passes it. 
+        # I can use it in my code if imported, but it's defined in the prompt.
+        # I cannot modify it. I can call it if I copy it or if it's available.
+        # Assuming I can't call it directly unless I redefine it, 
+        # but I can implement the check.
+        
+        # Let's implement a quick check
+        is_valid = True
+        # Boundary
+        if np.any(centers_res[:, 0] < radii_res) or np.any(centers_res[:, 0] > 1 - radii_res):
+            is_valid = False
+        if np.any(centers_res[:, 1] < radii_res) or np.any(centers_res[:, 1] > 1 - radii_res):
+            is_valid = False
+        
+        if is_valid:
+            # Check overlaps
+            # dist matrix
+            diff = centers_res[:, np.newaxis, :] - centers_res[np.newaxis, :, :]
+            dists = np.sqrt(np.sum(diff**2, axis=2))
+            r_sum = radii_res[:, np.newaxis] + radii_res[np.newaxis, :]
+            idx_i, idx_j = np.triu_indices(n, k=1)
+            if np.any(r_sum[idx_i, idx_j] > dists[idx_i, idx_j] + 1e-12):
+                is_valid = False
+        
+        if is_valid:
+            current_sum = np.sum(radii_res)
+            if current_sum > best_valid_sum:
+                best_valid_sum = current_sum
+                best_valid_centers = centers_res.copy()
+                best_valid_radii = radii_res.copy()
+                
+        # Also track best objective just in case?
+        # If we never find valid, we are in trouble.
+        # But with hex start, we should find valid.
+        
+        # If we found a valid solution, we can try to improve it specifically?
+        # Maybe run another optimization step with higher penalty?
+        # But L-BFGS-B handles bounds, penalty is in objective.
+        
+    # If we didn't find any valid solution (unlikely), fallback to last result?
+    # But we need to return valid.
+    # Let's ensure we return something.
+    
+    if best_valid_centers is None:
+        # Fallback: try to force validity by reducing radii
+        # Take the result with lowest penalty?
+        # But we didn't track that.
+        # Just run one more check on the last res?
+        # Let's assume we found one.
+        # If not, return a dummy valid packing (small circles)
+        # 26 circles radius 0.01 in grid.
+        pass
+
+    # If best_valid_centers is None, create a safe default
+    if best_valid_centers is None:
+        # Grid packing
+        ys = np.linspace(0.1, 0.9, 5)
+        xs = np.linspace(0.1, 0.9, 5)
+        # 25 points
+        # Add one at center? (0.5, 0.5) is in grid.
+        # Add at (0.05, 0.05)?
+        # Just use 26 points in 6x5 grid roughly.
+        # Safe radius 0.05
+        safe_centers = np.zeros((26, 2))
+        safe_radii = np.full(26, 0.04)
+        idx = 0
+        for i in range(6):
+            for j in range(5):
+                if idx < 26:
+                    safe_centers[idx, 0] = 0.15 + i * 0.18 # width 0.9 + 0.15 = 1.05? No.
+                    # 0.15 + 5*0.18 = 1.05. Too wide.
+                    # Use smaller step.
+                    safe_centers[idx, 0] = 0.05 + i * 0.18 # 0.05 + 0.9 = 0.95. OK.
+                    safe_centers[idx, 1] = 0.1 + j * 0.2  # 0.1 + 0.8 = 0.9. OK.
+                    idx += 1
+        
+        best_valid_centers = safe_centers
+        best_valid_radii = safe_radii
+        best_valid_sum = np.sum(safe_radii)
+
+    return best_valid_centers, best_valid_radii, float(best_valid_sum)
+
+# Helper function for grid generation
+def generate_hexagonal_grid(n, square_size=1.0):
+    centers = np.zeros((n, 2))
+    r_init = 0.08 
+    dy = r_init * np.sqrt(3)
+    count = 0
+    row = 0
+    y_curr = r_init
+    
+    while count < n:
+        if row % 2 == 0:
+            # Unshifted
+            x = r_init
+            while x <= 1.0 - r_init + 1e-9 and count < n:
+                centers[count, 0] = x
+                centers[count, 1] = y_curr
+                count += 1
+                x += 2 * r_init
+        else:
+            # Shifted
+            x = 2 * r_init
+            while x <= 1.0 - r_init + 1e-9 and count < n:
+                centers[count, 0] = x
+                centers[count, 1] = y_curr
+                count += 1
+                x += 2 * r_init
+        
+        y_curr += dy
+        row += 1
+        if y_curr > 1.0 + 1e-5:
+            break
+    return centers

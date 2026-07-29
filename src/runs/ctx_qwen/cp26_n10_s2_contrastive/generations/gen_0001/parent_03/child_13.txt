@@ -1,0 +1,322 @@
+
+
+Looking at this problem, I need to improve the current 2.602731 toward the target of 2.636. The best past solution achieved 2.622453 using hexagonal lattice initialization with SLSQP.
+
+<strategy>
+1. **Better initial configurations**: Use diverse hexagonal patterns (6-5-6-5-4, 5-6-5-6-4, etc.) with multiple noise seeds. Also try corner-weighted placements where circles near corners are initialized larger.
+
+2. **Vectorized constraints**: Use numpy broadcasting for distance calculations instead of nested loops, making SLSQP faster and allowing more iterations.
+
+3. **Multi-stage optimization**: 
+   - Stage 1: Quick exploration with many restarts (smaller max_iter)
+   - Stage 2: Careful refinement of best solutions (larger max_iter, tighter tolerance)
+   - Stage 3: Micro-perturbation refinement with very tight tolerances
+
+4. **Smarter constraint handling**: Use dist^2 - (r_i + r_j)^2 for smoother optimization landscape, avoiding singularity at zero distance.
+
+5. **Careful post-processing**: Fix boundary violations by adjusting radii, then fix overlaps by selective reduction (not global scaling).
+
+6. **Diverse restart strategies**: Combine hex lattice, grid, corner-biased, and random placements to explore the search space thoroughly.
+
+7. **Iterative improvement loop**: After finding best params, do multiple rounds of perturbation + optimization to escape local minima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+N = 26
+
+def objective(params):
+    """Minimize negative sum of radii."""
+    return -np.sum(params[2::3])
+
+
+def make_constraints(params):
+    """
+    Constraints: boundary (circle inside square) and non-overlap (pairwise).
+    Uses squared distance formulation for numerical stability.
+    Returns array of values that must be >= 0.
+    """
+    cx = params[0::3]
+    cy = params[1::3]
+    r = params[2::3]
+
+    # Boundary: x-r>=0, 1-x-r>=0, y-r>=0, 1-y-r>=0
+    c_boundary = np.concatenate([
+        cx - r,
+        1.0 - cx - r,
+        cy - r,
+        1.0 - cy - r,
+    ])
+
+    # Overlap: dist^2 >= (r_i + r_j)^2  (equivalent to dist >= r_i + r_j for non-negative values)
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist_sq = dx * dx + dy * dy
+    r_sum_sq = (r[:, None] + r[None, :]) ** 2
+
+    triu_idx = np.triu_indices(N, k=1)
+    c_overlap = dist_sq[triu_idx] - r_sum_sq[triu_idx]
+
+    return np.concatenate([c_boundary, c_overlap])
+
+
+def hex_init(row_configs, seed=42):
+    """
+    Create hexagonal lattice initialization.
+    row_configs: list of (count, offset_frac) tuples.
+    offset_frac shifts odd rows by fraction of cell width.
+    """
+    rng = np.random.RandomState(seed)
+    n_rows = len(row_configs)
+    y_spacing = 1.0 / (n_rows + 1)
+
+    params = np.zeros(3 * N)
+    idx = 0
+
+    for row_idx, (count, offset_frac) in enumerate(row_configs):
+        y = y_spacing * (row_idx + 1)
+        x_spacing = 1.0 / (count + 1)
+
+        for col in range(count):
+            if idx >= N:
+                break
+            x = x_spacing * (col + 1) + offset_frac * x_spacing * 0.5
+            x += rng.uniform(-0.025, 0.025)
+            y += rng.uniform(-0.025, 0.025)
+            params[3 * idx] = np.clip(x, 0.03, 0.97)
+            params[3 * idx + 1] = np.clip(y, 0.03, 0.97)
+            params[3 * idx + 2] = 0.035  # small initial radius
+            idx += 1
+
+    # Fill remaining slots if any
+    while idx < N:
+        params[3 * idx] = 0.5 + rng.uniform(-0.15, 0.15)
+        params[3 * idx + 1] = 0.5 + rng.uniform(-0.15, 0.15)
+        params[3 * idx + 2] = 0.035
+        idx += 1
+
+    return params
+
+
+def corner_biased_init(seed=42):
+    """Place some circles near corners/edges for larger radii, others interior."""
+    rng = np.random.RandomState(seed)
+    params = np.zeros(3 * N)
+    idx = 0
+
+    # 4 corners
+    corners = [(0.1, 0.1), (0.9, 0.1), (0.1, 0.9), (0.9, 0.9)]
+    for x, y in corners:
+        if idx >= N:
+            break
+        params[3 * idx] = x + rng.uniform(-0.03, 0.03)
+        params[3 * idx + 1] = y + rng.uniform(-0.03, 0.03)
+        params[3 * idx + 2] = 0.08
+        idx += 1
+
+    # 8 edge-mid points
+    edges = [
+        (0.5, 0.1), (0.5, 0.9),
+        (0.1, 0.5), (0.9, 0.5),
+        (0.3, 0.1), (0.7, 0.1),
+        (0.3, 0.9), (0.7, 0.9),
+    ]
+    for x, y in edges:
+        if idx >= N:
+            break
+        params[3 * idx] = x + rng.uniform(-0.05, 0.05)
+        params[3 * idx + 1] = y + rng.uniform(-0.05, 0.05)
+        params[3 * idx + 2] = 0.06
+        idx += 1
+
+    # Interior points
+    while idx < N:
+        params[3 * idx] = 0.5 + rng.uniform(-0.35, 0.35)
+        params[3 * idx + 1] = 0.5 + rng.uniform(-0.35, 0.35)
+        params[3 * idx + 2] = 0.035
+        idx += 1
+
+    return np.clip(params, 0.02, 0.98)
+
+
+def fix_violations(params):
+    """
+    Post-process to ensure constraints are satisfied.
+    Fix boundary by capping radii, fix overlaps by selective reduction.
+    """
+    cx = params[0::3].copy()
+    cy = params[1::3].copy()
+    r = params[2::3].copy()
+
+    # Fix boundary violations
+    for i in range(N):
+        max_r = min(cx[i], 1.0 - cx[i], cy[i], 1.0 - cy[i])
+        if r[i] > max_r - 1e-10:
+            r[i] = max(0.0, max_r - 1e-10)
+
+    # Iteratively fix overlap violations with selective reduction
+    for _ in range(300):
+        max_viol = 0.0
+        worst_i, worst_j = 0, 1
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = math.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                overlap = r[i] + r[j] - d
+                if overlap > max_viol:
+                    max_viol = overlap
+                    worst_i, worst_j = i, j
+
+        if max_viol < 1e-12:
+            break
+
+        # Reduce the two offending circles
+        reduction = max_viol * 0.6 + 1e-10
+        r[worst_i] = max(0.0, r[worst_i] - reduction)
+        r[worst_j] = max(0.0, r[worst_j] - reduction)
+
+    new_params = np.zeros(3 * N)
+    new_params[0::3] = cx
+    new_params[1::3] = cy
+    new_params[2::3] = r
+    return new_params
+
+
+def run_optimization(params, bounds, cons, max_iter=3000, ftol=1e-12):
+    """Run a single SLSQP optimization."""
+    try:
+        res = minimize(
+            objective,
+            params,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=cons,
+            options={'maxiter': max_iter, 'ftol': ftol, 'disp': False},
+        )
+        return res
+    except Exception:
+        return None
+
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in unit square to maximize sum of radii.
+    """
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': make_constraints}
+
+    best_sum = 0.0
+    best_params = None
+
+    # ============ STAGE 1: Hexagonal configurations ============
+    hex_configs = [
+        [(6, 0.0), (5, 0.5), (6, 0.0), (5, 0.5), (4, 0.0)],   # 26 circles
+        [(5, 0.0), (6, 0.5), (5, 0.0), (6, 0.5), (4, 0.0)],   # 26
+        [(6, 0.0), (6, 0.5), (5, 0.0), (5, 0.5), (4, 0.0)],   # 26
+        [(4, 0.0), (6, 0.5), (6, 0.0), (6, 0.5), (4, 0.0)],   # 26
+        [(5, 0.0), (5, 0.5), (6, 0.0), (5, 0.5), (5, 0.0)],   # 26
+        [(7, 0.0), (5, 0.5), (7, 0.0), (7, 0.0)],              # 26
+    ]
+
+    for config in hex_configs:
+        for seed in range(12):
+            x0 = hex_init(config, seed=seed)
+            res = run_optimization(x0, bounds, cons, max_iter=3000, ftol=1e-12)
+            if res is not None and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_params = res.x.copy()
+
+    # ============ STAGE 2: Corner-biased configurations ============
+    for seed in range(10):
+        x0 = corner_biased_init(seed=seed)
+        res = run_optimization(x0, bounds, cons, max_iter=3000, ftol=1e-12)
+        if res is not None and -res.fun > best_sum:
+            best_sum = -res.fun
+            best_params = res.x.copy()
+
+    # ============ STAGE 3: Random initializations ============
+    for seed in range(15):
+        rng = np.random.RandomState(seed)
+        x0 = np.zeros(3 * N)
+        for i in range(N):
+            x0[3 * i] = rng.uniform(0.12, 0.88)
+            x0[3 * i + 1] = rng.uniform(0.12, 0.88)
+            x0[3 * i + 2] = rng.uniform(0.03, 0.06)
+
+        res = run_optimization(x0, bounds, cons, max_iter=3000, ftol=1e-12)
+        if res is not None and -res.fun > best_sum:
+            best_sum = -res.fun
+            best_params = res.x.copy()
+
+    # ============ STAGE 4: Refinement of best solution ============
+    if best_params is not None:
+        for seed in range(15):
+            rng = np.random.RandomState(seed)
+            # Small perturbation of best solution
+            perturbation = rng.normal(0, 0.004, size=3 * N)
+            # Scale perturbation: positions larger, radii smaller
+            perturbation[0::3] *= 0.5   # x
+            perturbation[1::3] *= 0.5   # y
+            perturbation[2::3] *= 0.3   # r
+            
+            x0 = best_params + perturbation
+            x0 = np.clip(x0, 0.001, 0.999)
+            x0[2::3] = np.maximum(x0[2::3], 0.001)
+
+            res = run_optimization(x0, bounds, cons, max_iter=6000, ftol=1e-14)
+            if res is not None and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_params = res.x.copy()
+
+    # ============ STAGE 5: Ultra-fine refinement ============
+    if best_params is not None and best_sum > 2.6:
+        for seed in range(10):
+            rng = np.random.RandomState(seed + 1000)
+            x0 = best_params + rng.normal(0, 0.001, size=3 * N)
+            x0[0::3] = np.clip(x0[0::3], 0.001, 0.999)
+            x0[1::3] = np.clip(x0[1::3], 0.001, 0.999)
+            x0[2::3] = np.maximum(x0[2::3], 0.001)
+
+            res = run_optimization(x0, bounds, cons, max_iter=8000, ftol=1e-15)
+            if res is not None and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_params = res.x.copy()
+
+    # ============ STAGE 6: Iterative improvement loop ============
+    if best_params is not None and best_sum > 2.55:
+        for round_num in range(3):
+            improved = False
+            for seed in range(8):
+                rng = np.random.RandomState(seed + round_num * 100)
+                x0 = best_params + rng.normal(0, 0.002 * (1.5 ** (round_num)), size=3 * N)
+                x0[0::3] = np.clip(x0[0::3], 0.001, 0.999)
+                x0[1::3] = np.clip(x0[1::3], 0.001, 0.999)
+                x0[2::3] = np.maximum(x0[2::3], 0.001)
+
+                res = run_optimization(x0, bounds, cons, max_iter=5000, ftol=1e-14)
+                if res is not None and -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_params = res.x.copy()
+                    improved = True
+
+            if not improved:
+                break
+
+    # ============ FINAL: Fix violations and return ============
+    if best_params is not None:
+        params = fix_violations(best_params)
+        cx = params[0::3]
+        cy = params[1::3]
+        radii = np.maximum(params[2::3], 0.0)
+        centers = np.column_stack((cx, cy))
+        return centers, radii, float(np.sum(radii))
+
+    # Fallback (should never be reached)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, 0.02)
+    for i in range(N):
+        centers[i] = [0.1 + (i % 5) * 0.2, 0.1 + (i // 5) * 0.2]
+    return centers, radii, float(np.sum(radii))
+```

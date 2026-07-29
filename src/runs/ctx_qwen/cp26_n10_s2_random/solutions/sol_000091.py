@@ -1,0 +1,167 @@
+# sol_000091 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000068 (state 22e68fa8) state=56e54203 sum of radii=2.618068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(v):
+    """Objective: minimize negative sum of radii to maximize total radius."""
+    return -np.sum(v[2::3])
+
+def constraints(v):
+    """Computes boundary and pairwise non-overlap constraints (must be >= 0)."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Pairwise non-overlap constraints: dist^2 >= (ri + rj)^2
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c = np.concatenate([c, (dx**2 + dy**2)[mask] - dr[mask]**2])
+    return c
+
+def get_bounds():
+    """Returns variable bounds for x, y, r for each circle."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def repair_radii(centers, radii, safety=1e-10):
+    """Iteratively shrinks radii to resolve overlaps and clamp to boundaries."""
+    radii = radii.copy()
+    n = centers.shape[0]
+    
+    for _ in range(100):
+        changed = False
+        # Resolve pairwise overlaps
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                sum_r = radii[i] + radii[j]
+                if d < sum_r - safety:
+                    shrink = (sum_r - d + safety) / 2.0
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+                    
+        # Clamp to boundaries
+        for i in range(n):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - safety:
+                radii[i] = mr
+                changed = True
+                
+        if not changed:
+            break
+            
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Main function to pack 26 circles in a unit square."""
+    np.random.seed(42)
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_v = None
+    best_sum = -np.inf
+    
+    # Phase 1: Generate diverse initial configurations
+    inits = []
+    
+    # Hexagonal lattices with various scales and random perturbations
+    for scale in [0.85, 0.92, 1.0, 1.08]:
+        for seed in range(10):
+            rng = np.random.default_rng(seed)
+            centers = []
+            r0 = 0.095 * scale
+            y = r0
+            row = 0
+            while len(centers) < N:
+                x_start = r0 if row % 2 == 0 else 2 * r0
+                x = x_start
+                while x + r0 <= 1.0 + 1e-9 and len(centers) < N:
+                    centers.append([x + rng.normal(0, 0.004), y + rng.normal(0, 0.004)])
+                    x += 2 * r0
+                y += np.sqrt(3) * r0
+                row += 1
+            while len(centers) < N:
+                centers.append([rng.uniform(0.1, 0.9), rng.uniform(0.1, 0.9)])
+                
+            centers = np.clip(np.array(centers[:N]), 0.02, 0.98)
+            v = np.zeros(3 * N)
+            v[0::3] = centers[:, 0]
+            v[1::3] = centers[:, 1]
+            v[2::3] = 0.055  # Start with feasible small radii
+            inits.append(v)
+            
+    # Dense random starts to explore non-lattice optima
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        centers = rng.uniform(0.1, 0.9, (N, 2))
+        v = np.zeros(3 * N)
+        v[0::3] = centers[:, 0]
+        v[1::3] = centers[:, 1]
+        v[2::3] = 0.04
+        inits.append(v)
+        
+    # Phase 2: Multi-start optimization
+    for i, v0 in enumerate(inits):
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 12000, 'ftol': 1e-13})
+            s_val = -res.fun
+            c_vals = constraints(res.x)
+            if np.min(c_vals) >= -1e-7 and s_val > best_sum:
+                best_sum = s_val
+                best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 3: Perturbation & Refinement (Basin-Hopping style)
+    if best_v is not None:
+        for _ in range(60):
+            v_trial = best_v.copy()
+            # Perturb centers
+            v_trial[0::3] += np.random.normal(0, 0.0012, N)
+            v_trial[1::3] += np.random.normal(0, 0.0012, N)
+            v_trial[0::3] = np.clip(v_trial[0::3], 0.02, 0.98)
+            v_trial[1::3] = np.clip(v_trial[1::3], 0.02, 0.98)
+            # Slightly shrink radii to ensure feasible restart point
+            v_trial[2::3] *= 0.985
+            
+            try:
+                res = minimize(objective, v_trial, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 8000, 'ftol': 1e-13})
+                s_val = -res.fun
+                c_vals = constraints(res.x)
+                if np.min(c_vals) >= -1e-7 and s_val > best_sum:
+                    best_sum = s_val
+                    best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    # Fallback
+    if best_v is None:
+        best_v = inits[0]
+        
+    # Extract centers and radii
+    centers = np.column_stack((best_v[0::3], best_v[1::3]))
+    radii = best_v[2::3].copy()
+    
+    # Phase 4: Deterministic Repair for Strict Validation Compliance
+    radii = repair_radii(centers, radii)
+    
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii

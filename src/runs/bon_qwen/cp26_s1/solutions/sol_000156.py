@@ -1,389 +1,238 @@
 # sol_000156 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 39a6f529) state=496708a7 sum of radii=2.340000 correctness=1.0
+# generation=0 parent=seed (state 2bb08abb) state=8782aeb8 sum of radii=2.466053 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import scipy.optimize as opt
 import math
+import random
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Packs 26 circles in a unit square to maximize the sum of radii.
+    Solves the circle packing problem for 26 circles in a unit square.
+    Uses a force-directed relaxation to maximize the sum of radii.
     """
-    n_circles = 26
+    n = 26
     
-    # 1. Initialization: Hexagonal-like grid
-    # We try to fit circles in a pattern that mimics hexagonal packing
-    # to utilize space efficiently.
+    # Initial guess for radius based on target sum ~ 2.636
+    # 2.636 / 26 ≈ 0.1014
+    # We start slightly smaller to allow for convergence
+    r_initial = 0.095
     
-    # Parameters for initial placement
-    r_init = 0.09 # Start slightly below 0.1
+    # Generate initial positions: A hexagonal-like lattice
+    # We arrange rows with alternating counts to fit 26 circles
+    # Row counts: 5, 5, 5, 5, 4, 2 (Total 26)
+    row_counts = [5, 5, 5, 5, 4, 2]
     
-    # Generate points in a hexagonal pattern
-    # Vertical spacing = sqrt(3) * r
-    # Horizontal spacing = 2 * r
     centers = []
-    radii = []
+    y_pos = r_initial
     
-    y = r_init
-    row = 0
-    while y < 1.0 - r_init:
-        x = r_init
-        offset = (row % 2) * r_init # Shift every other row
-        while x < 1.0 - r_init:
-            centers.append([x + offset, y])
-            radii.append(r_init)
-            x += 2 * r_init
-            if len(centers) >= n_circles:
-                break
-        y += math.sqrt(3) * r_init
-        row += 1
-        if len(centers) >= n_circles:
+    # Spacing parameters for hexagonal packing
+    # Horizontal step = 2*r, Vertical step = sqrt(3)*r
+    # However, we will let the optimizer adjust these
+    
+    # We scale positions to fit within [0,1] approximately
+    # Estimate required width and height to normalize
+    max_width = max(row_counts) * 2 * r_initial
+    height_est = (len(row_counts) - 1) * r_initial * math.sqrt(3) + 2 * r_initial
+    
+    scale_x = 1.0 / max_width if max_width > 0 else 1.0
+    scale_y = 1.0 / height_est if height_est > 0 else 1.0
+    
+    current_y = 0
+    
+    for i, count in enumerate(row_counts):
+        # Determine x offset for hexagonal shifting
+        if i % 2 == 1:
+            x_offset = r_initial # Shift by one radius
+        else:
+            x_offset = 0
+            
+        # Calculate row width
+        row_width = (count - 1) * 2 * r_initial
+        x_start = x_offset
+        
+        # Distribute circles in the row
+        if count > 0:
+            # If count > 1, space them out
+            if count == 1:
+                x_pos = 0.5 # Center single circle
+            else:
+                x_pos = x_start
+            
+            for j in range(count):
+                # Normalize position to fit in [0,1] roughly
+                # A better initialization is just a dense grid/hex
+                # Let's use a simple heuristic: place them in a grid first
+                pass 
+                
+    # Reset to a more robust initialization: Random within a bounding box
+    # or a structured grid that fills the space well.
+    # A 6x5 grid (30 points) minus 4 points is a good start.
+    # Let's create a 6x5 grid of points and remove 4 random ones.
+    
+    grid_x = np.linspace(0.08, 0.92, 6)
+    grid_y = np.linspace(0.08, 0.92, 5)
+    
+    points = []
+    for y in grid_y:
+        for x in grid_x:
+            points.append((x, y))
+            
+    # Remove 4 random points to get 26
+    random.seed(42)
+    random.shuffle(points)
+    selected_points = points[:26]
+    
+    centers = np.array(selected_points)
+    radii = np.full(n, r_initial)
+    
+    # Optimization parameters
+    max_iters = 3000
+    alpha = 1.0 # Learning rate / force strength
+    decay = 0.995 # Decay learning rate
+    r_growth = 0.00005 # How much to grow radius each step if no collision
+    
+    # Run force-directed optimization
+    for step in range(max_iters):
+        # 1. Calculate forces
+        forces = np.zeros_like(centers)
+        overlap_penalty = 0.0
+        
+        # Forces from boundaries
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Push from left wall
+            if x - r < 0:
+                forces[i, 0] += (r - x) * 10.0
+            # Push from right wall
+            if x + r > 1:
+                forces[i, 0] -= (x + r - 1) * 10.0
+            # Push from bottom wall
+            if y - r < 0:
+                forces[i, 1] += (r - y) * 10.0
+            # Push from top wall
+            if y + r > 1:
+                forces[i, 1] -= (y + r - 1) * 10.0
+                
+        # Forces from other circles (repulsion)
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                
+                if dist < min_dist and dist > 1e-9:
+                    # Overlap detected
+                    overlap_penalty += (min_dist - dist)**2
+                    # Repulsive force proportional to overlap
+                    # F = (overlap / dist) * direction
+                    repulsion = (min_dist - dist) / dist
+                    fx = dx * repulsion
+                    fy = dy * repulsion
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+                elif dist < 1e-9:
+                    # Co-located, push apart randomly
+                    rx = random.uniform(-1, 1)
+                    ry = random.uniform(-1, 1)
+                    forces[i, 0] += rx
+                    forces[i, 1] += ry
+                    forces[j, 0] -= rx
+                    forces[j, 1] -= ry
+
+        # 2. Update centers
+        centers += alpha * forces
+        
+        # Clamp centers to valid range [r, 1-r] roughly, but let forces handle it
+        # Hard clamp to prevent flying off
+        centers = np.clip(centers, 0, 1)
+        
+        # 3. Grow radii if system is stable (low overlap)
+        if overlap_penalty < 1e-6:
+            # Grow radii
+            growth = r_growth
+            # If packing is very loose, grow faster
+            if overlap_penalty == 0:
+                growth *= 2.0
+                
+            radii += growth
+            # Cap radius to prevent explosion
+            if radii[0] > 0.12:
+                radii -= growth # Reset if too big, or just stop growing
+                # Actually, just stop growing if we hit a theoretical limit or stability
+                pass
+                
+        # Decay learning rate
+        alpha *= decay
+        
+    # Final adjustment: Ensure radii are consistent
+    # The optimization above treated radii as fixed during force calc mostly,
+    # but we grew them. A better way is to treat radii as variables or 
+    # just output the result.
+    
+    # Re-verify and adjust for exact validity
+    # If some circles are still slightly overlapping or out of bounds, shrink them
+    valid = True
+    # Simple check loop to shrink if needed
+    for _ in range(100):
+        max_violation = 0
+        for i in range(n):
+            # Boundary check
+            x, y = centers[i]
+            r = radii[i]
+            needed_r_x = min(x, 1-x)
+            needed_r_y = min(y, 1-y)
+            max_r = min(needed_r_x, needed_r_y)
+            if r > max_r + 1e-12:
+                radii[i] = max_r
+                max_violation = 1
+        
+        # Overlap check
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = math.sqrt(dx*dx + dy*dy)
+                if dist < radii[i] + radii[j] - 1e-12:
+                    # Shrink the smaller one or both
+                    # Simple heuristic: reduce radii proportionally
+                    scale = dist / (radii[i] + radii[j])
+                    radii[i] *= scale
+                    radii[j] *= scale
+                    max_violation = 1
+        
+        if max_violation == 0:
             break
             
-    # If we didn't get enough, add random ones (unlikely with r=0.09)
-    while len(centers) < n_circles:
-        centers.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)])
-        radii.append(r_init)
-        
-    centers = np.array(centers[:n_circles])
-    radii = np.array(radii[:n_circles])
+    # Equalize radii slightly if they diverged too much, 
+    # but the problem allows different radii. 
+    # However, for sum maximization, equal is usually best.
+    # Let's just return the optimized radii.
     
-    # 2. Optimization Loop
-    # We will iteratively try to increase radii and relax positions.
+    # To strictly maximize sum, we might want to push radii to be equal 
+    # if the configuration allows. But the force method should have pushed 
+    # them to the boundary of the packing.
     
-    max_iterations = 200
-    growth_step = 0.0005
-    
-    # Precompute indices for constraints
-    pairs = [(i, j) for i in range(n_circles) for j in range(i + 1, n_circles)]
-    
-    def get_overlap_energy(pos, rad):
-        """
-        Calculates the energy based on overlaps and boundary violations.
-        pos: (N, 2)
-        rad: (N,)
-        """
-        energy = 0.0
-        
-        # Pairwise overlaps
-        # Vectorized distance calculation
-        # pos shape (N, 2)
-        # Compute distance matrix
-        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :] # (N, N, 2)
-        dists = np.sqrt(np.sum(diff**2, axis=2)) # (N, N)
-        
-        # Lower triangle indices
-        triu_indices = np.triu_indices(n_circles, k=1)
-        r_sum = rad[np.newaxis, :] + rad[:, np.newaxis] # (N, N)
-        
-        overlaps = np.maximum(0, r_sum - dists)
-        energy += np.sum(overlaps**2)
-        
-        # Boundary violations
-        # Left/Right
-        violations_x_left = np.maximum(0, rad - pos[:, 0])
-        violations_x_right = np.maximum(0, rad - (1.0 - pos[:, 0]))
-        violations_y_bottom = np.maximum(0, rad - pos[:, 1])
-        violations_y_top = np.maximum(0, rad - (1.0 - pos[:, 1]))
-        
-        energy += np.sum(violations_x_left**2) + np.sum(violations_x_right**2)
-        energy += np.sum(violations_y_bottom**2) + np.sum(violations_y_top**2)
-        
-        return energy
+    # Final clean up of positions to be strictly inside
+    for i in range(n):
+        r = radii[i]
+        centers[i, 0] = max(r, min(1-r, centers[i, 0]))
+        centers[i, 1] = max(r, min(1-r, centers[i, 1]))
 
-    def energy_grad(pos, rad):
-        """
-        Gradient of energy w.r.t positions.
-        """
-        grad = np.zeros_like(pos)
-        
-        # Pairwise
-        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff**2, axis=2))
-        # Avoid division by zero
-        dists_safe = np.where(dists < 1e-12, 1e-12, dists)
-        dirs = diff / dists_safe[:, :, np.newaxis] # (N, N, 2)
-        
-        r_sum = rad[np.newaxis, :] + rad[:, np.newaxis]
-        overlaps = np.maximum(0, r_sum - dists)
-        
-        # Force magnitude for pair (i, j) is 2 * overlap
-        # Force direction on i is +dir, on j is -dir
-        # We sum contributions
-        
-        # Construct a matrix of forces magnitude
-        # F_mag[i, j] = 2 * overlap[i, j]
-        # But overlap is symmetric.
-        # Force on i from j: 2 * overlap * dir_ij
-        # Force on j from i: -2 * overlap * dir_ij
-        
-        # We can compute this efficiently
-        # Overlaps matrix is symmetric
-        # We only care where overlap > 0
-        
-        # Let's compute contribution to grad[i]
-        # grad[i] += sum_j ( 2 * overlap[i,j] * (pos[i] - pos[j]) / dist[i,j] )
-        
-        # Vectorized approach:
-        # We have dirs (N, N, 2). overlap (N, N).
-        # We want sum over j for each i.
-        
-        # Filter for overlaps
-        mask = overlaps > 1e-12
-        force_mag = 2.0 * overlaps * mask # (N, N)
-        
-        # Weighted sum of directions
-        # grad[i] = sum_j force_mag[i,j] * dirs[i,j]
-        # Note: dirs[i,j] = (pos[i]-pos[j])/dist
-        # This gives repulsion direction (away from j)
-        
-        # Compute sum
-        # (N, N) * (N, N, 2) -> sum axis 1
-        # Broadcasting: force_mag[:,:,np.newaxis] * dirs
-        
-        # However, this sums both i->j and j->i?
-        # No, loop i over rows, j over cols.
-        # For a specific i, we sum over j.
-        # dirs[i,j] is vector from j to i.
-        # So positive force_mag pushes i away from j. Correct.
-        
-        # But force_mag[i,j] == force_mag[j,i].
-        # dirs[i,j] == -dirs[j,i].
-        # So forces are consistent.
-        
-        # Summing over axis 1 (j)
-        # grad = np.sum(force_mag[:,:,np.newaxis] * dirs, axis=1)
-        
-        # This might be heavy memory wise for large N, but N=26 is small.
-        # Let's do it.
-        
-        # To save memory, we can compute iteratively or use sparse logic, but N=26 is trivial.
-        
-        # Actually, let's just loop for clarity and safety, N=26 is very small.
-        for i in range(n_circles):
-            for j in range(n_circles):
-                if i == j: continue
-                dist = dists[i, j]
-                if dist < r_sum[i, j]:
-                    overlap = r_sum[i, j] - dist
-                    # Direction from j to i
-                    direction = (pos[i] - pos[j]) / dist
-                    # Force is repulsive, proportional to overlap
-                    # Gradient of (overlap^2) is 2*overlap * (-grad_dist) ?
-                    # Energy term: (r_sum - dist)^2
-                    # dE/dpos[i] = 2(r_sum - dist) * (- d(dist)/dpos[i])
-                    # dist = |pos[i] - pos[j]|
-                    # d(dist)/dpos[i] = (pos[i] - pos[j]) / dist
-                    # So dE/dpos[i] = 2(r_sum - dist) * (-(pos[i] - pos[j])/dist)
-                    # Wait, overlap = r_sum - dist.
-                    # If we define Energy = overlap^2.
-                    # d(overlap)/dpos[i] = - (pos[i]-pos[j])/dist
-                    # So gradient is 2 * overlap * (- direction).
-                    # This is attractive?
-                    # If overlap > 0, we want to INCREASE dist.
-                    # Increasing dist means moving pos[i] AWAY from pos[j].
-                    # Vector away from j is (pos[i] - pos[j]).
-                    # So force should be in direction of (pos[i] - pos[j]).
-                    # Let's check signs.
-                    # E = (C - D)^2. dE/dD = -2(C-D).
-                    # D = |x|. dD/dx = x/|x|.
-                    # dE/dx = -2(C-D) * x/|x|.
-                    # If C > D (overlap), term is negative.
-                    # Force is -Gradient? No, we minimize E.
-                    # Gradient points uphill.
-                    # If C > D, (C-D) > 0. -2(+) * direction.
-                    # Direction is x/|x| (from j to i? No, x is pos[i]-pos[j]).
-                    # pos[i] - pos[j] points from j to i.
-                    # So gradient points from j to i?
-                    # If gradient points from j to i, moving in -gradient moves towards j.
-                    # That reduces distance. Bad.
-                    # We want to increase distance.
-                    # So we should move in direction +gradient?
-                    # No, minimize E.
-                    # If E is high, we want to go down.
-                    # If C > D, E increases as D decreases.
-                    # So E is high when D is small.
-                    # We want to increase D.
-                    # Gradient of E w.r.t pos[i] should point in direction that increases E?
-                    # Let's re-evaluate.
-                    # E = (K - |x|)^2.
-                    # If |x| < K, E > 0.
-                    # dE/d|x| = -2(K - |x|) < 0.
-                    # So increasing |x| decreases E.
-                    # |x| increases if we move x away from 0 (assuming 0 is pos[j]).
-                    # x = pos[i] - pos[j].
-                    # Moving pos[i] in direction x increases |x|.
-                    # So we want to move pos[i] in direction x.
-                    # Gradient of E w.r.t x:
-                    # dE/dx = dE/d|x| * d|x|/dx = -2(K-|x|) * (x/|x|).
-                    # This vector is opposite to x (since K-|x| > 0).
-                    # So Gradient points towards j.
-                    # To minimize E, we move in -Gradient, which is direction x (away from j).
-                    # Correct.
-                    
-                    # So Gradient = -2 * overlap * direction_away_from_j
-                    # direction_away_from_j = (pos[i] - pos[j]) / dist
-                    # Grad += -2 * overlap * (pos[i] - pos[j]) / dist
-                    
-                    # Let's stick to the code logic:
-                    # grad[i] -= 2 * overlap * direction
-                    pass
-            
-            # Vectorized gradient calculation for pairs
-            # dists[i,j] is dist between i and j
-            # overlap[i,j] is max(0, r_sum - dists)
-            # direction[i,j] = (pos[i] - pos[j]) / dists
-            
-            # grad[i] = sum_j ( -2 * overlap[i,j] * direction[i,j] )
-            # But overlap[i,j] is 0 if no overlap.
-            
-            # Let's compute matrix M where M[i,j] = 2 * overlap[i,j] / dists[i,j]
-            # Then grad[i] = - sum_j M[i,j] * (pos[i] - pos[j])
-            
-            # Careful with dist=0
-            mask = dists > 1e-12
-            inv_dists = np.zeros_like(dists)
-            inv_dists[mask] = 1.0 / dists[mask]
-            
-            overlaps_mat = np.maximum(0, r_sum - dists)
-            coeffs = 2.0 * overlaps_mat * inv_dists # (N, N)
-            
-            # grad[i] -= sum_j coeffs[i,j] * (pos[i] - pos[j])
-            # pos[i] - pos[j] is diff[i, j, :]
-            
-            # We can compute this using dot product
-            # grad[i] -= coeffs[i, :] @ diff[i, :, :]
-            
-            for i in range(n_circles):
-                grad[i] -= np.dot(coeffs[i, :], diff[i, :, :])
-
-        # Boundary gradients
-        # Left: E = (r - x)^2 if x < r. dE/dx = -2(r-x) = 2(x-r).
-        # If x < r, x-r < 0, so grad points negative (left).
-        # -Grad points right (away from wall). Correct.
-        # Term: max(0, r - x)^2
-        # Derivative w.r.t x: 2(r-x) * (-1) if r-x > 0 => -2(r-x) = 2(x-r).
-        
-        # x < r: violation.
-        violation_x_left = rad - pos[:, 0]
-        mask_x_left = violation_x_left > 1e-12
-        grad[mask_x_left, 0] += 2 * violation_x_left[mask_x_left] # Wait, dE/dx = 2(x-r) = -2(r-x).
-        # If x < r, r-x > 0. Gradient should be negative (pushing x up? No).
-        # If x is small (0), r-x is positive. E is high.
-        # We want to increase x.
-        # Gradient of E w.r.t x should be negative?
-        # If E = (r-x)^2, dE/dx = -2(r-x).
-        # If r-x > 0, dE/dx < 0.
-        # So Gradient points left (decreasing x).
-        # Minimizing E means moving against gradient -> moving right (increasing x).
-        # Correct.
-        # So grad component should be -2(r-x).
-        # My previous line: grad += 2*(r-x) was wrong sign?
-        # Let's re-verify.
-        # E = (r - x)^2.
-        # dE/dx = 2(r - x) * (-1) = -2(r - x).
-        # So grad[0] += -2 * (r - x).
-        
-        # Let's rewrite boundary gradients carefully.
-        
-        # Left Wall
-        val = rad - pos[:, 0]
-        mask = val > 1e-12
-        grad[mask, 0] += -2.0 * val[mask]
-        
-        # Right Wall: E = (r - (1-x))^2 = (r - 1 + x)^2.
-        # Let u = r - 1 + x. E = u^2. dE/dx = 2u * 1 = 2(r - 1 + x).
-        # Violation if 1-x < r => x > 1-r.
-        # val = (1-x) - r = 1 - x - r.
-        # If val < 0, violation.
-        # Let's use form (r - (1-x))^2.
-        # Violation amount: r - (1-x) = r - 1 + x.
-        # If > 0, penalty.
-        val = rad - (1.0 - pos[:, 0])
-        mask = val > 1e-12
-        grad[mask, 0] += 2.0 * val[mask] # Because dE/dx = 2val.
-        
-        # Bottom Wall
-        val = rad - pos[:, 1]
-        mask = val > 1e-12
-        grad[mask, 1] += -2.0 * val[mask]
-        
-        # Top Wall
-        val = rad - (1.0 - pos[:, 1])
-        mask = val > 1e-12
-        grad[mask, 1] += 2.0 * val[mask]
-        
-        return grad
-
-    # Optimization parameters
-    lr = 0.01 # Learning rate for gradient descent on positions
-    
-    # Main Loop
-    for step in range(max_iterations):
-        # 1. Optimize positions for current radii
-        # We use a simple gradient descent step or scipy minimize
-        # Scipy minimize might be overkill per step, but robust.
-        # Let's try a few steps of gradient descent with adaptive step size
-        
-        # Flatten positions for optimization
-        x_flat = centers.flatten()
-        
-        # Define objective for scipy
-        def obj(pos_flat):
-            pos = pos_flat.reshape(-1, 2)
-            return get_overlap_energy(pos, radii)
-        
-        def grad_obj(pos_flat):
-            pos = pos_flat.reshape(-1, 2)
-            g = energy_grad(pos, radii)
-            return g.flatten()
-        
-        # Use L-BFGS-B or similar
-        # Bounds for positions: [0, 1] is too loose, [r, 1-r] is tight
-        # But r changes. Let's use [0, 1] and rely on penalty.
-        bounds = [(0.0, 1.0)] * (2 * n_circles)
-        
-        try:
-            res = opt.minimize(obj, x_flat, jac=grad_obj, method='L-BFGS-B', bounds=bounds, 
-                               options={'maxiter': 50, 'ftol': 1e-12, 'gtol': 1e-10})
-            centers = res.x.reshape(-1, 2)
-        except Exception:
-            pass # Fallback to no update
-            
-        # 2. Check validity and try to grow
-        # Calculate current overlaps
-        e = get_overlap_energy(centers, radii)
-        
-        # If energy is very low (valid packing), try to increase radii
-        if e < 1e-6:
-            # Check if we can grow
-            # Try growing by a small amount
-            # Determine max possible growth based on gaps?
-            # Simple heuristic: grow by fixed step if valid
-            radii += growth_step
-            
-            # Clamp radii to reasonable max (0.5)
-            radii = np.minimum(radii, 0.5)
-            
-            # After growing, we likely have overlaps.
-            # The next iteration's position optimization will fix it.
-            # But we might need to reduce growth step if we can't resolve it.
-            # For now, keep it simple.
-        else:
-            # If not valid, maybe reduce growth step or just rely on optimization
-            # If energy is high, maybe we are stuck.
-            # Try to reduce growth step
-            if step > 50:
-                 growth_step *= 0.95
-
-    # Final check and return
     sum_radii = np.sum(radii)
     
-    # Ensure constraints are satisfied (clipping if necessary due to float errors)
-    # The validation function is strict, so we should be careful.
-    # But the optimization should have handled it.
-    
     return centers, radii, sum_radii
+
+# Helper to verify locally if needed (not part of solution output)
+if __name__ == "__main__":
+    centers, radii, total = run_packing()
+    print(f"Sum of radii: {total}")
+    # print(centers)
+    # print(radii)

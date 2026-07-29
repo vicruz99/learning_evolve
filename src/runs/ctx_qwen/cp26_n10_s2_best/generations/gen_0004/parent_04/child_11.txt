@@ -1,0 +1,184 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square, I will employ a refined multi-start optimization strategy combined with iterative perturbation refinement. Key improvements over previous attempts include:
+1. **Diverse Initial Configurations**: Generate structured hexagonal lattice patterns with varying row distributions, rotations, and shifts, alongside force-directed repulsive layouts. This covers both crystalline and disordered local minima basins.
+2. **Robust Feasibility Handling**: A dedicated `make_feasible` function iteratively adjusts radii to strictly satisfy non-overlap and boundary constraints before each optimization run, preventing SLSQP from failing on infeasible starts.
+3. **Adaptive Perturbation Refinement**: After the initial multi-start phase, I will apply a simulated annealing-like perturbation loop on the best configuration found. Centers are perturbed with decaying noise, radii are temporarily shrunk to create slack, and feasibility is restored before re-optimizing. This helps escape shallow local minima where circles are geometrically locked.
+4. **Strict Post-Processing**: Final enforcement of boundary and non-overlap constraints with a small safety margin guarantees validator compliance despite floating-point inaccuracies.
+5. **Vectorized & Efficient Constraint Evaluation**: Precomputed pairwise indices and squared distance constraints ensure fast gradient evaluation for SLSQP.
+</strategy>
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Compute inequality constraints: boundaries and pairwise non-overlap (squared)."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - (r[PAIR_I] + r[PAIR_J])**2
+    return c
+
+def make_feasible(centers, radii):
+    """Adjust radii to guarantee constraints are strictly satisfied."""
+    r = radii.copy()
+    r = np.minimum(r, np.minimum(centers[:, 0], 1.0 - centers[:, 0]))
+    r = np.minimum(r, np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    for _ in range(15):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if r[i] + r[j] > d + 1e-8:
+                    shrink = (r[i] + r[j] - d) / 2.0 + 1e-8
+                    r[i] = max(0.0, r[i] - shrink)
+                    r[j] = max(0.0, r[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+    return np.maximum(r, 1e-5)
+
+def generate_inits():
+    """Generate diverse initial configurations."""
+    inits = []
+    np.random.seed(42)
+    
+    # 1. Hexagonal lattice patterns with varying row counts
+    row_pats = [[6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], [7, 6, 6, 7], [4, 6, 6, 6, 4]]
+    for pat in row_pats:
+        if sum(pat) < N:
+            continue
+        r0 = 0.09
+        pts = []
+        y = r0
+        row_idx = 0
+        for count in pat:
+            x_start = r0 if row_idx % 2 == 0 else 2.0 * r0
+            for k in range(count):
+                if len(pts) >= N:
+                    break
+                x = x_start + k * 2.0 * r0
+                pts.append([x, y])
+            y += r0 * np.sqrt(3.0)
+            row_idx += 1
+        base = np.array(pts[:N])
+        
+        for ang in [0.0, 0.05, -0.05, 0.1, -0.1]:
+            for sx in [-0.02, 0.0, 0.02]:
+                for sy in [-0.02, 0.0, 0.02]:
+                    p = base.copy()
+                    if ang != 0.0:
+                        c, s = np.cos(ang), np.sin(ang)
+                        p = (p - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+                    p += [sx, sy]
+                    p = np.clip(p, 0.02, 0.98)
+                    r = make_feasible(p, np.full(N, 0.04))
+                    inits.append(np.concatenate([p[:, 0], p[:, 1], r]))
+
+    # 2. Force-directed repulsive layouts
+    for seed in range(15):
+        np.random.seed(seed)
+        c = np.random.uniform(0.15, 0.85, (N, 2))
+        for _ in range(150):
+            forces = np.zeros_like(c)
+            diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+            dist = np.linalg.norm(diff, axis=2)
+            np.fill_diagonal(dist, np.inf)
+            mask = dist < 0.2
+            f_mag = np.where(mask, (0.2 - dist) / dist, 0.0)
+            f_vec = diff * f_mag[:, :, np.newaxis]
+            forces += np.sum(f_vec, axis=1) * 0.02
+            c += forces
+            c = np.clip(c, 0.05, 0.95)
+        r = make_feasible(c, np.full(N, 0.03))
+        inits.append(np.concatenate([c[:, 0], c[:, 1], r]))
+        
+    return inits
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-5, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_v = None
+    inits = generate_inits()
+    
+    # Phase 1: Multi-start optimization
+    for v0 in inits:
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            s = -res.fun
+            if np.min(constraints(res.x)) >= -1e-6 and s > best_sum:
+                best_sum = s
+                best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Iterative perturbation refinement to escape local minima
+    if best_v is not None:
+        curr = best_v.copy()
+        for step in range(40):
+            np.random.seed(step + 500)
+            pert = curr.copy()
+            noise = 0.004 * (1.0 - step / 40.0)
+            pert[:2*N] += np.random.uniform(-noise, noise, 2*N)
+            pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+            
+            # Shrink radii to create slack for center rearrangement
+            pert[2*N:] *= 0.92
+            c_p = pert[:2*N].reshape(N, 2)
+            pert[2*N:] = make_feasible(c_p, pert[2*N:])
+            
+            try:
+                res = minimize(objective, pert, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+                s = -res.fun
+                if np.min(constraints(res.x)) >= -1e-6 and s > best_sum:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    curr = best_v.copy()
+            except Exception:
+                pass
+                
+    # Extract final configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    
+    # Strict post-processing for validator compliance
+    cr = np.minimum(cr, np.minimum(cx, 1.0 - cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0 - cy))
+    
+    for _ in range(20):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                if d < cr[i] + cr[j] - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    centers = np.column_stack((cx, cy))
+    return centers, cr, float(np.sum(cr))
+```

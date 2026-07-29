@@ -1,13 +1,13 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we treat this as a constrained nonlinear optimization problem. The objective is to maximize $\sum r_i$ subject to non-overlap and boundary constraints. 
+To maximize the sum of radii for 26 circles in a unit square, we formulate this as a non-linear constrained optimization problem. The decision variables are the $(x, y)$ coordinates and radius $r$ for each circle. The constraints are boundary conditions ($r \le x, y \le 1-r$) and non-overlap conditions ($\|c_i - c_j\| \ge r_i + r_j$).
 
-Strategy:
-1. **Initialization**: Start with a structured configuration to give the optimizer a good head start. A $5 \times 5$ grid of circles plus one additional circle placed in a gap provides a dense initial packing. We set initial radii to 0.09.
-2. **Optimization Method**: We use a penalty-based approach with `scipy.optimize.minimize` (method `L-BFGS-B`). This solver efficiently handles bound constraints. We incorporate overlap constraints into the objective function as a penalty term: $\text{Penalty} = \lambda \sum \max(0, r_i + r_j - d_{ij})^2$. The large penalty coefficient $\lambda$ forces the optimizer to respect non-overlap constraints while pushing radii to their maximum feasible values.
-3. **Refinement**: We run the optimization with a high penalty weight to ensure strict adherence to constraints. The bounds on coordinates $[0, 1]$ and radii $[0, 0.5]$ are enforced directly by the solver.
-4. **Final Validation**: A small epsilon is added to radii to prevent zero/negative values, and the final configuration is returned. The penalty method combined with a robust initial grid configuration typically converges to a local optimum near the global maximum for this problem size.
+We use `scipy.optimize.minimize` with the `SLSQP` method, which handles inequality constraints well. To escape local minima, we initialize the optimizer from multiple starting configurations:
+1. A structured hexagonal lattice pattern, scaled and centered in the square. This closely mimics optimal dense packing geometry.
+2. Several randomized configurations with different seeds to explore the solution space broadly.
+
+The constraint functions are vectorized using NumPy for computational efficiency. Global precomputed indices are used to avoid closure issues and repeated index generation. The optimizer runs multiple times, and the best valid configuration (highest sum of radii) is returned.
 </strategy>
 
 ```python
@@ -15,69 +15,87 @@ import numpy as np
 from scipy.optimize import minimize
 
 N_CIRCLES = 26
+I_IDX, J_IDX = np.triu_indices(N_CIRCLES, k=1)
 
-def compute_penalized_objective(vars, lam):
-    """
-    Objective function with penalty for overlaps.
-    Minimizes -sum(radii) + lambda * sum(violations^2)
-    """
+def get_objective(vars):
+    """Minimize negative sum of radii (equivalent to maximizing sum)"""
+    return -np.sum(vars[2*N_CIRCLES:])
+
+def get_constraints(vars):
+    """Compute constraint values. All must be >= 0 for validity."""
     x = vars[:N_CIRCLES]
     y = vars[N_CIRCLES:2*N_CIRCLES]
     r = vars[2*N_CIRCLES:]
     
-    obj = -np.sum(r)
-    penalty = 0.0
+    con = np.empty(4*N_CIRCLES + len(I_IDX))
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    con[:N_CIRCLES] = x - r
+    con[N_CIRCLES:2*N_CIRCLES] = 1 - x - r
+    con[2*N_CIRCLES:3*N_CIRCLES] = y - r
+    con[3*N_CIRCLES:4*N_CIRCLES] = 1 - y - r
     
-    # Check overlaps between all pairs
-    for i in range(N_CIRCLES):
-        for j in range(i + 1, N_CIRCLES):
-            dx = x[i] - x[j]
-            dy = y[i] - y[j]
-            dist = np.sqrt(dx*dx + dy*dy)
-            v = r[i] + r[j] - dist
-            if v > 0:
-                penalty += v**2
-                
-    return obj + lam * penalty
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = x[I_IDX] - x[J_IDX]
+    dy = y[I_IDX] - y[J_IDX]
+    dr = r[I_IDX] + r[J_IDX]
+    con[4*N_CIRCLES:] = dx**2 + dy**2 - dr**2
+    return con
 
-def run_packing():
-    # 1. Initialization: 5x5 grid + 1 extra circle
-    # This provides a dense, structured starting point
-    x_grid = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
-    y_grid = np.array([0.1, 0.3, 0.5, 0.7, 0.9])
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = [(0, 1)]*N_CIRCLES + [(0, 1)]*N_CIRCLES + [(0, 0.5)]*N_CIRCLES
     
-    x = np.tile(x_grid, 5)
-    y = np.repeat(y_grid, 5)
+    inits = []
     
-    # Place the 26th circle in a gap to avoid immediate massive overlap
-    x = np.append(x, 0.55)
-    y = np.append(y, 0.55)
+    # 1. Hexagonal lattice initialization
+    hex_pts = []
+    r0 = 0.1
+    rows = [5, 6, 5, 6, 4]
+    for r_idx, cnt in enumerate(rows):
+        y = r_idx * np.sqrt(3) * r0
+        x_start = (0 if r_idx % 2 == 0 else 1) * r0
+        for k in range(cnt):
+            hex_pts.append((x_start + k * 2*r0, y))
+            
+    hex_arr = np.array(hex_pts)
+    min_p = hex_arr.min(axis=0)
+    max_p = hex_arr.max(axis=0)
+    range_p = max_p - min_p
+    # Scale to fit comfortably within [0.1, 0.9]
+    target_range = 0.8
+    scale = target_range / range_p
+    hex_arr = (hex_arr - min_p) * scale + 0.1
     
-    r = np.full(N_CIRCLES, 0.09)
+    inits.append(np.concatenate([hex_arr[:, 0], hex_arr[:, 1], np.full(N_CIRCLES, 0.1)]))
     
-    # Concatenate variables: [x_0..x_25, y_0..y_25, r_0..r_25]
-    vars0 = np.concatenate([x, y, r])
+    # 2. Random initializations
+    for seed in range(5):
+        np.random.seed(seed)
+        rx = np.random.uniform(0.15, 0.85, N_CIRCLES)
+        ry = np.random.uniform(0.15, 0.85, N_CIRCLES)
+        inits.append(np.concatenate([rx, ry, np.full(N_CIRCLES, 0.08)]))
+        
+    best_sum_r = 0.0
+    best_vars = None
     
-    # Bounds: coordinates in [0, 1], radii in [0, 0.5]
-    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+    for init in inits:
+        try:
+            res = minimize(get_objective, init, method='SLSQP', bounds=bounds, 
+                           constraints={'type': 'ineq', 'fun': get_constraints},
+                           options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+            if not np.isnan(res.fun) and -res.fun > best_sum_r:
+                best_sum_r = -res.fun
+                best_vars = res.x
+        except Exception:
+            continue
+            
+    if best_vars is None:
+        best_vars = inits[0]
+        
+    cx = best_vars[:N_CIRCLES]
+    cy = best_vars[N_CIRCLES:2*N_CIRCLES]
+    cr = best_vars[2*N_CIRCLES:]
     
-    # Optimization
-    # Use a large penalty lambda to enforce non-overlap strictly
-    lam = 10000.0
-    res = minimize(compute_penalized_objective, vars0, args=(lam,), 
-                   method='L-BFGS-B', bounds=bounds, 
-                   options={'maxiter': 5000, 'ftol': 1e-15})
-    
-    # Extract results
-    x_opt = res.x[:N_CIRCLES]
-    y_opt = res.x[N_CIRCLES:2*N_CIRCLES]
-    r_opt = res.x[2*N_CIRCLES:]
-    
-    # Ensure radii are strictly positive
-    r_opt = np.maximum(r_opt, 1e-9)
-    
-    centers = np.column_stack([x_opt, y_opt])
-    total_sum = np.sum(r_opt)
-    
-    return centers, r_opt, total_sum
+    centers = np.column_stack((cx, cy))
+    radii = cr
+    return centers, radii, np.sum(radii)
 ```

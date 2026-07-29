@@ -1,126 +1,210 @@
 # sol_000064 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state cae61cda) state=969df99b sum of radii=2.583028 correctness=1.0
+# generation=0 parent=seed (state 608ae89b) state=d032f1ca sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import linprog
 
-def validate_packing(centers, radii):
-    """
-    Validate that circles don't overlap and are inside the unit square
-    """
-    n = centers.shape[0]
-    if np.isnan(centers).any() or np.isnan(radii).any():
-        return False
+def run_packing():
+    np.random.seed(42)
+    N = 26
+    centers = np.zeros((N, 2))
+    radii = np.zeros(N)
+    
+    # 1. Initialization: Hexagonal Grid
+    # Attempt to fit a 6-row hexagonal structure.
+    # If 6 rows don't fit, use 5 rows with perturbations.
+    # We start with a slightly smaller radius to ensure validity.
+    initial_r = 0.08 
+    
+    row_counts = [5, 4, 5, 4, 5, 3] # Total 26
+    if sum(row_counts) != N:
+        # Fallback to a more generic hex fill
+        row_counts = []
+        count = 0
+        row_idx = 0
+        while count < N:
+            # 5 or 4 circles per row
+            c = 5 if (count + 5 <= N and (N - count) % 2 == 0) else 4 # Logic adjustment
+            # Simpler: Just fill rows of 5 until done
+            c = 5
+            if count + c > N: c = N - count
+            row_counts.append(c)
+            count += c
+        
+    # Re-calc row counts properly for hex packing (alternating 5, 4)
+    # 5, 4, 5, 4, 5, 3 = 26. 
+    # Let's try to place them.
+    
+    idx = 0
+    for i, count in enumerate(row_counts):
+        y = initial_r + i * np.sqrt(3) * initial_r
+        if y + initial_r > 1.0: break
+        
+        # Shift odd rows
+        offset = (initial_r * 0.5) if i % 2 == 1 else 0
+        x_start = initial_r - offset
+        # Adjust start to fit 'count' circles
+        # Total width needed: (count-1)*2r + 2r = count*2r
+        # We have 1.0 width.
+        # If count*2r > 1, we must scale r or shift.
+        # Here we just place them centered.
+        
+        if count * 2 * initial_r > 1.0:
+             # Scale x positions to fit
+             spacing = 1.0 / count
+             for k in range(count):
+                 centers[idx, 0] = (k + 0.5) * spacing
+                 centers[idx, 1] = y
+                 idx += 1
+        else:
+            # Fit with spacing
+            # Center the row
+            row_width = (count - 1) * 2 * initial_r
+            x_start = (1.0 - row_width) / 2
+            for k in range(count):
+                centers[idx, 0] = x_start + k * 2 * initial_r
+                centers[idx, 1] = y
+                idx += 1
+
+    # Ensure we have N centers
+    if idx < N:
+        # Fill remaining randomly
+        for k in range(idx, N):
+            centers[k] = np.random.rand(2) * 0.8 + 0.1
+            
+    radii[:] = initial_r
+    
+    # 2. Optimization Loop
+    for iteration in range(1000):
+        # --- Step A: Optimize Radii (LP) ---
+        # Maximize sum(r_i)
+        # s.t. r_i + r_j <= dist(i,j)
+        #      r_i <= dist(i, boundary)
+        #      r_i >= 0
+        
+        # Construct LP
+        # c = -1 for all (maximize sum r)
+        c_obj = -np.ones(N)
+        
+        # Constraints matrix A_ub and b_ub
+        # r_i + r_j <= D_ij
+        # r_i <= B_i
+        
+        constraints_A = []
+        constraints_b = []
+        
+        # Precompute distances and boundaries
+        D = np.zeros((N, N))
+        B = np.zeros(N)
+        
+        for i in range(N):
+            xi, yi = centers[i]
+            B[i] = min(xi, 1.0 - xi, yi, 1.0 - yi)
+            
+            for j in range(i + 1, N):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                D[i, j] = dist
+                D[j, i] = dist
+                
+                # Constraint: r_i + r_j <= dist
+                row = np.zeros(N)
+                row[i] = 1.0
+                row[j] = 1.0
+                constraints_A.append(row)
+                constraints_b.append(dist)
+        
+        # Boundary constraints: r_i <= B_i
+        for i in range(N):
+            row = np.zeros(N)
+            row[i] = 1.0
+            constraints_A.append(row)
+            constraints_b.append(B[i])
+            
+        A_ub = np.array(constraints_A)
+        b_ub = np.array(constraints_b)
+        
+        # Bounds: r_i >= 0
+        bounds = [(0, None) for _ in range(N)]
+        
+        # Solve LP
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success:
+            radii = res.x
+        else:
+            # Fallback if LP fails (rare)
+            radii[:] = np.min([np.min(B), np.min(D)]) / 2.0 # Just shrink
+            
+        # --- Step B: Move Centers (Repulsion Forces) ---
+        # Calculate forces to push centers apart where constraints are tight
+        forces = np.zeros((N, 2))
+        alpha = 0.05 # Step size
+        
+        for i in range(N):
+            xi, yi = centers[i]
+            ri = radii[i]
+            
+            # Boundary repulsion
+            margin = 1e-6
+            if xi < ri + margin: forces[i, 0] += 1.0 / (xi + margin)
+            if xi > 1.0 - ri - margin: forces[i, 0] -= 1.0 / (1.0 - xi + margin)
+            if yi < ri + margin: forces[i, 1] += 1.0 / (yi + margin)
+            if yi > 1.0 - ri - margin: forces[i, 1] -= 1.0 / (1.0 - yi + margin)
+            
+            # Circle repulsion
+            for j in range(i + 1, N):
+                rj = radii[j]
+                dx = centers[j, 0] - xi
+                dy = centers[j, 1] - yi
+                dist = np.sqrt(dx*dx + dy*dy)
+                
+                if dist < 1e-9: dist = 1e-9 # Avoid div by zero
+                
+                # Repulsive force proportional to sum of radii and inverse distance squared
+                # Stronger push if they are touching (ri + rj approx dist)
+                overlap_metric = (ri + rj) / dist 
+                
+                # Force magnitude
+                mag = 0.5 * (ri + rj) / (dist**2 + 1e-6)
+                
+                fx = mag * dx / dist
+                fy = mag * dy / dist
+                
+                forces[i, 0] -= fx
+                forces[i, 1] -= fy
+                forces[j, 0] += fx
+                forces[j, 1] += fy
+
+        # Update centers
+        centers += alpha * forces
+        
+        # Clamp to square [0, 1]
+        centers = np.clip(centers, 0.0, 1.0)
+
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii
+
+# Validation check (internal)
+if __name__ == "__main__":
+    import math
+    centers, radii, s = run_packing()
+    # Print some stats
+    print(f"Sum of radii: {s}")
+    # Basic validity check
+    valid = True
+    n = len(radii)
     for i in range(n):
-        if radii[i] < -1e-12:
-            return False
         x, y = centers[i]
         r = radii[i]
-        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
-            return False
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
-            if dist < radii[i] + radii[j] - 1e-12:
-                return False
-    return True
-
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    N = 26
-    
-    # --- 1. Initial Configuration ---
-    # Hexagonal packing rows: 5, 6, 5, 6, 4 sums to 26
-    row_counts = [5, 6, 5, 6, 4]
-    centers = []
-    s = 0.21 # Estimated spacing
-    y = 0.1
-    
-    for i, cnt in enumerate(row_counts):
-        x_start = 0.5 - (cnt - 1) * s / 2
-        if i % 2 == 1:
-            x_start += s / 2.0
-        for k in range(cnt):
-            centers.append([x_start + k * s, y])
-        y += s * np.sqrt(3) / 2.0
-        
-    centers = np.array(centers)
-    
-    # Normalize to fit well in [0,1]
-    mins = np.min(centers, axis=0)
-    maxs = np.max(centers, axis=0)
-    span = maxs - mins
-    span[span < 1e-9] = 1e-9
-    
-    # Map to [0.05, 0.95] to leave room for radii optimization
-    centers = (centers - mins) / span
-    centers = centers * 0.9 + 0.05
-    
-    # Initial radii
-    r_init = 0.08 * np.ones(N)
-    
-    # Flatten to vector for optimizer: [x1, y1, r1, x2, y2, r2, ...]
-    x0 = np.zeros(N * 3)
-    for i in range(N):
-        x0[3*i] = centers[i, 0]
-        x0[3*i+1] = centers[i, 1]
-        x0[3*i+2] = r_init[i]
-        
-    bounds = [(0, 1)] * (3 * N)
-    
-    # --- 2. Constraints ---
-    # Boundary: x >= r, 1-x >= r, y >= r, 1-y >= r
-    def con_bound(v):
-        res = np.empty(N * 4)
-        for i in range(N):
-            xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
-            res[4*i] = xi - ri
-            res[4*i+1] = 1 - xi - ri
-            res[4*i+2] = yi - ri
-            res[4*i+3] = 1 - yi - ri
-        return res
-        
-    # Overlap: dist >= r_i + r_j
-    def con_overlap(v):
-        M = N * (N - 1) // 2
-        res = np.empty(M)
-        idx = 0
-        for i in range(N):
-            xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
-            for j in range(i+1, N):
-                xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
-                dx = xi - xj
-                dy = yi - yj
-                dist = np.sqrt(dx*dx + dy*dy)
-                res[idx] = dist - (ri + rj)
-                idx += 1
-        return res
-        
-    cons = [
-        {'type': 'ineq', 'fun': con_bound},
-        {'type': 'ineq', 'fun': con_overlap}
-    ]
-    
-    # --- 3. Objective ---
-    def obj(v):
-        return -np.sum(v[2::3])
-        
-    # --- 4. Optimization ---
-    res = minimize(obj, x0, method='SLSQP', bounds=bounds, constraints=cons, 
-                   options={'maxiter': 500, 'ftol': 1e-10, 'disp': False})
-    
-    # --- 5. Post-process ---
-    best_centers = np.zeros((N, 2))
-    best_radii = np.zeros(N)
-    for i in range(N):
-        best_centers[i] = [res.x[3*i], res.x[3*i+1]]
-        best_radii[i] = max(0, res.x[3*i+2]) # Ensure non-negative
-        
-    # Fallback check
-    if not validate_packing(best_centers, best_radii):
-        best_centers = centers
-        best_radii = r_init
-        
-    return best_centers, best_radii, float(np.sum(best_radii))
+        if x < r or x > 1-r or y < r or y > 1-r:
+            valid = False
+            break
+        for j in range(i+1, n):
+            dist = math.sqrt((x-centers[j,0])**2 + (y-centers[j,1])**2)
+            if dist < r + radii[j] - 1e-9:
+                valid = False
+                break
+    print(f"Valid: {valid}")

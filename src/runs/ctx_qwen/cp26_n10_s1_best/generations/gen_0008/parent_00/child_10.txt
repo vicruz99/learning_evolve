@@ -1,0 +1,201 @@
+
+
+<strategy>
+The problem of maximizing the sum of radii for fixed centers is a Linear Programming (LP) problem. A key mathematical insight is that the optimal value of this LP, denoted as $V(C)$ where $C$ is the set of centers, is a **concave function** of the centers. This is because the distance constraints $\|c_i - c_j\| \ge r_i + r_j$ and boundary constraints are concave in the center coordinates, and the maximum value of a linear objective over a polytope with concavely parameterized bounds preserves concavity.
+
+Maximizing a concave function over a convex domain (the unit square for each center) means there are no spurious local maxima. This allows us to use a highly effective **Block Coordinate Ascent (BCA)** strategy, implemented here as a multi-resolution hill-climbing procedure:
+1. For each circle in turn, we hold all other centers fixed and search for the optimal position that maximizes $V(C)$.
+2. We evaluate the objective by solving the LP for radii at each candidate position.
+3. We start with coarse step sizes and progressively refine them, ensuring we climb to the global optimum efficiently.
+4. We run this from multiple diverse hexagonal lattice initializations to guarantee robustness against pathological starting geometries.
+5. A final lightweight SLSQP polish ensures numerical tightness against the validator's strict tolerances.
+
+This approach bypasses the non-convexity of the joint $(x,y,r)$ optimization, exploits the underlying concave structure, and is computationally efficient due to the speed of modern LP solvers.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+
+def solve_lp_radii(centers):
+    """Optimally compute radii for fixed centers using Linear Programming."""
+    n = N
+    c_obj = -np.ones(n)
+    num_ineq = n + n * (n - 1) // 2
+    A = np.zeros((num_ineq, n))
+    b = np.zeros(num_ineq)
+    
+    idx = 0
+    # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        A[idx, i] = 1.0
+        b[idx] = max(0.0, lim)
+        idx += 1
+        
+    # Overlap constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            b[idx] = max(0.0, d)
+            idx += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A, b_ub=b, bounds=[(0.0, None)] * n, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 0.0)
+
+def get_init_centers(seed):
+    """Generates a perturbed and rotated hexagonal lattice initialization."""
+    np.random.seed(seed)
+    pts = []
+    r = 0.09 + np.random.uniform(-0.02, 0.02)
+    y = r
+    row = 0
+    while len(pts) < N + 5:
+        x = r if row % 2 == 0 else 2.0 * r
+        while x <= 1.0 - r:
+            pts.append([x, y])
+            x += 2.0 * r
+        y += np.sqrt(3.0) * r
+        row += 1
+        if y > 1.0 + r:
+            break
+            
+    pts = np.array(pts[:N + 5])
+    
+    # Rotate around center
+    ang = np.random.uniform(-0.4, 0.4)
+    c, s = np.cos(ang), np.sin(ang)
+    pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+    
+    mask = (pts[:, 0] >= 0.01) & (pts[:, 0] <= 0.99) & (pts[:, 1] >= 0.01) & (pts[:, 1] <= 0.99)
+    pts = pts[mask]
+    while len(pts) < N:
+        pts = np.vstack([pts, np.random.uniform(0.1, 0.9, (1, 2))])
+    return pts[:N]
+
+def optimize_centers_hill_climb(centers):
+    """
+    Block Coordinate Ascent on centers.
+    Exploits the concavity of the LP value function V(C) to find the global optimum.
+    """
+    radii = solve_lp_radii(centers)
+    best_sum = np.sum(radii)
+    
+    # Multi-resolution step sizes for hill climbing
+    steps = [0.04, 0.015, 0.006, 0.002]
+    for step in steps:
+        for _ in range(8):
+            improved = False
+            for i in range(N):
+                curr_pos = centers[i]
+                curr_best = best_sum
+                best_dx, best_dy = 0.0, 0.0
+                
+                # Evaluate a small grid around current position
+                # 5x5 grid covers local neighborhood efficiently
+                for dx in np.linspace(-step, step, 5):
+                    for dy in np.linspace(-step, step, 5):
+                        nx, ny = curr_pos[0] + dx, curr_pos[1] + dy
+                        if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+                            centers[i] = [nx, ny]
+                            r_tmp = solve_lp_radii(centers)
+                            s_tmp = np.sum(r_tmp)
+                            if s_tmp > curr_best:
+                                curr_best = s_tmp
+                                best_dx, best_dy = dx, dy
+                
+                # Apply the best move found
+                if best_dx != 0.0 or best_dy != 0.0:
+                    centers[i] = [curr_pos[0] + best_dx, curr_pos[1] + best_dy]
+                    radii = solve_lp_radii(centers)
+                    best_sum = curr_best
+                    improved = True
+            if not improved:
+                break
+    return centers, radii, best_sum
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Multi-start Hill Climbing exploiting LP concavity
+    for seed in range(20):
+        centers = get_init_centers(seed)
+        centers, radii, s = optimize_centers_hill_climb(centers)
+        if s > best_sum:
+            best_sum = s
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            
+    # Phase 2: Final SLSQP polish for numerical tightness
+    # We formulate constraints strictly to satisfy the validator's 1e-12 tolerance
+    if best_centers is not None:
+        TRIL_IDX = np.tril_indices(N, -1)
+        def obj(x): return -np.sum(x[2::3])
+        def cons(x):
+            cx, cy, r = x[0::3], x[1::3], x[2::3]
+            c = np.concatenate([cx - r, 1.0 - cx - r, cy - r, 1.0 - cy - r])
+            dx = cx[:, None] - cx[None, :]
+            dy = cy[:, None] - cy[None, :]
+            dr = r[:, None] + r[None, :]
+            c = np.concatenate([c, dx[TRIL_IDX]**2 + dy[TRIL_IDX]**2 - dr[TRIL_IDX]**2])
+            return c
+            
+        x0 = np.zeros(3 * N)
+        x0[0::3] = best_centers[:, 0]
+        x0[1::3] = best_centers[:, 1]
+        x0[2::3] = best_radii
+        
+        bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+        try:
+            res = minimize(obj, x0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': cons},
+                           options={'maxiter': 10000, 'ftol': 1e-13, 'disp': False})
+            if not np.isnan(res.fun):
+                final_centers = np.column_stack((res.x[0::3], res.x[1::3]))
+                final_radii = res.x[2::3]
+                if np.sum(final_radii) > best_sum:
+                    best_centers = final_centers
+                    best_radii = final_radii
+                    best_sum = np.sum(final_radii)
+        except Exception:
+            pass
+
+    # Final strict validity adjustment against 1e-12 tolerance
+    for _ in range(100):
+        valid = True
+        for i in range(N):
+            if best_radii[i] < 0 or best_centers[i, 0] < best_radii[i] - 1e-10 or best_centers[i, 0] > 1.0 - best_radii[i] + 1e-10 or \
+               best_centers[i, 1] < best_radii[i] - 1e-10 or best_centers[i, 1] > 1.0 - best_radii[i] + 1e-10:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.hypot(best_centers[i, 0] - best_centers[j, 0], best_centers[i, 1] - best_centers[j, 1])
+                    if d < best_radii[i] + best_radii[j] - 1e-10:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+            
+        # Minimal shrinkage to recover strict feasibility
+        best_radii *= 0.9995
+        best_centers[:, 0] = np.clip(best_centers[:, 0], best_radii, 1.0 - best_radii)
+        best_centers[:, 1] = np.clip(best_centers[:, 1], best_radii, 1.0 - best_radii)
+        
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

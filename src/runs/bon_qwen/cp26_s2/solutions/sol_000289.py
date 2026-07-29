@@ -1,0 +1,266 @@
+# sol_000289 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state a4dfceb8) state=7e4aefe3 sum of radii=2.617322 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+
+    if np.isnan(centers).any():
+        return False
+    if np.isnan(radii).any():
+        return False
+
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        elif np.isnan(radii[i]):
+            return False
+
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+
+    return True
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+
+    def objective(x):
+        # Negate sum of radii because we are minimizing
+        return -np.sum(x[n:])
+
+    def boundary_constraints(x):
+        c = x[:n]
+        r = x[n:]
+        # Ensure circles are inside [0, 1]
+        # x - r >= 0, x + r <= 1
+        return np.concatenate([c - r, 1 - c - r])
+
+    def separation_constraints(x):
+        c = x[:n]
+        r = x[n:]
+        cons = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((c[i] - c[j]) ** 2))
+                cons.append(dist - (r[i] + r[j]))
+        return np.array(cons)
+
+    def run_optimizer(init_x, seed):
+        np.random.seed(seed)
+        
+        # Perturb initial state slightly to avoid exact degeneracy
+        x0 = init_x + np.random.uniform(-1e-4, 1e-4, size=init_x.shape)
+        
+        bounds = [
+            (0, 1) for _ in range(n) # centers x
+        ] + [
+            (0, 1) for _ in range(n) # centers y
+        ] + [
+            (0, 0.5) for _ in range(n) # radii
+        ]
+        
+        # Flatten centers and radii for optimization
+        # x[:2n] are centers, x[2n:] are radii
+        # Note: The objective/constraints above assume x[:n] is centers and x[n:] is radii, 
+        # but centers are 2D. Let's fix the indexing.
+        
+        pass
+
+    # Corrected indexing for 1D array x:
+    # x[0...n-1] -> x coordinates
+    # x[n...2n-1] -> y coordinates
+    # x[2n...3n-1] -> radii
+    
+    def obj_flat(x):
+        return -np.sum(x[2*n:])
+
+    def constr_boundary_flat(x):
+        cx = x[:n]
+        cy = x[n:2*n]
+        r = x[2*n:]
+        # x - r >= 0 => x - r
+        # 1 - (x + r) >= 0 => 1 - x - r
+        return np.concatenate([cx - r, 1 - cx - r, cy - r, 1 - cy - r])
+
+    def constr_sep_flat(x):
+        cx = x[:n]
+        cy = x[n:2*n]
+        r = x[2*n:]
+        cons = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = cx[i] - cx[j]
+                dy = cy[i] - cy[j]
+                dist = np.sqrt(dx*dx + dy*dy)
+                cons.append(dist - (r[i] + r[j]))
+        return np.array(cons)
+
+    def try_optimization(init_cx, init_cy, init_r):
+        x0 = np.concatenate([init_cx, init_cy, init_r])
+        
+        bounds = [
+            (0, 1) for _ in range(2*n)
+        ] + [
+            (0, 1) for _ in range(n)
+        ]
+
+        cons = [
+            {'type': 'ineq', 'fun': constr_boundary_flat},
+            {'type': 'ineq', 'fun': constr_sep_flat}
+        ]
+
+        try:
+            res = minimize(
+                obj_flat, 
+                x0, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=cons, 
+                options={'maxiter': 500, 'ftol': 1e-9}
+            )
+            if res.success:
+                centers = np.column_stack((res.x[:n], res.x[n:2*n]))
+                radii = res.x[2*n:]
+                # Post-process: clip tiny radii to 0 to avoid negative/NaN issues
+                radii = np.maximum(radii, 1e-9)
+                # Re-validate
+                if validate_packing(centers, radii):
+                    return centers, radii, np.sum(radii)
+        except:
+            pass
+        return None, None, 0.0
+
+    # Initial Hexagonal Grid Setup
+    # Try to fit 26 circles. 5x5 is 25. Add 1.
+    # Hexagonal packing logic
+    init_cx = np.zeros(n)
+    init_cy = np.zeros(n)
+    init_r = np.full(n, 0.09) # Start slightly smaller than 0.1 to allow breathing room
+    
+    idx = 0
+    # Simple hexagonal layout approximation
+    rows = 6
+    circles_per_row = [4, 5, 4, 5, 4, 4] # Total 26
+    
+    # Adjust radii to fit roughly
+    r_est = 0.095
+    
+    y_offset = r_est
+    for r_idx, count in enumerate(circles_per_row):
+        # Shift rows
+        x_start = r_est if r_idx % 2 == 1 else r_est + r_est # Shift for hex
+        # Actually for hex, shift is r.
+        # But let's just distribute them evenly first
+        
+        for k in range(count):
+            if idx < n:
+                if r_idx % 2 == 1:
+                    init_cx[idx] = r_est + k * (2 * r_est)
+                else:
+                    init_cx[idx] = 2 * r_est + k * (2 * r_est) # Wait, this is wrong
+                
+                # Better approach:
+                # Row 0: 5 circles. x = 0.1, 0.3, 0.5, 0.7, 0.9
+                # Row 1: 4 circles. x = 0.2, 0.4, 0.6, 0.8
+                
+                # Let's reset and do standard hex
+                pass
+
+    # Let's build the initial config more carefully
+    # 5 rows of 5 circles is 25. 
+    # Let's try 5 rows of 5 and 1 extra? 
+    # Or 6 rows.
+    
+    # Configuration: 5, 5, 5, 5, 5, 1 ? No, height.
+    # Let's do 5, 4, 5, 4, 5, 3 ?
+    
+    # Let's just use a dense grid perturbed.
+    # 26 circles. 5x5 grid is 25. 
+    # We can place 25 in a grid and 1 in the center?
+    # Grid points: (0.1, 0.1) to (0.9, 0.9) step 0.2.
+    # Center (0.5, 0.5) is occupied.
+    # Let's try to optimize from a random dense pack.
+    
+    best_result = None
+    best_sum = 0.0
+    
+    for seed in range(20):
+        # Generate random valid initial configuration
+        cx = np.random.uniform(0.2, 0.8, n)
+        cy = np.random.uniform(0.2, 0.8, n)
+        r = np.full(n, 0.08)
+        
+        # Try to optimize
+        centers, radii, s = try_optimization(cx, cy, r)
+        if centers is not None and s > best_sum:
+            best_sum = s
+            best_result = (centers, radii, s)
+            
+        # Also try a structured initial guess
+        # Hexagonal packing
+        cx_init = []
+        cy_init = []
+        idx = 0
+        # Try to fit 26 in hex
+        # Row 0: 5 circles
+        # Row 1: 4 circles
+        # Row 2: 5 circles
+        # Row 3: 4 circles
+        # Row 4: 5 circles
+        # Row 5: 3 circles
+        # Total: 26
+        
+        r_init = 0.095
+        h = np.sqrt(3)/2 * (2*r_init)
+        
+        for row in range(6):
+            count = [5, 4, 5, 4, 5, 3][row]
+            y = r_init + row * h
+            if row % 2 == 1:
+                x_start = r_init + r_init # Shifted by r (half diameter)
+            else:
+                x_start = r_init
+            
+            for k in range(count):
+                if idx < n:
+                    cx_init.append(x_start + k * (2*r_init))
+                    cy_init.append(y)
+                    idx += 1
+                    
+        if len(cx_init) == n:
+            centers_init = np.array(cx_init)
+            cy_init_arr = np.array(cy_init)
+            r_init_arr = np.full(n, 0.09)
+            
+            centers, radii, s = try_optimization(centers_init, cy_init_arr, r_init_arr)
+            if centers is not None and s > best_sum:
+                best_sum = s
+                best_result = (centers, radii, s)
+
+    if best_result is None:
+        # Fallback
+        centers = np.random.uniform(0.1, 0.9, (n, 2))
+        radii = np.full(n, 0.01)
+        return centers, radii, np.sum(radii)
+        
+    return best_result

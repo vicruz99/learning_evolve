@@ -1,5 +1,5 @@
 # sol_000106 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state a3c1a30f) state=a2937308 sum of radii=2.204487 correctness=1.0
+# generation=0 parent=seed (state 81b841bb) state=a433dbd3 sum of radii=2.612832 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,83 +7,107 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def objective_function(centers_flat):
-    """
-    Computes the negative sum of maximal feasible radii for given centers.
-    Used as the objective for minimization.
-    """
-    centers = centers_flat.reshape(26, 2)
-    centers = np.clip(centers, 0.0, 1.0)
-    
-    # Distance to boundaries: min(x, 1-x, y, 1-y)
-    dists_bnd = np.array([centers[:, 0], 1.0 - centers[:, 0],
-                          centers[:, 1], 1.0 - centers[:, 1]])
-    min_bnd = np.min(dists_bnd, axis=0)
-    
-    # Pairwise distances between all circles
-    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists_mat = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists_mat, np.inf)  # Ignore self-distance
-    min_pair = np.min(dists_mat, axis=1)
-    
-    # Maximal radius is half the minimum distance to any obstacle
-    radii = np.minimum(min_bnd, 0.5 * min_pair)
-    return -np.sum(radii)
+N_CIRCLES = 26
 
-def compute_final_radii(centers):
-    """
-    Computes the exact maximal radii for a given set of centers.
-    """
-    centers = np.clip(centers, 0.0, 1.0)
-    dists_bnd = np.array([centers[:, 0], 1.0 - centers[:, 0],
-                          centers[:, 1], 1.0 - centers[:, 1]])
-    min_bnd = np.min(dists_bnd, axis=0)
+def _objective(vars, N):
+    """Objective function: minimize negative sum of radii"""
+    return -np.sum(vars[2*N:])
+
+def _jac(vars, N):
+    """Gradient of the objective function"""
+    jac = np.zeros_like(vars)
+    jac[2*N:] = -1.0
+    return jac
+
+def _constraints(vars, N):
+    """Constraint functions: boundaries and non-overlap"""
+    centers = vars[:2*N].reshape(N, 2)
+    radii = vars[2*N:]
+    n_cons = N*4 + N*(N-1)//2
+    cons = np.empty(n_cons)
     
-    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists_mat = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists_mat, np.inf)
-    min_pair = np.min(dists_mat, axis=1)
+    # Boundary constraints: circles inside [0,1]^2
+    for i in range(N):
+        x, y = centers[i]
+        r = radii[i]
+        cons[4*i] = x - r
+        cons[4*i+1] = 1.0 - x - r
+        cons[4*i+2] = y - r
+        cons[4*i+3] = 1.0 - y - r
+        
+    # Pairwise non-overlap constraints
+    idx = 4*N
+    for i in range(N):
+        ci = centers[i]
+        ri = radii[i]
+        for j in range(i+1, N):
+            cj = centers[j]
+            rj = radii[j]
+            d = np.sqrt(np.sum((ci - cj)**2))
+            cons[idx] = d - ri - rj
+            idx += 1
+    return cons
+
+def _get_init_config():
+    """Generate a hexagonal lattice initial configuration"""
+    centers = []
+    # Create a staggered grid
+    for r in range(6):
+        for c in range(5):
+            if len(centers) >= N_CIRCLES:
+                break
+            x = 0.1 + c*0.2 + (r%2)*0.1
+            y = 0.1 + r*0.17
+            centers.append([x, y])
+            
+    centers = np.array(centers)
+    # Normalize to fit comfortably inside the unit square
+    min_c = centers.min(axis=0)
+    max_c = centers.max(axis=0)
+    centers = (centers - min_c) * (0.85 / (max_c - min_c)) + 0.05
+    centers = np.clip(centers, 0.05, 0.95)
     
-    return np.minimum(min_bnd, 0.5 * min_pair)
+    # Small initial radii to ensure strict feasibility for the solver
+    radii = np.full(N_CIRCLES, 0.01)
+    return centers, radii
+
+def _optimize_once(centers, radii, N):
+    """Run SLSQP optimization from a given configuration"""
+    x0 = np.concatenate([centers.flatten(), radii])
+    bounds = [(0.0, 1.0)] * 2*N + [(0.001, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': _constraints, 'args': (N,)}
+    
+    res = minimize(_objective, x0, args=(N,), method='SLSQP', 
+                   jac=_jac, bounds=bounds, constraints=cons,
+                   options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False})
+    return res.x
 
 def run_packing():
-    np.random.seed(42)
-    best_score = -np.inf
-    best_centers = None
+    N = N_CIRCLES
+    best_sum = -np.inf
+    best_x = None
     
-    # Generate diverse initial configurations
-    init_configs = []
+    init_c, init_r = _get_init_config()
     
-    # 1. Pure random starts
-    for _ in range(4):
-        init_configs.append(np.random.rand(26, 2))
+    # Multi-restart strategy to escape local minima
+    for seed in range(5):
+        np.random.seed(seed)
+        # Perturb positions and radii slightly
+        c_p = init_c + np.random.uniform(-0.015, 0.015, init_c.shape)
+        c_p = np.clip(c_p, 0.05, 0.95)
+        r_p = init_r + np.random.uniform(-0.005, 0.005, N)
+        r_p = np.clip(r_p, 0.005, 0.15)
         
-    # 2. Random clustered start (encourages exploration of denser regions)
-    init_configs.append(np.random.rand(26, 2) * 0.6 + 0.2)
-    
-    # 3. Structured grid start (good baseline for hexagonal-like packing)
-    grid = np.array(np.meshgrid(np.linspace(0.15, 0.85, 6), np.linspace(0.15, 0.85, 5))).T.reshape(-1, 2)
-    init_configs.append(grid[:26])
-    
-    # 4. Quasi-random (low-discrepancy) start
-    idx = np.arange(1, 27)
-    x_qr = (np.mod(idx * 0.618033988749895, 1.0))
-    y_qr = (np.mod(idx * 0.381966011250105, 1.0))
-    init_configs.append(np.column_stack([x_qr, y_qr]) * 0.8 + 0.1)
-    
-    # Run optimization from each start
-    for start in init_configs:
-        x0 = start.flatten()
-        res = minimize(objective_function, x0, method='Nelder-Mead',
-                       options={'maxiter': 8000, 'xatol': 1e-7, 'fatol': 1e-9})
-        score = -res.fun
-        if score > best_score:
-            best_score = score
-            best_centers = res.x.reshape(26, 2)
+        res_x = _optimize_once(c_p, r_p, N)
+        curr_sum = np.sum(res_x[2*N:])
+        if curr_sum > best_sum:
+            best_sum = curr_sum
+            best_x = res_x
             
-    # Final precise radius computation and validation consistency
-    final_centers = best_centers
-    final_radii = compute_final_radii(final_centers)
-    final_sum = float(np.sum(final_radii))
+    opt_centers = best_x[:2*N].reshape(N, 2)
+    opt_radii = best_x[2*N:]
     
-    return final_centers, final_radii, final_sum
+    # Apply small safety margin to guarantee validity against numerical precision
+    opt_radii *= 0.998
+    
+    return opt_centers, opt_radii, float(np.sum(opt_radii))

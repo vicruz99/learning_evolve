@@ -1,0 +1,154 @@
+# sol_000052 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000026 (state fcd5fdc4) state=bc04b26c sum of radii=2.425185 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_full(p):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(p[52:])
+
+def constraints_full(p):
+    """Computes all boundary and non-overlap constraints."""
+    n = 26
+    c = p[:52].reshape(n, 2)
+    r = p[52:]
+    con = np.concatenate([
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ])
+    diff = c[:, None, :] - c[None, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    dist_safe = dist.copy()
+    np.fill_diagonal(dist_safe, np.inf)
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    con = np.concatenate([con, dist_safe[mask] - (r[:, None] + r[None, :])[mask]])
+    return con
+
+def obj_centers(c_flat):
+    """Objective for center-only polishing: maximize sum of valid radii."""
+    n = 26
+    c = c_flat.reshape(n, 2)
+    rb = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]), np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    diff = c[:, None, :] - c[None, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    dist_safe = dist.copy()
+    np.fill_diagonal(dist_safe, np.inf)
+    rp = 0.5 * np.min(dist_safe, axis=1)
+    return -np.sum(np.minimum(rb, rp))
+
+def get_hex_init(n=26):
+    """Generates a dense hexagonal lattice initialization."""
+    pts = []
+    s = 0.18
+    y = 0.0
+    row = 0
+    while y <= 1.0:
+        x_offset = s/2 if row % 2 == 1 else 0.0
+        x = 0.0
+        while x <= 1.0:
+            cx, cy = x + x_offset, y
+            if 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0:
+                pts.append([cx, cy])
+            x += s
+        y += s * np.sqrt(3) / 2
+        row += 1
+    pts = np.array(pts)
+    dists = np.hypot(pts[:, 0] - 0.5, pts[:, 1] - 0.5)
+    idx = np.argsort(dists)
+    return pts[idx[:n]]
+
+def run_packing():
+    """Pack 26 circles in a unit square to maximize sum of radii."""
+    np.random.seed(42)
+    n = 26
+    best_sum = -1.0
+    best_p = None
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints_full}
+    
+    # Diverse initial configurations
+    inits = [get_hex_init(n)]
+    inits.append(np.random.rand(n, 2) * 0.8 + 0.1)
+    
+    # Multi-start optimization
+    for init_idx, centers0 in enumerate(inits):
+        for seed in range(15):
+            np.random.seed(seed + init_idx * 100)
+            centers = centers0.copy()
+            centers += np.random.normal(0, 0.006, centers.shape)
+            centers = np.clip(centers, 0.05, 0.95)
+            
+            # Compute feasible initial radii slightly shrunk for stability
+            dists_bound = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                                     np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+            pd = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+            pd_safe = pd.copy()
+            np.fill_diagonal(pd_safe, np.inf)
+            r0 = np.minimum(dists_bound, 0.5 * np.min(pd_safe, axis=1)) * 0.92
+            
+            x0 = np.concatenate([centers.flatten(), r0])
+            
+            try:
+                res = minimize(objective_full, x0, method='SLSQP', bounds=bounds, 
+                               constraints=cons, options={'maxiter': 6000, 'ftol': 1e-12})
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    c_val = constraints_full(res.x)
+                    if np.all(c_val >= -1e-9):
+                        best_sum = curr_sum
+                        best_p = res.x.copy()
+            except Exception:
+                pass
+                
+    # Extract and polish best result
+    if best_p is not None:
+        c_opt = best_p[:52].reshape(n, 2)
+        try:
+            # Gradient-free polishing on centers to escape local constraint boundaries
+            res_pol = minimize(obj_centers, c_opt.flatten(), method='Powell', 
+                               options={'maxiter': 15000, 'ftol': 1e-12})
+            c_opt = res_pol.x.reshape(n, 2)
+        except Exception:
+            pass
+            
+        # Recompute exact max radii for polished centers
+        rb = np.minimum(np.minimum(c_opt[:, 0], 1.0 - c_opt[:, 0]), 
+                        np.minimum(c_opt[:, 1], 1.0 - c_opt[:, 1]))
+        pd = np.linalg.norm(c_opt[:, None, :] - c_opt[None, :, :], axis=2)
+        pd_safe = pd.copy()
+        np.fill_diagonal(pd_safe, np.inf)
+        r_opt = np.minimum(rb, 0.5 * np.min(pd_safe, axis=1))
+    else:
+        c_opt = get_hex_init(n)
+        r_opt = np.full(n, 0.08)
+        
+    # Final safety validation & adjustment against strict checker tolerances
+    for _ in range(30):
+        ok = True
+        for i in range(n):
+            x, y, r = c_opt[i, 0], c_opt[i, 1], r_opt[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                ok = False
+                break
+        if not ok:
+            break
+        for i in range(n):
+            for j in range(i+1, n):
+                d = np.hypot(c_opt[i,0]-c_opt[j,0], c_opt[i,1]-c_opt[j,1])
+                if d < r_opt[i] + r_opt[j] - 1e-12:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            break
+        r_opt *= 0.9999
+        
+    return c_opt, r_opt, float(np.sum(r_opt))

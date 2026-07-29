@@ -1,0 +1,351 @@
+# sol_000298 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state d060b5cc) state=348331b6 sum of radii=2.390249 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+import math
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True
+
+def get_optimal_radii(centers):
+    """
+    Given fixed centers, solve LP to maximize sum of radii.
+    Variables: r_0, ..., r_25
+    Maximize sum(r_i)
+    Subject to:
+      r_i >= 0
+      r_i <= x_i, 1-x_i, y_i, 1-y_i
+      r_i + r_j <= dist(c_i, c_j)
+    """
+    n = centers.shape[0]
+    
+    # Objective: minimize -sum(r)
+    c_obj = -np.ones(n)
+    
+    # Inequality constraints: A_ub @ r <= b_ub
+    # We will collect all constraints here
+    A_ub = []
+    b_ub = []
+    
+    # Wall constraints
+    for i in range(n):
+        x, y = centers[i]
+        # r_i <= x
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(x)
+        # r_i <= 1-x
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(1.0 - x)
+        # r_i <= y
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(y)
+        # r_i <= 1-y
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(1.0 - y)
+        
+    # Pairwise constraints: r_i + r_j <= dist
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dist)
+            
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    # Bounds for r_i: [0, inf)
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        return -res.fun, res.x
+    else:
+        # Fallback to simple calculation if LP fails (shouldn't happen often)
+        radii = np.zeros(n)
+        for i in range(n):
+            x, y = centers[i]
+            r_max = min(x, 1-x, y, 1-y)
+            for j in range(n):
+                if i == j: continue
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                r_max = min(r_max, dist) # This is a loose bound, but safe
+            radii[i] = r_max / 2.0 # Conservative estimate
+        return np.sum(radii), radii
+
+def run_packing():
+    n = 26
+    
+    # 1. Initialize centers
+    # Start with a hexagonal-like packing or grid
+    # 5x5 grid is 25 circles. We need 26.
+    # Let's place 25 in a 5x5 grid and one in the center?
+    # Or just random initialization near grid points.
+    
+    centers = np.zeros((n, 2))
+    
+    # Grid initialization
+    # 5 rows, 5 cols = 25.
+    # We can try to fit 26 by perturbing.
+    # Let's create a 5x5 grid with spacing 0.2, radius 0.1.
+    # Centers at 0.1, 0.3, 0.5, 0.7, 0.9
+    
+    idx = 0
+    grid_size = 5
+    spacing = 0.2
+    offset = 0.1
+    
+    for r in range(grid_size):
+        for c in range(grid_size):
+            if idx < n:
+                centers[idx, 0] = offset + c * spacing
+                centers[idx, 1] = offset + r * spacing
+                idx += 1
+    
+    # Place the 26th circle in the center (0.5, 0.5) initially, 
+    # but it will overlap. The optimizer should move it.
+    # Actually, let's just place it randomly or in a gap.
+    if idx < n:
+        centers[idx, 0] = 0.5
+        centers[idx, 1] = 0.5
+        idx += 1
+        
+    # Better initialization: Hexagonal packing approximation
+    # Rows of 5 and 6?
+    # Let's try to distribute them somewhat evenly.
+    # Re-initialize with a better heuristic.
+    
+    # Hexagonal packing layout for 26 circles
+    # Row counts: 5, 6, 5, 6, 4? Sum = 26.
+    # Or 6, 5, 6, 5, 4?
+    # Let's try to pack tightly.
+    
+    # Reset centers
+    centers = np.zeros((n, 2))
+    
+    # Let's use a dense packing heuristic
+    # Approximate positions for 26 circles
+    # We can use a simple grid and let SA fix it.
+    # 5x5 grid + 1 center is a good starting topology.
+    # Let's randomize slightly to break symmetry.
+    
+    for i in range(n):
+        centers[i, 0] = np.random.uniform(0.05, 0.95)
+        centers[i, 1] = np.random.uniform(0.05, 0.95)
+        
+    # Sort by x to make it more grid-like? No, random is fine for SA.
+    # But grid-like is better.
+    # Let's stick to the grid + center idea but shifted.
+    centers = np.zeros((n, 2))
+    count = 0
+    # 5 rows
+    for row in range(5):
+        # Number of cols in this row
+        # Alternate 5, 6, 5, 6, 4? 
+        # Width for 6 circles is 1.2 (too big).
+        # Width for 5 circles is 1.0.
+        # So max 5 circles per row if radius > 0.1.
+        # If we want radius > 0.1, we can't have 5 circles in a row?
+        # Wait, 5 circles diameter 0.2 -> width 1.0. 
+        # If radius > 0.1, diameter > 0.2. 
+        # So we can't fit 5 circles in a row if r > 0.1.
+        # But we can fit them if they are not in a straight line?
+        # SA will handle geometry.
+        
+        # Let's just place 26 circles in a 6x5 grid pattern (some empty)
+        # 6 columns, 5 rows? 30 spots. Pick 26.
+        # Spacing 1/6?
+        pass
+
+    # Actually, let's just use the grid initialization logic which is robust.
+    # 5x5 grid at 0.1 spacing is valid with r=0.1.
+    # Then we optimize.
+    
+    centers = np.zeros((n, 2))
+    idx = 0
+    # Create a 5x5 grid
+    for r in range(5):
+        for c in range(5):
+            centers[idx] = [0.1 + c * 0.2, 0.1 + r * 0.2]
+            idx += 1
+    # 26th circle at center
+    centers[25] = [0.5, 0.5]
+    
+    # Add some noise
+    centers += np.random.normal(0, 0.01, (n, 2))
+    centers = np.clip(centers, 0.01, 0.99)
+
+    # 2. Simulated Annealing
+    temperature = 0.05
+    decay = 0.995
+    steps = 5000
+    
+    current_centers = centers.copy()
+    
+    # Get initial radii
+    _, current_radii = get_optimal_radii(current_centers)
+    current_score = np.sum(current_radii)
+    
+    best_centers = current_centers.copy()
+    best_radii = current_radii.copy()
+    best_score = current_score
+    
+    for step in range(steps):
+        # Pick a circle to move
+        idx = np.random.randint(n)
+        
+        # Propose new position
+        # Move within a range proportional to temperature
+        move_size = temperature * 0.1
+        new_center = current_centers[idx].copy()
+        new_center[0] += np.random.uniform(-move_size, move_size)
+        new_center[1] += np.random.uniform(-move_size, move_size)
+        
+        # Keep inside bounds
+        new_center = np.clip(new_center, 0.001, 0.999)
+        
+        # Apply move
+        trial_centers = current_centers.copy()
+        trial_centers[idx] = new_center
+        
+        # Evaluate
+        # To save time, maybe only update affected radii? 
+        # But LP is fast enough for N=26.
+        trial_score, trial_radii = get_optimal_radii(trial_centers)
+        
+        delta = trial_score - current_score
+        
+        if delta > 0 or np.random.random() < math.exp(delta / temperature):
+            current_centers = trial_centers
+            current_radii = trial_radii
+            current_score = trial_score
+            
+            if current_score > best_score:
+                best_score = current_score
+                best_centers = current_centers.copy()
+                best_radii = current_radii.copy()
+        
+        temperature *= decay
+        if temperature < 1e-6:
+            temperature = 1e-6
+            
+    # 3. Final refinement
+    # Run a few more iterations with very low temp or just local search
+    # Let's do a quick local search on the best solution
+    current_centers = best_centers.copy()
+    current_score = best_score
+    temperature = 0.01
+    
+    for step in range(2000):
+        idx = np.random.randint(n)
+        move_size = temperature * 0.05
+        new_center = current_centers[idx].copy()
+        new_center[0] += np.random.uniform(-move_size, move_size)
+        new_center[1] += np.random.uniform(-move_size, move_size)
+        new_center = np.clip(new_center, 0.001, 0.999)
+        
+        trial_centers = current_centers.copy()
+        trial_centers[idx] = new_center
+        
+        trial_score, trial_radii = get_optimal_radii(trial_centers)
+        
+        if trial_score > current_score:
+            current_centers = trial_centers
+            current_radii = trial_radii
+            current_score = trial_score
+            best_centers = current_centers.copy()
+            best_radii = current_radii.copy()
+            best_score = current_score
+            
+    # 4. Validation
+    # Ensure no numerical issues
+    # The LP solution might be slightly violating constraints due to tolerance?
+    # Linprog usually respects bounds.
+    # But let's clamp radii slightly if needed? 
+    # Actually, the validation function has 1e-12 tolerance.
+    
+    # Check validity
+    if not validate_packing(best_centers, best_radii):
+        # If invalid, fallback to grid
+        print("Validation failed, falling back to grid")
+        centers = np.zeros((n, 2))
+        idx = 0
+        for r in range(5):
+            for c in range(5):
+                centers[idx] = [0.1 + c * 0.2, 0.1 + r * 0.2]
+                idx += 1
+        centers[25] = [0.5, 0.5]
+        # Calculate radii for this invalid grid? 
+        # The grid with center circle has overlap.
+        # We need a valid fallback.
+        # 5x5 grid with r=0.1 is valid for 25 circles.
+        # For 26, we can shrink r slightly.
+        # Let's just return the grid with r=0.09 for all?
+        radii = np.ones(n) * 0.09
+        best_centers = centers
+        best_radii = radii
+        best_score = np.sum(radii)
+        
+    return best_centers, best_radii, best_score

@@ -1,0 +1,228 @@
+# sol_000240 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000213 (state adb87445) state=eb7d75c3 sum of radii=2.434241 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+TRIU_I, TRIU_J = np.triu_indices(N, 1)
+NUM_PAIRS = N * (N - 1) // 2
+
+# Precompute constant LP constraint matrix structure
+A_LP = np.zeros((NUM_PAIRS + 4 * N, N))
+PAIR_IDX = []
+idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_LP[idx, i] = 1.0
+        A_LP[idx, j] = 1.0
+        PAIR_IDX.append((i, j))
+        idx += 1
+for i in range(N):
+    base = NUM_PAIRS + 4 * i
+    A_LP[base, i] = 1.0
+    A_LP[base + 1, i] = 1.0
+    A_LP[base + 2, i] = 1.0
+    A_LP[base + 3, i] = 1.0
+
+def solve_lp_and_duals(centers):
+    """Solves LP for maximal radii given fixed centers and returns dual multipliers."""
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-12)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.empty(NUM_PAIRS + 4 * N)
+    k = 0
+    for i, j in PAIR_IDX:
+        b[k] = dists[i, j]; k += 1
+    for i in range(N):
+        b[k] = centers[i, 0]; k += 1
+        b[k] = 1.0 - centers[i, 0]; k += 1
+        b[k] = centers[i, 1]; k += 1
+        b[k] = 1.0 - centers[i, 1]; k += 1
+        
+    res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b, 
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    if res.success:
+        try:
+            duals = np.asarray(res.ineqlin.marginals)
+        except AttributeError:
+            duals = np.zeros(len(b))
+        return res.x, np.sum(res.x), duals
+    return np.zeros(N), 0.0, np.zeros(len(b))
+
+def objective_powell(v):
+    """Objective for Powell optimization: negative sum of radii."""
+    return -solve_lp_and_duals(v.reshape(N, 2))[1]
+
+def force_init(seed):
+    """Generates a well-spaced configuration via repulsive forces."""
+    rng = np.random.default_rng(seed)
+    c = rng.uniform(0.15, 0.85, (N, 2))
+    for _ in range(800):
+        f = np.zeros_like(c)
+        for i in range(N):
+            for j in range(i + 1, N):
+                d_vec = c[i] - c[j]
+                d = np.linalg.norm(d_vec)
+                if d < 0.20 and d > 1e-5:
+                    push = (0.20 - d) * 0.05 / d
+                    f[i] += d_vec * push
+                    f[j] -= d_vec * push
+            # Gentle center attraction to keep points inside
+            f[i, 0] += (0.5 - c[i, 0]) * 0.02
+            f[i, 1] += (0.5 - c[i, 1]) * 0.02
+        c += f
+        c = np.clip(c, 0.05, 0.95)
+    return c
+
+def hex_init(seed, shift_type=0):
+    """Generates a hexagonal lattice initialization."""
+    rng = np.random.default_rng(seed)
+    c = []
+    r0 = 0.098
+    y = r0
+    row = 0
+    while len(c) < N:
+        sh = r0 if (row + shift_type) % 2 == 1 else 0.0
+        x = r0 + sh
+        while x + r0 <= 1.0 + 1e-9 and len(c) < N:
+            c.append([x, y])
+            x += 2.0 * r0
+        y += r0 * np.sqrt(3.0)
+        row += 1
+    c = np.array(c[:N])
+    c += rng.normal(0, 0.003, c.shape)
+    c = np.clip(c, 0.05, 0.95)
+    return c
+
+def gradient_ascent(c0, steps=1200, step_init=0.007):
+    """Gradient ascent on centers using LP duals for exact direction."""
+    c = c0.copy()
+    best_c = c.copy()
+    best_s = -1.0
+    step = step_init
+    for _ in range(steps):
+        _, s, duals = solve_lp_and_duals(c)
+        if s > best_s:
+            best_s = s
+            best_c = c.copy()
+            
+        grad = np.zeros_like(c)
+        diffs = c[:, None, :] - c[None, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        k = 0
+        for i, j in PAIR_IDX:
+            mu = duals[k]
+            if mu > 1e-9:
+                d = dists[i, j]
+                if d > 1e-9:
+                    vec = (c[i] - c[j]) / d
+                    grad[i] += mu * vec
+                    grad[j] -= mu * vec
+            k += 1
+        bs = NUM_PAIRS
+        for i in range(N):
+            grad[i, 0] += duals[bs + 4*i] - duals[bs + 4*i + 1]
+            grad[i, 1] += duals[bs + 4*i + 2] - duals[bs + 4*i + 3]
+            
+        gn = np.linalg.norm(grad)
+        if gn < 1e-10: break
+        move = step * (grad / gn)
+        nc = np.clip(c + move, 1e-5, 1.0 - 1e-5)
+        _, ns, _ = solve_lp_and_duals(nc)
+        
+        if ns > s + 1e-10:
+            c = nc
+            step = min(step * 1.12, 0.04)
+        else:
+            step *= 0.75
+            if step < 1e-9: break
+    return best_c, best_s
+
+def repair(centers, radii):
+    """Deterministic repair to guarantee strict validation compliance."""
+    radii = radii.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-11:
+                    shrink = (radii[i] + radii[j] - d) * 0.5 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr
+                changed = True
+        if not changed: break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    best_c = None
+    best_s = -1.0
+    
+    # Phase 1: Generate diverse initial configurations
+    starts = []
+    for s in range(15):
+        starts.append(force_init(s))
+    for s in range(8):
+        starts.append(hex_init(s, shift_type=0))
+        starts.append(hex_init(s, shift_type=1))
+    for s in range(10):
+        starts.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    # Phase 2: Gradient Ascent on all starts
+    for c_init in starts:
+        c_opt, s_opt = gradient_ascent(c_init, steps=1500, step_init=0.008)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # Phase 3: Powell refinement to handle non-smooth contact graphs
+    if best_c is not None:
+        res = minimize(objective_powell, best_c.flatten(), method='Powell',
+                       bounds=[(0.01, 0.99)] * (2 * N), 
+                       options={'maxiter': 3000, 'xtol': 1e-12, 'ftol': 1e-14})
+        c_pow = res.x.reshape(N, 2)
+        _, s_pow, _ = solve_lp_and_duals(c_pow)
+        if s_pow > best_s:
+            best_s = s_pow
+            best_c = c_pow
+            
+    # Phase 4: Simulated Annealing to escape local minima
+    c_curr = best_c.copy()
+    s_curr = best_s
+    T = 0.012
+    for step in range(800):
+        c_try = c_curr + rng.normal(0, 0.003, c_curr.shape)
+        c_try = np.clip(c_try, 0.02, 0.98)
+        _, s_try, _ = solve_lp_and_duals(c_try)
+        
+        if s_try > s_curr or (T > 1e-7 and rng.random() < np.exp((s_try - s_curr) / T)):
+            c_curr, s_curr = c_try, s_try
+            if s_curr > best_s:
+                best_s = s_curr
+                best_c = c_curr.copy()
+        T *= 0.996
+        
+    # Final LP solve to extract optimal radii for best centers
+    r_final, s_final, _ = solve_lp_and_duals(best_c)
+    if s_final > best_s:
+        best_s = s_final
+        
+    # Phase 5: Strict numerical repair
+    radii = repair(best_c, r_final)
+    return best_c, radii, float(np.sum(radii))

@@ -1,0 +1,151 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat this as a continuous optimization problem. The objective is to maximize $\sum r_i$ subject to non-overlap and boundary constraints. We'll use a penalty-based method with `scipy.optimize.minimize` (L-BFGS-B) because it efficiently handles the bounds and leverages analytical gradients for faster convergence.
+
+Key steps:
+1. **Smooth Penalty Function**: We approximate the hard constraints with a smooth penalty $P(d) = \mu (\frac{-d + \sqrt{d^2+\epsilon}}{2})^2$, where $d$ is the clearance (distance minus sum of radii). This avoids non-differentiability at $d=0$.
+2. **Analytical Gradients**: We derive and implement exact gradients for the penalty terms to guide L-BFGS-B efficiently.
+3. **Multiple Initializations**: We test grid, hexagonal, and random starting layouts to escape local minima.
+4. **Post-Processing**: After optimization, we run a repulsion pass to strictly enforce constraints and clip radii/centers to valid ranges, guaranteeing a valid packing for the validator.
+5. **Robustness**: We handle edge cases like zero distances and ensure all numerical operations are stable.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = 26
+    
+    def smooth_deriv(d, mu=100.0, eps=1e-8):
+        """Analytical derivative of the smooth penalty function."""
+        sq = np.sqrt(d**2 + eps)
+        val = (-d + sq) / 2.0
+        return mu * val * (-1.0 + d / sq)
+
+    def smooth_penalty(d, mu=100.0, eps=1e-8):
+        """Value of the smooth penalty function."""
+        sq = np.sqrt(d**2 + eps)
+        val = (-d + sq) / 2.0
+        return mu * val**2
+
+    def objective_and_grad(params):
+        centers = params[:2*n].reshape(n, 2)
+        radii = params[2*n:]
+        
+        grad = np.zeros_like(params)
+        grad[2*n:] = -1.0  # Gradient of -sum(r)
+        
+        mu = 100.0
+        eps = 1e-8
+        pen_val = 0.0
+        
+        # Boundary constraints
+        for axis in range(2):
+            d1 = centers[:, axis] - radii
+            term = smooth_deriv(d1, mu, eps)
+            grad[axis*n:(axis+1)*n] += term[:, np.newaxis]
+            grad[2*n:] -= term
+            pen_val += np.sum(smooth_penalty(d1, mu, eps))
+            
+            d2 = 1.0 - centers[:, axis] - radii
+            term = smooth_deriv(d2, mu, eps)
+            grad[axis*n:(axis+1)*n] -= term[:, np.newaxis]
+            grad[2*n:] -= term
+            pen_val += np.sum(smooth_penalty(d2, mu, eps))
+            
+        # Overlap constraints
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist = np.sqrt(np.sum(diff**2, axis=2))
+        rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        d = dist - rad_sum
+        
+        i_idx, j_idx = np.triu_indices(n, k=1)
+        d_ij = d[i_idx, j_idx]
+        term = smooth_deriv(d_ij, mu, eps)
+        pen_val += np.sum(smooth_penalty(d_ij, mu, eps))
+        
+        dx = diff[:, :, 0][i_idx, j_idx]
+        dy = diff[:, :, 1][i_idx, j_idx]
+        dist_ij = dist[i_idx, j_idx]
+        dist_ij[dist_ij < 1e-12] = 1e-12
+        
+        dir_x = dx / dist_ij
+        dir_y = dy / dist_ij
+        
+        grad[i_idx] += term[:, np.newaxis] * dir_x[:, np.newaxis]
+        grad[j_idx] -= term[:, np.newaxis] * dir_x[:, np.newaxis]
+        grad[i_idx + n] += term[:, np.newaxis] * dir_y[:, np.newaxis]
+        grad[j_idx + n] -= term[:, np.newaxis] * dir_y[:, np.newaxis]
+        grad[i_idx + 2*n] -= term
+        grad[j_idx + 2*n] -= term
+        
+        return -np.sum(radii) + pen_val, grad
+
+    best_params = None
+    best_val = np.inf
+    
+    # Generate diverse initial configurations
+    inits = []
+    
+    # 1. Perturbed 5x5 grid + 1
+    grid = np.array(np.meshgrid(np.linspace(0.1, 0.9, 5), np.linspace(0.1, 0.9, 5))).T.reshape(-1, 2)
+    init1 = np.vstack([grid[:25], [0.5, 0.5]])
+    init1 += np.random.uniform(-0.03, 0.03, size=init1.shape)
+    inits.append(init1)
+    
+    # 2. Random uniform
+    inits.append(np.random.uniform(0.05, 0.95, size=(n, 2)))
+    
+    # 3. Hexagonal-ish layout
+    hex_pts = []
+    for row in range(5):
+        y = 0.12 + row * 0.2
+        x_start = 0.12 if row % 2 == 0 else 0.17
+        for col in range(6):
+            x = x_start + col * 0.18
+            if len(hex_pts) < 26:
+                hex_pts.append([x, y])
+    inits.append(np.array(hex_pts[:n]) + np.random.uniform(-0.02, 0.02, size=(n, 2)))
+    
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    for init_centers in inits:
+        radii_init = np.full(n, 0.09)
+        params0 = np.hstack([init_centers.ravel(), radii_init])
+        
+        res = minimize(objective_and_grad, params0, method='L-BFGS-B', bounds=bounds, 
+                       options={'maxiter': 5000, 'ftol': 1e-12, 'gtol': 1e-10})
+        
+        if res.fun < best_val:
+            best_val = res.fun
+            best_params = res.x.copy()
+            
+    # Extract and clean results
+    best_params[:2*n] = np.clip(best_params[:2*n], 1e-6, 1-1e-6)
+    best_params[2*n:] = np.maximum(best_params[2*n:], 1e-6)
+    
+    centers = best_params[:2*n].reshape(n, 2)
+    radii = best_params[2*n:]
+    
+    # Strict post-processing to guarantee validity
+    for _ in range(200):
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                overlap = radii[i] + radii[j] - dist
+                if overlap > 1e-7:
+                    dir_vec = (centers[j] - centers[i]) / (dist + 1e-12)
+                    push = overlap / 2.0 + 1e-5
+                    centers[i] -= push * dir_vec
+                    centers[j] += push * dir_vec
+        centers = np.clip(centers, 1e-5, 1-1e-5)
+        for i in range(n):
+            r_max = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+            if radii[i] > r_max:
+                radii[i] = r_max
+                
+    return centers, radii, np.sum(radii)
+```

@@ -1,0 +1,177 @@
+# sol_000306 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 5f579b4b) state=09d75d56 sum of radii=2.036962 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing():
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n = 26
+    
+    # --- Stage 1: Initialization ---
+    # Initialize centers in a hexagonal-like grid pattern
+    centers = np.zeros((n, 2))
+    radius_est = 0.1 # Initial estimate
+    
+    # Create a 5x5 grid base and add an extra point, then jitter
+    # Hexagonal packing usually involves rows.
+    # Let's place them in rows.
+    row_counts = [5, 5, 5, 5, 4, 2] # Sums to 26
+    # Or better distribution for square: 5, 6, 5, 6, 4? 
+    # Let's try a random distribution first but kept inside
+    
+    # Better initialization: Hexagonal grid logic
+    # Try to fit 26 points. 
+    # 6 rows. 
+    # Row 0: 5 points. Row 1: 5 points (shifted). Row 2: 5 points. 
+    # Row 3: 5 points (shifted). Row 4: 4 points. Row 5: 2 points.
+    # Let's just scatter them slightly to avoid perfect symmetry traps
+    
+    # Let's use a simple grid first and jitter
+    x = np.linspace(0.15, 0.85, 5)
+    y = np.linspace(0.15, 0.85, 5)
+    # 5x5 = 25 points. Add 1 more.
+    
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            centers[idx] = [x[i], y[j]]
+            idx += 1
+    centers[25] = [0.5, 0.5] # Center
+    
+    # Add small random jitter
+    np.random.seed(42) # For reproducibility
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    
+    # Clip to safe bounds
+    centers = np.clip(centers, 0.05, 0.95)
+
+
+    # --- Stage 2: Optimization (Simulated Annealing) ---
+    
+    def get_max_radii_and_sum(c):
+        """
+        Given fixed centers c, solve LP to find max radii.
+        Maximize sum(r_i)
+        Subject to:
+        1. r_i >= 0
+        2. r_i <= dist(c_i, boundary)
+        3. r_i + r_j <= dist(c_i, c_j) for all i != j
+        """
+        # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+        x, y = c[:, 0], c[:, 1]
+        boundary_max_r = np.minimum(np.minimum(x, 1-x), np.minimum(y, 1-y))
+        
+        # Linear Programming Setup
+        # Maximize sum(r) <=> Minimize -sum(r)
+        c_obj = np.ones(n) * -1
+        
+        # Constraints A_ub * r <= b_ub
+        # 1. Boundary: r_i <= boundary_max_r[i]  =>  r_i - boundary_max_r[i] <= 0
+        #    Row i: 0...1...0 <= boundary_max_r[i]
+        A_ub = np.eye(n)
+        b_ub = boundary_max_r.copy()
+        
+        # 2. Pairwise distances: r_i + r_j <= dist(i, j)
+        #    Row: 0...1...1...0 <= dist
+        #    We need to construct these rows.
+        #    There are n*(n-1)/2 constraints.
+        
+        # Calculate pairwise distances
+        # Using broadcasting
+        diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        
+        # We only need upper triangle i < j
+        constraints_rows = []
+        constraints_vals = []
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                constraints_rows.append(row)
+                constraints_vals.append(dists[i, j])
+                
+        if constraints_rows:
+            A_pairwise = np.array(constraints_rows)
+            b_pairwise = np.array(constraints_vals)
+            
+            A_ub = np.vstack([A_ub, A_pairwise])
+            b_ub = np.concatenate([b_ub, b_pairwise])
+            
+        # Bounds for r_i: (0, None)
+        bounds = [(0, None) for _ in range(n)]
+        
+        # Solve
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success:
+            radii = res.x
+            return radii, np.sum(radii)
+        else:
+            # Fallback if LP fails (should not happen with valid inputs)
+            return np.zeros(n), 0.0
+
+    # Initial evaluation
+    current_radii, current_sum = get_max_radii_and_sum(centers)
+    best_centers = centers.copy()
+    best_radii = current_radii.copy()
+    best_sum = current_sum
+    
+    # Simulated Annealing Parameters
+    T = 0.5 # Initial temperature
+    T_min = 1e-6
+    alpha = 0.99 # Cooling rate
+    n_iter = 2000 # Number of iterations
+    
+    # Precompute indices for perturbation
+    for step in range(n_iter):
+        # Choose a random circle to move
+        i = np.random.randint(n)
+        
+        # Propose a move
+        # Step size decreases with temperature
+        step_size = T * 0.05 
+        new_centers = centers.copy()
+        new_centers[i] += np.random.uniform(-step_size, step_size, 2)
+        
+        # Clip new centers to valid range [0, 1]
+        # But strictly, centers must be within [r, 1-r]. 
+        # Since we don't know r yet, clip to [0, 1] and let LP handle boundary constraints.
+        # However, to ensure feasibility, keep away from edges slightly?
+        # LP handles boundary constraints, so center can be anywhere in [0,1].
+        # But if center is at 0, max r is 0.
+        new_centers = np.clip(new_centers, 0.0, 1.0)
+        
+        # Evaluate new configuration
+        new_radii, new_sum = get_max_radii_and_sum(new_centers)
+        
+        # Decision
+        delta = new_sum - current_sum
+        
+        if delta > 0 or np.random.random() < np.exp(delta / T):
+            centers = new_centers
+            current_radii = new_radii
+            current_sum = new_sum
+            
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = current_radii.copy()
+        
+        # Cool down
+        T *= alpha
+        
+    return best_centers, best_radii, float(best_sum)

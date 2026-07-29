@@ -1,187 +1,168 @@
 # sol_000095 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 5526c41b) state=2e2212e1 sum of radii=2.615828 correctness=1.0
+# generation=0 parent=seed (state 1e7a6456) state=488e37bd sum of radii=1.585208 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Packs 26 circles in a unit square [0,1]x[0,1] to maximize the sum of radii.
+    Optimizes the packing of 26 circles in a unit square.
+    Uses initialization followed by iterative force-directed relaxation and expansion.
     """
     n = 26
-    
-    # --- Step 1: Initialize with a Hexagonal Lattice ---
-    # Estimate radius based on area density heuristic
-    # Area = 1. Target density ~0.9. Sum area = 26 * pi * r^2.
-    # 26 * pi * r^2 ~ 0.9 -> r ~ 0.105.
-    # Start with a slightly smaller radius to ensure validity.
-    initial_r = 0.09
-    
     centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.05
     
-    # Generate hexagonal packing coordinates
-    # Vertical spacing = r * sqrt(3)
-    # Horizontal spacing = 2 * r
-    y_step = initial_r * np.sqrt(3)
-    x_step = 2 * initial_r
-    
+    # 1. Initialize with a dense hexagonal grid
+    # We place circles in a grid pattern that mimics a hexagonal lattice.
+    # 26 circles can be arranged in roughly 5 rows.
     idx = 0
-    row = 0
-    while idx < n:
-        # Determine number of circles in this row
-        # Offset odd rows by r
-        is_odd_row = (row % 2 == 1)
-        x_start = initial_r if not is_odd_row else initial_r * 2
-        
-        # Estimate max circles in row
-        # Width available = 1 - 2*r. Step = 2*r.
-        # Count = floor((1 - 2*r) / 2*r) + 1 = floor(1/2r - 1) + 1
-        count_in_row = int(np.floor((1.0 - 2.0 * initial_r) / (2.0 * initial_r))) + 1
-        
-        # Ensure we don't exceed total n
-        actual_count = min(count_in_row, n - idx)
-        
-        for i in range(actual_count):
-            if idx < n:
-                # X coordinate
-                if is_odd_row:
-                    cx = initial_r + i * x_step
-                else:
-                    cx = initial_r + i * x_step
-                
-                # Y coordinate
-                cy = initial_r + row * y_step
-                
-                centers[idx] = [cx, cy]
-                idx += 1
-        
-        row += 1
-
-    # --- Step 2: Force-Directed Relaxation (Pre-optimization) ---
-    # This helps resolve overlaps and move circles into valid positions
-    # before the strict optimizer runs.
-    radii = np.full(n, initial_r)
+    # Try to cover the square with a 6x5 grid pattern, skipping some if needed
+    # Hexagonal spacing factors: dx = 2r, dy = sqrt(3)r
+    # We use a fixed spacing for initialization, r will grow later.
     
-    # Simple repulsive force iteration
-    for _ in range(500): # 500 iterations
-        # Increase radii slightly to pack tighter
-        radii *= 1.001
+    # Let's just place them in a simple grid to start, the relaxation will fix it
+    cols = 6
+    rows = 5
+    x_space = 1.0 / (cols + 1)
+    y_space = 1.0 / (rows + 1)
+    
+    for r_idx in range(rows):
+        for c_idx in range(cols):
+            if idx < n:
+                # Add slight jitter to break symmetry and avoid grid artifacts
+                jitter = 0.02
+                centers[idx, 0] = (c_idx + 1) * x_space + np.random.uniform(-jitter, jitter)
+                centers[idx, 1] = (r_idx + 1) * y_space + np.random.uniform(-jitter, jitter)
+                idx += 1
+            else:
+                break
+        if idx >= n:
+            break
+
+    # 2. Simulation / Optimization Loop
+    # We iterate to resolve overlaps and expand radii
+    
+    num_iterations = 2000
+    # Adaptive step sizes
+    dt = 0.01 
+    expansion_rate = 1.0005
+    
+    for step in range(num_iterations):
+        # Increase radii slightly to push for maximum sum
+        # We do this every few steps or continuously
+        radii *= (1 + 0.0001) 
         
-        # Calculate forces
-        forces = np.zeros_like(centers)
+        forces = np.zeros((n, 2))
         
+        # Calculate repulsive forces between all pairs
+        # O(N^2) is fine for N=26
         for i in range(n):
-            # Boundary forces (push inside)
-            # Left wall
-            if centers[i, 0] < radii[i]:
-                forces[i, 0] += (radii[i] - centers[i, 0]) * 10
-            # Right wall
-            elif centers[i, 0] > 1.0 - radii[i]:
-                forces[i, 0] -= (centers[i, 0] - (1.0 - radii[i])) * 10
-            # Bottom wall
-            if centers[i, 1] < radii[i]:
-                forces[i, 1] += (radii[i] - centers[i, 1]) * 10
-            # Top wall
-            elif centers[i, 1] > 1.0 - radii[i]:
-                forces[i, 1] -= (centers[i, 1] - (1.0 - radii[i])) * 10
-            
-            # Inter-circle repulsion
             for j in range(i + 1, n):
-                dx = centers[j, 0] - centers[i, 0]
-                dy = centers[j, 1] - centers[i, 1]
-                dist = np.sqrt(dx*dx + dy*dy)
+                # Vector from j to i
+                vec = centers[i] - centers[j]
+                dist = np.linalg.norm(vec)
+                
                 min_dist = radii[i] + radii[j]
                 
-                if dist < min_dist and dist > 1e-9:
-                    # Repulsive force proportional to overlap
+                if dist < min_dist:
+                    # Overlap or too close. Apply repulsive force.
+                    # Force magnitude proportional to overlap
                     overlap = min_dist - dist
-                    fx = (dx / dist) * overlap * 5.0
-                    fy = (dy / dist) * overlap * 5.0
-                    forces[i, 0] -= fx
-                    forces[i, 1] -= fy
-                    forces[j, 0] += fx
-                    forces[j, 1] += fy
+                    if dist > 1e-9:
+                        force_mag = overlap * 5.0 # Spring constant
+                        forces[i] += (vec / dist) * force_mag
+                        forces[j] -= (vec / dist) * force_mag
+                    else:
+                        # Circles on top of each other, random push
+                        rand_vec = np.random.uniform(-1, 1, 2)
+                        forces[i] += rand_vec
+                        forces[j] -= rand_vec
+
+        # Apply boundary forces
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Left wall
+            if x - r < 0:
+                forces[i, 0] += (r - x) * 5.0
+            # Right wall
+            if x + r > 1:
+                forces[i, 0] -= (x + r - 1) * 5.0
+            # Bottom wall
+            if y - r < 0:
+                forces[i, 1] += (r - y) * 5.0
+            # Top wall
+            if y + r > 1:
+                forces[i, 1] -= (y + r - 1) * 5.0
         
         # Update positions
-        centers += forces * 0.01 # Learning rate
+        # Limit maximum displacement per step to maintain stability
+        max_displacement = 0.02
+        forces = np.clip(forces, -max_displacement, max_displacement)
+        centers += forces
         
-        # Clip to valid range [0, 1] to prevent escaping
-        centers = np.clip(centers, 1e-9, 1.0 - 1e-9)
+        # Clamp centers to [0, 1]
+        centers[:, 0] = np.clip(centers[:, 0], 0, 1)
+        centers[:, 1] = np.clip(centers[:, 1], 0, 1)
 
-    # --- Step 3: Numerical Optimization ---
-    # Use scipy.optimize to maximize sum of radii
-    # Flatten variables: [x0, y0, r0, x1, y1, r1, ..., x25, y25, r25]
-    # Total 78 variables.
+    # 3. Final Cleanup / Shrink to ensure validity
+    # The simulation might leave tiny overlaps due to numerical precision.
+    # We shrink radii slightly to guarantee validity with a margin.
+    margin = 1e-4
+    radii -= margin
     
-    def objective(vars_flat):
-        # Negative sum of radii for minimization
-        return -np.sum(vars_flat[2::3])
+    # If any radius became negative or too small, set to small positive
+    radii = np.maximum(radii, 0.001)
 
-    def constraint_boundary(vars_flat):
-        # Returns array of constraint values (must be >= 0)
-        constraints = []
+    # Re-check validity and scale down if necessary
+    # (A simple global scaling factor approach)
+    valid = True
+    # Check boundaries
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x < r or x > 1 - r or y < r or y > 1 - r:
+            valid = False
+            break
+    
+    if valid:
+        # Check overlaps
         for i in range(n):
-            x = vars_flat[3*i]
-            y = vars_flat[3*i + 1]
-            r = vars_flat[3*i + 2]
-            # x >= r  => x - r >= 0
-            constraints.append(x - r)
-            # x <= 1-r => 1 - x - r >= 0
-            constraints.append(1.0 - x - r)
-            # y >= r  => y - r >= 0
-            constraints.append(y - r)
-            # y <= 1-r => 1 - y - r >= 0
-            constraints.append(1.0 - y - r)
-            # r >= 0
-            constraints.append(r)
-        return np.array(constraints)
-
-    def constraint_overlap(vars_flat):
-        # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
-        constraints = []
-        for i in range(n):
-            xi, yi, ri = vars_flat[3*i], vars_flat[3*i+1], vars_flat[3*i+2]
             for j in range(i + 1, n):
-                xj, yj, rj = vars_flat[3*j], vars_flat[3*j+1], vars_flat[3*j+2]
-                dist_sq = (xi - xj)**2 + (yi - yj)**2
-                min_dist_sq = (ri + rj)**2
-                constraints.append(dist_sq - min_dist_sq)
-        return np.array(constraints)
-
-    # Prepare initial guess from relaxation
-    vars0 = np.zeros(3 * n)
-    for i in range(n):
-        vars0[3*i] = centers[i, 0]
-        vars0[3*i + 1] = centers[i, 1]
-        vars0[3*i + 2] = radii[i]
-
-    # Define constraints
-    cons = [
-        {'type': 'ineq', 'fun': constraint_boundary},
-        {'type': 'ineq', 'fun': constraint_overlap}
-    ]
-
-    # Bounds for variables (basic bounds, constraints handle tighter ones)
-    bounds = [(0, 1)] * (2 * n) + [(0, 1)] * n 
-
-    # Run optimizer
-    # SLSQP is suitable for constrained non-linear optimization
-    result = minimize(objective, vars0, method='SLSQP', bounds=bounds, constraints=cons, 
-                      options={'maxiter': 1000, 'ftol': 1e-12})
-
-    # Extract results
-    final_vars = result.x
-    final_centers = np.zeros((n, 2))
-    final_radii = np.zeros(n)
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if dist < radii[i] + radii[j]:
+                    valid = False
+                    break
+            if not valid:
+                break
     
+    if not valid:
+        # Scale down radii uniformly to fit
+        # Find the required scale factor
+        # This is a conservative fallback
+        scale = 1.0
+        for _ in range(100):
+            if check_packing_validity(centers, radii * scale):
+                break
+            scale *= 0.95
+        radii *= scale
+
+    return centers, radii, np.sum(radii)
+
+def check_packing_validity(centers, radii):
+    n = centers.shape[0]
     for i in range(n):
-        final_centers[i, 0] = final_vars[3*i]
-        final_centers[i, 1] = final_vars[3*i + 1]
-        final_radii[i] = final_vars[3*i + 2]
-        
-    sum_radii = np.sum(final_radii)
-    
-    return final_centers, final_radii, sum_radii
+        x, y = centers[i]
+        r = radii[i]
+        if x < r or x > 1 - r or y < r or y > 1 - r:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            if dist < radii[i] + radii[j]:
+                return False
+    return True

@@ -1,0 +1,271 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond ~2.636, we need a more robust optimization pipeline that effectively escapes local minima while maintaining strict constraint satisfaction. The strategy involves:
+
+1. **Diverse & Intelligent Initialization**: Generate multiple starting configurations including standard hexagonal lattices, rotated hexagonal lattices (rotation often yields better square packings), force-directed repulsion layouts, and dense random starts. This covers different topological basins of attraction.
+
+2. **Two-Phase Optimization per Start**:
+   - *Phase A (Center Optimization)*: Use `Powell` to optimize center positions by maximizing the sum of radii computed via a fast Linear Program (`linprog`). This decouples center movement from radius adjustment and efficiently navigates the non-smooth landscape of packing feasibility.
+   - *Phase B (Joint Polish)*: Use `SLSQP` to jointly optimize centers and radii with explicit inequality constraints. This smooths out numerical irregularities and pushes the solution to the exact boundary of the feasible region.
+
+3. **Iterative Radius Boosting**: After finding a strong local optimum, systematically scale radii up by a small factor (e.g., 1.0015) and re-optimize centers to satisfy constraints. This "pressure" technique forces circles to rearrange into denser configurations that standard gradient-based methods often miss.
+
+4. **Basin Hopping Perturbation**: Periodically inject controlled Gaussian noise into both centers and radii, then re-run local optimization. This accepts temporary feasibility relaxations to jump out of shallow local minima.
+
+5. **Strict Numerical Repair**: A deterministic post-processing loop that iteratively shrinks radii minimally to resolve any microscopic overlaps or boundary violations, guaranteeing the validator's `1e-12` tolerance is met without sacrificing meaningful radius sum.
+
+This hybrid approach combines the global exploration strength of multi-start heuristic layouts with the precise local convergence of LP and SLSQP, reliably squeezing out additional density.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I, J = np.triu_indices(N, k=1)
+NUM_PAIRS = len(I)
+
+# Precompute LP constraint matrix structure globally for speed
+A_ub_lp = np.zeros((NUM_PAIRS + 4*N, N))
+idx = 0
+for i, j in zip(I, J):
+    A_ub_lp[idx, i] = 1.0
+    A_ub_lp[idx, j] = 1.0
+    idx += 1
+for i in range(N):
+    for _ in range(4):
+        A_ub_lp[idx, i] = 1.0
+        idx += 1
+
+def get_lp_radii(centers):
+    """Solves LP to find optimal radii for fixed centers."""
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    b = np.zeros(NUM_PAIRS + 4*N)
+    idx = 0
+    for i, j in zip(I, J):
+        b[idx] = dists[i, j]
+        idx += 1
+    for i in range(N):
+        b[idx] = centers[i, 0]; idx += 1
+        b[idx] = 1.0 - centers[i, 0]; idx += 1
+        b[idx] = centers[i, 1]; idx += 1
+        b[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    try:
+        res = linprog(-np.ones(N), A_ub=A_ub_lp, b_ub=b, bounds=[(0, u) for u in ub], method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return ub * 0.5
+
+def obj_centers(x):
+    """Objective for center-only optimization: maximize sum of LP radii."""
+    c = x.reshape(N, 2)
+    return -np.sum(get_lp_radii(c))
+
+def cons_joint(v):
+    """Computes all boundary and non-overlap constraints for SLSQP."""
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = []
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    dx = c[I, 0] - c[J, 0]
+    dy = c[I, 1] - c[J, 1]
+    con.append(np.sqrt(dx**2 + dy**2) - (r[I] + r[J]))
+    return np.concatenate(con)
+
+def obj_joint(v):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def generate_starts(n, rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6],
+        [6, 4, 6, 5, 5], [4, 6, 6, 6, 4], [5, 4, 6, 6, 5],
+        [6, 6, 5, 5, 4], [5, 5, 6, 5, 5], [4, 5, 6, 5, 6],
+        [5, 5, 5, 6, 5], [5, 5, 4, 6, 6], [6, 5, 5, 5, 5]
+    ]
+    
+    # Standard hexagonal patterns
+    for pat in patterns:
+        for r0 in [0.08, 0.085, 0.09, 0.095, 0.10]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < n:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            c = np.array(c[:n])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.02, 0.98)
+            starts.append(c)
+            
+    # Rotated hexagonal patterns (often fit square boundaries better)
+    for pat in patterns[:4]:
+        for rot in [0.05, 0.1, 0.15, 0.2]:
+            c_base = []
+            r0 = 0.09
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c_base) < n:
+                        c_base.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            c_base = np.array(c_base[:n])
+            c_base -= c_base.mean(axis=0)
+            c_mat, s_mat = np.cos(rot), np.sin(rot)
+            rot_mat = np.array([[c_mat, -s_mat], [s_mat, c_mat]])
+            c_rot = c_base @ rot_mat.T
+            scale = 0.9 / (2 * np.max(np.abs(c_rot)))
+            c_rot *= scale
+            c_rot += 0.5
+            c_rot += rng.normal(0, 0.003, c_rot.shape)
+            c_rot = np.clip(c_rot, 0.02, 0.98)
+            starts.append(c_rot)
+            
+    # Force-directed repulsion starts
+    for seed in range(5):
+        rng_fd = np.random.default_rng(seed)
+        c = rng_fd.uniform(0.1, 0.9, (n, 2))
+        for _ in range(150):
+            forces = np.zeros_like(c)
+            for i in range(n):
+                for j in range(i+1, n):
+                    d = np.linalg.norm(c[i] - c[j])
+                    if d < 0.15:
+                        f = (0.15 - d) / (d + 1e-8) * 5.0
+                        diff = c[i] - c[j]
+                        forces[i] += diff * f
+                        forces[j] -= diff * f
+                for d_idx in range(2):
+                    if c[i, d_idx] < 0.1: forces[i, d_idx] += (0.1 - c[i, d_idx]) * 10.0
+                    elif c[i, d_idx] > 0.9: forces[i, d_idx] -= (c[i, d_idx] - 0.9) * 10.0
+            c += forces * 0.005
+            c = np.clip(c, 0.02, 0.98)
+        starts.append(c)
+        
+    # Dense random starts
+    for _ in range(8):
+        starts.append(rng.uniform(0.1, 0.9, (n, 2)))
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    best_v = None
+    best_sum = -np.inf
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': cons_joint}
+    
+    starts = generate_starts(N, rng)
+    
+    # Phase 1: Multi-start Powell (centers) + SLSQP (joint) polish
+    for c0 in starts:
+        try:
+            res_pow = minimize(obj_centers, c0.flatten(), method='Powell', 
+                               bounds=[(0.0, 1.0)]*(2*N),
+                               options={'maxiter': 3000, 'ftol': 1e-12, 'xtol': 1e-12})
+            c_opt = res_pow.x.reshape(N, 2)
+            r_opt = get_lp_radii(c_opt)
+            v_opt = np.concatenate([c_opt.flatten(), r_opt])
+            
+            res_sls = minimize(obj_joint, v_opt, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13})
+            if np.min(cons_joint(res_sls.x)) > -1e-7:
+                s = -res_sls.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_v = res_sls.x.copy()
+        except Exception:
+            pass
+            
+    if best_v is None:
+        c0 = starts[0]
+        r0 = get_lp_radii(c0)
+        v0 = np.concatenate([c0.flatten(), r0])
+        res = minimize(obj_joint, v0, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter': 2000})
+        best_v = res.x
+        
+    # Phase 2: Basin hopping perturbation search
+    for _ in range(30):
+        v_trial = best_v + rng.normal(0, 0.0003, best_v.shape)
+        v_trial[:2*N] = np.clip(v_trial[:2*N], 0.0, 1.0)
+        v_trial[2*N:] = np.clip(v_trial[2*N:], 0.0, 0.5)
+        try:
+            res = minimize(obj_joint, v_trial, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-13})
+            if np.min(cons_joint(res.x)) > -1e-7:
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+
+    # Phase 3: Iterative Radius Boosting to escape density plateaus
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:]
+    
+    for _ in range(15):
+        radii *= 1.0015
+        v_curr = np.concatenate([centers.flatten(), radii])
+        try:
+            res = minimize(obj_joint, v_curr, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
+            if np.min(cons_joint(res.x)) > -1e-7:
+                centers = res.x[:2*N].reshape(N, 2)
+                radii = res.x[2*N:]
+                s = np.sum(radii)
+                if s > best_sum:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            break 
+            
+    # Final extraction
+    best_centers = best_v[:2*N].reshape(N, 2)
+    best_radii = best_v[2*N:]
+    
+    # Phase 4: Strict numerical repair to guarantee validator tolerance compliance
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
+                if d < best_radii[i] + best_radii[j] - 1e-12:
+                    shrink = (best_radii[i] + best_radii[j] - d) / 2.0 + 1e-9
+                    best_radii[i] -= shrink
+                    best_radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(best_centers[i,0], 1.0-best_centers[i,0], best_centers[i,1], 1.0-best_centers[i,1])
+            if best_radii[i] > mr + 1e-12:
+                best_radii[i] = mr
+                changed = True
+        if not changed:
+            break
+            
+    best_radii = np.maximum(best_radii, 0.0)
+    return best_centers, best_radii, float(np.sum(best_radii))
+```

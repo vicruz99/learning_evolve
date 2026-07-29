@@ -1,0 +1,128 @@
+# sol_000029 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000004 (state 5455684e) state=9a6065a6 sum of radii=2.628607 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraints(vars):
+    """Inequality constraints: boundary and non-overlap."""
+    n = 26
+    xi = vars[0::3]
+    yi = vars[1::3]
+    ri = vars[2::3]
+    
+    num_overlap = n * (n - 1) // 2
+    res = np.empty(n * 4 + num_overlap)
+    
+    # Boundary constraints: circle inside [0,1]x[0,1]
+    res[:n] = xi - ri
+    res[n:2*n] = 1.0 - xi - ri
+    res[2*n:3*n] = yi - ri
+    res[3*n:4*n] = 1.0 - yi - ri
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = xi[:, None] - xi[None, :]
+    dy = yi[:, None] - yi[None, :]
+    dr = ri[:, None] + ri[None, :]
+    
+    i_idx, j_idx = np.tril_indices(n, -1)
+    res[4*n:] = dx[i_idx, j_idx]**2 + dy[i_idx, j_idx]**2 - dr[i_idx, j_idx]**2
+    
+    return res
+
+def run_packing():
+    n = 26
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    
+    best_val = -np.inf
+    best_vars = None
+    
+    # Multiple restarts with hexagonal lattice initialization
+    for seed in range(40):
+        np.random.seed(seed)
+        r_init = 0.095 + np.random.uniform(-0.008, 0.008)
+        
+        centers = []
+        y = r_init
+        row = 0
+        while len(centers) < n and y + r_init <= 1.0:
+            x = r_init + (row % 2) * r_init
+            while len(centers) < n and x + r_init <= 1.0:
+                centers.append([x, y])
+                x += 2 * r_init
+            y += r_init * np.sqrt(3)
+            row += 1
+            
+        if len(centers) < n:
+            while len(centers) < n:
+                centers.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)])
+                
+        centers = np.array(centers[:n])
+        centers += np.random.normal(0, 0.003, centers.shape)
+        centers = np.clip(centers, r_init + 1e-6, 1.0 - r_init - 1e-6)
+        
+        x0 = np.zeros(3 * n)
+        x0[0::3] = centers[:, 0]
+        x0[1::3] = centers[:, 1]
+        x0[2::3] = r_init
+        
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                       constraints={'type': 'ineq', 'fun': constraints},
+                       options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+                       
+        c_vals = constraints(res.x)
+        if np.min(c_vals) >= -1e-8 and -res.fun > best_val:
+            best_val = -res.fun
+            best_vars = res.x.copy()
+            
+        # Perturbation strategy to escape local minima
+        if seed > 15 and best_vars is not None and seed % 4 == 0:
+            noisy = best_vars + np.random.normal(0, 1e-4, size=best_vars.shape)
+            for k in range(n):
+                r = noisy[3*k+2]
+                if r < 0.01: r = 0.01
+                noisy[3*k+2] = r
+                noisy[3*k] = np.clip(noisy[3*k], r, 1.0-r)
+                noisy[3*k+1] = np.clip(noisy[3*k+1], r, 1.0-r)
+                
+            res2 = minimize(objective, noisy, method='SLSQP', bounds=bounds,
+                            constraints={'type': 'ineq', 'fun': constraints},
+                            options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+            c_vals2 = constraints(res2.x)
+            if np.min(c_vals2) >= -1e-8 and -res2.fun > best_val:
+                best_val = -res2.fun
+                best_vars = res2.x.copy()
+
+    if best_vars is None:
+        best_vars = np.zeros(3*n)
+        best_vars[2::3] = 0.09
+        best_vars[0::3] = np.tile(np.linspace(0.1, 0.9, 5), 6)[:n]
+        best_vars[1::3] = np.repeat(np.linspace(0.1, 0.9, 6), 5)[:n]
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    
+    # Repair loop to ensure strict validity against numerical errors
+    for _ in range(100):
+        valid = True
+        for i in range(n):
+            if radii[i] < 0: valid=False; break
+            if centers[i,0]-radii[i] < -1e-9 or centers[i,0]+radii[i] > 1.0+1e-9: valid=False; break
+            if centers[i,1]-radii[i] < -1e-9 or centers[i,1]+radii[i] > 1.0+1e-9: valid=False; break
+        if valid:
+            for i in range(n):
+                for j in range(i+1, n):
+                    if np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1]) < radii[i]+radii[j]-1e-9:
+                        valid=False; break
+                if not valid: break
+        if valid: break
+        radii *= 0.995
+        
+    return centers, radii, float(np.sum(radii))

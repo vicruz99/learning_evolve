@@ -1,0 +1,200 @@
+# sol_000083 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state aba87625) state=b96d727a sum of radii=2.080000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    n_circles = 26
+    
+    # 1. Initialization: Hexagonal lattice
+    # We start with a radius that allows fitting > 26 circles to ensure valid start
+    r_init = 0.08
+    
+    centers = []
+    # Generate points in a hexagonal pattern
+    # Vertical spacing: sqrt(3) * r
+    # Horizontal spacing: 2 * r
+    # Offset odd rows by r
+    
+    row_y = r_init
+    while row_y + r_init <= 1.0 + 1e-9:
+        # Determine x range
+        # For even rows (0, 2, ...), x starts at r_init
+        # For odd rows (1, 3, ...), x starts at r_init + r_init = 2*r_init (shifted by r)
+        # Actually, standard hex packing:
+        # Row 0: x = r, 3r, 5r...
+        # Row 1: x = 2r, 4r, 6r...
+        
+        row_idx = int((row_y - r_init) / (np.sqrt(3) * r_init))
+        is_odd = (row_idx % 2 == 1)
+        
+        start_x = 2 * r_init if is_odd else r_init
+        
+        row_x = start_x
+        while row_x + r_init <= 1.0 + 1e-9:
+            centers.append([row_x, row_y])
+            row_x += 2 * r_init
+        
+        row_y += np.sqrt(3) * r_init
+        
+    # We might have more than 26 points, select the first 26
+    # Or if fewer (unlikely with 0.08), we might need to adjust, but 0.08 fits ~33.
+    if len(centers) < n_circles:
+        # Fallback to random if grid fails (should not happen)
+        np.random.seed(42)
+        centers = np.random.rand(n_circles, 2) * 0.8 + 0.1
+    
+    centers = np.array(centers[:n_circles])
+    radii = np.full(n_circles, r_init)
+    
+    # 2. Optimization Setup
+    # Variables vector v: [x0, y0, r0, x1, y1, r1, ..., x25, y25, r25]
+    # Length: 3 * 26 = 78
+    initial_v = []
+    for i in range(n_circles):
+        initial_v.extend([centers[i, 0], centers[i, 1], radii[i]])
+    
+    initial_v = np.array(initial_v)
+    
+    # Bounds for variables
+    # x, y in [0, 1], r in [0, 0.5]
+    # But we have tighter bounds implicitly via constraints.
+    # Explicit bounds for solver stability:
+    bounds = []
+    for _ in range(n_circles):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+    
+    # 3. Define Objective and Constraints
+    # We need to pass these to minimize. 
+    # Since we cannot use lambdas or closures, we define standalone functions
+    # that take the vector 'v' and any necessary constants (passed via args or hardcoded N).
+    
+    def objective(v):
+        # Maximize sum of radii -> Minimize negative sum
+        r_sum = 0.0
+        for i in range(n_circles):
+            r_sum += v[3*i + 2]
+        return -r_sum
+
+    def constraints_func(v):
+        # Returns a list of constraint values, all must be >= 0
+        cons = []
+        
+        # Boundary and radius constraints
+        for i in range(n_circles):
+            x = v[3*i]
+            y = v[3*i + 1]
+            r = v[3*i + 2]
+            
+            # r >= 0 (handled by bounds, but good to enforce strictly if needed)
+            # x >= r
+            cons.append(x - r)
+            # x + r <= 1 => 1 - x - r >= 0
+            cons.append(1.0 - x - r)
+            # y >= r
+            cons.append(y - r)
+            # y + r <= 1 => 1 - y - r >= 0
+            cons.append(1.0 - y - r)
+            
+        # Non-overlap constraints
+        # (xi - xj)^2 + (yi - yj)^2 >= (ri + rj)^2
+        # => (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+        for i in range(n_circles):
+            xi = v[3*i]
+            yi = v[3*i + 1]
+            ri = v[3*i + 2]
+            for j in range(i + 1, n_circles):
+                xj = v[3*j]
+                yj = v[3*j + 1]
+                rj = v[3*j + 2]
+                
+                dx = xi - xj
+                dy = yi - yj
+                dist_sq = dx*dx + dy*dy
+                r_sum_sq = (ri + rj)**2
+                
+                cons.append(dist_sq - r_sum_sq)
+                
+        return np.array(cons)
+
+    # We can pass the constraint function as a dictionary for SLSQP
+    # However, SLSQP in scipy.optimize.minimize expects a constraint dict with 'fun'
+    # 'fun' should return an array of values >= 0 for 'ineq'
+    
+    # To avoid lambda, we can wrap the call or just use the function directly if signature matches
+    # minimize expects fun(x) returning array. constraints_func does exactly that.
+    
+    constraint_dict = {
+        'type': 'ineq',
+        'fun': constraints_func,
+        'jac': '2-point' # Numerical gradient approximation
+    }
+
+    # 4. Run Optimizer
+    # We might run a few restarts or just one strong run. 
+    # SLSQP is sensitive to start, but our start is good.
+    
+    try:
+        result = scipy.optimize.minimize(
+            objective,
+            initial_v,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraint_dict,
+            options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False}
+        )
+        
+        if result.success:
+            final_v = result.x
+        else:
+            # Fallback to initial if failed (unlikely)
+            final_v = initial_v
+    except Exception:
+        final_v = initial_v
+
+    # 5. Extract results
+    final_centers = np.zeros((n_circles, 2))
+    final_radii = np.zeros(n_circles)
+    
+    for i in range(n_circles):
+        final_centers[i, 0] = final_v[3*i]
+        final_centers[i, 1] = final_v[3*i + 1]
+        final_radii[i] = final_v[3*i + 2]
+        
+    # Ensure non-negative radii (numerical safety)
+    final_radii = np.maximum(final_radii, 1e-9)
+    
+    # Re-center or clamp if slightly out due to precision (validation handles small eps)
+    # But let's ensure valid inputs
+    for i in range(n_circles):
+        r = final_radii[i]
+        final_centers[i, 0] = np.clip(final_centers[i, 0], r, 1.0 - r)
+        final_centers[i, 1] = np.clip(final_centers[i, 1], r, 1.0 - r)
+        # If radius is too large for position (shouldn't happen with constraints), reduce radius
+        # Actually, if we clipped center, radius might be invalid relative to bounds?
+        # The constraint x >= r ensures r <= x. If we clamp x to r, it's consistent.
+        # However, if x was 0.1 and r was 0.2, we clamp x to 0.2. But r=0.2 implies x>=0.2.
+        # If constraint was violated, clipping fixes center but radius might still be "too big" for original x?
+        # But constraints enforce r <= x. So if valid, no clipping needed.
+        # If numerical error made it invalid, clipping x to r ensures x >= r.
+        # But what if x+r > 1? We clamp x to 1-r.
+        # So:
+        x, y = final_centers[i]
+        if x < r: x = r
+        if x > 1 - r: x = 1 - r
+        if y < r: y = r
+        if y > 1 - r: y = 1 - r
+        final_centers[i] = [x, y]
+
+    sum_radii = np.sum(final_radii)
+    
+    return (final_centers, final_radii, float(sum_radii))

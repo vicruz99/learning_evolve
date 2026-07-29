@@ -1,0 +1,192 @@
+
+
+<strategy>
+To improve the packing sum of radii beyond the current ~2.60, we need a more robust initialization and optimization strategy that escapes local minima effectively. 
+
+Key improvements in this approach:
+1. **Greedy Sequential Initialization**: Instead of starting from simple grids or random points, we place circles one-by-one at locations that maximize the minimum distance to boundaries and existing circles. This yields a highly dense, valid initial configuration that gives the optimizer a strong starting point.
+2. **Multi-start with Adaptive Perturbation**: We run the optimizer multiple times. After each successful optimization, we perturb the best solution (jitter centers, randomly shrink radii) to explore neighboring regions of the parameter space. The perturbation scale decreases over trials to transition from exploration to fine-tuning.
+3. **Squared Distance Constraints**: We use `dist^2 >= (r_i + r_j)^2` for overlap constraints. This avoids square roots in the constraint evaluation, improving numerical stability and speed for SLSQP.
+4. **Strict Post-processing**: We enforce boundary and non-overlap constraints with tight margins to guarantee the validation function passes, accounting for floating-point drift inherent in iterative optimizers.
+5. **Increased Sampling & Iterations**: The greedy init samples 20,000 points per circle for precision, and SLSQP is given 2,000 iterations per trial with a tight tolerance.
+
+This combination of geometric initialization, constrained gradient optimization, and iterative local search consistently pushes packings closer to theoretical limits for moderate N.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def get_pair_indices(n):
+    """Precompute indices for all unique circle pairs."""
+    i_idx = []
+    j_idx = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            i_idx.append(i)
+            j_idx.append(j)
+    return np.array(i_idx), np.array(j_idx)
+
+def objective(v, n):
+    """Objective: Minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraints(v, n, pi, pj):
+    """Compute inequality constraints: boundaries and non-overlap."""
+    centers = v[:2*n].reshape(n, 2)
+    radii = v[2*n:]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c = np.concatenate([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ])
+    
+    # Overlap constraints: dist^2 >= (r_i + r_j)^2
+    c_i = centers[pi]
+    c_j = centers[pj]
+    r_i = radii[pi]
+    r_j = radii[pj]
+    
+    dist_sq = np.sum((c_i - c_j)**2, axis=1)
+    r_sum = r_i + r_j
+    
+    c = np.concatenate([c, dist_sq - r_sum**2])
+    return c
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    pi, pj = get_pair_indices(n)
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    best_sum = 0.0
+    best_v = None
+    
+    # 1. Greedy Sequential Initialization
+    # Place each circle at the location maximizing min distance to boundaries and existing circles
+    np.random.seed(42)
+    centers_g = np.zeros((n, 2))
+    radii_g = np.zeros(n)
+    
+    for i in range(n):
+        samples = np.random.random((20000, 2))
+        best_d = 0.0
+        best_pt = None
+        
+        # Vectorized distance evaluation for speed
+        d_bounds = np.min(np.stack([samples, 1.0 - samples], axis=1), axis=1)
+        
+        if i > 0:
+            # dist to existing centers
+            diff = centers_g[:i] - samples[:, np.newaxis, :]
+            dist_to_cen = np.sqrt(np.sum(diff**2, axis=2))
+            min_dist_to_cen = np.min(dist_to_cen, axis=1)
+            d_all = np.minimum(d_bounds, min_dist_to_cen)
+        else:
+            d_all = d_bounds
+            
+        idx = np.argmax(d_all)
+        best_d = d_all[idx]
+        best_pt = samples[idx]
+        
+        centers_g[i] = best_pt
+        radii_g[i] = best_d
+        
+    # Shrink slightly to guarantee strict initial feasibility for optimizer
+    v0 = np.concatenate([centers_g.flatten(), radii_g * 0.94])
+    
+    # 2. Optimization Loop with Adaptive Perturbations
+    num_trials = 25
+    for trial in range(num_trials):
+        np.random.seed(trial * 13 + 7)
+        
+        if trial == 0:
+            curr_v = v0.copy()
+        else:
+            # Perturb best known configuration to escape local minima
+            curr_v = best_v.copy()
+            centers_curr = curr_v[:2*n].reshape(n, 2)
+            radii_curr = curr_v[2*n:]
+            
+            # Adaptive jitter scale: starts wide, narrows down
+            scale = 0.04 * (1.0 - trial / (num_trials + 5.0))
+            jitter = np.random.uniform(-scale, scale, size=centers_curr.shape)
+            centers_curr = np.clip(centers_curr + jitter, 0.01, 0.99)
+            
+            # Random shrinkage to ensure constraints are satisfied after jitter
+            radii_curr *= (0.90 + 0.05 * np.random.rand(n))
+            
+            curr_v = np.concatenate([centers_curr.flatten(), radii_curr])
+            
+        try:
+            res = minimize(objective, curr_v, args=(n,), method='SLSQP',
+                           bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraints, 'args': (n, pi, pj)},
+                           options={'maxiter': 2500, 'ftol': 1e-12})
+            
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                # Validate and clean candidate solution
+                v_check = res.x
+                centers_c = v_check[:2*n].reshape(n, 2)
+                radii_c = v_check[2*n:]
+                
+                # Strict feasibility enforcement margin
+                radii_c *= 0.99995
+                centers_c = np.clip(centers_c, 1e-9, 1.0 - 1e-9)
+                
+                valid = True
+                for i in range(n):
+                    if centers_c[i,0] - radii_c[i] < -1e-9 or centers_c[i,0] + radii_c[i] > 1.0 + 1e-9 or \
+                       centers_c[i,1] - radii_c[i] < -1e-9 or centers_c[i,1] + radii_c[i] > 1.0 + 1e-9:
+                        valid = False
+                        break
+                if valid:
+                    for i in range(n):
+                        for j in range(i + 1, n):
+                            d = np.sqrt(np.sum((centers_c[i] - centers_c[j])**2))
+                            if d < radii_c[i] + radii_c[j] - 1e-9:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                            
+                if valid:
+                    best_sum = curr_sum
+                    best_v = v_check.copy()
+                    
+        except Exception:
+            continue
+            
+    # Fallback in case optimization path failed unexpectedly
+    if best_v is None:
+        best_v = v0
+        
+    # 3. Final Post-processing
+    final_centers = best_v[:2*n].reshape(n, 2)
+    final_radii = best_v[2*n:]
+    
+    # Enforce boundary constraints strictly
+    for i in range(n):
+        final_radii[i] = min(final_radii[i], 
+                             final_centers[i,0], 1.0 - final_centers[i,0], 
+                             final_centers[i,1], 1.0 - final_centers[i,1])
+                             
+    # Enforce non-overlap strictly with safety margin
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((final_centers[i] - final_centers[j])**2))
+            s_r = final_radii[i] + final_radii[j]
+            if d < s_r:
+                shrink = (s_r - d) / 2.0 + 1e-7
+                final_radii[i] = max(0.0, final_radii[i] - shrink)
+                final_radii[j] = max(0.0, final_radii[j] - shrink)
+                
+    return final_centers, final_radii, float(np.sum(final_radii))
+```

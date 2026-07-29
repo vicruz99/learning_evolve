@@ -1,0 +1,108 @@
+# sol_000315 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 1cbfbe8a) state=de201f1f sum of radii=2.622884 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def _objective(x):
+    # x layout: [x_1...x_n, y_1...y_n, r_1...r_n]
+    # We want to maximize sum of radii, so minimize negative sum
+    return -np.sum(x[2*N_CIRCLES:])
+
+def _constraints(x):
+    n = N_CIRCLES
+    c = []
+    # Boundary constraints: circles must be inside [0,1]x[0,1]
+    # x_i - r_i >= 0
+    c.extend(x[:n] - x[2*n:])
+    # 1 - x_i - r_i >= 0  => x_i + r_i <= 1
+    c.extend(1.0 - x[:n] - x[2*n:])
+    # y_i - r_i >= 0
+    c.extend(x[n:2*n] - x[2*n:])
+    # 1 - y_i - r_i >= 0  => y_i + r_i <= 1
+    c.extend(1.0 - x[n:2*n] - x[2*n:])
+    
+    # Overlap constraints: dist(i,j) >= r_i + r_j
+    cx = x[:n]
+    cy = x[n:2*n]
+    r = x[2*n:]
+    
+    # Vectorized pairwise distance computation
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist_mat = np.sqrt(dx**2 + dy**2)
+    
+    r_sum_mat = r[:, None] + r[None, :]
+    
+    # Extract lower triangle (i > j) to avoid duplicates and self-distances
+    mask = np.tril(np.ones((n, n), dtype=bool), k=-1)
+    c.extend(dist_mat[mask] - r_sum_mat[mask])
+    
+    return np.array(c)
+
+def run_packing():
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0)] * n + [(0.0, 1.0)] * n + [(0.0, 0.5)] * n
+    cons = [{'type': 'ineq', 'fun': _constraints}]
+    
+    best_sum = 0.0
+    best_x = None
+    
+    # Multi-start optimization to escape local minima
+    for seed in range(15):
+        np.random.seed(seed)
+        
+        # Initialize with a perturbed grid layout for good spatial spread
+        idx = np.arange(n)
+        x_grid = (idx % 6 + 0.5) / 6.0
+        y_grid = (idx // 6 + 0.5) / 5.0
+        
+        x_init = np.clip(x_grid + np.random.randn(n) * 0.05, 0.1, 0.9)
+        y_init = np.clip(y_grid + np.random.randn(n) * 0.05, 0.1, 0.9)
+        r_init = np.ones(n) * 0.01
+        
+        x0 = np.concatenate([x_init, y_init, r_init])
+        
+        try:
+            res = minimize(_objective, x0, method='SLSQP', bounds=bounds, constraints=cons, 
+                           options={'maxiter': 200, 'ftol': 1e-9, 'disp': False})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    if best_x is None:
+        return np.zeros((n, 2)), np.zeros(n), 0.0
+        
+    # Local refinement step with small perturbations to polish the solution
+    for _ in range(5):
+        perturbed = best_x + np.random.randn(len(best_x)) * 0.002
+        # Project back to bounds
+        lower = [b[0] for b in bounds]
+        upper = [b[1] for b in bounds]
+        perturbed = np.clip(perturbed, lower, upper)
+        
+        try:
+            res = minimize(_objective, perturbed, method='SLSQP', bounds=bounds, constraints=cons, 
+                           options={'maxiter': 100, 'ftol': 1e-10})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_x = res.x.copy()
+        except Exception:
+            pass
+            
+    centers = np.column_stack((best_x[:n], best_x[n:2*n]))
+    radii = best_x[2*n:]
+    
+    # Ensure strict non-negativity and bounds compliance due to numerical precision
+    radii = np.maximum(radii, 0.0)
+    centers = np.clip(centers, 0.0, 1.0)
+    
+    return centers, radii, float(best_sum)

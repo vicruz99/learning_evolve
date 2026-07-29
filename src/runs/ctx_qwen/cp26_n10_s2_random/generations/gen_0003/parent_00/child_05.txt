@@ -1,0 +1,164 @@
+
+
+<strategy>
+To improve upon the current sum of radii (~2.628), we need a more robust optimization strategy that effectively navigates the non-convex landscape of circle packing. The previous approach used `SLSQP` with explicit constraints, which can struggle with constraint jacobian approximations and local minima. 
+
+Key improvements:
+1. **Unconstrained Formulation**: Instead of optimizing centers and radii jointly with constraints, we treat radii as dependent variables: $r_i = \min(\text{dist to boundary}, 0.5 \times \text{dist to nearest neighbor})$. The objective becomes maximizing $\sum r_i(centers)$, which is a continuous, albeit non-smooth, function of centers only. This eliminates constraint handling overhead and allows derivative-free optimizers to work more naturally.
+2. **Powell's Method**: `Powell` is highly effective for non-smooth, multi-modal optimization problems in moderate dimensions (52 here). It doesn't require gradients and handles the kinks in the max-radius function well.
+3. **Diverse & Structured Initializations**: We generate starts from hexagonal lattices (optimal packing density), square grids, corner-pushed configurations, and random dense clusters. This covers different topological basins.
+4. **Iterative Basin Hopping**: After finding the best local optimum, we perform a decaying perturbation loop. Each perturbation is followed by a `Powell` refinement. This systematically escapes shallow local minima while fine-tuning the configuration.
+5. **Strict Post-Processing Repair**: A deterministic shrinkage loop guarantees that floating-point drift from the optimizer does not cause validation failures, ensuring strict compliance with the $10^{-12}$ tolerance.
+
+This approach directly targets the geometric optimum by letting circles naturally find positions that balance boundary proximity and mutual separation, typically yielding denser packings than constrained gradient methods.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def compute_max_radii(centers):
+    """
+    Computes the maximum valid radius for each circle given fixed centers.
+    r_i = min(dist to boundary, 0.5 * dist to nearest neighbor)
+    """
+    x, y = centers[:, 0], centers[:, 1]
+    
+    # Distance to boundaries: min(x, 1-x, y, 1-y)
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)  # Ignore self-distance
+    
+    # Radius limited by half the distance to the nearest neighbor
+    r_pair = 0.5 * np.min(dist, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(centers_flat):
+    """
+    Objective function for minimization: maximize sum of radii.
+    Returns negative sum for scipy.minimize.
+    """
+    centers = centers_flat.reshape(N, 2)
+    # Keep centers strictly inside to avoid boundary singularity during search
+    centers = np.clip(centers, 1e-7, 1.0 - 1e-7)
+    radii = compute_max_radii(centers)
+    return -np.sum(radii)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Packs 26 circles in a unit square to maximize the sum of radii."""
+    np.random.seed(42)
+    best_val = np.inf
+    best_centers = None
+    
+    starts = []
+    
+    # 1. Hexagonal lattices with various densities (optimal packing structure)
+    for r_init in [0.090, 0.095, 0.100, 0.105, 0.110]:
+        pts = []
+        y = r_init
+        row = 0
+        while len(pts) < N:
+            x = r_init if row % 2 == 0 else 2 * r_init
+            while x + r_init <= 1.0 and len(pts) < N:
+                pts.append([x, y])
+                x += 2 * r_init
+            y += np.sqrt(3) * r_init
+            row += 1
+        starts.append(np.array(pts[:N]).flatten())
+        
+    # 2. Square grids (covers symmetric basins)
+    for spacing in [0.17, 0.18, 0.19, 0.20]:
+        pts = []
+        y = spacing / 2
+        while y + spacing / 2 <= 1.0 and len(pts) < N:
+            x = spacing / 2
+            while x + spacing / 2 <= 1.0 and len(pts) < N:
+                pts.append([x, y])
+                x += spacing
+            y += spacing
+        while len(pts) < N:
+            pts.append([0.5, 0.5])
+        starts.append(np.array(pts[:N]).flatten())
+        
+    # 3. Random dense starts (explores non-lattice optima)
+    for _ in range(15):
+        starts.append(np.random.rand(N, 2).flatten())
+        
+    # 4. Corner-pushed configurations (highly efficient for boundary utilization)
+    corners = np.array([[0.12, 0.12], [0.88, 0.12], [0.12, 0.88], [0.88, 0.88]])
+    for _ in range(10):
+        c = np.vstack([corners, np.random.rand(N - 4, 2) * 0.6 + 0.2])
+        starts.append(c.flatten())
+
+    # Phase 1: Multi-start optimization
+    for s in starts:
+        s_pert = s + np.random.normal(0, 0.001, s.shape)
+        s_pert = np.clip(s_pert, 1e-6, 1.0 - 1e-6)
+        
+        try:
+            res = minimize(objective, s_pert, method='Powell', 
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'xtol': 1e-13})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            continue
+            
+    # Phase 2: Iterative Perturbation & Refinement (Basin Hopping style)
+    # Decaying noise scale to escape local minima while refining
+    for step in range(40):
+        noise_scale = 0.006 * (0.92 ** step)
+        pert = best_centers + np.random.normal(0, noise_scale, best_centers.shape)
+        pert = np.clip(pert, 1e-6, 1.0 - 1e-6)
+        
+        try:
+            res = minimize(objective, pert.flatten(), method='Powell',
+                           options={'maxiter': 4000, 'ftol': 1e-13})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            continue
+            
+    # Compute final radii exactly for the optimized centers
+    final_radii = compute_max_radii(best_centers)
+    sum_radii = float(np.sum(final_radii))
+    
+    # Phase 3: Strict validation repair (handles floating point drift)
+    # Iteratively shrink radii minimally to guarantee strict feasibility
+    for _ in range(30):
+        valid = True
+        
+        # Check boundaries
+        for i in range(N):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], final_radii[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                valid = False
+                break
+        if not valid:
+            final_radii *= 0.9995
+            continue
+            
+        # Check overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                             best_centers[i, 1] - best_centers[j, 1])
+                if d < final_radii[i] + final_radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            break
+        final_radii *= 0.9995
+        
+    return best_centers, final_radii, float(np.sum(final_radii))
+```

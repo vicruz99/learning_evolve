@@ -1,0 +1,198 @@
+
+
+<strategy>
+To improve the packing beyond 2.627, I will employ a two-phase optimization strategy combined with highly targeted initializations:
+
+1. **Targeted Initializations**: Instead of purely random or generic grids, I will generate initial configurations using:
+   - Multiple hexagonal lattice patterns with row counts that sum to 26 (e.g., `[5,6,5,6,4]`, `[6,5,6,5,4]`), known to approximate optimal dense packings.
+   - A greedy farthest-point placement algorithm, which naturally spreads circles to maximize minimum distances.
+   - Varied base radii and noise levels to explore different basin of attraction landscapes.
+
+2. **Two-Phase Optimization**:
+   - **Phase 1 (Centers-Only)**: Optimize only the circle centers using `Powell` to maximize the sum of radii derived from nearest-neighbor and boundary distances. This removes constraint-handling overhead and effectively finds high-quality geometric basins.
+   - **Phase 2 (Full SLSQP Polish)**: Use the best centers from Phase 1 to initialize a full optimization (centers + radii) with `SLSQP` and explicit inequality constraints. This precisely satisfies the mathematical conditions while pushing radii to their theoretical limits.
+
+3. **Iterative Pressure & Perturbation**: After the initial polish, I will run a refinement loop that slightly scales up radii (creating "packing pressure") and adds decaying Gaussian noise to centers. This forces the solver to escape shallow local minima and re-negotiate circle boundaries.
+
+4. **Strict Repair**: A final deterministic pass resolves any floating-point drift by proportionally shrinking overlapping circles and clamping to boundaries with a safe margin (`1e-10`), guaranteeing the validator's `1e-12` tolerance is met.
+
+This approach systematically targets the known equal-circle optimum (~2.6353) while allowing variable radii to squeeze out any remaining gain.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+_MASK_I, _MASK_J = np.triu_indices(N, k=1)
+
+def compute_radii_from_centers(centers):
+    x, y = centers[:, 0], centers[:, 1]
+    r_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)
+    r_pair = 0.5 * np.min(dist, axis=1)
+    return np.minimum(r_bound, r_pair)
+
+def obj_centers(v):
+    return -np.sum(compute_radii_from_centers(v.reshape(N, 2)))
+
+def obj_full(v):
+    return -np.sum(v[2*N:])
+
+def cons_full(v):
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = np.concatenate([
+        c[:, 0] - r, 1.0 - c[:, 0] - r,
+        c[:, 1] - r, 1.0 - c[:, 1] - r
+    ])
+    dx = c[:, 0, None] - c[:, 0]
+    dy = c[:, 1, None] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    con = np.concatenate([con, dists[_MASK_I, _MASK_J] - (r[_MASK_I] + r[_MASK_J])])
+    return con
+
+def get_bounds_full():
+    return [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+
+def get_hex_init(rows, r0=0.1, noise=0.0):
+    centers = []
+    y = r0
+    dy = np.sqrt(3.0) * r0
+    dx = 2.0 * r0
+    for i, cnt in enumerate(rows):
+        offset = (dx / 2.0) if (i % 2 == 1) else 0.0
+        x = r0 + offset
+        for _ in range(cnt):
+            centers.append([x, y])
+            x += dx
+        y += dy
+    centers = np.array(centers[:N])
+    if noise > 0:
+        centers += np.random.normal(0, noise, centers.shape)
+    min_c = centers.min(axis=0)
+    max_c = centers.max(axis=0)
+    span = max_c - min_c
+    if span.max() > 1e-9:
+        scale = 0.94 / span
+        centers = (centers - min_c) * scale + 0.03
+    return np.clip(centers, 0.01, 0.99)
+
+def greedy_init(rng, n_samples=2000):
+    centers = []
+    centers.append([0.5, 0.5])
+    for _ in range(N - 1):
+        pts = rng.uniform(0.05, 0.95, (n_samples, 2))
+        valid = (pts[:, 0] >= 0.05) & (pts[:, 0] <= 0.95) & \
+                (pts[:, 1] >= 0.05) & (pts[:, 1] <= 0.95)
+        pts = pts[valid]
+        if len(pts) == 0:
+            pts = rng.uniform(0.1, 0.9, (100, 2))
+            
+        if len(centers) > 0:
+            dists_to_centers = np.linalg.norm(pts[:, None, :] - centers[None, :, :], axis=2)
+            min_dists = np.min(dists_to_centers, axis=1)
+        else:
+            min_dists = np.full(len(pts), 1.0)
+            
+        best_idx = np.argmax(min_dists)
+        centers.append(pts[best_idx])
+    return np.array(centers[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    bounds = get_bounds_full()
+    cons = {'type': 'ineq', 'fun': cons_full}
+    
+    starts = []
+    
+    row_patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5],
+        [4, 6, 6, 6, 4], [5, 5, 5, 5, 6], [6, 5, 5, 5, 5]
+    ]
+    for pat in row_patterns:
+        for r0 in [0.09, 0.10, 0.11]:
+            for noise in [0.0, 0.005, 0.015]:
+                c = get_hex_init(pat, r0, noise)
+                r = np.full(N, 0.09)
+                starts.append(np.concatenate([c.flatten(), r]))
+                
+    for _ in range(5):
+        c = greedy_init(rng)
+        r = np.full(N, 0.07)
+        starts.append(np.concatenate([c.flatten(), r]))
+        
+    for _ in range(10):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        r = np.full(N, 0.06)
+        starts.append(np.concatenate([c.flatten(), r]))
+        
+    best_val = -np.inf
+    best_vars = None
+    
+    bounds_c = [(0.01, 0.99)] * (2*N)
+    for s in starts:
+        c0 = s[:2*N]
+        try:
+            res = minimize(obj_centers, c0, method='Powell', bounds=bounds_c,
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            if -res.fun > best_val:
+                best_val = -res.fun
+                c_opt = res.x.reshape(N, 2)
+                r_opt = compute_radii_from_centers(c_opt)
+                best_vars = np.concatenate([c_opt.flatten(), r_opt])
+        except Exception:
+            continue
+            
+    if best_vars is None:
+        best_vars = starts[0]
+        
+    curr = best_vars.copy()
+    for step in range(50):
+        curr[2*N:] *= 1.0015
+        noise_scale = 0.0005 * np.exp(-step/15.0)
+        curr[:2*N] += rng.normal(0, noise_scale, 2*N)
+        curr[:2*N] = np.clip(curr[:2*N], 0.02, 0.98)
+        
+        try:
+            res = minimize(obj_full, curr, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            if np.all(cons_full(res.x) >= -1e-9):
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    centers = best_vars[:2*N].reshape(N, 2)
+    radii = best_vars[2*N:].copy()
+    
+    for _ in range(40):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    ov = radii[i] + radii[j] - d + 1e-10
+                    radii[i] -= ov / 2.0
+                    radii[j] -= ov / 2.0
+                    changed = True
+                    
+        for i in range(N):
+            mx = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            if radii[i] > mx + 1e-10:
+                radii[i] = mx - 1e-10
+                changed = True
+                
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

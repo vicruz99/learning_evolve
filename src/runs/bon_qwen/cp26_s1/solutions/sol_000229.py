@@ -1,0 +1,109 @@
+# sol_000229 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state f043a2e3) state=48187bd9 sum of radii=2.626930 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective_func(v):
+    """Objective: maximize sum of radii (minimize negative sum)."""
+    return -np.sum(v[2*N_CIRCLES:])
+
+def constraint_func(v):
+    """Vectorized constraint function for boundary and non-overlap conditions."""
+    c = []
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    for i in range(N_CIRCLES):
+        xi, yi, ri = 2*i, 2*i+1, 2*N_CIRCLES+i
+        c.append(v[xi] - v[ri])
+        c.append(1.0 - v[xi] - v[ri])
+        c.append(v[yi] - v[ri])
+        c.append(1.0 - v[yi] - v[ri])
+        
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    for i in range(N_CIRCLES):
+        for j in range(i+1, N_CIRCLES):
+            xi, yi, ri = 2*i, 2*i+1, 2*N_CIRCLES+i
+            xj, yj, rj = 2*j, 2*j+1, 2*N_CIRCLES+j
+            dx = v[xi] - v[xj]
+            dy = v[yi] - v[yj]
+            dr = v[ri] + v[rj]
+            c.append(dx*dx + dy*dy - dr*dr)
+            
+    return np.array(c)
+
+def run_packing():
+    best_sum = 0.0
+    best_centers = np.zeros((N_CIRCLES, 2))
+    best_radii = np.zeros(N_CIRCLES)
+    
+    # Variable bounds: x,y in [0,1], r in [1e-6, 0.5]
+    bounds = [(0.0, 1.0)] * (2*N_CIRCLES) + [(1e-6, 0.5)] * N_CIRCLES
+    cons = [{'type': 'ineq', 'fun': constraint_func}]
+    
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. 5x5 Grid + 1 center
+    cfg_grid = []
+    for x in np.linspace(0.1, 0.9, 5):
+        for y in np.linspace(0.1, 0.9, 5):
+            cfg_grid.append([x, y])
+    cfg_grid.append([0.5, 0.5])
+    configs.append(cfg_grid[:N_CIRCLES])
+    
+    # 2. Hexagonal lattice approximation
+    cfg_hex = []
+    y = 0.1
+    row = 0
+    while len(cfg_hex) < N_CIRCLES and y <= 0.9:
+        x = 0.1
+        shift = 0.15 if row % 2 == 1 else 0.0
+        while x <= 0.9 and len(cfg_hex) < N_CIRCLES:
+            cfg_hex.append([x + shift, y])
+            x += 0.2
+        y += 0.1732
+        row += 1
+    while len(cfg_hex) < N_CIRCLES:
+        cfg_hex.append([0.5, 0.5])
+    configs.append(cfg_hex[:N_CIRCLES])
+    
+    # 3. Random configurations
+    np.random.seed(42)
+    for _ in range(8):
+        cfg_rand = np.random.uniform(0.15, 0.85, (N_CIRCLES, 2)).tolist()
+        configs.append(cfg_rand)
+        
+    # Optimize each configuration
+    for cfg in configs:
+        x0 = np.zeros(3*N_CIRCLES)
+        for i in range(N_CIRCLES):
+            x0[2*i] = cfg[i][0]
+            x0[2*i+1] = cfg[i][1]
+            x0[2*N_CIRCLES+i] = 0.02  # Small feasible initial radius
+            
+        res = minimize(objective_func, x0, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12})
+        
+        if res.success:
+            curr_sum = np.sum(res.x[2*N_CIRCLES:])
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = res.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+                best_radii = res.x[2*N_CIRCLES:].copy()
+                
+    # Final refinement pass on the best solution found
+    x0_final = np.concatenate([best_centers.flatten(), best_radii])
+    res_final = minimize(objective_func, x0_final, method='SLSQP', bounds=bounds,
+                         constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12})
+    
+    if res_final.success:
+        best_centers = res_final.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+        best_radii = res_final.x[2*N_CIRCLES:]
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, best_sum

@@ -1,0 +1,184 @@
+# sol_000362 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b037cf31) state=8a20870e sum of radii=2.474518 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    n = 26
+    
+    # 1. Initialization: 5x5 grid with perturbation + 1 extra
+    centers = []
+    # 5x5 grid
+    for r in range(5):
+        for c in range(5):
+            centers.append([0.1 + c * 0.2, 0.1 + r * 0.2])
+    # 26th circle in a gap
+    centers.append([0.2, 0.4])
+    
+    centers = np.array(centers)
+    # Add small perturbation to break symmetry
+    centers += np.random.normal(0, 0.005, centers.shape)
+    
+    radii = np.ones(n) * 0.01
+    best_sum = 0.0
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    # 2. Iterative Optimization
+    for step in range(300):
+        # Decay learning rate
+        alpha = 0.05 * (0.995 ** step)
+        
+        # Solve LP for radii
+        # Variables: r_0, ..., r_25
+        # Objective: Max sum(r) -> Min -sum(r)
+        c_obj = -np.ones(n)
+        
+        A_ub = []
+        b_ub = []
+        
+        # Distance constraints: r_i + r_j <= dist_ij
+        dists = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(centers[i] - centers[j])
+                dists[i, j] = d
+                dists[j, i] = d
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(d)
+                
+        # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+        for i in range(n):
+            x, y = centers[i]
+            max_r = min(x, 1 - x, y, 1 - y)
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(max_r)
+            
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        # Bounds for radii (r_i >= 0)
+        bounds = [(0, None) for _ in range(n)]
+        
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                radii = res.x
+            else:
+                # Fallback if LP fails
+                radii = np.ones(n) * 0.01
+        except Exception:
+            radii = np.ones(n) * 0.01
+
+        # Calculate sum and track best
+        current_sum = np.sum(radii)
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            
+        # 3. Calculate Forces on Centers
+        forces = np.zeros_like(centers)
+        
+        # Repulsion from active distance constraints
+        # Only consider pairs that are close (active or near-active)
+        threshold = 1.05 # Factor for "active" check
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = dists[i, j]
+                if d > 1e-9:
+                    # Check if constraint is tight
+                    if radii[i] + radii[j] > d * 0.99:
+                        # Repulsive force
+                        diff = centers[i] - centers[j]
+                        # Normalize
+                        dir_ij = diff / d
+                        # Magnitude: stronger if circles are larger
+                        magnitude = (radii[i] + radii[j]) / d
+                        forces[i] += dir_ij * magnitude
+                        forces[j] -= dir_ij * magnitude
+                        # Damping force if they overlap to separate them quickly
+                        overlap = (radii[i] + radii[j]) - d
+                        if overlap > 0:
+                            push = overlap * 10.0
+                            forces[i] += dir_ij * push
+                            forces[j] -= dir_ij * push
+
+        # Repulsion from boundaries
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            
+            # Check boundary tightness
+            if r > x * 0.99: forces[i, 0] += 1.0 # Left wall
+            if r > (1 - x) * 0.99: forces[i, 0] -= 1.0 # Right wall
+            if r > y * 0.99: forces[i, 1] += 1.0 # Bottom wall
+            if r > (1 - y) * 0.99: forces[i, 1] -= 1.0 # Top wall
+            
+        # Update centers
+        centers += alpha * forces
+        
+        # Project centers to [0, 1]^2
+        centers = np.clip(centers, 1e-6, 1 - 1e-6)
+        
+    return best_centers, best_radii, best_sum
+
+# Validation function provided in prompt
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
+    """
+    n = centers.shape[0]
+
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
+
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
+
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
+
+    return True

@@ -1,0 +1,186 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we treat the problem as a non-convex optimization task. The strategy involves:
+1. **Coordinate Transformation:** We parameterize circle centers $x_i, y_i$ using a normalized coordinate $u_i, v_i \in [0, 1]$ and the radius $r_i$. This ensures that boundary constraints ($0 \le x_i - r_i$ and $x_i + r_i \le 1$) are satisfied automatically.
+2. **Smooth Penalty Formulation:** We construct a smooth, differentiable objective function that combines a negative sum of radii with a "soft" penalty for inter-circle overlaps. This avoids the non-differentiability of the standard hard collision constraint, allowing gradient-based optimizers to function.
+3. **Multi-Stage Optimization:**
+   - **Initialization:** We start with a perturbed hexagonal lattice, which provides a high-density geometric baseline for 26 circles.
+   - **Annealing:** We use a "penalty annealing" technique. We start with a low penalty weight to allow the optimizer to arrange the circles in a valid configuration, then gradually increase the penalty to force the circles to expand and become tangent.
+   - **Refinement:** A final pass with a high penalty weight pushes the circles to their maximum possible size, ensuring they are packed as tightly as possible while maintaining strict non-overlap.
+4. **Validation:** Before returning, we ensure the solution is strictly valid (no NaNs, no overlaps, within bounds) as required by the validation function.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square [0,1]x[0,1] to maximize sum of radii.
+    """
+    n_circles = 26
+    
+    # 1. Initialization: Perturbed Hexagonal Lattice
+    # This provides a good geometric starting point for 26 circles.
+    rng = np.random.default_rng(42)
+    radii = np.full(n_circles, 0.09)
+    
+    # Generate centers
+    centers_init = []
+    row = 0
+    col = 0
+    step_x = 0.2
+    step_y = 0.2 * np.sqrt(3) / 2
+    shift_x = step_x / 2
+    
+    while len(centers_init) < n_circles:
+        if row % 2 == 0:
+            x = 0.1 + col * step_x
+        else:
+            x = 0.1 + shift_x + col * step_x
+        
+        y = 0.1 + row * step_y
+        
+        if x <= 0.9 and y <= 0.9:
+            centers_init.append([x, y])
+            col += 1
+        else:
+            col = 0
+            row += 1
+    
+    # If we generated more or fewer than 26, trim or pad (though loop is exact for 26 with these params)
+    centers_init = np.array(centers_init[:n_circles])
+    if centers_init.shape[0] < n_circles:
+        # Fallback padding if needed
+        for _ in range(n_circles - centers_init.shape[0]):
+            centers_init = np.vstack([centers_init, [rng.random(), rng.random()]])
+    
+    # 2. Helper Functions for Optimization
+    def get_centers(r, u, v):
+        # r: (n,), u: (n,), v: (n,)
+        # Returns centers (n, 2)
+        # Formula: center = radius + (1 - 2*radius) * normalized_pos
+        return np.column_stack([r + (1 - 2*r)*u, r + (1 - 2*r)*v])
+
+    def compute_objective(x):
+        # x = [r_0...r_n, u_0...u_n, v_0...v_n]
+        r = x[:n_circles]
+        u = x[n_circles:2*n_circles]
+        v = x[2*n_circles:]
+        
+        centers = get_centers(r, u, v)
+        
+        # Objective: Maximize sum of radii => Minimize negative sum
+        obj = -np.sum(r)
+        
+        # Penalty for overlaps
+        # Soft penalty using smooth approximation of max(0, dist_sum - actual_dist)
+        # We want actual_dist >= r_i + r_j. 
+        # Penalty triggers if (r_i + r_j) > dist.
+        
+        penalty = 0.0
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                overlap = r[i] + r[j] - dist
+                if overlap > 0:
+                    # Smooth quadratic penalty
+                    penalty += overlap**2
+        
+        # We anneal lambda by using a global constant defined below in the loop
+        global lambda_penalty
+        return obj + lambda_penalty * penalty
+
+    # 3. Optimization Loop (Annealing)
+    # We start with small radii and low penalty, then increase penalty to tighten packing.
+    
+    # Initial variables
+    u_init = (centers_init[:, 0] - radii) / (1 - 2*radii)
+    v_init = (centers_init[:, 1] - radii) / (1 - 2*radii)
+    # Clip to [0, 1]
+    u_init = np.clip(u_init, 0.001, 0.999)
+    v_init = np.clip(v_init, 0.001, 0.999)
+    
+    x0 = np.concatenate([radii, u_init, v_init])
+    
+    bounds = [
+        (0.001, 0.5) for _ in range(n_circles) # radii
+    ] + [
+        (0.001, 0.999) for _ in range(n_circles) # u
+    ] + [
+        (0.001, 0.999) for _ in range(n_circles) # v
+    ]
+    
+    # Annealing stages
+    lambdas = [10, 50, 100, 500, 1000, 2000, 5000, 10000]
+    
+    for lam in lambdas:
+        global lambda_penalty
+        lambda_penalty = lam
+        
+        res = minimize(
+            compute_objective,
+            x0,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 1000, 'ftol': 1e-12}
+        )
+        x0 = res.x
+    
+    # 4. Extract Final Results
+    r_final = x0[:n_circles]
+    u_final = x0[n_circles:2*n_circles]
+    v_final = x0[2*n_circles:]
+    
+    centers_final = get_centers(r_final, u_final, v_final)
+    
+    # 5. Validation and Adjustment
+    # The optimizer might leave tiny overlaps due to numerical precision.
+    # We enforce strict non-overlap by slightly reducing radii if necessary.
+    
+    # Check overlaps
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            dist = np.sqrt(np.sum((centers_final[i] - centers_final[j])**2))
+            req_dist = r_final[i] + r_final[j]
+            if dist < req_dist - 1e-9:
+                # Reduce radii proportionally to satisfy constraint
+                scale = dist / req_dist
+                r_final[i] *= scale
+                r_final[j] *= scale
+                # Recompute centers based on new radii
+                # Note: u, v stay same, but x = r + (1-2r)u changes
+                centers_final[i] = r_final[i] + (1 - 2*r_final[i])*np.array([u_final[i], v_final[i]])
+                centers_final[j] = r_final[j] + (1 - 2*r_final[j])*np.array([u_final[j], v_final[j]])
+
+    sum_radii = np.sum(r_final)
+    
+    return centers_final, r_final, sum_radii
+
+if __name__ == "__main__":
+    centers, radii, s_r = run_packing()
+    print(f"Sum of radii: {s_r}")
+    print(f"Min radius: {np.min(radii)}, Max radius: {np.max(radii)}")
+    
+    # Quick self-validation
+    import numpy as np
+    def validate_packing(centers, radii):
+        n = centers.shape[0]
+        if np.isnan(centers).any() or np.isnan(radii).any():
+            return False
+        for i in range(n):
+            if radii[i] < 0: return False
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                return False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist < radii[i] + radii[j] - 1e-12:
+                    return False
+        return True
+
+    print(f"Valid: {validate_packing(centers, radii)}")
+```

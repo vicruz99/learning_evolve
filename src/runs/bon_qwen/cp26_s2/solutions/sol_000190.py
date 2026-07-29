@@ -1,0 +1,286 @@
+# sol_000190 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 624944be) state=021ca134 sum of radii=2.290086 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+import random
+import math
+
+def solve_radii_for_centers(centers):
+    """
+    Given a set of centers, solve the LP to find radii that maximize sum of radii
+    without overlapping or going outside the unit square.
+    
+    Returns:
+        radii: np.array of optimal radii
+        sum_radii: float sum of optimal radii
+        success: bool
+    """
+    n = centers.shape[0]
+    if n == 0:
+        return np.array([]), 0.0, True
+
+    x = centers[:, 0]
+    y = centers[:, 1]
+
+    # 1. Define objective: Maximize sum(r_i) => Minimize -sum(r_i)
+    c = -np.ones(n)
+
+    # 2. Define constraints: A_ub @ r <= b_ub
+    # Constraints come from:
+    # a) Inter-circle distances: r_i + r_j <= dist(C_i, C_j)
+    # b) Boundary distances: r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+    
+    # We will collect constraints in lists to build matrix efficiently
+    # Or use sparse matrix if n was large, but for n=26 dense is fine.
+    
+    num_constraints = 0
+    # Number of pairs
+    num_pairs = n * (n - 1) // 2
+    num_constraints = num_pairs
+    
+    # We can incorporate boundary constraints into the 'bounds' argument of linprog
+    # instead of A_ub, which is more efficient.
+    
+    # Calculate boundary limits (upper bounds for r_i)
+    # r_i <= x, r_i <= 1-x, r_i <= y, r_i <= 1-y
+    # Also r_i >= 0 (handled by bounds)
+    
+    bounds_r = []
+    ub = np.zeros(n)
+    for i in range(n):
+        d_left = x[i]
+        d_right = 1.0 - x[i]
+        d_down = y[i]
+        d_up = 1.0 - y[i]
+        limit = min(d_left, d_right, d_down, d_up)
+        # If limit is negative, the center is outside, but we assume valid centers.
+        # Just clamp to 0.
+        limit = max(limit, 0.0)
+        ub[i] = limit
+        bounds_r.append((0.0, limit))
+
+    # Build A_ub for pair constraints: r_i + r_j <= dist
+    # A_ub will be (num_pairs, n)
+    A_ub = np.zeros((num_pairs, n))
+    b_ub = np.zeros(num_pairs)
+    
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = math.sqrt((x[i] - x[j])**2 + (y[i] - y[j])**2)
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dist
+            idx += 1
+            
+    # Solve LP
+    # Method 'highs' is usually faster and more robust in newer scipy
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            radii = res.x
+            return radii, np.sum(radii), True
+        else:
+            # If LP fails, return small radii (e.g., 0)
+            return np.zeros(n), 0.0, False
+    except Exception:
+        return np.zeros(n), 0.0, False
+
+def run_packing():
+    n = 26
+    
+    # --- Initialization ---
+    # Start with a hexagonal-like grid pattern to ensure good spacing
+    # 5 rows of roughly 5-6 circles
+    centers = []
+    
+    # Try to place them in a compact arrangement
+    # 6 rows might fit better?
+    # Let's try a simple grid first and perturb
+    # 5x5 grid = 25. We need 26.
+    # Let's place 26 points on a distorted grid
+    
+    # Heuristic: Fill rows with staggered positions
+    row_counts = [5, 5, 5, 5, 5, 1] # Sum = 26? No 25+1.
+    # Maybe 6, 5, 5, 5, 5? Sum = 26.
+    # Or 5, 6, 5, 5, 5?
+    # Let's just use random initialization for robustness, 
+    # but constrained to valid square.
+    
+    # Better initial guess: 
+    # Hexagonal packing logic
+    # Approximate radius 0.1.
+    # Spacing x: 0.2, y: 0.1732
+    
+    # Let's create a list of coordinates
+    init_centers = []
+    
+    # Pattern: 6 rows. 
+    # Row 0: 5 circles
+    # Row 1: 5 circles (shifted)
+    # Row 2: 5 circles
+    # Row 3: 5 circles
+    # Row 4: 5 circles
+    # Row 5: 1 circle?
+    # That's 26.
+    
+    # Let's construct specific coordinates
+    # y coords
+    # x coords
+    
+    # To maximize chances, let's just randomize with a bit of structure
+    # or use a grid.
+    
+    # Grid approach
+    # 6 rows, y from 0.1 to 0.9
+    # x from 0.1 to 0.9
+    # Place 26 points.
+    
+    pts = []
+    # 5x5 grid
+    for i in range(5):
+        for j in range(5):
+            pts.append([0.1 + i*0.2, 0.1 + j*0.2])
+    # Add one more at center? (0.5, 0.5) is occupied.
+    # Maybe (0.5, 0.1)?
+    # pts.append([0.5, 0.1]) # Overlap with grid
+    
+    # Let's just use random points, it's robust enough for the optimizer
+    # but keep them separated initially to avoid immediate conflicts
+    # or just random.
+    
+    random.seed(42)
+    centers_list = []
+    for _ in range(n):
+        cx = random.uniform(0.05, 0.95)
+        cy = random.uniform(0.05, 0.95)
+        centers_list.append([cx, cy])
+    
+    centers = np.array(centers_list)
+    
+    # --- Optimization Loop ---
+    # We will perform a randomized hill climbing / simulated annealing
+    # to optimize the centers.
+    
+    best_centers, best_radii, best_sum = solve_radii_for_centers(centers)
+    if not np.all(best_radii > 0):
+        # If initial solve failed or gave 0, reset
+        pass 
+    
+    current_centers = centers
+    current_sum = best_sum
+    
+    # Parameters
+    temp = 1.0
+    min_temp = 1e-6
+    alpha = 0.99 # Cooling rate
+    step_size = 0.05 # Initial perturbation magnitude
+    
+    num_iterations = 2000 # Adjust based on time limit
+    
+    # Cache for centers to avoid copying
+    temp_centers = current_centers.copy()
+    
+    for it in range(num_iterations):
+        # Pick a random circle to move
+        idx = random.randint(0, n - 1)
+        
+        # Perturb
+        old_pos = temp_centers[idx].copy()
+        dx = random.uniform(-step_size, step_size)
+        dy = random.uniform(-step_size, step_size)
+        
+        new_x = old_pos[0] + dx
+        new_y = old_pos[1] + dy
+        
+        # Boundary check for center?
+        # The LP handles boundary constraints for radii, but if center is too close to wall,
+        # radius becomes 0. It's better to keep centers somewhat inside.
+        # Let's clamp or reflect?
+        # Actually, allowing centers near boundary is fine, LP will handle it.
+        # But if center is outside [0,1], dist to wall is negative -> bound < 0 -> infeasible?
+        # linprog bounds (0, negative) is infeasible.
+        # So we must ensure centers are inside [0,1] roughly.
+        # Or at least x in [0,1].
+        if new_x < 0 or new_x > 1 or new_y < 0 or new_y > 1:
+            # Reject move if center goes out of square
+            continue
+            
+        temp_centers[idx, 0] = new_x
+        temp_centers[idx, 1] = new_y
+        
+        # Solve LP
+        # Optimization: Only re-solve? Yes.
+        new_radii, new_sum, success = solve_radii_for_centers(temp_centers)
+        
+        if not success or new_sum <= 0:
+            # Revert
+            temp_centers[idx] = old_pos
+            continue
+            
+        # Acceptance criteria
+        delta = new_sum - current_sum
+        
+        if delta > 0:
+            # Accept improvement
+            current_centers = temp_centers.copy() # Copy to persist
+            current_sum = new_sum
+            best_centers = current_centers.copy()
+            best_sum = current_sum
+            best_radii = new_radii.copy()
+            
+            # Reduce step size slightly?
+            step_size *= 0.999
+        else:
+            # Simulated Annealing
+            prob = math.exp(delta / max(temp, 1e-9))
+            if random.random() < prob:
+                current_centers = temp_centers.copy()
+                current_sum = new_sum
+            else:
+                # Revert
+                temp_centers[idx] = old_pos
+        
+        # Cool down
+        temp *= alpha
+        
+        # Adaptive step size?
+        if it % 100 == 0:
+            step_size *= 0.95
+
+    # --- Final Polish ---
+    # Run a few more iterations with very small steps to fine-tune
+    # Or just rely on the best found.
+    # Let's do a final local search with smaller steps
+    
+    step_size = 0.01
+    temp = 0.01
+    for it in range(500):
+        idx = random.randint(0, n - 1)
+        old_pos = current_centers[idx].copy()
+        dx = random.uniform(-step_size, step_size)
+        dy = random.uniform(-step_size, step_size)
+        new_x = old_pos[0] + dx
+        new_y = old_pos[1] + dy
+        
+        if 0 <= new_x <= 1 and 0 <= new_y <= 1:
+            current_centers[idx, 0] = new_x
+            current_centers[idx, 1] = new_y
+            
+            new_radii, new_sum, success = solve_radii_for_centers(current_centers)
+            if success and new_sum > current_sum:
+                current_sum = new_sum
+                best_centers = current_centers.copy()
+                best_radii = new_radii.copy()
+                best_sum = current_sum
+            else:
+                current_centers[idx] = old_pos
+        else:
+            current_centers[idx] = old_pos
+
+    # Return the best solution found
+    return best_centers, best_radii, best_sum

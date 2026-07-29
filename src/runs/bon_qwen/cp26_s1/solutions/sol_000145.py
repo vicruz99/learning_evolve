@@ -1,91 +1,147 @@
 # sol_000145 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state a66096c7) state=462affa8 sum of radii=2.008680 correctness=1.0
+# generation=0 parent=seed (state 68244382) state=e26426a0 sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+import math
 
-def spread_penalty(vars, n):
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Computes the objective value for packing optimization.
-    Minimizes -d + sum of penalties for boundary and overlap violations.
+    Packs 26 circles in a unit square to maximize the sum of radii using 
+    a physics-based growing circles simulation.
     """
-    centers = vars[:n*2].reshape(n, 2)
-    d = vars[n*2]
-    obj = -d  # We want to maximize d
-    half_d = d * 0.5
+    n_circles = 26
     
-    # Boundary penalties: circles must stay at least half_d away from walls
-    obj += np.sum(np.maximum(0.0, half_d - centers[:, 0])**2)
-    obj += np.sum(np.maximum(0.0, centers[:, 0] + half_d - 1.0)**2)
-    obj += np.sum(np.maximum(0.0, half_d - centers[:, 1])**2)
-    obj += np.sum(np.maximum(0.0, centers[:, 1] + half_d - 1.0)**2)
-    
-    # Pairwise distance penalties: circles must be at least d apart
-    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diffs**2, axis=2))
-    np.fill_diagonal(dists, 1.0)  # Ignore self-distance
-    obj += np.sum(np.maximum(0.0, d - dists)**2)
-    
-    return obj
-
-def run_packing():
-    np.random.seed(42)
-    n = 26
-    
-    # 1. Initialize centers with a perturbed hexagonal lattice pattern
-    # Row distribution [5, 6, 5, 6, 4] approximates optimal hex packing density
+    # --- 1. Initialization ---
+    # Generate centers using a hexagonal lattice pattern for high density
     centers = []
-    counts = [5, 6, 5, 6, 4]
-    y = 0.12
-    dy = 0.18
-    for i, c in enumerate(counts):
-        dx = 0.16
-        x_start = (1.0 - (c - 1) * dx) / 2.0
-        if i % 2 == 1:
-            x_start += dx / 2.0  # Shift odd rows for hexagonal packing
-        for j in range(c):
-            x = x_start + j * dx
-            # Add small noise to break symmetry and help optimization
-            centers.append([x + np.random.normal(0, 0.005), 
-                            y + np.random.normal(0, 0.005)])
-        y += dy
+    row = 0
+    # We estimate a radius to fit a grid, but actual radii will be determined by optimization.
+    # This just ensures good initial spacing.
+    spacing = 0.2 
+    
+    # Fill rows until we have enough points
+    while len(centers) < n_circles:
+        for col in range(0, 6): # Enough columns to fit width
+            x = (col + 0.5) * spacing
+            # Offset rows for hexagonal packing
+            y = row * spacing * math.sqrt(3)/2 + 0.1
+            
+            # Adjust x for odd rows to nest circles
+            if row % 2 != 0:
+                x += spacing / 2.0
+                
+            # Keep within bounds roughly
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                centers.append([x, y])
+                if len(centers) >= n_circles:
+                    break
+        row += 1
+    
+    centers = np.array(centers[:n_circles])
+    radii = np.ones(n_circles) * 0.05 # Start with small radii
+    
+    # --- 2. Optimization Loop (Physics Simulation) ---
+    iterations = 2000
+    # Initial growth rate and force coefficient
+    growth_rate = 0.001 
+    repulsion_strength = 10.0
+    damping = 0.9999 # Slight damping to help convergence
+    
+    # Loop parameters
+    for step in range(iterations):
+        # Decay growth rate to settle into fine details
+        current_growth = growth_rate * (1.0 - step / iterations)
+        if current_growth < 1e-6:
+            current_growth = 1e-6
+
+        # --- A. Grow Radii ---
+        # Attempt to increase radii. We scale them up.
+        radii *= (1.0 + current_growth * 0.05)
+
+        # --- B. Calculate Forces and Update Centers ---
+        forces = np.zeros_like(centers)
         
-    centers = np.array(centers)
-    centers = np.clip(centers, 0.02, 0.98)
+        # 1. Inter-circle repulsion
+        # Vectorized distance calculation
+        # diff shape: (26, 26, 2)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        dist = np.sqrt(np.maximum(dist_sq, 1e-9))
+        
+        # Required distance (sum of radii)
+        req_dist = radii[:, np.newaxis] + radii[np.newaxis, :]
+        
+        # Overlap amount (positive if overlapping)
+        overlap = req_dist - dist
+        
+        # Apply force proportional to overlap along the connection line
+        # Avoid self-interaction (diagonal)
+        np.fill_diagonal(overlap, 0)
+        
+        # Force vector = overlap * (diff / dist)
+        # We need to be careful with division by zero, though dist > 0 due to max(1e-9)
+        # Normalize diff
+        direction = diff / dist[:, :, np.newaxis]
+        
+        # Accumulate forces
+        # forces[i] += sum_j( overlap_ij * direction_ij )
+        # overlap is (N, N), direction is (N, N, 2)
+        forces += np.sum(overlap[:, :, np.newaxis] * direction, axis=1)
+
+        # 2. Wall repulsion
+        # Left wall (x - r < 0) -> push right
+        overlap_x_neg = radii - centers[:, 0]
+        overlap_x_pos = centers[:, 0] + radii - 1
+        overlap_y_neg = radii - centers[:, 1]
+        overlap_y_pos = centers[:, 1] + radii - 1
+        
+        # Only apply force if overlapping (positive value)
+        overlap_x_neg = np.maximum(0, overlap_x_neg)
+        overlap_x_pos = np.maximum(0, overlap_x_pos)
+        overlap_y_neg = np.maximum(0, overlap_y_neg)
+        overlap_y_pos = np.maximum(0, overlap_y_pos)
+        
+        # Add to forces
+        # Left wall pushes right (+x)
+        forces[:, 0] += overlap_x_neg
+        # Right wall pushes left (-x)
+        forces[:, 0] -= overlap_x_pos
+        # Bottom wall pushes up (+y)
+        forces[:, 1] += overlap_y_neg
+        # Top wall pushes down (-y)
+        forces[:, 1] -= overlap_y_pos
+        
+        # Scale forces
+        forces *= repulsion_strength
+        
+        # Update centers
+        centers += forces * 0.01 # Step size for position update
+        
+        # --- C. Boundary Clamping ---
+        # Ensure centers don't fly out, though forces should keep them in.
+        # Also, strictly, center must be at least radius away from wall.
+        # But we rely on forces for that. Let's just clamp to [0,1] to be safe.
+        centers = np.clip(centers, 0, 1)
+        
+    # --- 3. Final Adjustment ---
+    # One last pass to clean up any tiny numerical overlaps and tighten radii
+    # Calculate max valid radius for each circle based on current positions
+    # This is a greedy local improvement
+    for i in range(n_circles):
+        max_r = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        for j in range(n_circles):
+            if i != j:
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                max_r = min(max_r, dist - radii[j])
+        radii[i] = max(0, max_r - 1e-9) # Tiny buffer
+
+    # Sort circles by radius descending (optional, just for consistency)
+    # But we need to keep centers aligned.
+    # The validate function doesn't require sorting.
     
-    # 2. Estimate initial separation d based on current layout
-    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diffs**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    min_pair_dist = np.min(dists)
+    sum_radii = np.sum(radii)
     
-    min_boundary_dist = min(np.min(centers[:, 0]), np.min(1.0 - centers[:, 0]),
-                            np.min(centers[:, 1]), np.min(1.0 - centers[:, 1]))
-    d_init = min(min_pair_dist, 2.0 * min_boundary_dist) * 0.95
-    
-    x0 = np.concatenate([centers.ravel(), [d_init]])
-    
-    # 3. Optimize to maximize minimum separation distance
-    bounds = [(0.0, 1.0)] * (n * 2) + [(0.01, 0.5)]
-    res = minimize(spread_penalty, x0, args=(n,), method='L-BFGS-B', bounds=bounds,
-                   options={'maxiter': 5000, 'ftol': 1e-12, 'gtol': 1e-8})
-                   
-    best_centers = res.x[:n * 2].reshape(n, 2)
-    
-    # 4. Compute strictly valid radius from optimized positions
-    diffs = best_centers[:, np.newaxis, :] - best_centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diffs**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    min_pair = np.min(dists)
-    
-    min_bdry = min(np.min(best_centers[:, 0]), np.min(1.0 - best_centers[:, 0]),
-                   np.min(best_centers[:, 1]), np.min(1.0 - best_centers[:, 1]))
-                   
-    # Radius is half the limiting distance
-    r = min(min_pair, 2.0 * min_bdry) / 2.0
-    radii = np.full(n, r)
-    
-    return best_centers, radii, float(np.sum(radii))
+    return centers, radii, sum_radii

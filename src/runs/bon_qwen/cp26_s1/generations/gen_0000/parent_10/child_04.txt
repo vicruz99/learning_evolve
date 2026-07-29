@@ -1,121 +1,118 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we treat this as a continuous optimization problem. While analytical solutions exist for small N, a robust numerical approach is preferred here. We assume equal radii (which maximizes the sum for a fixed number of circles under area/packing constraints due to concavity) and use a force-directed simulation (gradient descent on a penalty function).
+To maximize the sum of radii for 26 circles in a unit square, we decompose the problem into two parts:
+1. **Given centers, find optimal radii**: This is a Linear Programming (LP) problem. For fixed centers, the constraints $r_i + r_j \leq \|C_i - C_j\|$ and $r_i \leq \text{dist}(C_i, \text{boundary})$ are linear in $r$. We maximize $\sum r_i$ subject to these constraints.
+2. **Optimize centers**: The LP objective value as a function of centers is non-smooth and non-convex. We use Simulated Annealing (SA) to explore the center configuration space, accepting moves that increase the LP sum of radii. This is followed by a local hill-climbing phase to polish the solution.
 
-Key steps:
-1. **Initialization**: Start with randomly placed centers to avoid grid-induced symmetries that might trap optimization.
-2. **Force-Directed Inflation**: Iteratively inflate a common radius $r$. When overlaps or boundary violations occur, compute repulsive forces proportional to the violation depth. Update center positions to resolve conflicts.
-3. **Adaptive Control**: Gradually increase $r$ when the system is stable (low energy/policy violation), and slightly decrease it when conflicts are high. Decay the learning rate over time for convergence.
-4. **Multiple Restarts**: Run the simulation from different random seeds to escape poor local optima and track the best configuration globally.
-5. **Final Polish**: After optimization, compute the minimum clearance gap and shrink $r$ slightly if needed to strictly satisfy the $10^{-12}$ tolerance in the validation function.
-
-This approach is computationally efficient (O(N²) per step, trivial for N=26), avoids complex constraint solvers, and reliably finds packings with sum of radii well above the 2.636 target (typical optimal for N=26 is ~3.56).
+This approach efficiently handles the non-convex geometry by leveraging LP for exact radius computation and SA for robust global search.
 </strategy>
 
 ```python
 import numpy as np
-import math
+from scipy.optimize import linprog
 
-def run_packing():
-    np.random.seed(42)
-    n = 26
-    best_r = 0.01
-    best_centers = None
+def solve_radii(centers):
+    """
+    Solves the LP to find the maximum sum of radii for fixed centers.
+    Returns (radii, sum_radii).
+    """
+    n = centers.shape[0]
+    # Objective: maximize sum(r_i) => minimize -sum(r_i)
+    c = -np.ones(n)
     
-    # Run multiple restarts to avoid poor local optima
-    for restart in range(5):
-        # Initialize centers randomly in the unit square
-        centers = np.random.rand(n, 2)
-        r = 0.05
-        lr = 0.003
-        beta = 800.0  # Penalty weight for forces
+    # Compute pairwise distances
+    diff = centers[:, None] - centers[None, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Indices for upper triangle (pairwise constraints)
+    i, j = np.triu_indices(n, k=1)
+    n_pairs = len(i)
+    
+    # Constraints matrix A_ub * x <= b_ub
+    # 1. Pairwise: r_i + r_j <= d_ij
+    # 2. Boundaries: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    A_ub = np.zeros((n_pairs + 4*n, n))
+    b_ub = np.zeros(n_pairs + 4*n)
+    
+    # Fill pairwise constraints
+    row_idx = np.arange(n_pairs)
+    A_ub[row_idx, i] = 1
+    A_ub[row_idx, j] = 1
+    b_ub[:n_pairs] = dists[i, j]
+    
+    # Fill boundary constraints
+    # r_i <= x_i
+    A_ub[n_pairs : n_pairs+n, np.arange(n)] = 1
+    b_ub[n_pairs : n_pairs+n] = centers[:, 0]
+    # r_i <= 1-x_i
+    A_ub[n_pairs+n : n_pairs+2*n, np.arange(n)] = 1
+    b_ub[n_pairs+n : n_pairs+2*n] = 1 - centers[:, 0]
+    # r_i <= y_i
+    A_ub[n_pairs+2*n : n_pairs+3*n, np.arange(n)] = 1
+    b_ub[n_pairs+2*n : n_pairs+3*n] = centers[:, 1]
+    # r_i <= 1-y_i
+    A_ub[n_pairs+3*n : n_pairs+4*n, np.arange(n)] = 1
+    b_ub[n_pairs+3*n : n_pairs+4*n] = 1 - centers[:, 1]
+    
+    bounds = [(0, None)] * n
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        return res.x, -res.fun
+    else:
+        # Fallback for numerical issues
+        return np.full(n, 1e-5), 0.0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    N = 26
+    np.random.seed(42)
+    # Initialize centers randomly
+    centers = np.random.rand(N, 2)
+    
+    # Simulated Annealing parameters
+    T = 0.1
+    decay = 0.999
+    moves = 0
+    max_moves = 12000
+    
+    best_centers = centers.copy()
+    _, best_score = solve_radii(best_centers)
+    current_score = best_score
+    
+    # SA Loop: Optimize centers to maximize sum of radii
+    while T > 1e-6 and moves < max_moves:
+        i = np.random.randint(N)
+        step = max(0.005, T)
+        new_centers = centers.copy()
+        new_centers[i] += np.random.uniform(-step, step, 2)
+        new_centers[i] = np.clip(new_centers[i], 0, 1)
         
-        for step in range(4000):
-            forces = np.zeros((n, 2))
-            energy = 0.0
-            
-            # Boundary constraints and forces
-            for i in range(n):
-                x, y = centers[i]
-                # Left boundary
-                if x < r:
-                    v = r - x
-                    forces[i, 0] += v * beta
-                    energy += v**2
-                # Right boundary
-                if x > 1 - r:
-                    v = x - (1 - r)
-                    forces[i, 0] -= v * beta
-                    energy += v**2
-                # Bottom boundary
-                if y < r:
-                    v = r - y
-                    forces[i, 1] += v * beta
-                    energy += v**2
-                # Top boundary
-                if y > 1 - r:
-                    v = y - (1 - r)
-                    forces[i, 1] -= v * beta
-                    energy += v**2
-                    
-            # Inter-circle constraints and forces
-            for i in range(n):
-                for j in range(i + 1, n):
-                    dx = centers[i, 0] - centers[j, 0]
-                    dy = centers[i, 1] - centers[j, 1]
-                    dist = math.hypot(dx, dy)
-                    if dist < 2 * r:
-                        overlap = 2 * r - dist
-                        energy += overlap**2
-                        if dist > 1e-9:
-                            # Repulsive force proportional to overlap
-                            fx = (dx / dist) * overlap * beta
-                            fy = (dy / dist) * overlap * beta
-                            forces[i, 0] += fx
-                            forces[i, 1] += fy
-                            forces[j, 0] -= fx
-                            forces[j, 1] -= fy
-                            
-            # Update positions
-            centers += forces * lr
-            centers = np.clip(centers, 0.0, 1.0)
-            
-            # Adaptive radius inflation
-            if energy < 1e-4:
-                r += 0.00025
-                if r > best_r:
-                    best_r = r
-                    best_centers = centers.copy()
-            else:
-                r -= 0.00008
-                if r < 0.01: 
-                    r = 0.01
-                
-            # Decay learning rate gradually
-            if step % 300 == 0:
-                lr *= 0.96
-                
-    # Ensure we have a valid configuration
-    if best_centers is None:
-        best_centers = centers
-        best_r = 0.05
+        _, new_score = solve_radii(new_centers)
         
-    # Final strict validation adjustment to guarantee 1e-12 tolerance
-    min_gap = 1.0
-    for i in range(n):
-        x, y = best_centers[i]
-        min_gap = min(min_gap, x - best_r, 1 - x - best_r, y - best_r, 1 - y - best_r)
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = math.hypot(best_centers[i,0]-best_centers[j,0], best_centers[i,1]-best_centers[j,1])
-            min_gap = min(min_gap, dist - 2*best_r)
+        delta = new_score - current_score
+        if delta > 0 or np.random.rand() < np.exp(delta / T):
+            centers = new_centers
+            current_score = new_score
+            if current_score > best_score:
+                best_score = current_score
+                best_centers = centers.copy()
+        T *= decay
+        moves += 1
+        
+    # Local hill climbing to polish the solution
+    for _ in range(5000):
+        i = np.random.randint(N)
+        step = 0.001
+        new_centers = best_centers.copy()
+        new_centers[i] += np.random.uniform(-step, step, 2)
+        new_centers[i] = np.clip(new_centers[i], 0, 1)
+        
+        _, new_score = solve_radii(new_centers)
+        if new_score > best_score:
+            best_score = new_score
+            best_centers = new_centers
             
-    if min_gap < 0:
-        best_r += min_gap
-        if best_r < 0.001: 
-            best_r = 0.001
-            
-    radii = np.full(n, best_r)
-    return best_centers, radii, np.sum(radii)
+    best_radii, final_score = solve_radii(best_centers)
+    return best_centers, best_radii, final_score
 ```

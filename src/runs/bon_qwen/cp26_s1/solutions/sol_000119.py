@@ -1,5 +1,5 @@
 # sol_000119 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 47219f56) state=8514c8b2 sum of radii=2.602920 correctness=1.0
+# generation=0 parent=seed (state 4ac25994) state=e795f8a7 sum of radii=2.626930 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,84 +7,96 @@
 import numpy as np
 from scipy.optimize import minimize
 
-N = 26
+N_CIRCLES = 26
 
-def objective_func(v):
-    # Maximize sum of radii -> minimize negative sum
-    return -np.sum(v[2::3])
-
-def constraint_func(v):
-    # Returns array of constraint values. Must be >= 0 for validity.
-    res = []
-    for i in range(N):
-        x = v[3*i]
-        y = v[3*i+1]
-        r = v[3*i+2]
-        
-        # Boundary constraints: circle inside [0,1]x[0,1]
-        res.append(x - r)
-        res.append(1.0 - x - r)
-        res.append(y - r)
-        res.append(1.0 - y - r)
-        
-        # Non-overlap constraints: dist^2 >= (r_i + r_j)^2
-        for j in range(i + 1, N):
-            dx = v[3*i] - v[3*j]
-            dy = v[3*i+1] - v[3*j+1]
-            dr = v[3*i+2] + v[3*j+2]
-            res.append(dx*dx + dy*dy - dr*dr)
-            
-    return np.array(res)
-
-def get_initial_config():
-    # Hexagonal lattice initialization
-    centers = []
-    radii = []
-    r_init = 0.08
-    dy = np.sqrt(3)/2 * 2 * r_init
-    row_counts = [5, 6, 5, 6, 4]
+def get_initial_params():
+    """Create a feasible initial configuration using a hexagonal-like grid."""
+    centers = np.zeros((N_CIRCLES, 2))
+    radii = np.ones(N_CIRCLES) * 0.08
     
-    for r_idx, cnt in enumerate(row_counts):
-        y = 0.5 - (len(row_counts) - 1) * dy / 2 + r_idx * dy
-        shift = r_init if r_idx % 2 == 1 else 0.0
-        row_width = cnt * 2 * r_init
-        x_start = 0.5 - row_width / 2 + shift
-        
-        for c in range(cnt):
-            centers.append([x_start + c * 2 * r_init, y])
-            radii.append(r_init)
+    idx = 0
+    # Arrange in 5 rows with hexagonal shifting
+    for row in range(5):
+        y = 0.12 + row * 0.18
+        shift = 0.09 if row % 2 == 1 else 0.0
+        cols = 5
+        for col in range(cols):
+            if idx >= N_CIRCLES: 
+                break
+            x = 0.12 + col * 0.18 + shift
+            # Clamp to safe interior region initially
+            centers[idx] = [np.clip(x, 0.1, 0.9), np.clip(y, 0.1, 0.9)]
+            idx += 1
             
-    return np.array(centers), np.array(radii)
+    # Place any remaining circles in central gaps if needed
+    while idx < N_CIRCLES:
+        centers[idx] = [0.5, 0.5]
+        idx += 1
+        
+    return np.concatenate([centers.flatten(), radii])
+
+def objective(params):
+    """Maximize sum of radii => Minimize negative sum."""
+    radii = params[2 * N_CIRCLES:]
+    return -np.sum(radii)
+
+def constraints(params):
+    """Define inequality constraints: g(x) >= 0."""
+    centers = params[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = params[2 * N_CIRCLES:]
+    vals = []
+    
+    # Pairwise non-overlap: dist(i, j) >= r_i + r_j
+    for i in range(N_CIRCLES):
+        for j in range(i + 1, N_CIRCLES):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            vals.append(dist - radii[i] - radii[j])
+            
+    # Boundary containment: r <= x <= 1-r, r <= y <= 1-r
+    for i in range(N_CIRCLES):
+        x, y = centers[i]
+        r = radii[i]
+        vals.append(x - r)
+        vals.append(1.0 - x - r)
+        vals.append(y - r)
+        vals.append(1.0 - y - r)
+        
+    return np.array(vals)
 
 def run_packing():
-    centers, radii = get_initial_config()
-    v0 = np.zeros(3 * N)
+    """Run optimization and return valid packing."""
+    x0 = get_initial_params()
     
-    for i in range(N):
-        v0[3*i] = centers[i, 0]
-        v0[3*i+1] = centers[i, 1]
-        v0[3*i+2] = radii[i]
+    # Bounds: centers in [0, 1], radii in [0, 0.5]
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+    
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    # Optimize using SLSQP
+    res = minimize(
+        objective, 
+        x0, 
+        method='SLSQP', 
+        bounds=bounds, 
+        constraints=cons, 
+        options={'maxiter': 3000, 'ftol': 1e-10, 'disp': False}
+    )
+    
+    centers = res.x[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = res.x[2 * N_CIRCLES:]
+    
+    # Post-process to strictly enforce constraints within tolerance
+    for i in range(N_CIRCLES):
+        r = radii[i]
+        x, y = centers[i]
+        # Ensure circle stays inside square
+        max_r = min(x, 1.0 - x, y, 1.0 - y)
+        if r > max_r + 1e-9:
+            r = max_r
+        radii[i] = r
+        centers[i] = [np.clip(x, r, 1.0 - r), np.clip(y, r, 1.0 - r)]
         
-    # Small perturbation to break symmetry and avoid flat valleys
-    np.random.seed(42)
-    v0 += np.random.uniform(-1e-5, 1e-5, size=v0.shape)
+    # Ensure radii are strictly positive to avoid validation issues
+    radii = np.maximum(radii, 1e-6)
     
-    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
-    cons = {'type': 'ineq', 'fun': constraint_func}
-    
-    # Stage 1: Coarse optimization
-    res1 = minimize(objective_func, v0, method='SLSQP', bounds=bounds, 
-                    constraints=cons, options={'maxiter': 3000, 'ftol': 1e-10})
-                    
-    # Stage 2: Fine-tuning for strict feasibility
-    res2 = minimize(objective_func, res1.x, method='SLSQP', bounds=bounds, 
-                    constraints=cons, options={'maxiter': 2000, 'ftol': 1e-14})
-                    
-    v_opt = res2.x
-    
-    # Extract results
-    opt_centers = np.array([[v_opt[3*i], v_opt[3*i+1]] for i in range(N)])
-    opt_radii = v_opt[2::3]
-    total_sum = np.sum(opt_radii)
-    
-    return opt_centers, opt_radii, total_sum
+    return centers, radii, float(np.sum(radii))

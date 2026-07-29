@@ -1,0 +1,154 @@
+# sol_000209 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 8fb167b6) state=5ad9d87d sum of radii=1.300000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    n = 26
+    
+    # --- 1. Initialization ---
+    # We initialize with a hexagonal-like grid pattern to encourage dense packing.
+    # We want 26 circles. A hexagonal arrangement usually has rows of alternating lengths.
+    # Let's try to fit them in a grid first, then optimization will adjust.
+    # A 6x5 grid has 30 points. We can take 26.
+    # To make it hexagonal-ish, we can offset every other row.
+    
+    centers = []
+    radii_init = 0.05 # Small initial radius to ensure validity
+    
+    # We can try to generate points row by row
+    # Let's aim for a layout that fits well. 
+    # Rows: 6, 5, 6, 5, 4 = 26 circles.
+    # This is a common dense packing count.
+    
+    row_lengths = [6, 5, 6, 5, 4]
+    # Check sum
+    assert sum(row_lengths) == 26
+    
+    y_curr = 0.15 # Start y
+    x_start = 0.1 # Start x
+    spacing = 0.15 # Initial spacing
+    
+    for i, count in enumerate(row_lengths):
+        # Offset odd rows (0-indexed: 1, 3...)
+        if i % 2 == 1:
+            current_x_start = x_start + spacing / 2
+        else:
+            current_x_start = x_start
+            
+        for j in range(count):
+            cx = current_x_start + j * spacing
+            cy = y_curr
+            centers.append([cx, cy])
+        
+        # Move to next row
+        y_curr += spacing * np.sqrt(3) / 2 # Hexagonal vertical spacing
+    
+    centers = np.array(centers)
+    radii = np.full(n, radii_init)
+    
+    # If any points are out of bounds (unlikely with these params but safe to check), clamp or adjust
+    # Actually, with spacing 0.15 and 6 cols: width approx 6*0.15 = 0.9. Fits in 1.0.
+    # 5 rows height approx 4 * 0.15 * 0.866 + 0.15 approx 0.7. Fits.
+    
+    # Flatten to 1D vector for optimizer
+    # Order: x1, y1, r1, x2, y2, r2, ...
+    x0 = np.hstack([centers.ravel(), radii])
+    
+    # --- 2. Optimization Setup ---
+    
+    # Bounds for variables
+    # x, y in [0, 1]
+    # r in [0, 1] (practically r <= 0.5)
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 1.0)])
+    
+    # Objective function with penalties
+    # We want to maximize sum(r), so minimize -sum(r)
+    # Penalties for:
+    # 1. Circle i outside [0,1]x[0,1]
+    # 2. Circle i overlapping Circle j
+    
+    def objective_with_penalty(vars):
+        centers = vars[:2*n].reshape(n, 2)
+        radii = vars[2*n:]
+        
+        # Main objective: negative sum of radii
+        obj_val = -np.sum(radii)
+        
+        # Penalty term
+        penalty = 0.0
+        weight = 1000.0 # High weight to enforce constraints
+        
+        # Boundary constraints
+        # x - r >= 0  => r - x <= 0
+        # x + r <= 1  => x + r - 1 <= 0
+        # y - r >= 0
+        # y + r <= 1
+        
+        # Vectorized boundary violations
+        # Left/Bottom
+        viol_1 = np.maximum(0.0, radii - centers[:, 0]) # x < r
+        viol_2 = np.maximum(0.0, radii - centers[:, 1]) # y < r
+        
+        # Right/Top
+        viol_3 = np.maximum(0.0, centers[:, 0] + radii - 1.0) # x + r > 1
+        viol_4 = np.maximum(0.0, centers[:, 1] + radii - 1.0) # y + r > 1
+        
+        penalty += weight * (np.sum(viol_1**2) + np.sum(viol_2**2) + 
+                             np.sum(viol_3**2) + np.sum(viol_4**2))
+        
+        # Overlap constraints
+        # Distance between centers (i, j) >= r_i + r_j
+        # dist^2 >= (r_i + r_j)^2  is not smooth at 0 dist, but dist >= sum is standard.
+        # Using (r_i + r_j - dist)^2 if positive.
+        
+        # Compute pairwise distances
+        # Using broadcasting
+        # diffs: (n, n, 2)
+        diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2)) # (n, n)
+        
+        # Sum of radii matrix
+        rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        
+        # Violation: rad_sum - dists > 0
+        # We only care about upper triangle to avoid double counting and self
+        # But full matrix squared penalty is also fine, just double count.
+        # Let's use full matrix for vectorization, divide by 2 if needed, but weight handles it.
+        
+        overlap_violations = np.maximum(0.0, rad_sum - dists)
+        
+        # Add penalty
+        # Note: dists[i,i] = 0, rad_sum[i,i] = 2*r_i. 
+        # self-overlap penalty will be (2*r_i)^2. This is bad, it penalizes radius existence.
+        # We must exclude diagonal.
+        
+        # Create a mask for i < j
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        valid_violations = overlap_violations[mask]
+        
+        penalty += weight * np.sum(valid_violations**2)
+        
+        return obj_val + penalty
+
+    # Run optimization
+    # L-BFGS-B is good for bound-constrained problems
+    res = minimize(objective_with_penalty, x0, method='L-BFGS-B', bounds=bounds, 
+                   options={'ftol': 1e-9, 'maxiter': 2000, 'disp': False})
+    
+    # Extract solution
+    optimal_centers = res.x[:2*n].reshape(n, 2)
+    optimal_radii = res.x[2*n:]
+    
+    # Sanity check: ensure radii are non-negative (though bounds enforce it)
+    optimal_radii = np.maximum(optimal_radii, 0.0)
+    
+    sum_radii = np.sum(optimal_radii)
+    
+    return optimal_centers, optimal_radii, sum_radii

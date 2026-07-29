@@ -1,0 +1,219 @@
+
+
+<strategy>
+For packing 26 circles in a unit square to maximize the sum of radii, I'll use a multi-phase optimization approach:
+
+1. **Initial Configuration**: Start with a hexagonal packing pattern, which is known to be optimal for equal circles. This gives a good geometric starting point with circles already in a dense arrangement.
+
+2. **Force-Based Pre-optimization**: Before using gradient-based optimization, I'll run a force-based simulation to:
+   - Gradually increase radii
+   - Push overlapping circles apart using repulsive forces
+   - Push circles away from boundaries when they violate constraints
+   - This helps escape poor local minima and provides a feasible starting point for the optimizer
+
+3. **Penalty Method with L-BFGS-B**: Use a sequential penalty method where:
+   - Constraint violations are penalized quadratically in the objective
+   - The penalty weight increases geometrically over iterations
+   - L-BFGS-B handles bounds efficiently and is faster than SLSQP for large-scale problems
+
+4. **Multiple Restarts**: Try several initial configurations (hexagonal with perturbations) to avoid local minima.
+
+5. **Post-processing**: Slightly shrink radii to ensure strict feasibility within the validation tolerance (1e-12).
+
+The target sum of radii is 2.636, meaning average radius ≈ 0.1014. With hexagonal packing, circles with this radius can fit in about 5 rows of 5 circles each (25 circles) plus 1 extra, which aligns with our 26 circles.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+
+def compute_objective_with_penalty(x, penalty_weight):
+    centers = x[:2 * N].reshape(N, 2)
+    radii = x[2 * N:]
+    
+    obj = -np.sum(radii)
+    
+    for i in range(N):
+        for dim in range(2):
+            val = centers[i, dim] - radii[i]
+            if val < 0:
+                obj += penalty_weight * val * val
+            
+            val = centers[i, dim] + radii[i] - 1.0
+            if val > 0:
+                obj += penalty_weight * val * val
+    
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist_sq = dx * dx + dy * dy
+            dist = np.sqrt(dist_sq + 1e-30)
+            overlap = radii[i] + radii[j] - dist
+            if overlap > 0:
+                obj += penalty_weight * overlap * overlap
+    
+    return obj
+
+
+def create_hexagonal_initial():
+    centers = []
+    count = 0
+    row = 0
+    
+    while count < N:
+        y = 0.06 + row * 0.16
+        if y > 0.94:
+            break
+        
+        col = 0
+        x_start = 0.06 if row % 2 == 0 else 0.13
+        
+        while count < N:
+            x = x_start + col * 0.16
+            if x > 0.94:
+                break
+            centers.append([x, y])
+            count += 1
+            col += 1
+        row += 1
+    
+    centers = np.array(centers[:N])
+    radii = np.full(N, 0.06)
+    return np.concatenate([centers.flatten(), radii])
+
+
+def create_bounds():
+    b = []
+    for _ in range(N):
+        b.append((0.0, 1.0))
+        b.append((0.0, 1.0))
+        b.append((1e-10, 0.5))
+    return b
+
+
+def force_based_preoptimize(centers, radii, num_steps=3000):
+    centers = centers.copy()
+    radii = radii.copy()
+    
+    for step in range(num_steps):
+        for i in range(N):
+            radii[i] = radii[i] + 1.5e-5
+        
+        forces = np.zeros((N, 2))
+        
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist_sq = dx * dx + dy * dy
+                dist = np.sqrt(dist_sq + 1e-30)
+                
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist:
+                    overlap = min_dist - dist
+                    if dist > 1e-10:
+                        fx = overlap * dx / dist
+                        fy = overlap * dy / dist
+                        forces[i, 0] += fx
+                        forces[i, 1] += fy
+                        forces[j, 0] -= fx
+                        forces[j, 1] -= fy
+            
+            for dim in range(2):
+                if centers[i, dim] - radii[i] < 0:
+                    forces[i, dim] += (radii[i] - centers[i, dim]) * 50.0
+                if centers[i, dim] + radii[i] > 1.0:
+                    forces[i, dim] -= (centers[i, dim] + radii[i] - 1.0) * 50.0
+        
+        lr = 0.4 / (1.0 + step * 0.002)
+        centers = centers + lr * forces
+        
+        for i in range(N):
+            centers[i, 0] = np.clip(centers[i, 0], radii[i], 1.0 - radii[i])
+            centers[i, 1] = np.clip(centers[i, 1], radii[i], 1.0 - radii[i])
+    
+    return centers, radii
+
+
+def check_validity(centers, radii):
+    for i in range(N):
+        for dim in range(2):
+            if centers[i, dim] - radii[i] < -1e-11:
+                return False
+            if centers[i, dim] + radii[i] > 1.0 + 1e-11:
+                return False
+    
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            if dist < radii[i] + radii[j] - 1e-11:
+                return False
+    
+    return True
+
+
+def run_packing():
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    bounds = create_bounds()
+    
+    for trial in range(4):
+        x0 = create_hexagonal_initial()
+        
+        if trial > 0:
+            noise = np.random.RandomState(trial * 17).randn(len(x0)) * 0.015
+            x0 = x0 + noise
+        
+        centers = x0[:2 * N].reshape(N, 2)
+        radii = x0[2 * N:]
+        
+        centers, radii = force_based_preoptimize(centers, radii, num_steps=2000)
+        
+        x = np.concatenate([centers.flatten(), radii])
+        
+        penalty = 500.0
+        for iteration in range(25):
+            result = minimize(
+                compute_objective_with_penalty,
+                x,
+                args=(penalty,),
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 800, 'ftol': 1e-15}
+            )
+            x = result.x
+            penalty = penalty * 2.5
+        
+        centers_opt = x[:2 * N].reshape(N, 2)
+        radii_opt = x[2 * N:]
+        
+        valid = check_validity(centers_opt, radii_opt)
+        
+        if valid:
+            current_sum = np.sum(radii_opt)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers_opt.copy()
+                best_radii = radii_opt.copy()
+    
+    if best_centers is None:
+        best_centers = centers_opt
+        best_radii = radii_opt
+        best_sum = np.sum(radii_opt)
+    
+    for i in range(N):
+        max_r = min(best_centers[i, 0], 1.0 - best_centers[i, 0],
+                     best_centers[i, 1], 1.0 - best_centers[i, 1])
+        if best_radii[i] > max_r:
+            best_radii[i] = max_r - 2e-13
+    
+    return best_centers, best_radii, best_sum
+```

@@ -1,0 +1,255 @@
+# sol_000074 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 25735fc7) state=57a598fe sum of radii=1.226760 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import math
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    
+    Strategy:
+    1. Initialize centers in a hexagonal pattern.
+    2. Run a repulsive force simulation to spread centers out.
+    3. Solve an LP to find the optimal radii for the final centers.
+    """
+    n = 26
+    
+    # --- Step 1: Initialization ---
+    # We want to pack 26 circles. A hexagonal pattern is efficient.
+    # Let's try to arrange them in rows. 
+    # Hexagonal spacing: horizontal step 2r, vertical step sqrt(3)r.
+    # But we don't know r yet. Let's start with a unit grid/hex and scale/adjust.
+    # A 5x5 grid has 25 points. We need 26.
+    # Let's try a pattern with rows of size 6, 5, 6, 5, 4 (sum 26) or similar.
+    # Actually, a simpler dense packing is to start with a perturbed grid or random 
+    # but constrained to be somewhat spread out.
+    
+    # Let's generate points on a hexagonal lattice.
+    # Basis vectors: (1, 0) and (0.5, sqrt(3)/2).
+    # We will generate a cloud of points and select/placement to fit 26.
+    
+    # Heuristic: Place points in rows.
+    # Row y-coordinates: 0.1, 0.3, 0.5, 0.7, 0.9 (like grid) but offset x.
+    # Let's try 5 rows.
+    # If we put 6 circles in a row, width required is high.
+    # Let's try a random initialization with a repulsive start to avoid clustering.
+    
+    centers = np.zeros((n, 2))
+    
+    # Generate initial positions: 5 rows, distributing 26 circles.
+    # Counts: 6, 5, 6, 5, 4 = 26
+    row_counts = [6, 5, 6, 5, 4]
+    y_coords = [0.1, 0.3, 0.5, 0.7, 0.9] # Initial guess y
+    
+    idx = 0
+    for r_idx, count in enumerate(row_counts):
+        y = y_coords[r_idx]
+        # Distribute x uniformly in [0.05, 0.95] initially
+        # For even counts, center might be 0.5. For odd, 0.5 is occupied.
+        # Let's just use linspace
+        x_coords = np.linspace(0.05, 0.95, count)
+        # Offset even rows for hexagonal packing feel
+        if r_idx % 2 == 1:
+            shift = (0.95 - 0.05) / (2 * (count - 1)) if count > 1 else 0
+            x_coords += shift
+        
+        for x in x_coords:
+            centers[idx] = [x, y]
+            idx += 1
+            
+    # --- Step 2: Force-Directed Optimization ---
+    # Repulsive forces to maximize distances.
+    # We want to maximize min distance to neighbor and boundary.
+    
+    # Parameters
+    iterations = 500
+    alpha = 0.05  # Initial step size
+    alpha_decay = 0.99
+    repulsion_strength = 1.0
+    
+    # Run simulation
+    for it in range(iterations):
+        forces = np.zeros_like(centers)
+        
+        # Repulsion between circles
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist_sq = np.dot(diff, diff)
+                dist = math.sqrt(dist_sq)
+                
+                if dist < 1e-5:
+                    # Avoid division by zero, push randomly
+                    diff = np.random.randn(2)
+                    dist = 1.0
+                
+                # Force magnitude: 1/dist^2 (strong when close)
+                # We want to push them apart if they are closer than some ideal distance.
+                # But since we don't know ideal distance, just repulsion helps spread.
+                # However, pure repulsion might push them to corners where boundary limits r.
+                # So we need a balance.
+                
+                force_mag = repulsion_strength / (dist_sq + 1e-6) 
+                # Damp force if dist is large to prevent overshooting too much
+                # Actually, standard Coulomb force is good.
+                
+                direction = diff / dist
+                force_vec = direction * force_mag
+                
+                forces[i] += force_vec
+                forces[j] -= force_vec
+        
+        # Boundary repulsion (push towards center)
+        # Distance to boundary is min(x, 1-x, y, 1-y)
+        # We want to increase this distance.
+        # Force should push away from walls.
+        # If x < 0.5, push right (+x). If x > 0.5, push left (-x).
+        # Force proportional to 1/distance_to_wall? Or just constant?
+        # Let's use a soft potential.
+        
+        boundary_strength = 5.0 # Stronger to keep them away from walls
+        
+        for i in range(n):
+            x, y = centers[i]
+            
+            # X direction
+            if x < 0.5:
+                # Wall at 0. Push right.
+                dist_to_wall = x
+                fx = boundary_strength / (dist_to_wall + 0.1)
+            else:
+                # Wall at 1. Push left.
+                dist_to_wall = 1.0 - x
+                fx = -boundary_strength / (dist_to_wall + 0.1)
+            
+            # Y direction
+            if y < 0.5:
+                # Wall at 0. Push up.
+                dist_to_wall = y
+                fy = boundary_strength / (dist_to_wall + 0.1)
+            else:
+                # Wall at 1. Push down.
+                dist_to_wall = 1.0 - y
+                fy = -boundary_strength / (dist_to_wall + 0.1)
+            
+            forces[i, 0] += fx
+            forces[i, 1] += fy
+            
+        # Update centers
+        # Clip forces to prevent huge steps
+        max_force = 0.5
+        forces = np.clip(forces, -max_force, max_force)
+        
+        centers += alpha * forces
+        
+        # Constrain centers to [0, 1]
+        centers = np.clip(centers, 0.0, 1.0)
+        
+        alpha *= alpha_decay
+
+    # --- Step 3: Solve LP for Radii ---
+    # Maximize sum(r_i)
+    # s.t. r_i + r_j <= ||c_i - c_j||
+    #      r_i <= dist(c_i, boundary)
+    #      r_i >= 0
+    
+    # Variables: r_0, ..., r_25
+    # c vector for linprog (minimize -sum(r))
+    c_obj = np.ones(n)
+    # linprog minimizes, so we maximize sum by minimizing -sum
+    
+    # Constraints: A_ub @ r <= b_ub
+    
+    # 1. Pairwise constraints: r_i + r_j <= dist_ij
+    # Indices
+    rows = []
+    cols = []
+    dists = []
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            rows.append(i)
+            rows.append(j) # Wait, linprog takes matrix A.
+            # Actually easier to build A matrix directly or use sparse? 
+            # n=26, dense matrix is fine.
+            
+    # Let's build A_ub matrix
+    # Number of constraints: n*(n-1)/2 + n (boundary)
+    num_pair_constraints = n * (n - 1) // 2
+    num_boundary_constraints = n
+    num_constraints = num_pair_constraints + num_boundary_constraints
+    
+    A_ub = np.zeros((num_constraints, n))
+    b_ub = np.zeros(num_constraints)
+    
+    # Pairwise constraints
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = dist
+            k += 1
+            
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        # dist to boundary = min(x, 1-x, y, 1-y)
+        d_min = min(x, 1.0 - x, y, 1.0 - y)
+        A_ub[k, i] = 1.0
+        b_ub[k] = d_min
+        k += 1
+        
+    # Bounds for r_i >= 0
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve
+    # method='highs' is usually fast and robust
+    try:
+        res = linprog(-c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            radii = res.x
+        else:
+            # Fallback to geometric estimate if LP fails
+            radii = np.zeros(n)
+            for i in range(n):
+                min_dist = np.inf
+                for j in range(n):
+                    if i != j:
+                        d = np.linalg.norm(centers[i] - centers[j])
+                        if d < min_dist:
+                            min_dist = d
+                d_bound = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+                radii[i] = 0.5 * min(min_dist, d_bound)
+    except Exception:
+        # Fallback
+        radii = np.zeros(n)
+        for i in range(n):
+            min_dist = np.inf
+            for j in range(n):
+                if i != j:
+                    d = np.linalg.norm(centers[i] - centers[j])
+                    if d < min_dist:
+                        min_dist = d
+            d_bound = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+            radii[i] = 0.5 * min(min_dist, d_bound)
+
+    sum_radii = np.sum(radii)
+    
+    # Ensure no negative radii due to numerical errors
+    radii = np.maximum(radii, 0.0)
+    
+    # Final check and clamping
+    # If any circle is outside, clamp it? 
+    # The LP ensures r_i <= dist to boundary, so centers +/- radii should be inside.
+    # However, numerical precision might be an issue.
+    # But linprob should be accurate.
+    
+    return centers, radii, sum_radii

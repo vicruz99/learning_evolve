@@ -1,0 +1,229 @@
+# sol_000138 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 24d569ae) state=6332c214 sum of radii=2.505270 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def get_optimal_radii(centers):
+    """
+    Solves the Linear Programming problem to find the maximum sum of radii
+    for a fixed set of centers.
+    
+    Args:
+        centers: np.array of shape (n, 2)
+        
+    Returns:
+        radii: np.array of shape (n)
+        sum_radii: float
+    """
+    n = centers.shape[0]
+    
+    # Objective: Maximize sum(r_i) -> Minimize -sum(r_i)
+    c_obj = -np.ones(n)
+    
+    # Constraints matrix A_ub * x <= b_ub
+    # We will build rows for A_ub and b_ub
+    a_ub_rows = []
+    b_ub_vals = []
+    
+    # 1. Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    for i in range(n):
+        x, y = centers[i]
+        
+        # r_i <= x
+        row = np.zeros(n)
+        row[i] = 1.0
+        a_ub_rows.append(row)
+        b_ub_vals.append(x)
+        
+        # r_i <= 1 - x
+        row = np.zeros(n)
+        row[i] = 1.0
+        a_ub_rows.append(row)
+        b_ub_vals.append(1.0 - x)
+        
+        # r_i <= y
+        row = np.zeros(n)
+        row[i] = 1.0
+        a_ub_rows.append(row)
+        b_ub_vals.append(y)
+        
+        # r_i <= 1 - y
+        row = np.zeros(n)
+        row[i] = 1.0
+        a_ub_rows.append(row)
+        b_ub_vals.append(1.0 - y)
+
+    # 2. Pairwise non-overlap constraints: r_i + r_j <= dist(i, j)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            a_ub_rows.append(row)
+            b_ub_vals.append(dist)
+            
+    A_ub = np.array(a_ub_rows)
+    b_ub = np.array(b_ub_vals)
+    
+    # Bounds for r_i: [0, infinity)
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    # method='highs' is generally fast and robust
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        radii = res.x
+        return radii, -res.fun
+    else:
+        # Fallback if LP fails (should not happen for valid geometry)
+        return np.zeros(n), 0.0
+
+def run_packing():
+    n = 26
+    
+    # --- Phase 1: Initialization ---
+    # Use a hexagonal lattice pattern for initial centers
+    # This provides a dense, efficient starting configuration
+    centers = np.zeros((n, 2))
+    
+    # Parameters for hex grid
+    # We want to fit 26 circles. 
+    # A 5x5 grid has 25. A hex packing can be denser.
+    # Let's generate a grid of points and select the best 26 or just place them.
+    
+    # Simple approach: Place points in a hexagonal grid pattern inside the square
+    # Estimate spacing. Area ~ 1, n=26. 
+    # Hex density ~ 0.9. Area per circle ~ 0.45. r ~ 0.38? No.
+    # r^2 * pi ~ 0.45/26 ? No.
+    # Let's just generate a sufficiently fine hex grid and pick points.
+    
+    points = []
+    # Row height
+    dy = 0.15 
+    # Col spacing
+    dx = 0.18 # Adjusted to fit
+    
+    # Generate points
+    y = 0.1
+    row_idx = 0
+    while y <= 0.9:
+        x = 0.1
+        if row_idx % 2 == 1:
+            x = 0.1 + dx/2 # Offset row
+        
+        while x <= 0.9:
+            points.append([x, y])
+            x += dx
+        y += dy
+        row_idx += 1
+        
+    points = np.array(points)
+    
+    # If we have too many points, we need to select 26. 
+    # If too few, we need to add random points or adjust grid.
+    # Let's check count.
+    if len(points) >= n:
+        # Select first n points (might be clustered, but let's try)
+        # Better: Select points that maximize min distance? 
+        # For now, just take first n.
+        centers[:n] = points[:n]
+    else:
+        # Fill remaining with random points if grid was too sparse
+        # (Unlikely with parameters above, but safety check)
+        current = len(points)
+        while current < n:
+            r_x = np.random.uniform(0.05, 0.95)
+            r_y = np.random.uniform(0.05, 0.95)
+            centers[current] = [r_x, r_y]
+            current += 1
+            
+    # --- Phase 2: Optimization ---
+    # Coordinate descent / Local search to maximize sum of radii
+    
+    best_sum = 0.0
+    best_centers = centers.copy()
+    best_radii = np.zeros(n)
+    
+    # Solve once to get baseline
+    radii, current_sum = get_optimal_radii(centers)
+    best_sum = current_sum
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    # Optimization loop
+    num_iterations = 2000 # Adjust based on time limit
+    step_size = 0.05 # Initial perturbation size
+    
+    # To speed up, we can reduce step size
+    decay = 0.995
+    
+    for _ in range(num_iterations):
+        improved = False
+        # Pick a random circle to move
+        idx = np.random.randint(0, n)
+        
+        # Generate random perturbation
+        dx = np.random.uniform(-step_size, step_size)
+        dy = np.random.uniform(-step_size, step_size)
+        
+        new_x = np.clip(centers[idx, 0] + dx, 0.0, 1.0)
+        new_y = np.clip(centers[idx, 1] + dy, 0.0, 1.0)
+        
+        # Store old position
+        old_pos = centers[idx].copy()
+        
+        # Update center
+        centers[idx] = [new_x, new_y]
+        
+        # Solve LP for radii
+        # Note: For small changes, maybe we don't need full LP? 
+        # But LP is fast enough.
+        radii, new_sum = get_optimal_radii(centers)
+        
+        if new_sum > best_sum:
+            best_sum = new_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+            improved = True
+        else:
+            # Revert
+            centers[idx] = old_pos
+            
+        # Decay step size occasionally to refine
+        if _ % 100 == 0 and _ > 0:
+            step_size *= 0.9
+
+    # --- Phase 3: Final Refinement (Optional Gradient/Random Search on best) ---
+    # Just a few more iterations on the best found so far
+    centers = best_centers
+    radii = best_radii
+    
+    # Small random perturbations to shake off any remaining issues
+    for _ in range(500):
+        idx = np.random.randint(0, n)
+        dx = np.random.uniform(-0.01, 0.01)
+        dy = np.random.uniform(-0.01, 0.01)
+        
+        new_x = np.clip(centers[idx, 0] + dx, 0.0, 1.0)
+        new_y = np.clip(centers[idx, 1] + dy, 0.0, 1.0)
+        
+        old_pos = centers[idx].copy()
+        centers[idx] = [new_x, new_y]
+        
+        radii, new_sum = get_optimal_radii(centers)
+        
+        if new_sum > best_sum:
+            best_sum = new_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+        else:
+            centers[idx] = old_pos
+
+    return best_centers, best_radii, best_sum

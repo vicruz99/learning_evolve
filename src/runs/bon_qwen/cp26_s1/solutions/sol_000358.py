@@ -1,0 +1,146 @@
+# sol_000358 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b8d6b6a1) state=0d57a561 sum of radii=2.471896 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    rng = np.random.default_rng(42)
+
+    # 1. Define Objective Function
+    def objective(x):
+        r = x[2::3]
+        return -np.sum(r)
+
+    # 2. Define Constraints
+    # Boundary constraints: x >= r, x + r <= 1, y >= r, y + r <= 1
+    def boundary_constraints(x):
+        xi = x[0::3]
+        yi = x[1::3]
+        ri = x[2::3]
+        
+        c1 = xi - ri          # x >= r
+        c2 = 1 - xi - ri      # x + r <= 1
+        c3 = yi - ri          # y >= r
+        c4 = 1 - yi - ri      # y + r <= 1
+        
+        return np.concatenate([c1, c2, c3, c4])
+
+    # Distance constraints: dist^2 >= (r_i + r_j)^2
+    def distance_constraints(x):
+        xi = x[0::3]
+        yi = x[1::3]
+        ri = x[2::3]
+        
+        # Vectorized computation of all pairwise constraints
+        x_diff = xi[:, None] - xi[None, :]
+        y_diff = yi[:, None] - yi[None, :]
+        r_sum = ri[:, None] + ri[None, :]
+        
+        dist_sq = x_diff**2 + y_diff**2
+        rad_sq = r_sum**2
+        
+        slack = dist_sq - rad_sq
+        
+        # Extract upper triangle (i < j) to avoid duplicates and self-constraints
+        iu, ju = np.triu_indices(n, k=1)
+        return slack[iu, ju]
+
+    constraints = [
+        {'type': 'ineq', 'fun': boundary_constraints},
+        {'type': 'ineq', 'fun': distance_constraints}
+    ]
+
+    # Bounds for variables
+    bounds = [(0, 1)] * 2 * n + [(0, 0.5)] * n
+
+    best_result = None
+    best_sum = -np.inf
+
+    # 3. Multi-start Optimization
+    # Try multiple initializations to improve chances of finding the global optimum
+    
+    # Initialization 1: Random
+    for _ in range(3):
+        centers = rng.uniform(0.1, 0.9, size=(n, 2))
+        radii = np.ones(n) * 0.01
+        x0 = np.zeros(3 * n)
+        for i in range(n):
+            x0[3*i] = centers[i, 0]
+            x0[3*i+1] = centers[i, 1]
+            x0[3*i+2] = radii[i]
+        
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-12})
+        if res.success and (-res.fun) > best_sum:
+            best_sum = -res.fun
+            best_result = res
+
+    # Initialization 2: Hexagonal Grid Pattern
+    # This provides a structured starting point closer to optimal density
+    row_counts = [5, 6, 5, 6, 4] # Sums to 26
+    rows = len(row_counts)
+    # Approximate spacing
+    h_spacing = 1.0 / 6.0
+    v_spacing = h_spacing * np.sqrt(3) / 2
+    
+    y_pos = 0.1
+    current_idx = 0
+    grid_centers = []
+    
+    for r in range(rows):
+        count = row_counts[r]
+        x_start = 0.1 + (r % 2) * (h_spacing / 2)
+        for c in range(count):
+            if current_idx < n:
+                x = x_start + c * h_spacing
+                # Clamp to valid range [0, 1]
+                x = np.clip(x, 0.1, 0.9)
+                y = np.clip(y_pos, 0.1, 0.9)
+                grid_centers.append([x, y])
+                current_idx += 1
+        y_pos += v_spacing
+    
+    # Fill remaining if any (though 26 is covered)
+    while len(grid_centers) < n:
+        grid_centers.append([0.5, 0.5])
+
+    radii_grid = np.ones(n) * 0.01
+    x0_grid = np.zeros(3 * n)
+    for i in range(n):
+        x0_grid[3*i] = grid_centers[i][0]
+        x0_grid[3*i+1] = grid_centers[i][1]
+        x0_grid[3*i+2] = radii_grid[i]
+
+    res_grid = minimize(objective, x0_grid, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-12})
+    if res_grid.success and (-res_grid.fun) > best_sum:
+        best_sum = -res_grid.fun
+        best_result = res_grid
+
+    # 4. Extract and Validate Solution
+    if best_result is not None:
+        x_sol = best_result.x
+    else:
+        # Fallback to last result if all failed
+        x_sol = res_grid.x if 'res_grid' in locals() else x0
+
+    centers_sol = np.zeros((n, 2))
+    radii_sol = np.zeros(n)
+    for i in range(n):
+        centers_sol[i, 0] = x_sol[3*i]
+        centers_sol[i, 1] = x_sol[3*i+1]
+        radii_sol[i] = x_sol[3*i+2]
+
+    # Ensure non-negative radii (optimizer should handle, but safety check)
+    radii_sol = np.maximum(radii_sol, 0.0)
+
+    # Final sum calculation
+    sum_radii = np.sum(radii_sol)
+
+    return centers_sol, radii_sol, sum_radii
+
+# Run the function to get the packing
+centers, radii, sum_radii = run_packing()

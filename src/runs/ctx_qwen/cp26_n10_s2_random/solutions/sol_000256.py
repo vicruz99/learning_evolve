@@ -1,0 +1,294 @@
+# sol_000256 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000205 (state 0b4dbf91) state=1f7b50a5 sum of radii=2.613549 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+A_LP = None
+PAIR_IDX = None
+
+def setup_lp_matrices():
+    global A_LP, PAIR_IDX
+    num_pairs = N * (N - 1) // 2
+    num_bound = 4 * N
+    A_LP = np.zeros((num_pairs + num_bound, N))
+    PAIR_IDX = []
+    k = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A_LP[k, i] = 1.0
+            A_LP[k, j] = 1.0
+            PAIR_IDX.append((i, j))
+            k += 1
+    for i in range(N):
+        for _ in range(4):
+            A_LP[k, i] = 1.0
+            k += 1
+
+setup_lp_matrices()
+
+def solve_lp_and_grad(centers):
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.zeros(A_LP.shape[0])
+    k = 0
+    for i, j in PAIR_IDX:
+        b[k] = dists[i, j]
+        k += 1
+    for i in range(N):
+        b[k] = centers[i, 0]; k += 1
+        b[k] = 1.0 - centers[i, 0]; k += 1
+        b[k] = centers[i, 1]; k += 1
+        b[k] = 1.0 - centers[i, 1]; k += 1
+        
+    try:
+        res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b, 
+                      bounds=[(0, u) for u in ub], method='highs')
+        if not res.success:
+            return np.zeros(N), 0.0, np.zeros_like(centers)
+    except Exception:
+        return np.zeros(N), 0.0, np.zeros_like(centers)
+        
+    radii = res.x
+    try:
+        duals = np.asarray(res.ineqlin.marginals)
+    except AttributeError:
+        duals = np.zeros(A_LP.shape[0])
+        
+    grad = np.zeros_like(centers)
+    k = 0
+    for i, j in PAIR_IDX:
+        lam = duals[k]
+        if lam > 1e-7:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        k += 1
+        
+    bound_start = len(PAIR_IDX)
+    for i in range(N):
+        mu_x0 = duals[bound_start + 4 * i]
+        mu_x1 = duals[bound_start + 4 * i + 1]
+        mu_y0 = duals[bound_start + 4 * i + 2]
+        mu_y1 = duals[bound_start + 4 * i + 3]
+        grad[i, 0] += mu_x0 - mu_x1
+        grad[i, 1] += mu_y0 - mu_y1
+        
+    return radii, np.sum(radii), grad
+
+def obj_grad(x_flat):
+    c = x_flat.reshape(N, 2)
+    _, s, g = solve_lp_and_grad(c)
+    return -s, -g.flatten()
+
+def slsqp_obj(v):
+    return -np.sum(v[2 * N:])
+
+def slsqp_cons(v):
+    c = v[:2 * N].reshape(N, 2)
+    r = v[2 * N:]
+    con = [c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r]
+    i, j = np.triu_indices(N, 1)
+    dx = c[i, 0] - c[j, 0]
+    dy = c[i, 1] - c[j, 1]
+    dr = r[i] + r[j]
+    con.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(con)
+
+def generate_starts(rng):
+    starts = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6],
+        [6, 4, 6, 5, 5], [4, 6, 6, 6, 4], [5, 4, 6, 6, 5],
+        [6, 6, 5, 5, 4], [5, 5, 6, 5, 5], [4, 5, 6, 5, 6],
+        [5, 6, 4, 5, 6], [5, 5, 4, 6, 6], [6, 6, 4, 5, 5],
+        [7, 7, 6, 6], [6, 7, 6, 7], [7, 6, 7, 6], [5, 5, 5, 5, 6]
+    ]
+    
+    for pat in patterns:
+        for r_est in [0.085, 0.092, 0.098, 0.105, 0.112]:
+            c = []
+            y = r_est
+            for r_idx, cnt in enumerate(pat):
+                shift = r_est if r_idx % 2 == 1 else 0.0
+                x = r_est + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r_est
+                y += r_est * np.sqrt(3.0)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+            starts.append(c)
+            
+    for _ in range(20):
+        starts.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    for _ in range(10):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(800):
+            forces = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d_vec = c[i] - c[j]
+                    dist = np.linalg.norm(d_vec)
+                    if dist < 0.25 and dist > 1e-4:
+                        f = (0.25 - dist) / (dist**2 + 1e-6)
+                        forces[i] += d_vec * f
+                        forces[j] -= d_vec * f
+            c += forces * 0.004
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+        
+    for _ in range(8):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        c[:4] = [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92]]
+        starts.append(c)
+        
+    return starts
+
+def repair_packing(centers, radii):
+    radii = radii.copy()
+    for _ in range(80):
+        changed = False
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], 
+                     centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = max(mr, 0.0)
+                changed = True
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], 
+                             centers[i, 1] - centers[j, 1])
+                if radii[i] + radii[j] > d - 1e-11:
+                    shrink = (radii[i] + radii[j] - d) * 0.5 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(12345)
+    best_c = None
+    best_sum = -1.0
+    bounds_centers = [(0.005, 0.995)] * (2 * N)
+    
+    starts = generate_starts(rng)
+    
+    # Phase 1: Gradient Ascent (L-BFGS-B)
+    for i, c0 in enumerate(starts):
+        try:
+            res = minimize(obj_grad, c0.flatten(), method='L-BFGS-B', 
+                           bounds=bounds_centers, jac=True,
+                           options={'maxiter': 6000, 'ftol': 1e-15, 'gtol': 1e-12})
+            _, s, _ = solve_lp_and_grad(res.x.reshape(N, 2))
+            if s > best_sum:
+                best_sum = s
+                best_c = res.x.reshape(N, 2).copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Simulated Annealing
+    if best_c is not None:
+        c_curr = best_c.copy()
+        s_curr = best_sum
+        T = 0.01
+        decay = 0.995
+        
+        for step in range(5000):
+            if rng.random() < 0.3:
+                idx = rng.choice(N, size=2, replace=False)
+                c_try = c_curr.copy()
+                c_try[idx] += rng.normal(0, 0.015, (2, 2))
+            else:
+                i = rng.integers(N)
+                c_try = c_curr.copy()
+                c_try[i] += rng.normal(0, 0.01, 2)
+                
+            c_try = np.clip(c_try, 0.01, 0.99)
+            _, s_try, _ = solve_lp_and_grad(c_try)
+            
+            delta = s_try - s_curr
+            if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-9)):
+                c_curr = c_try
+                s_curr = s_try
+                if s_curr > best_sum:
+                    best_sum = s_curr
+                    best_c = c_curr.copy()
+            T *= decay
+            
+        res2 = minimize(obj_grad, best_c.flatten(), method='L-BFGS-B', 
+                        bounds=bounds_centers, jac=True,
+                        options={'maxiter': 5000, 'ftol': 1e-15})
+        _, s2, _ = solve_lp_and_grad(res2.x.reshape(N, 2))
+        if s2 > best_sum:
+            best_sum = s2
+            best_c = res2.x.reshape(N, 2).copy()
+
+    # Phase 3: Joint SLSQP Polish
+    radii_init, _, _ = solve_lp_and_grad(best_c)
+    v0 = np.concatenate([best_c.flatten(), radii_init])
+    bounds_sl = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    
+    try:
+        res_sl = minimize(slsqp_obj, v0, method='SLSQP', bounds=bounds_sl,
+                          constraints={'type': 'ineq', 'fun': slsqp_cons},
+                          options={'maxiter': 10000, 'ftol': 1e-14})
+        if np.min(slsqp_cons(res_sl.x)) >= -1e-7:
+            s_sl = np.sum(res_sl.x[2 * N:])
+            if s_sl > best_sum:
+                best_sum = s_sl
+                best_c = res_sl.x[:2 * N].reshape(N, 2)
+    except Exception:
+        pass
+
+    # Phase 4: Coordinate-wise refinement
+    c_ref = best_c.copy()
+    _, s_ref, _ = solve_lp_and_grad(c_ref)
+    improved = True
+    passes = 0
+    while improved and passes < 3:
+        improved = False
+        passes += 1
+        for i in range(N):
+            c_old = c_ref[i].copy()
+            best_local_s = s_ref
+            best_local_c = c_old.copy()
+            for _ in range(40):
+                c_try_i = c_old + rng.normal(0, 0.004, 2)
+                c_try_i = np.clip(c_try_i, 0.01, 0.99)
+                c_temp = c_ref.copy()
+                c_temp[i] = c_try_i
+                _, s_temp, _ = solve_lp_and_grad(c_temp)
+                if s_temp > best_local_s + 1e-9:
+                    best_local_s = s_temp
+                    best_local_c = c_try_i
+            if best_local_s > s_ref + 1e-9:
+                c_ref[i] = best_local_c
+                _, s_ref, _ = solve_lp_and_grad(c_ref)
+                improved = True
+                if best_local_s > best_sum:
+                    best_sum = best_local_s
+                    best_c = c_ref.copy()
+
+    # Final radius computation and repair
+    radii_init, _, _ = solve_lp_and_grad(best_c)
+    centers = best_c.copy()
+    radii = repair_packing(centers, radii_init.copy())
+    
+    return centers, radii, float(np.sum(radii))

@@ -1,0 +1,107 @@
+
+
+<strategy>
+The previous approaches relied on SLSQP to simultaneously optimize centers and radii with non-linear constraints. This often gets trapped in local minima and struggles with the non-smooth nature of the packing constraints. 
+
+A more robust strategy is to decouple the problem into two stages:
+1. **Inner Stage (LP):** For any fixed set of centers, maximizing the sum of radii subject to non-overlap and boundary constraints is a **Linear Programming** problem. This can be solved exactly and extremely fast using `scipy.optimize.linprog`.
+2. **Outer Stage (Global Optimization):** We treat the center coordinates as variables and use a derivative-free global optimizer (`differential_evolution`) to maximize the LP's objective value. This creates a smooth, well-behaved landscape for the global optimizer.
+3. **Refinement:** Follow DE with a local `Powell` optimizer and a perturbed restart to escape any remaining shallow local minima.
+
+This hybrid LP + DE approach is standard in computational geometry for circle packing, avoids constraint violation pitfalls, and efficiently explores the configuration space to find near-optimal arrangements.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, differential_evolution, minimize
+
+N = 26
+# Precompute pairwise constraint matrix indices for speed
+pair_indices = np.array([(i, j) for i in range(N) for j in range(i + 1, N)])
+A_pairs = np.zeros((len(pair_indices), N))
+for idx, (i, j) in enumerate(pair_indices):
+    A_pairs[idx, i] = 1.0
+    A_pairs[idx, j] = 1.0
+
+def get_max_radii(centers):
+    """Solves LP to find maximum sum of radii for fixed centers."""
+    # Ensure centers are strictly inside to give positive boundary margins
+    cx = np.clip(centers[:, 0], 1e-7, 1 - 1e-7)
+    cy = np.clip(centers[:, 1], 1e-7, 1 - 1e-7)
+    
+    # Compute pairwise distances efficiently
+    diff_x = cx[:, None] - cx[None, :]
+    diff_y = cy[:, None] - cy[None, :]
+    dists = np.sqrt(diff_x**2 + diff_y**2)
+    dists_upper = dists[pair_indices[:, 0], pair_indices[:, 1]]
+    
+    # Boundary distances: min distance to any of the 4 walls
+    bounds_val = np.minimum(np.minimum(cx, 1.0 - cx), np.minimum(cy, 1.0 - cy))
+    
+    # LP constraints: A_ub @ r <= b_ub
+    # Pairwise: r_i + r_j <= dist_ij
+    # Boundary: r_i <= bounds_val_i
+    A_ub = np.vstack([A_pairs, np.eye(N)])
+    b_ub = np.concatenate([dists_upper, bounds_val])
+    
+    # Maximize sum(r) => minimize -sum(r)
+    res = linprog(-np.ones(N), A_ub=A_ub, b_ub=b_ub, bounds=(0, None), method='highs')
+    if res.success:
+        return res.x
+    # Fallback for numerical edge cases
+    return np.full(N, 1e-6)
+
+def objective(centers_flat):
+    """Objective for outer optimizer: negative sum of optimal radii."""
+    centers = centers_flat.reshape(-1, 2)
+    radii = get_max_radii(centers)
+    return -np.sum(radii)
+
+def generate_hex_init():
+    """Generates a structured hexagonal initial guess to guide optimization."""
+    pts = []
+    row = 0
+    y = 0.12
+    while y < 0.88 and len(pts) < N:
+        x = 0.12 if row % 2 == 0 else 0.19
+        while x < 0.88 and len(pts) < N:
+            pts.append([x, y])
+            x += 0.25
+        y += 0.2165
+        row += 1
+    return np.array(pts[:N])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    bounds = [(0.05, 0.95)] * (2 * N)
+    
+    # Phase 1: Global optimization with Differential Evolution
+    # DE efficiently explores the 52-dimensional space of centers
+    res_de = differential_evolution(
+        objective, bounds, seed=42, maxiter=120, popsize=18,
+        mutation=(0.5, 1.0), recombination=0.8, tol=1e-9, polish=True
+    )
+    
+    # Phase 2: Local refinement using derivative-free Powell method
+    res_local = minimize(objective, res_de.x, method='Powell', 
+                         options={'maxiter': 500, 'ftol': 1e-12})
+    
+    # Phase 3: Perturbation restart to escape potential local minima
+    rng = np.random.default_rng(123)
+    x_pert = res_local.x.copy()
+    x_pert += rng.normal(0, 0.002, x_pert.shape)
+    x_pert = np.clip(x_pert, 0.05, 0.95)
+    res_pert = minimize(objective, x_pert, method='Powell', 
+                        options={'maxiter': 500, 'ftol': 1e-12})
+    
+    # Select the best configuration found
+    best_flat = res_pert.x if res_pert.fun < res_local.fun else res_local.x
+    best_centers = best_flat.reshape(-1, 2)
+    radii = get_max_radii(best_centers)
+    
+    # Apply negligible shrink to strictly satisfy validator's 1e-12 tolerance
+    radii = np.maximum(radii - 1e-9, 0.0)
+    
+    sum_r = float(np.sum(radii))
+    return best_centers, radii, sum_r
+```

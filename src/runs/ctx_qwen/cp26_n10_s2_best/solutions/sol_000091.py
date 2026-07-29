@@ -1,0 +1,178 @@
+# sol_000091 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000049 (state 0aad4082) state=364131c7 sum of radii=2.629868 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v, i_idx, j_idx):
+    """Inequality constraints: boundaries and non-overlap."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints (squared distance for better gradients)
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    c_pair = dx**2 + dy**2 - (r[i_idx] + r[j_idx])**2
+    
+    return np.concatenate([c, c_pair])
+
+def get_hex_centers(r0, shift_x, shift_y, rot_angle):
+    """Generate hexagonal lattice centers with optional rotation."""
+    centers = []
+    y = r0 + shift_y
+    row = 0
+    while len(centers) < N + 5:
+        x_start = r0 + shift_x + (row % 2) * r0
+        x = x_start
+        while x <= 1 - r0 and len(centers) < N + 5:
+            centers.append([x, y])
+            x += 2 * r0
+        y += r0 * np.sqrt(3)
+        row += 1
+        
+    pts = np.array(centers[:N])
+    if rot_angle != 0:
+        cx, cy = 0.5, 0.5
+        pts[:, 0] -= cx
+        pts[:, 1] -= cy
+        c, s = np.cos(rot_angle), np.sin(rot_angle)
+        pts = pts @ np.array([[c, -s], [s, c]])
+        pts[:, 0] += cx
+        pts[:, 1] += cy
+        
+    return np.clip(pts, 0.01, 0.99)
+
+def make_initial_config(seed):
+    """Generate a diverse initial configuration based on seed."""
+    np.random.seed(seed)
+    layout_type = seed % 4
+    
+    if layout_type == 0: # Hexagonal lattice
+        r0 = 0.085 + np.random.uniform(-0.005, 0.015)
+        shift_x = np.random.uniform(-0.02, 0.02)
+        shift_y = np.random.uniform(-0.02, 0.02)
+        rot = np.random.uniform(-0.15, 0.15)
+        centers = get_hex_centers(r0, shift_x, shift_y, rot)
+    elif layout_type == 1: # Rotated Grid
+        pts = np.array([[0.1 + i*0.16, 0.1 + j*0.18] for i in range(6) for j in range(5)])
+        pts = pts[:N]
+        angle = np.random.uniform(-0.2, 0.2)
+        cx, cy = 0.5, 0.5
+        pts[:, 0] -= cx
+        pts[:, 1] -= cy
+        c, s = np.cos(angle), np.sin(angle)
+        pts = pts @ np.array([[c, -s], [s, c]])
+        pts[:, 0] += cx
+        pts[:, 1] += cy
+        centers = np.clip(pts + np.random.uniform(-0.01, 0.01, pts.shape), 0.02, 0.98)
+    elif layout_type == 2: # Dense staggered rows
+        centers = []
+        ry = 0.08
+        for row in range(6):
+            count = 6 if row % 2 == 0 else 5
+            rx = 0.08 if row % 2 == 0 else 0.17
+            for _ in range(count):
+                if len(centers) < N:
+                    centers.append([rx, ry])
+                    rx += 0.17
+            ry += 0.15
+        centers = np.array(centers[:N])
+        centers += np.random.uniform(-0.015, 0.015, centers.shape)
+        centers = np.clip(centers, 0.02, 0.98)
+    else: # Random uniform
+        centers = np.random.uniform(0.05, 0.95, (N, 2))
+        
+    # Start with small radii to guarantee initial feasibility
+    r = np.full(N, 0.03)
+    v = np.concatenate([centers[:, 0], centers[:, 1], r])
+    return v
+
+def run_packing():
+    # Precompute pairwise indices for efficient constraint evaluation
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints, 'args': (i_idx, j_idx)}
+    
+    best_v = None
+    best_sum = -1.0
+    
+    # Phase 1: Multi-start optimization from diverse basins of attraction
+    for seed in range(50):
+        v0 = make_initial_config(seed)
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                # Verify feasibility with tolerance
+                if np.min(constraints(res.x, i_idx, j_idx)) >= -1e-5:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Fallback initialization
+    if best_v is None:
+        best_v = make_initial_config(0)
+        
+    # Phase 2: Local refinement to escape shallow local minima
+    current_v = best_v
+    for step in range(12):
+        pert = current_v.copy()
+        # Perturb centers to explore neighborhood
+        pert[:2*N] += np.random.uniform(-0.004, 0.004, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        # Shrink radii slightly to ensure the perturbed state is feasible
+        pert[2*N:] *= 0.975
+        
+        try:
+            res = minimize(objective, pert, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                if np.min(constraints(res.x, i_idx, j_idx)) >= -1e-5:
+                    best_sum = s
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Extract optimal configuration
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Strict post-processing to guarantee validator compliance
+    # 1. Enforce boundary constraints strictly
+    for i in range(N):
+        cr[i] = min(cr[i], centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        
+    # 2. Enforce non-overlap constraints iteratively with safety margin
+    for _ in range(10):
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                if d < cr[i] + cr[j] - 1e-9:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    
+    return centers, cr, float(np.sum(cr))

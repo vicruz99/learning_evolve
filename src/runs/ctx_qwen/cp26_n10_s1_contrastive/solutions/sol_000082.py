@@ -1,0 +1,166 @@
+# sol_000082 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000025 (state d15e4e7a) state=8534ac16 sum of radii=2.612348 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    r = vars[0::3]
+    return -np.sum(r)
+
+def constraints(vars):
+    """
+    Computes pairwise non-overlap constraints.
+    Boundary constraints are automatically satisfied by the parameterization.
+    Returns array where each element must be >= 0.
+    """
+    r = vars[0::3]
+    u = vars[1::3]
+    v = vars[2::3]
+    
+    # Parameterization: x = r + u*(1-2r), y = r + v*(1-2r)
+    # Ensures r <= x <= 1-r and r <= y <= 1-r automatically for u,v in [0,1]
+    fact = 1.0 - 2.0 * r
+    x = r + u * fact
+    y = r + v * fact
+    
+    # Pairwise separation: dist^2 >= (r_i + r_j)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist2 = dx**2 + dy**2
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    # Upper triangular mask to avoid duplicates and self-comparison
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    return dist2[mask] - r_sum[mask]**2
+
+def get_init_from_centers(centers):
+    """Converts a set of centers to the (r, u, v) parameterization with safe initial radii."""
+    n = centers.shape[0]
+    r = np.zeros(n)
+    for i in range(n):
+        d_bound = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        d_min = 1.0
+        for j in range(n):
+            if i != j:
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if d < d_min:
+                    d_min = d
+        # Safe fraction to guarantee strict feasibility for SLSQP start
+        r[i] = 0.45 * min(d_bound, d_min / 2.0)
+        
+    fact = 1.0 - 2.0 * r
+    u = (centers[:, 0] - r) / fact
+    v = (centers[:, 1] - r) / fact
+    
+    u = np.clip(u, 0.0, 1.0)
+    v = np.clip(v, 0.0, 1.0)
+    
+    vars_init = np.zeros(3 * n)
+    vars_init[0::3] = r
+    vars_init[1::3] = u
+    vars_init[2::3] = v
+    return vars_init
+
+def run_packing():
+    # Bounds: r in [1e-6, 0.49], u in [0, 1], v in [0, 1]
+    bounds = [(1e-6, 0.49), (0.0, 1.0), (0.0, 1.0)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    inits = []
+    
+    # 1. Hexagonal Lattice Initialization
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        x_start = r_est if row % 2 == 0 else 2.0 * r_est
+        x = x_start
+        while x <= 1.0 - r_est and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    inits.append(get_init_from_centers(np.array(pts[:N])))
+    
+    # 2. Square Grid + Center Initialization
+    pts2 = []
+    for i in range(5):
+        for j in range(5):
+            pts2.append([0.1 + i * 0.2, 0.1 + j * 0.2])
+    pts2.append([0.5, 0.5])
+    inits.append(get_init_from_centers(np.array(pts2[:N])))
+    
+    # 3. Diverse Random Initializations
+    np.random.seed(42)
+    for _ in range(45):
+        c_rand = 0.1 + 0.8 * np.random.rand(N, 2)
+        inits.append(get_init_from_centers(c_rand))
+        
+    # Phase 1: Global Search from all initializations
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                           options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            if res.success:
+                c_val = constraints(res.x)
+                if np.min(c_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: High-Precision Polish & Local Escape
+    if best_vars is not None:
+        # Tight refinement
+        for _ in range(3):
+            try:
+                res_f = minimize(objective, best_vars, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                                 options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+                if res_f.success and np.min(constraints(res_f.x)) >= -1e-7:
+                    best_vars = res_f.x
+                    best_sum = -res_f.fun
+            except Exception:
+                pass
+                
+        # Perturbation search to escape local minima
+        np.random.seed(99)
+        for _ in range(20):
+            x_pert = best_vars + np.random.randn(3 * N) * 0.003
+            x_pert[0::3] = np.clip(x_pert[0::3], 1e-6, 0.49)
+            x_pert[1::3] = np.clip(x_pert[1::3], 0.0, 1.0)
+            x_pert[2::3] = np.clip(x_pert[2::3], 0.0, 1.0)
+            try:
+                res_p = minimize(objective, x_pert, method='SLSQP', bounds=bounds, constraints=cons_dict,
+                                 options={'maxiter': 2500, 'ftol': 1e-13, 'disp': False})
+                if res_p.success and np.min(constraints(res_p.x)) >= -1e-7:
+                    if -res_p.fun > best_sum:
+                        best_sum = -res_p.fun
+                        best_vars = res_p.x.copy()
+            except Exception:
+                pass
+                
+    # Reconstruct centers and radii from parameters
+    r_opt = best_vars[0::3]
+    u_opt = best_vars[1::3]
+    v_opt = best_vars[2::3]
+    fact_opt = 1.0 - 2.0 * r_opt
+    x_opt = r_opt + u_opt * fact_opt
+    y_opt = r_opt + v_opt * fact_opt
+    centers = np.column_stack((x_opt, y_opt))
+    radii = r_opt
+    
+    return centers, radii, float(np.sum(radii))

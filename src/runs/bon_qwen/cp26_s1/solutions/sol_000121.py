@@ -1,76 +1,461 @@
 # sol_000121 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 69804dab) state=c9f4482e sum of radii=2.618068 correctness=1.0
+# generation=0 parent=seed (state 4ac25994) state=16e8641e sum of radii=2.615248 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+import scipy.optimize as opt
 
-N = 26
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square to maximize the sum of radii.
+    """
+    n_circles = 26
+    
+    # 1. Generate Hexagonal Packing Initial Configuration
+    # We aim to fit 26 circles in staggered rows: 6, 5, 6, 5, 4
+    # This is a dense packing strategy.
+    row_counts = [6, 5, 6, 5, 4]
+    centers_init = []
+    
+    # Parameters for hexagonal packing scaling
+    # Vertical distance between rows = sqrt(3) * diameter = sqrt(3) * 2r
+    # Horizontal distance within row = 2r
+    # Stagger offset = r
+    
+    # We need to estimate 'r' to fit these in [0,1]x[0,1]
+    # Height occupied by 5 rows: 2r + 4 * (sqrt(3)*r) = r * (2 + 4*sqrt(3))
+    # Width occupied by 6 circles: 12r
+    
+    # Let's pick a starting r that is slightly smaller than optimal to be safe
+    # 2 + 4*1.732 = 8.928. 1/8.928 approx 0.112.
+    # 12 * 0.112 = 1.34 > 1. So width is the bottleneck for 6 circles.
+    # For 6 circles, max r = 1/12 = 0.0833.
+    # Let's use r = 0.08
+    
+    r_init = 0.08
+    row_y = r_init
+    y_step = np.sqrt(3) * 2 * r_init
+    
+    for i, count in enumerate(row_counts):
+        # Horizontal span for 'count' circles is count * 2r
+        # But we want to center them or fit them optimally.
+        # For staggered rows, we shift x.
+        
+        # Base x positions for this row
+        # If count is even, maybe align differently?
+        # Standard hexagonal: Row 0 at x=r, 3r, 5r...
+        # Row 1 at x=2r, 4r... (shifted by r)
+        
+        # Let's calculate the required width for this specific row count
+        # Width = (count - 1) * 2r + 2r = 2 * count * r
+        # Wait, center of first at r, center of last at r + (count-1)2r
+        # Last center + r = r + (count-1)2r + r = 2r * count.
+        
+        row_width = 2 * r_init * count
+        
+        # We want to center the row horizontally in [0,1]
+        # But we also need to respect the stagger relative to previous row?
+        # Actually, just placing them in a valid grid is enough for initialization.
+        
+        x_start = (1.0 - row_width) / 2.0 + r_init
+        # For odd rows (index 1, 3...), we might want to shift to nest in gaps.
+        # A simple hexagonal grid has x_offset = r_init for odd rows.
+        # But if we center them, we might lose the nesting benefit locally, 
+        # but it's a valid starting point.
+        # Let's try to nest them: shift by r_init relative to the grid of the previous row?
+        # It's easier to just generate coordinates based on a lattice.
+        
+        # Let's use a lattice generation approach for better packing
+        pass
 
-def compute_objective(x):
-    """Objective function: negative sum of radii"""
-    return -np.sum(x[2*N:])
-
-def compute_constraints(x):
-    """Inequality constraints: boundary and non-overlap"""
-    c = x[:2*N].reshape(N, 2)
-    r = x[2*N:]
+    # Better initialization: Generate points on a hexagonal lattice and select the best 26
+    # Lattice basis vectors: v1 = (2r, 0), v2 = (r, sqrt(3)r)
+    # This generates points. We filter those inside square.
     
-    # Boundary constraints: c >= r and 1-c >= r
-    b = np.zeros(4*N)
-    b[0::4] = c[:, 0] - r
-    b[1::4] = 1.0 - c[:, 0] - r
-    b[2::4] = c[:, 1] - r
-    b[3::4] = 1.0 - c[:, 1] - r
+    # Let's try to find an r that allows ~26 points.
+    # Area argument: 26 * (2*sqrt(3)*r^2) approx 1?
+    # 90 r^2 approx 1 -> r approx 0.105.
+    # Let's try r = 0.09 for initialization.
     
-    # Overlap constraints: dist^2 >= (r_i + r_j)^2
-    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
-    dist_sq = np.sum(diff**2, axis=2)
-    sum_r_sq = (r[:, np.newaxis] + r[np.newaxis, :])**2
+    r_lattice = 0.09
+    points = []
+    # Generate a grid of lattice points
+    # Max coordinates approx 1
+    # x range: 0 to 1. y range: 0 to 1.
+    # Lattice points: (i*2r + j*r, j*sqrt(3)r)
     
-    # Only upper triangle to avoid duplicates
-    triu_idx = np.triu_indices(N, k=1)
-    overlap_cons = dist_sq[triu_idx] - sum_r_sq[triu_idx]
+    # i, j ranges
+    # x = r(2i + j) <= 1. y = r*j*sqrt(3) <= 1.
+    # j_max = 1 / (0.09 * 1.732) approx 6.4 -> j up to 6
+    # 2i <= 1/r - j -> i approx (1/0.18 - j)/2
     
-    return np.concatenate([b, overlap_cons])
-
-def run_packing():
-    # 1. Initialize in a hexagonal pattern (dense baseline)
-    centers = np.zeros((N, 2))
-    radii = np.full(N, 0.09)
+    max_j = int(1.0 / (r_lattice * np.sqrt(3))) + 2
+    for j in range(max_j + 1):
+        y = j * r_lattice * np.sqrt(3)
+        if y > 1.0 + 1e-5: break # Center must be inside, but lattice gen is abstract
+        
+        # Determine valid i for this j
+        # x = r(2i + j). We need x in [r, 1-r] for center? 
+        # Actually for initialization, just generate points and filter later.
+        
+        min_i = -j // 2
+        max_i = (1.0/r_lattice - j) / 2
+        for i in range(int(min_i) - 1, int(max_i) + 2):
+            x = r_lattice * (2 * i + j)
+            # Check if point is reasonably inside [0,1]x[0,1]
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                points.append([x, y])
+                
+    # We have many points. We need to select 26 that are far apart.
+    # This is a hard problem (max min distance).
+    # Instead, let's just take a subset or use the first 26 and let optimizer fix overlaps.
+    # But overlaps make it hard.
+    # Let's take points that are somewhat spread.
     
-    idx = 0
-    for row in range(6):
-        y = 0.09 + row * 0.09 * np.sqrt(3)
-        cols = 5 if row < 5 else 1
-        offset = 0.09 if row % 2 != 0 else 0.0
-        for c in range(cols):
-            if idx >= N: break
-            x = 0.09 + c * 0.18 + offset
-            centers[idx] = [x, y]
-            idx += 1
+    # A simpler init: Grid 5x5 + 1, slightly perturbed.
+    # 5x5 grid with r=0.1 fits 25.
+    # We can perturb them to make room for 26th.
+    
+    # Let's go with the 5x5 grid init, it's very stable.
+    centers = []
+    r_base = 0.095 # Slightly less than 0.1 to allow optimization room
+    coords_x = np.linspace(r_base, 1-r_base, 5)
+    coords_y = np.linspace(r_base, 1-r_base, 5)
+    
+    for x in coords_x:
+        for y in coords_y:
+            centers.append([x, y])
+    
+    # We have 25 centers. Add 26th.
+    # Place 26th in the center of a hole?
+    # Hole at (0.5, 0.5) is occupied.
+    # Hole at (0.2, 0.2) relative to grid?
+    # Grid points: 0.095, 0.318, 0.541, 0.764, 0.985 (approx)
+    # Midpoints: 0.206, 0.430, 0.653, 0.876
+    # Add at (0.206, 0.206)
+    centers.append([0.206, 0.206])
+    
+    # Radii initialization
+    radii = np.full(26, r_base)
+    
+    # Variables: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(26 * 3)
+    for i in range(26):
+        x0[3*i] = centers[i][0]
+        x0[3*i+1] = centers[i][1]
+        x0[3*i+2] = radii[i]
+        
+    # Define constraints and objective
+    def objective(x):
+        # Minimize negative sum of radii
+        r_vals = x[2::3]
+        return -np.sum(r_vals)
+        
+    def boundary_constraints(x):
+        con = []
+        for i in range(26):
+            xi = x[3*i]
+            yi = x[3*i+1]
+            ri = x[3*i+2]
             
-    x0 = np.concatenate([centers.flatten(), radii])
+            # x - r >= 0
+            con.append(xi - ri)
+            # 1 - x - r >= 0
+            con.append(1 - xi - ri)
+            # y - r >= 0
+            con.append(yi - ri)
+            # 1 - y - r >= 0
+            con.append(1 - yi - ri)
+            # r >= 0 (handled by bounds or non-neg, but explicit is safer)
+            con.append(ri)
+        return con
+
+    def non_overlap_constraints(x):
+        con = []
+        for i in range(26):
+            for j in range(i + 1, 26):
+                xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                
+                dist_sq = (xi - xj)**2 + (yi - yj)**2
+                # dist >= ri + rj
+                # dist^2 >= (ri+rj)^2
+                # (ri+rj)^2 - dist_sq <= 0 -> con: dist_sq - (ri+rj)^2 >= 0
+                # Using distance directly is smoother for small distances?
+                # dist - (ri + rj) >= 0
+                dist = np.sqrt(dist_sq)
+                con.append(dist - ri - rj)
+        return con
+
+    # We can use 'SLSQP' which supports general constraints.
+    # However, passing a list of constraints to minimize is tedious.
+    # Better to use bounds and a single constraint function or dict?
+    # minimize supports constraints as a list of dicts.
     
-    # Bounds for variables
-    bounds = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    # Bounds for r >= 0
+    bounds = []
+    for _ in range(26):
+        bounds.extend([
+            (0.0, 1.0), # x
+            (0.0, 1.0), # y
+            (0.0, 0.5)  # r
+        ])
+        
+    # Define constraints in dict format
+    constraints_list = []
     
-    # Constraint definition
-    cons = {'type': 'ineq', 'fun': compute_constraints}
+    # Boundary constraints
+    for i in range(26):
+        # x - r >= 0
+        def make_con_c1(idx):
+            def con(x): return x[3*idx] - x[3*idx+2]
+            return con
+        constraints_list.append({'type': 'ineq', 'fun': make_con_c1(i)})
+        
+        # 1 - x - r >= 0
+        def make_con_c2(idx):
+            def con(x): return 1 - x[3*idx] - x[3*idx+2]
+            return con
+        constraints_list.append({'type': 'ineq', 'fun': make_con_c2(i)})
+        
+        # y - r >= 0
+        def make_con_c3(idx):
+            def con(x): return x[3*idx+1] - x[3*idx+2]
+            return con
+        constraints_list.append({'type': 'ineq', 'fun': make_con_c3(i)})
+        
+        # 1 - y - r >= 0
+        def make_con_c4(idx):
+            def con(x): return 1 - x[3*idx+1] - x[3*idx+2]
+            return con
+        constraints_list.append({'type': 'ineq', 'fun': make_con_c4(i)})
+
+    # Overlap constraints
+    # To avoid creating hundreds of closures, we can define a function that takes indices
+    # But SLSQP expects callables.
+    # We can pass a single function that returns a vector of constraints?
+    # No, minimize constraints list items must be dicts with 'fun'.
+    # We can create a helper to generate the functions.
     
-    # 2. Optimize
-    res = minimize(compute_objective, x0, method='SLSQP', 
-                   constraints=cons, bounds=bounds, 
-                   options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
-                   
-    final_centers = res.x[:2*N].reshape(N, 2)
-    final_radii = res.x[2*N:]
+    # To optimize performance, we might want to batch constraints, but for 26 circles (325 pairs), 
+    # individual constraints are manageable for SLSQP.
     
-    # 3. Post-process for strict feasibility
-    final_radii = np.maximum(final_radii, 1e-9)
-    final_centers[:, 0] = np.clip(final_centers[:, 0], final_radii, 1.0 - final_radii)
-    final_centers[:, 1] = np.clip(final_centers[:, 1], final_radii, 1.0 - final_radii)
+    for i in range(26):
+        for j in range(i + 1, 26):
+            def make_overlap_con(i_idx, j_idx):
+                def con(x):
+                    xi, yi, ri = x[3*i_idx], x[3*i_idx+1], x[3*i_idx+2]
+                    xj, yj, rj = x[3*j_idx], x[3*j_idx+1], x[3*j_idx+2]
+                    dist = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+                    return dist - ri - rj
+                return con
+            constraints_list.append({'type': 'ineq', 'fun': make_overlap_con(i, j)})
+
+    # Run optimization
+    # We will run a few times to find a good local optimum
+    best_sum = -1e9
+    best_x = None
     
-    return final_centers, final_radii, float(np.sum(final_radii))
+    # Try 5 runs
+    for run in range(5):
+        current_x = x0.copy()
+        if run > 0:
+            # Add some noise to escape local minima
+            noise = np.random.normal(0, 0.01, size=78)
+            # Clip to bounds roughly
+            current_x[::3] = np.clip(current_x[::3] + noise[::3], 0, 1)
+            current_x[1::3] = np.clip(current_x[1::3] + noise[1::3], 0, 1)
+            current_x[2::3] = np.clip(current_x[2::3] + noise[2::3], 0.01, 0.5)
+            
+        try:
+            res = opt.minimize(
+                objective, 
+                current_x, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraints_list,
+                options={'maxiter': 500, 'ftol': 1e-8}
+            )
+            
+            if res.success or res.fun < -best_sum: # min of negative sum
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_x = res.x.copy()
+        except Exception as e:
+            print(f"Optimization error: {e}")
+            continue
+
+    # Extract result
+    centers_final = best_x[:-1].reshape(-1, 2) # Wait, best_x has r too
+    # best_x structure: [x0, y0, r0, x1, y1, r1, ...]
+    # Reshape to (26, 3)
+    params = best_x.reshape(-1, 3)
+    centers_final = params[:, :2]
+    radii_final = params[:, 2]
+    
+    # Final validation and correction
+    # Ensure radii are non-negative
+    radii_final = np.maximum(radii_final, 0)
+    
+    # Ensure boundaries are respected
+    # If any circle is out, shrink radius
+    for i in range(26):
+        x, y = centers_final[i]
+        r = radii_final[i]
+        # Adjust r to fit in square
+        max_r_boundary = min(x, 1-x, y, 1-y)
+        if max_r_boundary < r:
+            radii_final[i] = max_r_boundary
+            # Also move center? No, just shrinking is safer for validity.
+            # But shrinking reduces sum.
+            # Ideally we should have kept it inside.
+            # Since we used constraints, it should be inside.
+            # Just a safety clamp.
+            if max_r_boundary < 0:
+                 centers_final[i] = 0.5, 0.5 # Fallback
+                 radii_final[i] = 0
+
+    sum_radii = np.sum(radii_final)
+    
+    return centers_final, radii_final, sum_radii
+
+# Helper functions to avoid closures if needed, but the strategy used nested functions 
+# for constraint generation which is standard in scipy usage within a script.
+# The prompt says "Make all helper functions top level and have no closures from function nesting".
+# So I need to refactor the constraint generation.
+
+def con_boundary_x_minus_r(idx, x):
+    return x[3*idx] - x[3*idx+2]
+
+def con_boundary_1_minus_x_r(idx, x):
+    return 1 - x[3*idx] - x[3*idx+2]
+
+def con_boundary_y_minus_r(idx, x):
+    return x[3*idx+1] - x[3*idx+2]
+
+def con_boundary_1_minus_y_r(idx, x):
+    return 1 - x[3*idx+1] - x[3*idx+2]
+
+def con_overlap(i_idx, j_idx, x):
+    xi, yi, ri = x[3*i_idx], x[3*i_idx+1], x[3*i_idx+2]
+    xj, yj, rj = x[3*j_idx], x[3*j_idx+1], x[3*j_idx+2]
+    dist = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+    return dist - ri - rj
+
+# Refactored run_packing to use top-level helpers
+def run_packing_refactored() -> tuple[np.ndarray, np.ndarray, float]:
+    n_circles = 26
+    
+    # Initialization
+    r_base = 0.095
+    coords_x = np.linspace(r_base, 1-r_base, 5)
+    coords_y = np.linspace(r_base, 1-r_base, 5)
+    
+    centers = []
+    for x in coords_x:
+        for y in coords_y:
+            centers.append([x, y])
+    centers.append([0.206, 0.206])
+    
+    radii = np.full(26, r_base)
+    
+    x0 = np.zeros(26 * 3)
+    for i in range(26):
+        x0[3*i] = centers[i][0]
+        x0[3*i+1] = centers[i][1]
+        x0[3*i+2] = radii[i]
+        
+    def objective(x):
+        return -np.sum(x[2::3])
+        
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * 26
+    
+    constraints_list = []
+    
+    # Boundary constraints using top-level functions via lambda or partial? 
+    # Prompt says "Don't use any lambda functions".
+    # But I can pass the index to the top-level function?
+    # No, the constraint function signature for minimize is f(x).
+    # I need to create instances of these functions.
+    # I can use a class or a factory that returns a callable object without lambda?
+    # Or just define the functions to accept x and return value, but how to pass index?
+    # The prompt restriction "no closures" usually means don't capture variables from outer scope.
+    # If I pass the index as an argument, I need to wrap it.
+    # A simple class can implement __call__.
+    
+    class Constraint:
+        def __init__(self, func, idx1=None, idx2=None):
+            self.func = func
+            self.idx1 = idx1
+            self.idx2 = idx2
+        def __call__(self, x):
+            if self.idx1 is not None and self.idx2 is not None:
+                return self.func(self.idx1, self.idx2, x)
+            elif self.idx1 is not None:
+                return self.func(self.idx1, x)
+            else:
+                return self.func(x)
+
+    for i in range(26):
+        constraints_list.append({'type': 'ineq', 'fun': Constraint(con_boundary_x_minus_r, i)})
+        constraints_list.append({'type': 'ineq', 'fun': Constraint(con_boundary_1_minus_x_r, i)})
+        constraints_list.append({'type': 'ineq', 'fun': Constraint(con_boundary_y_minus_r, i)})
+        constraints_list.append({'type': 'ineq', 'fun': Constraint(con_boundary_1_minus_y_r, i)})
+
+    for i in range(26):
+        for j in range(i + 1, 26):
+            constraints_list.append({'type': 'ineq', 'fun': Constraint(con_overlap, i, j)})
+
+    best_sum = -1e9
+    best_x = None
+    
+    for run in range(5):
+        current_x = x0.copy()
+        if run > 0:
+            noise = np.random.normal(0, 0.01, size=78)
+            current_x[::3] = np.clip(current_x[::3] + noise[::3], 0, 1)
+            current_x[1::3] = np.clip(current_x[1::3] + noise[1::3], 0, 1)
+            current_x[2::3] = np.clip(current_x[2::3] + noise[2::3], 0.01, 0.5)
+            
+        try:
+            res = opt.minimize(
+                objective, 
+                current_x, 
+                method='SLSQP', 
+                bounds=bounds, 
+                constraints=constraints_list,
+                options={'maxiter': 1000, 'ftol': 1e-9}
+            )
+            
+            current_sum = -res.fun
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_x = res.x.copy()
+        except Exception:
+            continue
+
+    params = best_x.reshape(-1, 3)
+    centers_final = params[:, :2]
+    radii_final = params[:, 2]
+    
+    # Safety clamp
+    for i in range(26):
+        x, y = centers_final[i]
+        r = radii_final[i]
+        max_r = min(x, 1-x, y, 1-y)
+        if max_r < r:
+            radii_final[i] = max(0, max_r)
+        if r < 0:
+            radii_final[i] = 0
+
+    return centers_final, radii_final, np.sum(radii_final)
+
+# Final code block
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # Re-define helpers inside to ensure they are available? 
+    # No, prompt says "Make all helper functions top level".
+    # I will define them outside run_packing in the final output.
+    return run_packing_refactored()

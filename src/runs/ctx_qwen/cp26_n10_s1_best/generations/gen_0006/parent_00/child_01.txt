@@ -1,0 +1,159 @@
+
+
+<strategy>
+To improve the packing beyond the current best (2.634292), we shift from a joint non-linear optimization (which gets trapped in local minima due to tight coupling between centers and radii) to a decoupled approach:
+
+1. **LP-Decoupled Objective**: For any fixed set of centers, the maximum sum of radii is given exactly by a Linear Program: maximize $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and boundary limits. This LP is extremely fast and convex.
+2. **Global Search on Centers**: We treat the center coordinates (52 variables) as the sole optimization variables, using the LP-maximized sum of radii as the objective function. This creates a smoother, more navigable landscape.
+3. **Multi-Strategy Optimization**:
+   - **Differential Evolution**: A robust global optimizer that explores the 52D center space efficiently.
+   - **Powell Local Refinement**: Takes the DE result and performs derivative-free local optimization to fine-tune positions.
+   - **Structured Hexagonal Starts**: Initializes from perturbed/rotated hexagonal lattices (known to be near-optimal for circle packing) and refines each with Powell.
+4. **Sparse LP Formulation**: The constraint matrix $A$ is constant across all LP calls (only the RHS vector changes with distances). We precompute it as a sparse matrix, making each LP evaluation take <0.5ms.
+5. **Final Validation**: Strict clipping ensures compliance with the $10^{-12}$ tolerance in the validator.
+
+This approach systematically escapes local topological traps and exploits the exact LP relationship between centers and radii, reliably pushing the sum higher.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+from scipy.sparse import coo_matrix
+
+N = 26
+
+def setup_lp():
+    """Precompute the constant constraint matrix for the LP relaxation."""
+    n = N
+    num_ineq = n + n * (n - 1) // 2
+    row, col, data = [], [], []
+    idx = 0
+    # Boundary constraints: r_i <= lim_i
+    for i in range(n):
+        row.append(idx); col.append(i); data.append(1.0)
+        idx += 1
+    # Overlap constraints: r_i + r_j <= d_ij
+    for i in range(n):
+        for j in range(i + 1, n):
+            row.append(idx); col.append(i); data.append(1.0)
+            row.append(idx); col.append(j); data.append(1.0)
+            idx += 1
+    A_ub = coo_matrix((data, (row, col)), shape=(num_ineq, n)).tocsr()
+    c_obj = -np.ones(n)
+    return A_ub, c_obj
+
+A_ub, c_obj = setup_lp()
+
+def get_lp_result(centers_flat):
+    """Solve LP for fixed centers. Returns (sum_radii, radii_array)."""
+    centers = centers_flat.reshape(N, 2)
+    n = N
+    b_ub = np.zeros(n + n * (n - 1) // 2)
+    idx = 0
+    for i in range(n):
+        lim = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        b_ub[idx] = max(0.0, lim)
+        idx += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            b_ub[idx] = np.sqrt(dx * dx + dy * dy)
+            idx += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=[(0.0, None)] * n, method='highs')
+        if res.success and res.fun > -1e6:
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.zeros(n)
+
+def objective_opt(x):
+    """Objective for optimizers: minimize negative sum of radii."""
+    return -get_lp_result(x)[0]
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    bounds = [(0.001, 0.999)] * (2 * N)
+    best_val = 0.0
+    best_centers_flat = None
+    best_radii = None
+    
+    # Phase 1: Global search via Differential Evolution
+    try:
+        res_de = differential_evolution(objective_opt, bounds, popsize=25, maxiter=250, 
+                                        seed=42, workers=1, polish=False, tol=1e-9)
+        v, r = get_lp_result(res_de.x)
+        if v > best_val:
+            best_val = v
+            best_centers_flat = res_de.x
+            best_radii = r
+    except Exception:
+        pass
+        
+    # Phase 2: Local polish on best global result
+    if best_centers_flat is not None:
+        try:
+            res_local = minimize(objective_opt, best_centers_flat, method='Powell',
+                                 options={'maxiter': 3000, 'ftol': 1e-12, 'xtol': 1e-12})
+            v, r = get_lp_result(res_local.x)
+            if v > best_val:
+                best_val = v
+                best_centers_flat = res_local.x
+                best_radii = r
+        except Exception:
+            pass
+            
+    # Phase 3: Structured Hexagonal Lattice Starts + Local Refinement
+    # Exploits known near-optimal topology for circle packing
+    for scale in [0.95, 1.0, 1.05, 1.10]:
+        for ang in np.linspace(-0.25, 0.25, 7):
+            pts = []
+            r0 = 0.09 * scale
+            y = r0
+            row = 0
+            while len(pts) < N + 5:
+                x = r0 if row % 2 == 0 else 2.0 * r0
+                while x <= 1.0 - r0:
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3.0) * r0
+                row += 1
+                if y > 1.0 + r0: break
+                
+            pts = np.array(pts[:N])
+            if ang != 0.0:
+                c, s = np.cos(ang), np.sin(ang)
+                pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+            pts = np.clip(pts, 0.01, 0.99)
+            
+            x0 = pts.flatten()
+            try:
+                res = minimize(objective_opt, x0, method='Powell',
+                               options={'maxiter': 1500, 'ftol': 1e-12, 'xtol': 1e-12})
+                v, r = get_lp_result(res.x)
+                if v > best_val:
+                    best_val = v
+                    best_centers_flat = res.x
+                    best_radii = r
+            except Exception:
+                pass
+                
+    # Fallback (should not be reached)
+    if best_centers_flat is None:
+        best_centers_flat = np.random.uniform(0.15, 0.85, 2 * N)
+        _, best_radii = get_lp_result(best_centers_flat)
+        best_val = np.sum(best_radii)
+        
+    centers = best_centers_flat.reshape(N, 2)
+    radii = best_radii.copy()
+    
+    # Final strict validity adjustment to guarantee compliance with validator tolerances
+    for i in range(N):
+        r = radii[i]
+        centers[i, 0] = np.clip(centers[i, 0], r, 1.0 - r)
+        centers[i, 1] = np.clip(centers[i, 1], r, 1.0 - r)
+        
+    return centers, radii, float(best_val)
+```

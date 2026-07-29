@@ -1,0 +1,144 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need to overcome the highly non-convex nature of the packing problem. Key improvements over the previous approach:
+1. **Squared Distance Constraints**: Replacing `dist - r_i - r_j >= 0` with `dist^2 - (r_i + r_j)^2 >= 0` eliminates the `sqrt` operation, providing a polynomial constraint surface with smoother, well-behaved gradients that significantly improve SLSQP convergence and stability near contact points.
+2. **Hexagonal Lattice Initialization**: Hexagonal packing is the densest 2D arrangement. We generate multiple initial configurations using perturbed hexagonal lattices with varying scales and shifts to cover different promising basins of attraction.
+3. **Perturbation Local Search**: After finding the global best from multiple restarts, we run a targeted local search by perturbing the best solution slightly and re-optimizing. This helps escape shallow local minima that trap standard gradient methods.
+4. **Strict Feasibility Enforcement**: A robust post-processing step iteratively checks boundary and pairwise slacks, applying a minimal scale-down factor only when necessary to guarantee strict validity within the `1e-12` tolerance required by the validator.
+5. **Vectorized Constraint Evaluation**: Precomputing pairwise indices and using NumPy array operations accelerates the constraint function evaluation, allowing more iterations within the optimization budget.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+# Precompute indices for all unique circle pairs (upper triangle)
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Minimize negative sum of radii to maximize total radius."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """
+    Compute all inequality constraints. Returns array where each element >= 0.
+    Uses squared distances for smoother optimization landscape.
+    """
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c_bound = np.zeros(4*N)
+    c_bound[0::4] = x - r
+    c_bound[1::4] = 1 - x - r
+    c_bound[2::4] = y - r
+    c_bound[3::4] = 1 - y - r
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = x[I_IDX] - x[J_IDX]
+    dy = y[I_IDX] - y[J_IDX]
+    r_sum = r[I_IDX] + r[J_IDX]
+    
+    c_pair = dx**2 + dy**2 - r_sum**2
+    
+    return np.concatenate([c_bound, c_pair])
+
+def generate_init(seed):
+    """Generate a valid initial configuration from a perturbed hexagonal lattice."""
+    np.random.seed(seed)
+    # Base radius estimate for hexagonal packing
+    r0 = 0.09 + np.random.uniform(-0.02, 0.02)
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < N + 10:
+        # Hexagonal shift: odd rows shifted horizontally by r0
+        xs = r0 + (row % 2) * r0
+        x = xs
+        while x <= 1 - r0 and len(pts) < N + 10:
+            pts.append((x, y))
+            x += 2 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+        
+    pts = np.array(pts[:N])
+    # Add controlled jitter to break symmetry
+    pts += np.random.uniform(-0.03, 0.03, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    
+    # Initial small radii to guarantee feasibility
+    init_radii = np.full(N, 0.06)
+    return np.concatenate([pts[:, 0], pts[:, 1], init_radii])
+
+def run_packing():
+    # Variable bounds: coordinates in [0, 1], radii in [0, 0.5]
+    bounds = [(0.0, 1.0)]*(2*N) + [(0.0, 0.5)]*N
+    best_sum = 0.0
+    best_v = None
+    
+    # Phase 1: Multi-start optimization from diverse hexagonal lattices
+    for seed in range(20):
+        v0 = generate_init(seed)
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraints},
+                           options={'maxiter': 6000, 'ftol': 1e-11, 'disp': False})
+            s = -res.fun
+            # Accept if better and sufficiently feasible
+            if s > best_sum and np.min(constraints(res.x)) >= -1e-7:
+                best_sum = s
+                best_v = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Perturbation local search to escape shallow local minima
+    if best_v is not None:
+        for _ in range(5):
+            v_pert = best_v.copy()
+            v_pert += np.random.normal(0, 0.005, v_pert.shape)
+            v_pert = np.clip(v_pert, 0.0, 1.0)
+            v_pert[2*N:] = np.clip(v_pert[2*N:], 0.0, 0.5)
+            
+            try:
+                res = minimize(objective, v_pert, method='SLSQP', bounds=bounds,
+                               constraints={'type': 'ineq', 'fun': constraints},
+                               options={'maxiter': 4000, 'ftol': 1e-11, 'disp': False})
+                if -res.fun > best_sum and np.min(constraints(res.x)) >= -1e-7:
+                    best_sum = -res.fun
+                    best_v = res.x.copy()
+            except Exception:
+                continue
+                
+    # Extract final results
+    centers = np.column_stack((best_v[:N], best_v[N:2*N]))
+    radii = best_v[2*N:]
+    
+    # Phase 3: Strict feasibility enforcement
+    # Iteratively shrink radii minimally only if constraints are violated
+    for _ in range(10):
+        min_slack = 1.0
+        # Check boundaries
+        for i in range(N):
+            x, y = centers[i]
+            r = radii[i]
+            sl = min(x - r, 1 - x - r, y - r, 1 - y - r)
+            if sl < min_slack: min_slack = sl
+        # Check pairwise distances
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                sl = d - radii[i] - radii[j]
+                if sl < min_slack: min_slack = sl
+                
+        if min_slack < -1e-9:
+            # Apply minimal uniform scale-down to restore feasibility
+            scale = 1.0 + min_slack / np.max(radii)
+            radii *= max(0.999, scale)
+        else:
+            break
+            
+    return centers, radii, float(np.sum(radii))
+```

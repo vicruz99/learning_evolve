@@ -1,0 +1,162 @@
+# sol_000268 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state fd8f28d8) state=869f7f0e sum of radii=2.120490 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # 1. Initial hexagonal lattice setup
+    # Row configurations for 26 points: 5, 6, 5, 6, 4
+    rows_config = [5, 6, 5, 6, 4]
+    centers = []
+    y_base = 0.05
+    dy = 0.2
+    
+    for row_idx, num_points in enumerate(rows_config):
+        y = y_base + row_idx * dy
+        if row_idx % 2 == 0: # Even rows start at 0.05
+            x_start = 0.05
+            x_step = 0.2
+            if num_points > 5: # Adjust spacing for 6 points
+                x_step = 1.0 / 6.0
+                x_start = x_step / 2.0
+        else: # Odd rows (staggered)
+            x_start = 0.15
+            x_step = 0.2
+            if num_points > 5:
+                x_step = 1.0 / 6.0
+                x_start = x_step / 2.0 + (x_step / 2.0)
+                
+        # Generate x coordinates
+        x_coords = np.linspace(0.1, 0.9, num_points)
+        
+        for x in x_coords:
+            centers.append([x, y])
+
+    centers = np.array(centers[:n])
+    # Initialize radii slightly smaller to ensure validity
+    radii = np.full(n, 0.04)
+    
+    # 2. Iterative Optimization
+    for iteration in range(50):
+        # 2a. Solve LP for optimal radii given fixed centers
+        # Variables: r_0, ..., r_25
+        # Maximize sum(r_i) => Minimize -sum(r_i)
+        c_obj = -np.ones(n)
+        
+        A_ub = []
+        b_ub = []
+        
+        # Inter-circle constraints: r_i + r_j <= distance_ij
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                A_ub.append(np.zeros(n))
+                A_ub[-1][i] = 1.0
+                A_ub[-1][j] = 1.0
+                b_ub.append(dist)
+        
+        # Boundary constraints: r_i <= min(x, 1-x, y, 1-y)
+        for i in range(n):
+            max_r = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+            A_ub.append(np.zeros(n))
+            A_ub[-1][i] = 1.0
+            b_ub.append(max_r)
+            
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        bounds = [(0, None) for _ in range(n)]
+        res_lp = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if not res_lp.success:
+            continue
+        radii = res_lp.x
+        
+        # 2b. Perturb centers to improve packing
+        noise = np.random.normal(0, 0.002, (n, 2))
+        centers = centers + noise
+        
+        # 2c. Optimize centers to maximize sum of radii
+        def objective(vars_2d):
+            # We want to maximize sum(radii). In minimize, we return negative.
+            # The constraints will ensure radii are feasible.
+            return -np.sum(radii)
+        
+        # We optimize the positions. 
+        # We can't directly change 'radii' in the objective because they are results of LP.
+        # Instead, we optimize centers to increase the "potential" radii.
+        # A simpler proxy: maximize the minimum slack.
+        # However, to be robust, we just keep the LP radii and adjust centers.
+        
+        # Let's define a function that calculates sum of radii for a set of centers
+        def get_sum_radii(centers_flat):
+            c = centers_flat.reshape(-1, 2)
+            A = []
+            b = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dist = np.sqrt(np.sum((c[i] - c[j])**2))
+                    A.append(np.zeros(n))
+                    A[-1][i] = 1.0
+                    A[-1][j] = 1.0
+                    b.append(dist)
+                mx = min(c[i, 0], 1 - c[i, 0], c[i, 1], 1 - c[i, 1])
+                A.append(np.zeros(n))
+                A[-1][i] = 1.0
+                b.append(mx)
+            A = np.array(A)
+            b = np.array(b)
+            res = linprog(-np.ones(n), A_ub=A, b_ub=b, bounds=[(0, None)]*n, method='highs')
+            if res.success:
+                return -res.fun, res.x
+            else:
+                return -1e9, np.zeros(n)
+        
+        # Use L-BFGS-B to find better centers
+        current_sum = np.sum(radii)
+        
+        # Simple gradient-free approach for centers using minimize
+        def obj_center(vars_1d):
+            s, _ = get_sum_radii(vars_1d)
+            return -s
+
+        cons = [{'type': 'ineq', 'fun': lambda v: min(v[0], 1-v[0], v[1], 1-v[1])}] # placeholder, handled in LP
+
+        # To speed up, we only optimize if we want, but here we do it for robustness
+        # Note: full optimization of 78 variables is heavy. We rely on LP for radii 
+        # and simple random walk/noise for centers.
+        
+    # Final LP to get exact max radii for final centers
+    A_final = []
+    b_final = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            A_final.append(np.zeros(n))
+            A_final[-1][i] = 1.0
+            A_final[-1][j] = 1.0
+            b_final.append(dist)
+        mx = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        A_final.append(np.zeros(n))
+        A_final[-1][i] = 1.0
+        b_final.append(mx)
+        
+    A_final = np.array(A_final)
+    b_final = np.array(b_final)
+    
+    res_final = linprog(-np.ones(n), A_ub=A_final, b_ub=b_final, bounds=[(0, None)]*n, method='highs')
+    
+    if res_final.success:
+        radii = res_final.x
+        sum_radii = np.sum(radii)
+    else:
+        radii = np.full(n, 0.01)
+        sum_radii = 0.26
+
+    return centers, radii, sum_radii

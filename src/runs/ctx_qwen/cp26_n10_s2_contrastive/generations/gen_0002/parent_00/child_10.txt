@@ -1,0 +1,244 @@
+
+
+<strategy>
+To push the sum of radii past 2.636, I will employ a multi-stage optimization strategy that addresses the non-convex nature of the circle packing problem:
+
+1. **Smooth Constraint Formulation**: Replace Euclidean distance constraints with squared-distance constraints `(x_i-x_j)^2 + (y_i-y_j)^2 - (r_i+r_j)^2 >= 0`. This removes the `sqrt` singularity at zero distance and provides a $C^1$ smooth landscape, significantly improving SLSQP convergence speed and precision.
+2. **LP-Guided Initialization**: For any given set of centers, the optimal radii form a linear programming problem. I will solve this LP to generate feasible, tightly-packed initial radii for each random/geometric start. This guarantees feasibility and places the optimizer near a local basin immediately.
+3. **Diverse Multi-Start SLSQP**: Run constrained optimization from multiple structurally distinct layouts (random, hexagonal lattice, grid) to explore the configuration space broadly.
+4. **Gradient-Free Center Polishing (LP Oracle)**: After SLSQP converges, switch to a derivative-free search that perturbs centers and re-solves the LP for radii. This directly maximizes the true objective function without getting trapped by constraint manifolds, often finding configurations that gradient-based methods miss.
+5. **Strict Post-Processing**: Apply iterative overlap resolution and boundary clamping with tight numerical tolerances to guarantee the `validate_packing` function accepts the result.
+
+This hybrid approach combines the local precision of SLSQP with the global robustness of direct search over the LP-reduced objective space.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N_CIRCLES = 26
+I_IDX, J_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def solve_lp_radii(centers):
+    """Solve LP to find optimal radii for fixed centers."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    A_ub = np.zeros((n * (n - 1) // 2, n))
+    b_ub = np.zeros(n * (n - 1) // 2)
+    bounds_r = []
+    
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        ub = min(x, 1.0 - x, y, 1.0 - y)
+        bounds_r.append((0.0, max(0.0, ub)))
+        
+        for j in range(i + 1, n):
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            d = np.hypot(dx, dy)
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = d
+            k += 1
+            
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 0.02)
+
+def objective(x):
+    """Negative sum of radii."""
+    return -np.sum(x[2 * N_CIRCLES:])
+
+def constraints(x):
+    """Inequality constraints: boundary and squared pairwise non-overlap."""
+    cx = x[:N_CIRCLES]
+    cy = x[N_CIRCLES:2 * N_CIRCLES]
+    r = x[2 * N_CIRCLES:]
+    
+    c = []
+    # Boundary constraints
+    c.append(cx - r)
+    c.append(1.0 - cx - r)
+    c.append(cy - r)
+    c.append(1.0 - cy - r)
+    
+    # Squared distance constraints for smoothness
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist_sq = dx**2 + dy**2
+    r_sum = r[:, None] + r[None, :]
+    c.append(dist_sq[I_IDX, J_IDX] - r_sum[I_IDX, J_IDX]**2)
+    
+    return np.concatenate(c)
+
+def generate_init_configs(rng):
+    """Generate diverse initial center configurations."""
+    configs = []
+    n = N_CIRCLES
+    
+    # 1. Random placements
+    for _ in range(25):
+        c = rng.uniform(0.15, 0.85, (n, 2))
+        configs.append(c)
+        
+    # 2. Hexagonal lattice variants
+    for seed in range(15):
+        c = np.zeros((n, 2))
+        idx = 0
+        row = 0
+        y = 0.08 + row * 0.185 * np.sqrt(3) / 2
+        while idx < n and y < 0.95:
+            x_start = 0.08 + (row % 2) * 0.0925
+            col = 0
+            while x_start + col * 0.185 < 0.95 and idx < n:
+                c[idx] = [x_start + col * 0.185, y]
+                idx += 1
+                col += 1
+            y += 0.185 * np.sqrt(3) / 2
+            row += 1
+        c += rng.uniform(-0.025, 0.025, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        configs.append(c)
+        
+    # 3. Grid-like variants
+    for seed in range(10):
+        c = np.zeros((n, 2))
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                if idx < n:
+                    c[idx] = [0.12 + j * 0.16, 0.12 + i * 0.16]
+                    idx += 1
+        while idx < n:
+            c[idx] = rng.uniform(0.2, 0.8, 2)
+            idx += 1
+        c += rng.uniform(-0.02, 0.02, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        configs.append(c)
+        
+    return configs
+
+def run_packing():
+    np.random.seed(12345)
+    rng = np.random.RandomState(12345)
+    
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    configs = generate_init_configs(rng)
+    
+    # Phase 1: SLSQP from diverse starts with LP-initialized radii
+    for centers in configs:
+        r_init = solve_lp_radii(centers) * 0.98  # Slight margin for strict feasibility
+        x0 = np.concatenate([centers.flatten(), r_init])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict,
+                           options={'maxiter': 2500, 'ftol': 1e-13, 'disp': False})
+            
+            c_opt = res.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+            r_opt = res.x[2*N_CIRCLES:]
+            
+            if np.sum(r_opt) > best_sum:
+                best_sum = np.sum(r_opt)
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local refinement around best found
+    if best_c is not None:
+        for trial in range(40):
+            rng_ref = np.random.RandomState(trial + 500)
+            pert_c = best_c + rng_ref.randn(N_CIRCLES, 2) * 0.002
+            pert_c = np.clip(pert_c, 0.01, 0.99)
+            pert_r = best_r + rng_ref.randn(N_CIRCLES) * 0.0005
+            pert_r = np.clip(pert_r, 0.001, 0.5)
+            
+            x0 = np.concatenate([pert_c.flatten(), pert_r])
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons_dict,
+                               options={'maxiter': 5000, 'ftol': 1e-14, 'disp': False})
+                c_opt = res.x[:2*N_CIRCLES].reshape(N_CIRCLES, 2)
+                r_opt = res.x[2*N_CIRCLES:]
+                
+                if np.sum(r_opt) > best_sum:
+                    best_sum = np.sum(r_opt)
+                    best_c = c_opt.copy()
+                    best_r = r_opt.copy()
+            except Exception:
+                continue
+                
+    # Phase 3: Gradient-free center search using LP oracle
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_r = best_r.copy()
+        best_lp_sum = np.sum(curr_r)
+        step = 0.008
+        
+        for epoch in range(40):
+            improved = False
+            for _ in range(25):
+                cand_c = curr_c + np.random.randn(N_CIRCLES, 2) * step
+                cand_c = np.clip(cand_c, 0.02, 0.98)
+                cand_r = solve_lp_radii(cand_c)
+                s = np.sum(cand_r)
+                if s > best_lp_sum:
+                    best_lp_sum = s
+                    curr_c = cand_c.copy()
+                    curr_r = cand_r.copy()
+                    improved = True
+            if not improved:
+                step *= 0.85
+            else:
+                step = min(step * 1.05, 0.03)
+                
+        if best_lp_sum > best_sum:
+            best_sum = best_lp_sum
+            best_c = curr_c.copy()
+            best_r = curr_r.copy()
+
+    # Phase 4: Strict post-processing to guarantee validation passes
+    if best_c is not None:
+        margin = 1e-9
+        for i in range(N_CIRCLES):
+            x, y = best_c[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y) - margin
+            if best_r[i] > max_r:
+                best_r[i] = max(0.0, max_r)
+                
+        for _ in range(150):
+            changed = False
+            for i in range(N_CIRCLES):
+                for j in range(i + 1, N_CIRCLES):
+                    dx = best_c[i, 0] - best_c[j, 0]
+                    dy = best_c[i, 1] - best_c[j, 1]
+                    d = np.hypot(dx, dy)
+                    if d < best_r[i] + best_r[j] - 1e-12:
+                        excess = best_r[i] + best_r[j] - d + 1e-10
+                        best_r[i] -= excess / 2.0
+                        best_r[j] -= excess / 2.0
+                        changed = True
+            if not changed:
+                break
+        best_r = np.maximum(best_r, 0.0)
+        best_sum = np.sum(best_r)
+        
+    if best_c is None:
+        best_c = np.random.rand(N_CIRCLES, 2) * 0.6 + 0.2
+        best_r = np.full(N_CIRCLES, 0.02)
+        best_sum = np.sum(best_r)
+        
+    return best_c, best_r, float(best_sum)
+```

@@ -1,0 +1,154 @@
+# sol_000080 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000001 (state 1501c8b5) state=231e57c1 sum of radii=1.511457 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def get_pair_indices(n):
+    """Return indices for the upper triangle of the distance matrix."""
+    return np.triu_indices(n, k=1)
+
+def objective_func(vars_):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars_[2*N_CIRCLES:])
+
+def constraint_func(vars_, pair_i, pair_j):
+    """
+    Computes all inequality constraints (must return values >= 0).
+    Uses squared distances to avoid sqrt singularities and improve gradients.
+    """
+    xs = vars_[:N_CIRCLES]
+    ys = vars_[N_CIRCLES:2*N_CIRCLES]
+    rs = vars_[2*N_CIRCLES:]
+    
+    # Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+    cons = np.concatenate([
+        xs - rs,
+        1.0 - xs - rs,
+        ys - rs,
+        1.0 - ys - rs
+    ])
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    dx = xs[pair_i] - xs[pair_j]
+    dy = ys[pair_i] - ys[pair_j]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = rs[pair_i] + rs[pair_j]
+    cons = np.concatenate([cons, dist_sq - r_sum**2])
+    
+    return cons
+
+def generate_init_config(n, seed, config_type='hex'):
+    """Generate a feasible initial configuration."""
+    np.random.seed(seed)
+    if config_type == 'hex':
+        centers = []
+        r_est = 0.09
+        y = r_est
+        row = 0
+        while len(centers) < n + 10:
+            x_start = r_est if row % 2 == 0 else 2 * r_est
+            x = x_start
+            while x <= 1.0 - r_est:
+                centers.append([x, y])
+                x += 2 * r_est
+            y += r_est * np.sqrt(3)
+            row += 1
+        np.random.shuffle(centers)
+        centers = np.array(centers[:n])
+        centers += np.random.uniform(-0.01, 0.01, size=centers.shape)
+        centers = np.clip(centers, 0.05, 0.95)
+    else:
+        centers = np.random.uniform(0.05, 0.95, size=(n, 2))
+    return centers
+
+def enforce_validity(centers, radii, n):
+    """Strictly enforce boundary and non-overlap constraints."""
+    radii = radii.copy()
+    for k in range(n):
+        radii[k] = max(0.0, radii[k])
+        x, y = centers[k]
+        radii[k] = min(radii[k], x, 1.0 - x, y, 1.0 - y)
+        
+    for k in range(n):
+        for l in range(k + 1, n):
+            d = np.hypot(centers[k, 0] - centers[l, 0], centers[k, 1] - centers[l, 1])
+            s = radii[k] + radii[l]
+            if d < s:
+                shrink = (s - d) / 2.0 + 1e-9
+                radii[k] = max(0.0, radii[k] - shrink)
+                radii[l] = max(0.0, radii[l] - shrink)
+    return radii
+
+def run_packing():
+    n = N_CIRCLES
+    pair_i, pair_j = get_pair_indices(n)
+    bounds = [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # 1. Multi-start optimization
+    configs = []
+    for seed in range(10):
+        configs.append((generate_init_config(n, seed, 'hex'), 0.03))
+        configs.append((generate_init_config(n, seed + 100, 'random'), 0.03))
+        
+    for centers_init, r_init_val in configs:
+        v0 = np.concatenate([centers_init.flatten(), np.full(n, r_init_val)])
+        
+        try:
+            res = minimize(objective_func, v0, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': constraint_func, 'args': (pair_i, pair_j)},
+                           options={'maxiter': 4000, 'ftol': 1e-12, 'disp': False})
+            
+            if res.success:
+                centers = res.x[:2 * n].reshape(n, 2)
+                radii = enforce_validity(centers, res.x[2 * n:], n)
+                
+                curr_sum = np.sum(radii)
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_centers = centers.copy()
+                    best_radii = radii.copy()
+        except Exception:
+            pass
+            
+    # 2. Local refinement to escape shallow local minima
+    if best_centers is not None:
+        for seed in range(5):
+            np.random.seed(seed)
+            c_pert = best_centers + np.random.uniform(-0.002, 0.002, size=(n, 2))
+            c_pert = np.clip(c_pert, 0.01, 0.99)
+            r_pert = best_radii * 0.99
+            v0 = np.concatenate([c_pert.flatten(), r_pert])
+            
+            try:
+                res = minimize(objective_func, v0, method='SLSQP', bounds=bounds,
+                               constraints={'type': 'ineq', 'fun': constraint_func, 'args': (pair_i, pair_j)},
+                               options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+                if res.success:
+                    centers = res.x[:2 * n].reshape(n, 2)
+                    radii = enforce_validity(centers, res.x[2 * n:], n)
+                    curr_sum = np.sum(radii)
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_centers = centers.copy()
+                        best_radii = radii.copy()
+            except Exception:
+                pass
+
+    # Fallback (should not be reached given robust starts)
+    if best_centers is None:
+        best_centers = np.random.uniform(0.1, 0.9, size=(n, 2))
+        best_radii = np.full(n, 0.01)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, float(best_sum)

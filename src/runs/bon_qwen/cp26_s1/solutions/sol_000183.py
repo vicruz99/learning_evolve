@@ -1,5 +1,5 @@
 # sol_000183 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9afef83a) state=48597ec9 sum of radii=2.022927 correctness=1.0
+# generation=0 parent=seed (state 5c6e3651) state=695b7f64 sum of radii=0.000000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,90 +7,168 @@
 import numpy as np
 
 def run_packing():
-    np.random.seed(42)
-    N = 26
+    """
+    Pack 26 circles in a unit square to maximize the sum of radii.
     
-    # Initialize centers in a hexagonal pattern
-    centers = np.zeros((N, 2))
-    idx = 0
-    counts = [6, 5, 6, 5, 4]
-    for r_idx, count in enumerate(counts):
-        y = r_idx * 0.18 + 0.15
-        for c_idx in range(count):
-            x = c_idx * 0.2 + 0.15 + (0.1 if r_idx % 2 == 1 else 0)
-            if idx < N:
-                centers[idx] = [x, y]
-                idx += 1
-                
-    # Add small noise to break symmetry and avoid grid-locking
-    centers += np.random.randn(N, 2) * 0.005
-    centers = np.clip(centers, 0.05, 0.95)
+    Returns:
+        centers: np.array of shape (26, 2)
+        radii: np.array of shape (26,)
+        sum_radii: float
+    """
+    n = 26
     
-    radii = np.full(N, 0.04)
+    # --- Initialization ---
+    # Place circles in a grid pattern to start with a valid, spread-out configuration
+    cols = 6
+    rows = 5
+    dx = 1.0 / (cols + 1)
+    dy = 1.0 / (rows + 1)
     
-    steps = 5000
-    for step in range(steps):
+    centers = []
+    radii = []
+    
+    grid_count = 0
+    for r_idx in range(rows):
+        for c_idx in range(cols):
+            if grid_count < n:
+                x = (c_idx + 1) * dx
+                y = (r_idx + 1) * dy
+                centers.append([x, y])
+                radii.append(0.02)  # Initial small radius
+                grid_count += 1
+    
+    centers = np.array(centers)
+    radii = np.array(radii)
+    
+    # --- Simulation Parameters ---
+    dt = 0.01
+    damping = 0.95
+    radii_growth = 0.0003  # Step size for increasing radii
+    max_steps = 10000      # Maximum number of simulation steps
+    
+    velocities = np.zeros_like(centers)
+    
+    # --- Simulation Loop ---
+    for step in range(max_steps):
+        # 1. Increase radii uniformly
+        radii += radii_growth
+        
+        # 2. Calculate Forces
         forces = np.zeros_like(centers)
         
-        # Circle-circle repulsion
-        for i in range(N):
-            for j in range(i + 1, N):
-                diff = centers[i] - centers[j]
-                dist = np.hypot(diff[0], diff[1])
-                min_dist = radii[i] + radii[j]
-                if dist < min_dist:
-                    overlap = min_dist - dist
-                    if dist > 1e-9:
-                        factor = overlap / dist
-                        forces[i, 0] += diff[0] * factor
-                        forces[i, 1] += diff[1] * factor
-                        forces[j, 0] -= diff[0] * factor
-                        forces[j, 1] -= diff[1] * factor
-                    else:
-                        # Fallback for coincident centers
-                        forces[i, 0] += np.random.randn() * 0.05
-                        forces[i, 1] += np.random.randn() * 0.05
-                        forces[j, 0] -= forces[i, 0]
-                        forces[j, 1] -= forces[i, 1]
-                        
-            # Boundary repulsion
+        # Boundary forces (stiff springs pushing circles back inside)
+        for i in range(n):
             x, y = centers[i]
             r = radii[i]
-            if x < r: forces[i, 0] += (r - x) * 2.0
-            if x > 1.0 - r: forces[i, 0] -= (x - (1.0 - r)) * 2.0
-            if y < r: forces[i, 1] += (r - y) * 2.0
-            if y > 1.0 - r: forces[i, 1] -= (y - (1.0 - r)) * 2.0
             
-        # Adaptive step size (cooldown)
-        alpha = 0.15 * (1.0 - step / steps) + 0.005
+            # Left wall
+            if x - r < 0:
+                forces[i, 0] += (r - x) * 100.0
+            # Right wall
+            if x + r > 1:
+                forces[i, 0] -= (x + r - 1) * 100.0
+            # Bottom wall
+            if y - r < 0:
+                forces[i, 1] += (r - y) * 100.0
+            # Top wall
+            if y + r > 1:
+                forces[i, 1] -= (y + r - 1) * 100.0
         
-        centers += alpha * forces
-        centers = np.clip(centers, 0.0, 1.0)
+        # Pairwise repulsive forces for overlapping circles
+        for i in range(n):
+            for j in range(i + 1, n):
+                diff = centers[i] - centers[j]
+                dist = np.sqrt(np.sum(diff ** 2))
+                
+                if dist < radii[i] + radii[j]:
+                    # Calculate repulsive force proportional to overlap
+                    overlap = (radii[i] + radii[j]) - dist
+                    # Avoid division by zero
+                    if dist > 1e-9:
+                        force_magnitude = overlap * 100.0 / dist
+                        forces[i] += diff * force_magnitude
+                        forces[j] -= diff * force_magnitude
+                    else:
+                        # If centers coincide, push apart randomly or along axis
+                        forces[i, 0] += 10.0
+                        forces[j, 0] -= 10.0
         
-        # Expand radii gradually
-        if step < 4000:
-            expansion = 1.0 + 0.004 / (1.0 + step / 300.0)
-            for i in range(N):
-                max_r = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
-                for j in range(N):
-                    if i == j: continue
-                    d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
-                    if d / 2.0 < max_r:
-                        max_r = d / 2.0
-                radii[i] = min(radii[i] * expansion, max_r * 0.995)
+        # 3. Update Velocities and Positions
+        velocities += forces * dt
+        velocities *= damping
+        centers += velocities * dt
+        
+        # 4. Hard Constraints (Clamp positions to ensure validity)
+        # This prevents circles from getting stuck in walls or overlapping significantly
+        for i in range(n):
+            r = radii[i]
+            centers[i, 0] = np.clip(centers[i, 0], r, 1 - r)
+            centers[i, 1] = np.clip(centers[i, 1], r, 1 - r)
+            
+            # Additional check: if radius is too large for any position, shrink it
+            # This handles cases where radii growth outpaces position adjustment
+            max_possible_r = min(centers[i, 0], 1 - centers[i, 0], 
+                                 centers[i, 1], 1 - centers[i, 1])
+            if radii[i] > max_possible_r + 1e-9:
+                radii[i] = max_possible_r
 
-    # Final exact radius calculation based on settled positions
-    final_radii = np.zeros(N)
-    for i in range(N):
-        max_r = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
-        for j in range(N):
-            if i == j: continue
-            d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
-            if d / 2.0 < max_r:
-                max_r = d / 2.0
-        final_radii[i] = max_r
-        
-    # Conservative adjustment to guarantee strict inequality in validation
-    final_radii = final_radii * 0.9999999
+    # Final validation and cleaning
+    # Ensure no NaNs and valid bounds
+    centers = np.nan_to_num(centers, nan=0.5)
+    radii = np.nan_to_num(radii, nan=0.0)
     
-    return centers, final_radii, np.sum(final_radii)
+    # One last pass to strictly enforce constraints (shrink if necessary)
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        
+        # Boundary check
+        r = min(r, x, 1 - x, y, 1 - y)
+        
+        # Overlap check with all others
+        for j in range(n):
+            if i == j: continue
+            dx = centers[i, 0] - centers[j, 0]
+            dy = centers[i, 1] - centers[j, 1]
+            dist = np.sqrt(dx*dx + dy*dy)
+            required_dist = radii[i] + radii[j]
+            if dist < required_dist:
+                # Shrink radius i to resolve overlap (simple fix)
+                # Ideally both should shrink, but shrinking one is sufficient for validity
+                # We shrink the one that allows less reduction? 
+                # Just shrink i to fit
+                r = dist - radii[j]
+                if r < 0: r = 0
+        
+        radii[i] = r
+        # Update center to be strictly inside with new radius
+        centers[i, 0] = np.clip(centers[i, 0], radii[i], 1 - radii[i])
+        centers[i, 1] = np.clip(centers[i, 1], radii[i], 1 - radii[i])
+
+    sum_radii = np.sum(radii)
+    return centers, radii, sum_radii
+
+# Helper to run and print result if executed directly
+if __name__ == "__main__":
+    centers, radii, sum_r = run_packing()
+    print(f"Sum of radii: {sum_r:.6f}")
+    
+    # Basic validation
+    try:
+        import numpy as np_np # alias to avoid conflict if any
+        n = centers.shape[0]
+        valid = True
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < -1e-9 or x + r > 1 + 1e-9 or y - r < -1e-9 or y + r > 1 + 1e-9:
+                print(f"Invalid boundary for circle {i}")
+                valid = False
+            for j in range(i + 1, n):
+                dist = np.sqrt((centers[i, 0]-centers[j, 0])**2 + (centers[i, 1]-centers[j, 1])**2)
+                if dist < radii[i] + radii[j] - 1e-9:
+                    print(f"Overlap between {i} and {j}")
+                    valid = False
+        print(f"Validation passed: {valid}")
+    except Exception as e:
+        print(f"Validation error: {e}")

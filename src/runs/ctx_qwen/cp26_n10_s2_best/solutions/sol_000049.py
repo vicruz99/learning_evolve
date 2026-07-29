@@ -1,0 +1,159 @@
+# sol_000049 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000016 (state 585439f0) state=0aad4082 sum of radii=2.628058 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(vars):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars[2*N:])
+
+def constraints(vars):
+    """Inequality constraints: boundaries and non-overlap."""
+    x = vars[:N]
+    y = vars[N:2*N]
+    r = vars[2*N:]
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c = np.concatenate([
+        x - r,
+        1.0 - x - r,
+        y - r,
+        1.0 - y - r
+    ])
+    
+    # Pairwise non-overlap constraints (vectorized)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    sum_r = r[:, None] + r[None, :]
+    
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c = np.concatenate([c, (dist - sum_r)[mask]])
+    return c
+
+def ensure_feasible(vars):
+    """Adjusts radii to guarantee the configuration satisfies all constraints strictly."""
+    x = vars[:N].copy()
+    y = vars[N:2*N].copy()
+    r = vars[2*N:].copy()
+    tol = 1e-6
+    
+    # Enforce boundary constraints
+    for i in range(N):
+        r[i] = min(r[i], x[i] - tol, 1.0 - x[i] - tol, y[i] - tol, 1.0 - y[i] - tol)
+        
+    # Enforce non-overlap constraints iteratively until stable
+    for _ in range(10):
+        for i in range(N):
+            for j in range(N):
+                if i == j: continue
+                d = np.hypot(x[i] - x[j], y[i] - y[j])
+                max_r = d - r[j] - tol
+                if r[i] > max_r:
+                    r[i] = max(0.0, max_r)
+                    
+    return np.concatenate([x, y, r])
+
+def generate_init(seed, layout='hex'):
+    """Generates an initial configuration and ensures feasibility."""
+    np.random.seed(seed)
+    if layout == 'hex':
+        r0 = 0.09
+        centers = []
+        y = r0
+        row = 0
+        while len(centers) < N:
+            x_start = r0 if row % 2 == 0 else 2 * r0
+            x = x_start
+            while x <= 1 - r0 and len(centers) < N:
+                centers.append([x, y])
+                x += 2 * r0
+            y += r0 * np.sqrt(3)
+            row += 1
+        centers = np.array(centers[:N])
+    else: # dense grid variant
+        centers = []
+        for i in range(5):
+            for j in range(5):
+                centers.append([0.1 + i * 0.2, 0.1 + j * 0.2])
+        centers.append([0.5, 0.05])
+        centers = np.array(centers[:N])
+        
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    centers = np.clip(centers, 0.02, 0.98)
+    r = np.full(N, 0.04)
+    
+    vars_init = np.concatenate([centers[:, 0], centers[:, 1], r])
+    return ensure_feasible(vars_init)
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Multi-start optimization with diverse initializations
+    for seed in range(15):
+        for layout in ['hex', 'grid']:
+            x0 = generate_init(seed, layout)
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons_dict,
+                               options={'maxiter': 10000, 'ftol': 1e-13})
+                
+                # Check feasibility and record best
+                if -res.fun > best_sum:
+                    if np.all(constraints(res.x) >= -1e-8):
+                        best_sum = -res.fun
+                        best_x = res.x.copy()
+            except Exception:
+                continue
+                
+    # Local search refinement: perturb best solution to escape shallow local minima
+    if best_x is not None:
+        for _ in range(8):
+            x0 = best_x.copy()
+            # Perturb centers slightly
+            x0[:2*N] += np.random.uniform(-0.005, 0.005, 2*N)
+            x0[:2*N] = np.clip(x0[:2*N], 0.01, 0.99)
+            # Shrink radii to ensure feasibility after perturbation
+            x0[2*N:] *= 0.96
+            x0 = ensure_feasible(x0)
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons_dict,
+                               options={'maxiter': 10000, 'ftol': 1e-13})
+                if -res.fun > best_sum:
+                    if np.all(constraints(res.x) >= -1e-8):
+                        best_sum = -res.fun
+                        best_x = res.x.copy()
+            except Exception:
+                continue
+
+    if best_x is None:
+        best_x = generate_init(0, 'hex')
+        
+    centers = np.column_stack((best_x[:N], best_x[N:2*N]))
+    radii = best_x[2*N:].copy()
+    
+    # Strict post-processing to guarantee validation passes
+    for i in range(N):
+        radii[i] = min(radii[i], centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+        
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            if d < radii[i] + radii[j] - 1e-9:
+                shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-7
+                radii[i] = max(0.0, radii[i] - shrink)
+                radii[j] = max(0.0, radii[j] - shrink)
+                
+    return centers, radii, float(np.sum(radii))

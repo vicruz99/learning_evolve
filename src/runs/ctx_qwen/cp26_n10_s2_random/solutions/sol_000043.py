@@ -1,0 +1,164 @@
+# sol_000043 | problem=circle_packing_26 entrypoint=run_packing
+# generation=1 parent=sol_000002 (state 2c120403) state=e63f418f sum of radii=2.623068 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+N = 26
+
+# Precompute indices for pairwise overlap constraints to speed up evaluation
+i_idx, j_idx = np.triu_indices(N, k=1)
+
+def objective(p):
+    """Minimize negative sum of radii to maximize total radius."""
+    return -np.sum(p[2::3])
+
+def constraint_func(p):
+    """
+    Computes all boundary and non-overlap constraints.
+    Returns a 1D array where each element must be >= 0.
+    """
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3]
+    
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    # x >= r  => x - r >= 0
+    # 1 - x >= r => 1 - x - r >= 0
+    # y >= r => y - r >= 0
+    # 1 - y >= r => 1 - y - r >= 0
+    c_bound = np.concatenate([x - r, 1 - x - r, y - r, 1 - y - r])
+    
+    # Non-overlap constraints: dist(i,j) >= r_i + r_j
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    dist = np.sqrt(dx**2 + dy**2)
+    sum_r = r[i_idx] + r[j_idx]
+    
+    # Using linear distance instead of squared provides better gradient conditioning at the boundary
+    c_overlap = dist - sum_r
+    
+    return np.concatenate([c_bound, c_overlap])
+
+def generate_hex_init(perturb_scale=0.01):
+    """Generates an initial hexagonal packing configuration with optional noise."""
+    centers = np.zeros((N, 2))
+    radii = np.full(N, 0.09)
+    idx = 0
+    y = 0.09
+    row = 0
+    r = 0.09
+    
+    while idx < N:
+        # Alternate rows shifted by r for hexagonal packing
+        x_start = r if row % 2 == 0 else 2 * r
+        x = x_start
+        while x + r <= 1.0 + 1e-9 and idx < N:
+            centers[idx] = [x, y]
+            idx += 1
+            x += 2 * r
+        y += np.sqrt(3) * r
+        row += 1
+        
+    # Add controlled perturbation to break symmetry
+    noise = np.random.normal(0, perturb_scale, centers.shape)
+    centers += noise
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    # Flatten to [x1, y1, r1, x2, y2, r2, ...]
+    p = np.zeros(N * 3)
+    p[0::3] = centers[:, 0]
+    p[1::3] = centers[:, 1]
+    p[2::3] = radii
+    return p
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    
+    # Variable bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = []
+    for _ in range(N):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_p = None
+    best_sum = -np.inf
+    
+    # Phase 1: Multiple random restarts from perturbed hexagonal grids
+    num_restarts = 40
+    for seed in range(num_restarts):
+        np.random.seed(seed)
+        # Vary perturbation scale to explore different regions of the solution space
+        perturb = 0.005 * ((seed % 5) + 1)
+        p0 = generate_hex_init(perturb_scale=perturb)
+        
+        try:
+            res = opt.minimize(
+                objective, p0, method='SLSQP', bounds=bounds, 
+                constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12}
+            )
+            current_sum = -res.fun
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_p = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local search around the best found configuration
+    if best_p is not None:
+        for _ in range(15):
+            p_trial = best_p.copy()
+            # Small random perturbation to escape local minima
+            p_trial += np.random.normal(0, 0.001, p_trial.shape)
+            try:
+                res = opt.minimize(
+                    objective, p_trial, method='SLSQP', bounds=bounds,
+                    constraints=cons, options={'maxiter': 800, 'ftol': 1e-12}
+                )
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_p = res.x.copy()
+            except Exception:
+                continue
+                
+    # Fallback initialization if optimization fails entirely
+    if best_p is None:
+        best_p = generate_hex_init(perturb_scale=0.0)
+        
+    # Extract centers and radii
+    centers = np.zeros((N, 2))
+    radii = np.zeros(N)
+    centers[:, 0] = best_p[0::3]
+    centers[:, 1] = best_p[1::3]
+    radii = best_p[2::3].copy()
+    
+    # Repair phase: fix any microscopic overlaps or boundary violations from numerical precision
+    for _ in range(50):
+        changed = False
+        # Fix overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if dist < radii[i] + radii[j] - 1e-10:
+                    overlap = radii[i] + radii[j] - dist
+                    radii[i] -= overlap * 0.5
+                    radii[j] -= overlap * 0.5
+                    changed = True
+        # Fix boundaries
+        for i in range(N):
+            x, y = centers[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y)
+            if radii[i] > max_r - 1e-10:
+                radii[i] = max_r
+                changed = True
+        if not changed:
+            break
+            
+    # Ensure non-negativity
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))

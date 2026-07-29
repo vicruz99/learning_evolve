@@ -1,0 +1,393 @@
+
+
+Looking at the current solution and past attempts, I need a more sophisticated approach. The key insight is that the LP refinement for fixed centers is critical - it finds the mathematically optimal radii. The challenge is finding better center arrangements.
+
+<strategy>
+My strategy focuses on several improvements:
+
+1. **More diverse initializations**: Hexagonal patterns with varying spacing, corner-focused patterns (circles in corners can be larger), and random placements to ensure global exploration.
+
+2. **Aggressive multi-start search**: Run many more initial optimizations (150+) to find better basins of attraction.
+
+3. **Two-phase alternating optimization**: First run SLSQP jointly on centers+radii, then refine radii via LP. This combination is powerful because LP finds globally optimal radii for any fixed center configuration.
+
+4. **Multi-scale local refinement**: After finding the best solution, apply perturbations at multiple scales (small, medium, large) to escape local optima and find better global arrangements.
+
+5. **Constraint formulation**: Use squared distance constraints for smoother optimization landscape, and ensure numerical precision with tight tolerances.
+
+6. **HiGHS LP solver**: Use the HiGHS solver for faster and more reliable LP refinement of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+N_PAIRS = len(I_IDX)
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    A_ub = np.zeros((N_PAIRS, n))
+    A_ub[np.arange(N_PAIRS), I_IDX] = 1.0
+    A_ub[np.arange(N_PAIRS), J_IDX] = 1.0
+    
+    dx = centers[I_IDX, 0] - centers[J_IDX, 0]
+    dy = centers[I_IDX, 1] - centers[J_IDX, 1]
+    b_ub = np.sqrt(dx * dx + dy * dy)
+    
+    bounds_r = []
+    for i in range(n):
+        x, y = centers[i]
+        ub = min(x, 1.0 - x, y, 1.0 - y)
+        bounds_r.append((0.0, max(0.0, ub)))
+    
+    for method in ['highs', 'interior-point']:
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method=method)
+            if res.success and np.all(res.x >= -1e-9):
+                return np.maximum(res.x, 0.0), -res.fun
+        except Exception:
+            continue
+    return np.zeros(n), 0.0
+
+
+def objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+
+def constraints(x):
+    """Inequality constraints (>= 0): boundary + squared non-overlap."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    c = np.empty(4 * N + N_PAIRS)
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[I_IDX] - cx[J_IDX]
+    dy = cy[I_IDX] - cy[J_IDX]
+    r_sum = r[I_IDX] + r[J_IDX]
+    c[4*N:] = dx * dx + dy * dy - r_sum * r_sum
+    return c
+
+
+def gen_hex_init(seed, spacing=None):
+    """Generate hexagonal lattice initialization with varying parameters."""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    
+    if spacing is None:
+        spacing = 0.15 + rng.uniform(-0.03, 0.05)
+    
+    idx = 0
+    row = 0
+    y = spacing / 2.0 + rng.uniform(0, 0.03)
+    
+    while idx < N and y < 1.0 - spacing / 2.0:
+        x_start = spacing / 2.0 + (row % 2) * spacing / 2.0 + rng.uniform(0, 0.02)
+        col = 0
+        while x_start + col * spacing < 1.0 - spacing / 2.0 and idx < N:
+            centers[idx] = [x_start + col * spacing, y]
+            idx += 1
+            col += 1
+        y += spacing * np.sqrt(3) / 2.0
+        row += 1
+    
+    while idx < N:
+        centers[idx] = rng.uniform(0.1, 0.9, 2)
+        idx += 1
+    
+    centers += rng.normal(0, 0.006, centers.shape)
+    return np.clip(centers, 0.03, 0.97)
+
+
+def gen_corner_init(seed):
+    """Generate initialization with larger circles near corners."""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    
+    # Corner circles (can be larger)
+    centers[0] = [0.12 + rng.uniform(0, 0.04), 0.12 + rng.uniform(0, 0.04)]
+    centers[1] = [0.88 - rng.uniform(0, 0.04), 0.12 + rng.uniform(0, 0.04)]
+    centers[2] = [0.12 + rng.uniform(0, 0.04), 0.88 - rng.uniform(0, 0.04)]
+    centers[3] = [0.88 - rng.uniform(0, 0.04), 0.88 - rng.uniform(0, 0.04)]
+    
+    # Edge midpoints
+    centers[4] = [0.5 + rng.normal(0, 0.02), 0.10 + rng.uniform(0, 0.03)]
+    centers[5] = [0.5 + rng.normal(0, 0.02), 0.90 - rng.uniform(0, 0.03)]
+    centers[6] = [0.10 + rng.uniform(0, 0.03), 0.5 + rng.normal(0, 0.02)]
+    centers[7] = [0.90 - rng.uniform(0, 0.03), 0.5 + rng.normal(0, 0.02)]
+    
+    # Fill remaining with hexagonal pattern
+    idx = 8
+    spacing = 0.17 + rng.uniform(-0.02, 0.02)
+    y = spacing * 0.8
+    row = 0
+    while idx < N:
+        shift = (row % 2) * spacing / 2.0
+        x = spacing / 2.0 + shift + rng.uniform(0, 0.02)
+        col = 0
+        while x < 1.0 - spacing / 2.0 and idx < N:
+            centers[idx] = [x + rng.normal(0, 0.005), y + rng.normal(0, 0.005)]
+            idx += 1
+            x += spacing
+            col += 1
+        y += spacing * np.sqrt(3) / 2.0
+        row += 1
+    
+    centers += rng.normal(0, 0.004, centers.shape)
+    return np.clip(centers, 0.03, 0.97)
+
+
+def gen_grid_init(seed):
+    """Generate grid-based initialization."""
+    rng = np.random.RandomState(seed)
+    centers = np.zeros((N, 2))
+    
+    spacing = 0.18 + rng.uniform(-0.03, 0.03)
+    idx = 0
+    y = spacing / 2.0
+    while y < 1.0 - spacing / 2.0 and idx < N:
+        x = spacing / 2.0
+        while x < 1.0 - spacing / 2.0 and idx < N:
+            centers[idx] = [x + rng.normal(0, 0.01), y + rng.normal(0, 0.01)]
+            idx += 1
+            x += spacing
+        y += spacing
+    
+    while idx < N:
+        centers[idx] = rng.uniform(0.1, 0.9, 2)
+        idx += 1
+    
+    return np.clip(centers, 0.03, 0.97)
+
+
+def optimize_from_start(c0, bounds, cons, maxiter=10000):
+    """Run SLSQP + LP refinement from a starting configuration."""
+    n = N
+    r0, _ = solve_lp_radii(c0)
+    r0 = np.maximum(r0 * 0.95, 1e-6)
+    
+    x0 = np.zeros(3 * n)
+    x0[0::3] = c0[:, 0]
+    x0[1::3] = c0[:, 1]
+    x0[2::3] = r0
+    
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                       constraints=cons,
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        c_opt = np.column_stack((res.x[0::3], res.x[1::3]))
+        r_opt, s_opt = solve_lp_radii(c_opt)
+        return c_opt, r_opt, s_opt
+    except Exception:
+        return None, None, 0.0
+
+
+def optimize_from_start_advanced(c0, bounds, cons, maxiter=10000):
+    """Run multiple SLSQP rounds with LP refinement."""
+    n = N
+    r0, _ = solve_lp_radii(c0)
+    r0 = np.maximum(r0 * 0.96, 1e-6)
+    
+    x0 = np.zeros(3 * n)
+    x0[0::3] = c0[:, 0]
+    x0[1::3] = c0[:, 1]
+    x0[2::3] = r0
+    
+    best_c = c0.copy()
+    best_r = r0.copy()
+    best_s = np.sum(r0)
+    
+    for iteration in range(3):
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons,
+                           options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+            c_opt = np.column_stack((res.x[0::3], res.x[1::3]))
+            r_opt, s_opt = solve_lp_radii(c_opt)
+            
+            if s_opt > best_s:
+                best_s = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+            
+            # Prepare for next round with LP-optimized radii
+            r_new = np.maximum(best_r * 0.98, 1e-6)
+            x0 = np.zeros(3 * n)
+            x0[0::3] = best_c[:, 0]
+            x0[1::3] = best_c[:, 1]
+            x0[2::3] = r_new
+        except Exception:
+            break
+    
+    return best_c, best_r, best_s
+
+
+def strict_fix(centers, radii):
+    """Ensure strict feasibility."""
+    n = centers.shape[0]
+    radii = radii.copy()
+    
+    for i in range(n):
+        x, y = centers[i]
+        mx = min(x, 1.0 - x, y, 1.0 - y)
+        radii[i] = min(radii[i], max(0.0, mx - 1e-9))
+    
+    for _ in range(200):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    exc = radii[i] + radii[j] - d
+                    radii[i] -= exc / 2.0
+                    radii[j] -= exc / 2.0
+                    changed = True
+        if not changed:
+            break
+    
+    radii = np.maximum(radii, 0.0)
+    return centers, radii
+
+
+def run_packing():
+    """Main optimization routine."""
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-7, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Phase 1: Broad multi-start search with diverse initializations
+    all_starts = []
+    
+    # Hexagonal patterns with varying spacing
+    for seed in range(80):
+        spacing = 0.14 + (seed % 40) * 0.0015
+        all_starts.append(gen_hex_init(seed * 31 + 7, spacing))
+    
+    # Corner-focused patterns
+    for seed in range(30):
+        all_starts.append(gen_corner_init(seed * 17 + 13))
+    
+    # Grid patterns
+    for seed in range(20):
+        all_starts.append(gen_grid_init(seed * 23 + 11))
+    
+    # Random placements
+    for seed in range(40):
+        rng = np.random.RandomState(seed * 37 + 5)
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        c += rng.normal(0, 0.02, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        all_starts.append(c)
+    
+    for c0 in all_starts:
+        c_opt, r_opt, s_opt = optimize_from_start(c0, bounds, cons, maxiter=8000)
+        if c_opt is not None and s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            best_r = r_opt.copy()
+    
+    # Phase 2: Advanced refinement on best found so far
+    if best_c is not None:
+        c_ref, r_ref, s_ref = optimize_from_start_advanced(best_c, bounds, cons, maxiter=15000)
+        if s_ref > best_sum:
+            best_sum = s_ref
+            best_c = c_ref.copy()
+            best_r = r_ref.copy()
+    
+    # Phase 3: Fine local perturbation refinement
+    if best_c is not None:
+        for trial in range(100):
+            rng = np.random.RandomState(trial * 41 + 19)
+            c_pert = best_c + rng.normal(0, 0.002, best_c.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            
+            c_opt, r_opt, s_opt = optimize_from_start(c_pert, bounds, cons, maxiter=10000)
+            if c_opt is not None and s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    
+    # Phase 4: Medium-scale perturbation to escape local minima
+    if best_c is not None:
+        for trial in range(50):
+            rng = np.random.RandomState(trial * 53 + 29)
+            noise_scale = rng.uniform(0.005, 0.02)
+            c_pert = best_c + rng.normal(0, noise_scale, best_c.shape)
+            c_pert = np.clip(c_pert, 0.03, 0.97)
+            
+            c_opt, r_opt, s_opt = optimize_from_start(c_pert, bounds, cons, maxiter=12000)
+            if c_opt is not None and s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    
+    # Phase 5: Single-circle perturbation refinement
+    if best_c is not None:
+        for trial in range(60):
+            rng = np.random.RandomState(trial * 67 + 31)
+            c_pert = best_c.copy()
+            # Perturb only 2-3 circles at a time
+            n_perturb = rng.randint(1, 4)
+            indices = rng.choice(N, n_perturb, replace=False)
+            c_pert[indices] += rng.normal(0, 0.003, (n_perturb, 2))
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            
+            c_opt, r_opt, s_opt = optimize_from_start(c_pert, bounds, cons, maxiter=8000)
+            if c_opt is not None and s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    
+    # Phase 6: Simulated annealing style search
+    if best_c is not None:
+        current_c = best_c.copy()
+        current_r = best_r.copy()
+        current_s = best_sum
+        
+        for step in range(80):
+            rng = np.random.RandomState(step * 71 + 37)
+            temperature = 0.01 * np.exp(-step / 20)
+            
+            c_pert = current_c + rng.normal(0, temperature, current_c.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            
+            c_opt, r_opt, s_opt = optimize_from_start(c_pert, bounds, cons, maxiter=6000)
+            
+            if c_opt is not None:
+                if s_opt > current_s:
+                    current_s = s_opt
+                    current_c = c_opt.copy()
+                    current_r = r_opt.copy()
+                    if s_opt > best_sum:
+                        best_sum = s_opt
+                        best_c = current_c.copy()
+                        best_r = current_r.copy()
+                elif rng.random() < np.exp((s_opt - current_s) / (temperature + 1e-10)):
+                    current_s = s_opt
+                    current_c = c_opt.copy()
+                    current_r = r_opt.copy()
+    
+    # Fallback safety net
+    if best_c is None:
+        best_c = gen_hex_init(0, 0.17)
+        best_r, best_sum = solve_lp_radii(best_c)
+    
+    # Strict post-processing to guarantee validity
+    best_c, best_r = strict_fix(best_c, best_r)
+    best_sum = float(np.sum(best_r))
+    
+    return best_c, best_r, best_sum
+```

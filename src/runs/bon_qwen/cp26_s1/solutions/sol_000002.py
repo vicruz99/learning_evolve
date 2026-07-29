@@ -1,144 +1,210 @@
 # sol_000002 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 6882cd8b) state=5957c717 sum of radii=2.340000 correctness=1.0
-# stdout(first 200): 
+# generation=0 parent=seed (state ada29bac) state=b70fa7af sum of radii=1.975161 correctness=1.0
+# stdout(first 200): warning: basinhopping: local minimization failure basinhopping step 0: f -1.97516 warning: basinhopping: local minimization failure basinhopping step 1: f -1.63797 trial_f -1.63797 accepted True lowes
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import linprog, basinhopping
+import math
 
-def generate_hexagonal_packing(n=26):
+def solve_radii(centers):
     """
-    Generates an initial configuration of circles in a hexagonal lattice pattern.
+    Solves for the maximum sum of radii for a fixed set of centers using Linear Programming.
     """
-    r_initial = 0.09
-    centers = []
-    row = 0
-    while len(centers) < n:
-        y = r_initial + row * (r_initial * np.sqrt(3))
-        if y + r_initial > 1.0:
-            break
-        
-        # Shift odd rows horizontally
-        x_start = 2 * r_initial if row % 2 == 1 else r_initial
-        x = x_start
-        while x + r_initial <= 1.0 and len(centers) < n:
-            centers.append([x, y])
-            x += 2 * r_initial
-        row += 1
-        
-    centers = np.array(centers[:n])
-    radii = np.full(n, r_initial)
-    return centers, radii
-
-def check_validity(centers, radii):
-    """
-    Checks validity constraints for the optimization process.
-    """
-    n = len(radii)
-    if np.any(radii < 0):
-        return False
-    if np.any(centers < 0) or np.any(centers > 1.0):
-        return False
+    n = centers.shape[0]
     
-    # Boundary check
+    # Objective: maximize sum(r) => minimize -sum(r)
+    c = np.ones(n) * -1.0
+    
+    # 1. Bounds for radii based on boundaries (x, 1-x, y, 1-y)
+    bounds_r = []
     for i in range(n):
-        if (centers[i, 0] - radii[i] < -1e-9) or (centers[i, 0] + radii[i] > 1.0 + 1e-9):
-            return False
-        if (centers[i, 1] - radii[i] < -1e-9) or (centers[i, 1] + radii[i] > 1.0 + 1e-9):
-            return False
-            
-    # Overlap check
+        x, y = centers[i]
+        # Margin to the nearest wall
+        margin = min(x, 1.0 - x, y, 1.0 - y)
+        # Radius must be non-negative and within margin
+        # If center is outside [0,1], margin is negative, which is handled by linprog
+        # but we clamp to 0 to avoid infeasible bounds (0, neg)
+        max_r = max(0.0, margin)
+        bounds_r.append((0.0, max_r))
+    
+    # 2. Pairwise constraints: r_i + r_j <= dist(i, j)
+    # Number of pairs
+    m = n * (n - 1) // 2
+    
+    # Efficient construction of constraints
+    # We can use a list of (i, j, dist) and convert to sparse or dense
+    # Given n=26, dense matrix 325x26 is small enough.
+    
+    # Preallocate for speed
+    # We will build rows for the constraint matrix A_ub
+    # Since linprog takes A_ub (dense or sparse), let's build it.
+    
+    # Using a simple list comprehension for distance calculation might be faster than loops
+    # But explicit loops are clear and fast enough for n=26
+    
+    # We can also skip constructing the full matrix if we use a specialized callback, 
+    # but linprog needs it upfront.
+    
+    # Optimization: compute distance matrix first
+    # dists[i, j]
+    # Using broadcasting
+    c_diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(c_diff ** 2, axis=2))
+    
+    # We only need upper triangle
+    # Create A_ub and b_ub
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    
+    idx = 0
     for i in range(n):
         for j in range(i + 1, n):
-            dist = np.linalg.norm(centers[i] - centers[j])
-            if dist < radii[i] + radii[j] - 1e-9:
-                return False
-    return True
+            d = dists[i, j]
+            # Constraint: 1*r_i + 1*r_j <= d
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = d
+            idx += 1
+            
+    # Solve LP
+    # method='highs' is efficient and default in recent scipy
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            return -res.fun, res.x
+        else:
+            # If infeasible (shouldn't happen with valid bounds), return 0
+            return 0.0, np.zeros(n)
+    except Exception:
+        return 0.0, np.zeros(n)
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+def objective_function(centers_flat):
+    """
+    Objective function for the optimizer.
+    Minimizes negative sum of radii.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    
+    # Clamp centers to [0, 1] to keep them valid during optimization steps
+    # This prevents LP from receiving invalid centers that might cause issues
+    # although bounds in basinhopping should handle it, this is a safety measure.
+    # Actually, basinhopping minimizer steps might go outside bounds if not careful.
+    # We rely on bounds in the minimizer.
+    
+    sum_radii, radii = solve_radii(centers)
+    
+    # We want to maximize sum_radii, so minimize negative sum
+    return -sum_radii, radii # return radii for tracking? No, objective function returns scalar.
+    
+    # Wait, basinhopping needs a function that returns scalar.
+    # We can't return radii easily unless we wrap it.
+    # Let's just return the value.
+
+def minimizer_func(centers_flat):
+    val, radii = objective_function(centers_flat)
+    # Store best radii globally? 
+    # Better to just return value.
+    return val
+
+def run_packing():
     n = 26
     
-    # --- Initialization ---
-    centers, radii = generate_hexagonal_packing(n)
-    var_init = np.concatenate([centers.flatten(), radii])
+    # Initial configuration: Hexagonal grid
+    # We want to place 26 points.
+    # Let's try to generate a hex grid and pick 26 points.
+    # Spacing s.
+    # Rows: 5.
+    # Row lengths: 6, 5, 6, 5, 4 (sum 26)
     
-    # --- Optimization Objective ---
-    def objective(vars_flat):
-        radii_vars = vars_flat[-n:]
-        # We want to maximize sum(radii), so we minimize negative sum
-        return -np.sum(radii_vars)
+    centers = []
+    row_height = 1.0 / (5.0) # rough estimate, we will optimize
+    # Actually, let's just put them in a grid and let optimizer fix it.
+    # A simple grid initialization is robust.
     
-    # --- Constraints ---
-    constraints = []
-    bounds = []
-
-    for i in range(n):
-        # Bounds for centers (0 to 1) and radii (0 to 0.5)
-        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    # 5 rows, 6 cols -> 30 points. Take first 26.
+    # Or better, a hex pattern.
+    
+    # Let's generate a hex grid of points
+    # x = k * dx + (row_idx % 2) * dx/2
+    # y = row_idx * dy
+    
+    # Let's estimate spacing to fit 26 circles.
+    # Area per circle approx 1/26.
+    # r approx 0.1. Diameter 0.2.
+    # Spacing 0.2.
+    
+    dx = 0.15
+    dy = dx * math.sqrt(3) / 2
+    
+    row_idx = 0
+    while len(centers) < n:
+        y = 0.1 + row_idx * dy
+        if y > 0.9: # boundary check for generation
+             # shift y to fit better?
+             y = 0.9
+        x_start = 0.1 if row_idx % 2 == 0 else 0.1 + dx/2
         
-        # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
-        ix, iy = 3 * i, 3 * i + 1
-        ir = 3 * i + 2
-        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[ix] - v[ir]})
-        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[ix] - v[ir]})
-        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[iy] - v[ir]})
-        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[iy] - v[ir]})
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            ix, iy = 3 * i, 3 * i + 1
-            ir_i = 3 * i + 2
-            jx, jy = 3 * j, 3 * j + 1
-            ir_j = 3 * j + 2
+        k = 0
+        while True:
+            x = x_start + k * dx
+            if x > 0.9:
+                break
+            if len(centers) < n:
+                centers.append([x, y])
+            k += 1
+        row_idx += 1
+        
+        # Safety break
+        if row_idx > 10:
+            break
             
-            # Constraint: dist^2 >= (r_i + r_j)^2
-            def make_constraint(i_idx, j_idx):
-                def constraint(v):
-                    dx = v[3 * i_idx] - v[3 * j_idx]
-                    dy = v[3 * i_idx + 1] - v[3 * j_idx + 1]
-                    dist_sq = dx**2 + dy**2
-                    rad_sum_sq = (v[3 * i_idx + 2] + v[3 * j_idx + 2])**2
-                    return dist_sq - rad_sum_sq
-                return constraint
-
-            constraints.append({'type': 'ineq', 'fun': make_constraint(i, j)})
-
-    # --- Multi-Stage Optimization ---
-    best_sum = -1.0
-    best_state = var_init
-
-    # Stage 1: Main optimization from hexagonal start
-    res = minimize(objective, var_init, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 2000})
-    if res.success and check_validity(res.x[:-n].reshape(n, 2), res.x[-n:]):
-        if -res.fun > best_sum:
-            best_sum = -res.fun
-            best_state = res.x
-
-    # Stage 2: Perturbation and refinement to escape local minima
-    for _ in range(5):
-        perturb = np.random.normal(0, 0.002, size=var_init.shape)
-        perturbed_state = best_state + perturb
-        # Ensure radii stay non-negative after perturbation
-        perturbed_state[3::3] = np.maximum(perturbed_state[3::3], 0.01)
+    # If not enough points (unlikely with this logic), pad with random
+    while len(centers) < n:
+        centers.append([np.random.rand(), np.random.rand()])
         
-        res2 = minimize(objective, perturbed_state, method='SLSQP', bounds=bounds, constraints=constraints, options={'maxiter': 1000})
-        if res2.success and check_validity(res2.x[:-n].reshape(n, 2), res2.x[-n:]):
-            if -res2.fun > best_sum:
-                best_sum = -res2.fun
-                best_state = res2.x
-
-    # --- Final Formatting ---
-    final_centers = best_state[:-n].reshape(n, 2)
-    final_radii = best_state[-n:]
+    centers = np.array(centers[:n])
     
-    # Final validation check
-    if not check_validity(final_centers, final_radii):
-        # Fallback to initial if optimization somehow failed validation
-        return centers, radii, np.sum(radii)
+    # Define bounds for the minimizer (centers must be in [0, 1])
+    # 26 circles * 2 coords = 52 variables
+    bounds_opt = [(0, 1)] * (n * 2)
+    
+    # Use BasinHopping for global optimization
+    # Minimizer inside basin hopping
+    minimizer_kwargs = {"method": "Nelder-Mead", "options": {"maxiter": 100, "xatol": 1e-6, "fatol": 1e-6}}
+    
+    # Define a wrapper that only returns scalar for basinhopping
+    def scalar_obj(centers_flat):
+        return minimizer_func(centers_flat)
+        
+    try:
+        # BasinHopping might be slow, limit niter
+        # niter=50 might be enough if start is good
+        ret = basinhopping(scalar_obj, centers.flatten(), minimizer_kwargs=minimizer_kwargs, 
+                           niter=30, stepsize=0.05, interval=50, disp=True)
+        
+        best_centers = ret.x.reshape(-1, 2)
+        # Retrieve best radii
+        sum_rad, best_radii = solve_radii(best_centers)
+        
+    except Exception as e:
+        print(f"Optimization failed: {e}")
+        # Fallback to initial
+        sum_rad, best_radii = solve_radii(centers)
+        best_centers = centers
 
-    return final_centers, final_radii, float(np.sum(final_radii))
+    # Final validation and cleanup
+    # Ensure radii are valid
+    # The LP solver guarantees validity relative to centers.
+    # We just return the result.
+    
+    # Note: best_centers might have tiny numerical errors outside [0,1] due to optimization?
+    # But bounds were [0,1].
+    
+    return best_centers, best_radii, float(sum_rad)
 
 if __name__ == "__main__":
-    c, r, s = run_packing()
-    print(f"Sum of radii: {s}")
+    # Just to allow running as script for testing if needed, 
+    # though the problem asks for run_packing function.
+    pass

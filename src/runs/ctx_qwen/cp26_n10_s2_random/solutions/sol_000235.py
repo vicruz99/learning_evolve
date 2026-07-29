@@ -1,0 +1,261 @@
+# sol_000235 | problem=circle_packing_26 entrypoint=run_packing
+# generation=10 parent=sol_000223 (state d9ff9b60) state=bff7d641 sum of radii=2.308699 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+N = 26
+IDX_I, IDX_J = np.triu_indices(N, 1)
+NUM_PAIRS = len(IDX_I)
+
+# Precompute LP A matrix structure for pairwise and boundary constraints
+A_LP = np.zeros((NUM_PAIRS + 4 * N, N))
+for k in range(NUM_PAIRS):
+    A_LP[k, IDX_I[k]] = 1.0
+    A_LP[k, IDX_J[k]] = 1.0
+for i in range(N):
+    base = NUM_PAIRS + 4 * i
+    A_LP[base, i] = 1.0
+    A_LP[base + 1, i] = 1.0
+    A_LP[base + 2, i] = 1.0
+    A_LP[base + 3, i] = 1.0
+
+def get_duals_safe(res):
+    """Safely extract dual marginals from linprog result across scipy versions."""
+    try:
+        if hasattr(res, 'marginals') and res.marginals is not None:
+            if hasattr(res.marginals, 'ineqlin') and res.marginals.ineqlin is not None:
+                return res.marginals.ineqlin
+        if hasattr(res, 'ineqlin') and res.ineqlin is not None:
+            if hasattr(res.ineqlin, 'marginals') and res.ineqlin.marginals is not None:
+                return res.ineqlin.marginals
+    except Exception:
+        pass
+    return np.zeros(NUM_PAIRS + 4 * N)
+
+def solve_lp_and_grad(centers):
+    """Solves LP for max sum of radii and computes exact gradient w.r.t centers."""
+    c = np.clip(centers, 1e-8, 1.0 - 1e-8)
+    
+    # Upper bounds from boundary constraints: r_i <= dist_to_wall
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]),
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    # Pairwise distances
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, 0.0)
+    
+    # Build b_ub vector for LP
+    b_ub = np.zeros(NUM_PAIRS + 4 * N)
+    b_ub[:NUM_PAIRS] = dists[np.triu_indices(N, 1)]
+    for i in range(N):
+        base = NUM_PAIRS + 4 * i
+        b_ub[base] = c[i, 0]
+        b_ub[base + 1] = 1.0 - c[i, 0]
+        b_ub[base + 2] = c[i, 1]
+        b_ub[base + 3] = 1.0 - c[i, 1]
+        
+    # Solve LP: max sum(r) => min -sum(r)
+    res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b_ub,
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    
+    if not res.success:
+        return np.zeros(N), 0.0, np.zeros_like(c)
+        
+    radii = res.x
+    s = np.sum(radii)
+    duals = get_duals_safe(res)
+    
+    grad = np.zeros_like(c)
+    
+    # Pairwise repulsion forces from active distance constraints
+    d_2d = dists[IDX_I, IDX_J]
+    for k in range(NUM_PAIRS):
+        if d_2d[k] > 1e-9 and duals[k] > 1e-10:
+            mu = duals[k]
+            vec = diff[IDX_I[k], IDX_J[k]] / d_2d[k]
+            grad[IDX_I[k]] += mu * vec
+            grad[IDX_J[k]] -= mu * vec
+            
+    # Boundary push forces from active wall constraints
+    for i in range(N):
+        base = NUM_PAIRS + 4 * i
+        grad[i, 0] += duals[base] - duals[base + 1]
+        grad[i, 1] += duals[base + 2] - duals[base + 3]
+        
+    return radii, s, grad
+
+def gradient_ascent(c0, max_iter=2500, step_init=0.008, rng=None):
+    """Performs adaptive gradient ascent on centers to maximize sum of radii."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    c = c0.copy()
+    best_c = c.copy()
+    best_radii = np.zeros(N)
+    best_s = -1.0
+    step = step_init
+    
+    radii, s, _ = solve_lp_and_grad(c)
+    best_s = s
+    best_radii = radii.copy()
+    
+    for _ in range(max_iter):
+        radii, s, grad = solve_lp_and_grad(c)
+        if s > best_s + 1e-12:
+            best_s = s
+            best_c = c.copy()
+            best_radii = radii.copy()
+            
+        gn = np.linalg.norm(grad)
+        if gn < 1e-12:
+            break
+            
+        # Adaptive line search step
+        c_new = c + step * grad / gn
+        c_new = np.clip(c_new, 0.01, 0.99)
+        
+        _, s_new, _ = solve_lp_and_grad(c_new)
+        if s_new > s + 1e-10:
+            c = c_new
+            step = min(step * 1.05, 0.05)
+        else:
+            step *= 0.85
+            if step < 1e-9:
+                break
+                
+    return best_c, best_radii, best_s
+
+def generate_starts(rng):
+    """Generates diverse initial configurations covering lattice, boundary, and random basins."""
+    configs = []
+    
+    # 1. Hexagonal lattice patterns with varying row counts
+    patterns = [
+        [5, 5, 5, 5, 6], [5, 6, 5, 6, 4], [6, 5, 6, 5, 4],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 5, 6, 5, 5],
+        [4, 5, 6, 5, 6], [6, 5, 5, 5, 5], [5, 7, 5, 6, 3],
+        [7, 6, 6, 7], [6, 7, 7, 6]
+    ]
+    for pat in patterns:
+        c = []
+        r0 = 0.10
+        y = r0
+        for r_idx, cnt in enumerate(pat):
+            shift = r0 if r_idx % 2 == 1 else 0.0
+            x = r0 + shift
+            for _ in range(cnt):
+                if len(c) < N:
+                    c.append([x, y])
+                x += 2.0 * r0
+            y += r0 * np.sqrt(3.0)
+        while len(c) < N:
+            c.append(rng.uniform(0.1, 0.9, 2))
+        c = np.array(c[:N])
+        c += rng.normal(0, 0.003, c.shape)
+        c = np.clip(c, 0.05, 0.95)
+        configs.append(c)
+        
+    # 2. Corner and edge biased starts to exploit boundary packing
+    for _ in range(8):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        # Force 4 circles into corners
+        c[0] = [0.12, 0.12] + rng.normal(0, 0.01, 2)
+        c[1] = [0.88, 0.12] + rng.normal(0, 0.01, 2)
+        c[2] = [0.12, 0.88] + rng.normal(0, 0.01, 2)
+        c[3] = [0.88, 0.88] + rng.normal(0, 0.01, 2)
+        # Force circles to mid-edges
+        for idx, (ex, ey) in enumerate([
+            (0.25, 0.08), (0.5, 0.08), (0.75, 0.08),
+            (0.08, 0.25), (0.08, 0.5), (0.08, 0.75),
+            (0.92, 0.25), (0.92, 0.5)
+        ]):
+            if idx < N - 4:
+                c[4 + idx] = [ex, ey] + rng.normal(0, 0.01, 2)
+        c = np.clip(c, 0.05, 0.95)
+        configs.append(c)
+        
+    # 3. Random dense starts
+    for _ in range(10):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        configs.append(c)
+        
+    return configs
+
+def repair_packing(centers, radii):
+    """Deterministically shrinks radii to guarantee strict validation compliance."""
+    radii = radii.copy()
+    
+    for _ in range(50):
+        changed = False
+        # Boundary clamp
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], 
+                     centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+                
+        # Pairwise overlap resolution
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    configs = generate_starts(rng)
+    
+    # Phase 1: Gradient Ascent from diverse starts
+    for c0 in configs:
+        c_opt, r_opt, s_opt = gradient_ascent(c0, max_iter=2500, step_init=0.008, rng=rng)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_centers = c_opt.copy()
+            best_radii = r_opt.copy()
+            
+    # Phase 2: Perturbation Search to escape active-set plateaus
+    if best_centers is not None:
+        for step_idx in range(30):
+            noise_scale = 0.006 * (0.85 ** (step_idx // 6))
+            c_pert = best_centers + rng.normal(0, noise_scale, best_centers.shape)
+            c_pert = np.clip(c_pert, 0.02, 0.98)
+            
+            # Random swap to break symmetry traps
+            idx = rng.choice(N, 2, replace=False)
+            c_pert[idx] = c_pert[idx[::-1]]
+            
+            c_opt, r_opt, s_opt = gradient_ascent(c_pert, max_iter=1500, step_init=0.005, rng=rng)
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_centers = c_opt.copy()
+                best_radii = r_opt.copy()
+                
+    # Fallback safety
+    if best_centers is None:
+        best_centers = rng.uniform(0.1, 0.9, (N, 2))
+        best_radii = np.full(N, 0.05)
+        best_sum = np.sum(best_radii)
+        
+    # Final strict repair to guarantee validator passes
+    best_radii = repair_packing(best_centers, best_radii)
+    final_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, final_sum

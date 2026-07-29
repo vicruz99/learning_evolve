@@ -1,0 +1,167 @@
+
+
+<strategy>
+To improve the circle packing sum of radii beyond 2.631, I will implement a more robust and exploratory optimization strategy:
+
+1. **Diverse Initializations**: Instead of static hexagonal grids, I'll generate initial configurations with randomized spacing and rotational angles (0°, 15°, 30°, 45°, 60°). Rotating the lattice helps the optimizer escape symmetries that trap it in suboptimal local minima.
+2. **Adaptive Perturbation Schedule**: After finding an initial good packing, I'll run a multi-stage perturbation loop with a "cooling" step size schedule (0.025 → 0.0015). This allows the optimizer to first escape shallow basins, then finely tune the configuration.
+3. **Constraint & Objective Formulation**: The constraints remain boundary (`x±r ∈ [0,1]`) and pairwise non-overlap (`dist ≥ r_i + r_j`). I'll use `SLSQP` which handles non-linear constraints efficiently. The objective is simply `-sum(radii)`.
+4. **Numerical Stability & Post-Processing**: SLSQP may yield configurations with microscopic constraint violations due to floating-point tolerances. A dedicated post-processing pass will strictly clamp radii to boundaries and iteratively shrink overlapping pairs until all constraints are satisfied within `1e-10`.
+5. **Vectorized Operations**: Distance and constraint computations are fully vectorized using NumPy broadcasting and `np.triu_indices` for performance, allowing more restarts and longer iterations within time limits.
+
+This combination of rotational diversity, adaptive basin-hopping, and strict validation correction typically pushes the sum of radii past the 2.636 target for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(params):
+    """Negative sum of radii to be minimized."""
+    return -np.sum(params[2 * N:])
+
+def constraints(params):
+    """Inequality constraints: boundary and non-overlap (must be >= 0)."""
+    c = params[:2 * N].reshape(N, 2)
+    r = params[2 * N:]
+    
+    # Boundary constraints
+    bc = np.empty(4 * N)
+    bc[0:N] = c[:, 0] - r
+    bc[N:2*N] = 1.0 - c[:, 0] - r
+    bc[2*N:3*N] = c[:, 1] - r
+    bc[3*N:4*N] = 1.0 - c[:, 1] - r
+    
+    # Pairwise non-overlap constraints
+    dx = c[:, 0][:, None] - c[:, 0][None, :]
+    dy = c[:, 1][:, None] - c[:, 1][None, :]
+    dists = np.hypot(dx, dy)
+    r_sum = r[:, None] + r[None, :]
+    
+    pc = dists[I_IDX, J_IDX] - r_sum[I_IDX, J_IDX]
+    
+    return np.concatenate([bc, pc])
+
+def generate_hex_init(seed, spacing=0.20, angle=0.0):
+    """Generate a rotated and perturbed hexagonal lattice initialization."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    idx = 0
+    y = 0.05
+    row = 0
+    while idx < N and y < 0.95:
+        x_start = 0.05 + (row % 2) * spacing / 2.0
+        col = 0
+        while x_start + col * spacing < 0.95 and idx < N:
+            x = x_start + col * spacing
+            pts.append([x, y])
+            idx += 1
+            col += 1
+        y += spacing * math.sqrt(3) / 2.0
+        row += 1
+        
+    centers = np.array(pts[:N])
+    if angle != 0.0:
+        c, s = math.cos(angle), math.sin(angle)
+        centers -= 0.5
+        rot = np.array([[c, -s], [s, c]])
+        centers = centers @ rot.T
+        centers += 0.5
+        
+    centers += rng.uniform(-0.015, 0.015, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    return centers, np.full(N, 0.05)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons_dict = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    # Phase 1: Diverse initial configurations (varied spacing and rotation)
+    for seed in range(40):
+        spacing = 0.18 + (seed % 10) * 0.005
+        angle = (seed % 5) * (math.pi / 12) # 0, 15, 30, 45, 60 degrees
+        c, r = generate_hex_init(seed, spacing=spacing, angle=angle)
+        x0 = np.concatenate([c.ravel(), r])
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons_dict,
+                           options={'maxiter': 25000, 'ftol': 1e-13, 'disp': False})
+            if res.success:
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_c = res.x[:2*N].reshape(N, 2).copy()
+                    best_r = res.x[2*N:].copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Adaptive perturbation search with cooling schedule
+    if best_c is not None:
+        for step in [0.025, 0.015, 0.008, 0.004, 0.0015]:
+            for trial in range(20):
+                rng = np.random.RandomState(trial * 13 + 7)
+                c_p = best_c + rng.randn(N, 2) * step
+                c_p = np.clip(c_p, 0.02, 0.98)
+                r_p = best_r + rng.randn(N) * step * 0.4
+                r_p = np.clip(r_p, 0.01, 0.45)
+                
+                x0 = np.concatenate([c_p.ravel(), r_p])
+                try:
+                    res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                                   constraints=cons_dict,
+                                   options={'maxiter': 20000, 'ftol': 1e-13, 'disp': False})
+                    if res.success:
+                        s = -res.fun
+                        if s > best_sum:
+                            best_sum = s
+                            best_c = res.x[:2*N].reshape(N, 2).copy()
+                            best_r = res.x[2*N:].copy()
+                except Exception:
+                    continue
+
+    # Phase 3: Strict validity enforcement and numerical correction
+    if best_c is not None:
+        # Clamp to boundaries
+        for i in range(N):
+            x, y = best_c[i]
+            max_r = min(x, 1.0 - x, y, 1.0 - y) - 1e-9
+            if best_r[i] > max_r:
+                best_r[i] = max(0.0, max_r)
+                
+        # Iteratively resolve overlaps
+        for _ in range(300):
+            changed = False
+            for i in range(N):
+                for j in range(i + 1, N):
+                    dx = best_c[i,0] - best_c[j,0]
+                    dy = best_c[i,1] - best_c[j,1]
+                    d = math.hypot(dx, dy)
+                    if d < best_r[i] + best_r[j] - 1e-10:
+                        excess = best_r[i] + best_r[j] - d
+                        diff = excess / 2.0
+                        best_r[i] = max(0.0, best_r[i] - diff)
+                        best_r[j] = max(0.0, best_r[j] - diff)
+                        changed = True
+            if not changed:
+                break
+                
+        best_r = np.maximum(best_r, 0.0)
+        best_sum = np.sum(best_r)
+
+    # Fallback (highly unlikely to be reached)
+    if best_c is None:
+        best_c = np.random.uniform(0.1, 0.9, (N, 2))
+        best_r = np.full(N, 0.02)
+        best_sum = np.sum(best_r)
+        
+    return best_c, best_r, float(best_sum)
+```

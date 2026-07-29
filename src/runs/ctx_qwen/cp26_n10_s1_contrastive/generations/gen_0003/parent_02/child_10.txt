@@ -1,0 +1,193 @@
+
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+I_IDX, J_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Computes inequality constraints for pairwise separation.
+    Uses parameterization to automatically satisfy boundary constraints.
+    Returns array of values that must be >= 0.
+    """
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is strictly inside [0,1]^2
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = r[:, None] + r[None, :]
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[I_IDX, J_IDX] - r_sum[I_IDX, J_IDX]**2
+
+def get_init_vars(seed, row_counts, rot=0.0, scale=1.0):
+    """Generates a strictly feasible initial configuration based on a hexagonal lattice."""
+    np.random.seed(seed)
+    pts = []
+    R_est = 0.098
+    y = R_est
+    for r_idx, count in enumerate(row_counts):
+        x_off = (r_idx % 2) * R_est
+        x = R_est + x_off
+        for _ in range(count):
+            pts.append([x, y])
+            x += 2.0 * R_est
+        y += np.sqrt(3.0) * R_est
+        
+    pts = np.array(pts[:N_CIRCLES])
+    
+    # Center and scale the lattice
+    pts = pts - 0.5
+    pts *= scale
+    pts += 0.5
+    
+    # Apply rotation around the center
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        rot_mat = np.array([[c, -s], [s, c]])
+        pts = pts @ rot_mat.T
+        pts = pts - pts.mean(axis=0) + 0.5
+        
+    # Add controlled jitter to break exact symmetries
+    pts += np.random.uniform(-0.02, 0.02, pts.shape)
+    pts = np.clip(pts, 0.02, 0.98)
+    
+    # Compute strictly feasible initial radii
+    r_vals = np.zeros(N_CIRCLES)
+    for i in range(N_CIRCLES):
+        d_wall = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+        d_min = np.inf
+        for j in range(N_CIRCLES):
+            if i != j:
+                d = np.linalg.norm(pts[i] - pts[j])
+                if d < d_min: 
+                    d_min = d
+        # 0.35 factor ensures strict feasibility for SLSQP start
+        r_vals[i] = 0.35 * min(d_wall, 0.5 * d_min)
+        
+    denom = np.clip(1.0 - 2.0 * r_vals, 1e-4, 1.0)
+    u_vals = np.clip((pts[:, 0] - r_vals) / denom, 0.0, 1.0)
+    v_vals = np.clip((pts[:, 1] - r_vals) / denom, 0.0, 1.0)
+    
+    vars0 = np.empty(3 * N_CIRCLES)
+    vars0[0::3] = r_vals
+    vars0[1::3] = u_vals
+    vars0[2::3] = v_vals
+    return vars0
+
+def run_packing():
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * N_CIRCLES
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    # Diverse hexagonal row patterns summing to 26
+    row_patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [4, 6, 5, 6, 5],
+        [5, 5, 5, 5, 6], [6, 4, 6, 5, 5], [5, 6, 4, 6, 5],
+        [4, 5, 6, 5, 6], [5, 5, 6, 5, 5], [6, 6, 4, 5, 5]
+    ]
+    
+    configs = []
+    for pat in row_patterns:
+        if sum(pat) == N_CIRCLES:
+            for s in range(3):
+                configs.append((pat, s, 0.0, 1.0))
+            for rot in [-0.1, 0.1, -0.05, 0.05]:
+                configs.append((pat, 100+s, rot, 1.0))
+                
+    # Add randomly rotated/scaled variations
+    for s in range(10):
+        np.random.seed(s)
+        configs.append(([6, 5, 6, 5, 4], s+200, np.random.uniform(-0.2, 0.2), np.random.uniform(0.95, 1.05)))
+        
+    # Phase 1: Optimization from diverse structured starts
+    for i, (pat, seed, rot, scale) in enumerate(configs):
+        try:
+            x0 = get_init_vars(seed, pat, rot, scale)
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            # Accept if sufficiently feasible
+            if np.min(constraint_func(res.x)) >= -1e-7:
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local perturbation refinement to escape local minima
+    if best_vars is not None:
+        for k in range(40):
+            x_pert = best_vars.copy()
+            # Perturb positions (u, v) more aggressively than radii
+            x_pert[1::3] += np.random.uniform(-0.04, 0.04, N_CIRCLES)
+            x_pert[2::3] += np.random.uniform(-0.04, 0.04, N_CIRCLES)
+            x_pert[0::3] += np.random.uniform(-0.002, 0.002, N_CIRCLES)
+            
+            x_pert[0::3] = np.clip(x_pert[0::3], 1e-6, 0.5)
+            x_pert[1::3] = np.clip(x_pert[1::3], 0.0, 1.0)
+            x_pert[2::3] = np.clip(x_pert[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, x_pert, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                if np.min(constraint_func(res.x)) >= -1e-7:
+                    if -res.fun > best_sum:
+                        best_sum = -res.fun
+                        best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+        # Phase 3: High-precision final polish on the absolute best configuration
+        try:
+            res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                                 constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraint_func(res_final.x)) >= -1e-8:
+                best_vars = res_final.x
+                best_sum = -res_final.fun
+        except Exception:
+            pass
+            
+    # Fallback configuration (valid 5x5 grid + center)
+    if best_vars is None:
+        centers = np.zeros((N_CIRCLES, 2))
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                centers[idx] = [0.1 + 0.2*i, 0.1 + 0.2*j]
+                idx += 1
+        centers[25] = [0.5, 0.5]
+        r_f = np.full(N_CIRCLES, 0.09)
+        best_vars = np.empty(3 * N_CIRCLES)
+        best_vars[0::3] = r_f
+        best_vars[1::3] = (centers[:, 0] - r_f) / (1.0 - 2.0 * r_f)
+        best_vars[2::3] = (centers[:, 1] - r_f) / (1.0 - 2.0 * r_f)
+        best_sum = np.sum(r_f)
+        
+    # Reconstruct centers from optimized parameters
+    r_opt = best_vars[0::3]
+    u_opt = best_vars[1::3]
+    v_opt = best_vars[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    radii = r_opt
+    
+    return centers, radii, float(best_sum)
+```

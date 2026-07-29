@@ -1,0 +1,139 @@
+
+
+<strategy>
+To improve the circle packing beyond 2.626 and target > 2.636, we need a more robust optimization strategy that escapes local minima and better exploits boundary space. Key improvements:
+
+1. **Hexagonal Lattice Initialization**: Instead of square grids, initialize with a hexagonal lattice. Hexagonal packing has higher density and naturally guides the optimizer towards better configurations.
+2. **Multiple Scales & Seeds**: Run SLSQP from various initial radius scales (0.075 to 0.115) and multiple random seeds to explore different regions of the configuration space.
+3. **Iterative Perturbation Refinement**: After finding a local optimum, apply controlled random perturbations to positions (and slightly to radii), then re-optimize. This acts as a deterministic basin-hopping step to climb out of shallow local minima.
+4. **Vectorized Constraints**: Compute all pairwise distances and boundary constraints in a single vectorized pass for speed and numerical stability. Use `dist >= r_i + r_j` directly.
+5. **Strict Post-Processing**: Enforce boundary and non-overlap constraints with a minimal safety margin to guarantee the validator passes without unnecessarily shrinking the sum of radii.
+6. **RandomState Isolation**: Use `np.random.RandomState` for reproducibility and to avoid interfering with global RNG state during initialization.
+
+This combination typically pushes SLSQP past grid-based local optima into high-density hexagonal-like arrangements that fully utilize corners and edges.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(v):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(v[2*N_CIRCLES:])
+
+def constraint_func(v):
+    """
+    Computes all inequality constraints:
+    1. Boundary: center +/- radius within [0, 1]
+    2. Pairwise: distance >= sum of radii
+    Returns a flat array where each element >= 0 indicates a satisfied constraint.
+    """
+    cx = v[:N_CIRCLES]
+    cy = v[N_CIRCLES:2*N_CIRCLES]
+    r = v[2*N_CIRCLES:]
+    
+    # Boundary constraints
+    c = np.concatenate([
+        cx - r,
+        1.0 - cx - r,
+        cy - r,
+        1.0 - cy - r
+    ])
+    
+    # Pairwise non-overlap constraints (vectorized)
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    r_sum = r[:, None] + r[None, :]
+    
+    # Extract upper triangle (i < j) to avoid duplicates and self-comparisons
+    mask = np.triu(np.ones((N_CIRCLES, N_CIRCLES), dtype=bool), k=1)
+    c = np.concatenate([c, (dist - r_sum)[mask]])
+    return c
+
+def get_initial_guess(seed, r_start):
+    """Generate a perturbed hexagonal lattice initialization."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    y = r_start
+    row = 0
+    while len(pts) < N_CIRCLES + 10:
+        x = r_start if row % 2 == 0 else 2.0 * r_start
+        while x <= 1.0 - r_start and len(pts) < N_CIRCLES + 10:
+            pts.append([x, y])
+            x += 2.0 * r_start
+        y += r_start * np.sqrt(3.0)
+        row += 1
+        
+    pts = np.array(pts[:N_CIRCLES])
+    # Add controlled jitter to break symmetry and aid optimization
+    pts += rng.uniform(-0.015, 0.015, pts.shape)
+    pts = np.clip(pts, 0.02, 0.98)
+    
+    r = np.full(N_CIRCLES, r_start)
+    return np.concatenate([pts[:, 0], pts[:, 1], r])
+
+def run_packing():
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = 0.0
+    best_v = None
+    
+    # Multi-start optimization with varying lattice densities
+    scales = [0.075, 0.085, 0.095, 0.105, 0.115]
+    for s in scales:
+        for seed in range(4):
+            v0 = get_initial_guess(seed, s)
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            curr_sum = -res.fun
+            c_vals = constraint_func(res.x)
+            if np.all(c_vals >= -1e-6) and curr_sum > best_sum:
+                best_sum = curr_sum
+                best_v = res.x.copy()
+                
+    if best_v is None:
+        best_v = get_initial_guess(0, 0.08)
+        
+    # Iterative perturbation refinement to escape local minima
+    for _ in range(6):
+        v_curr = best_v.copy()
+        noise = np.random.uniform(-0.004, 0.004, v_curr.shape)
+        noise[2*n:] *= 0.1  # Perturb radii much less than positions
+        v_pert = v_curr + noise
+        v_pert[:2*n] = np.clip(v_pert[:2*n], 0.0, 1.0)
+        v_pert[2*n:] = np.clip(v_pert[2*n:], 0.0, 0.5)
+        
+        res_p = minimize(objective, v_pert, method='SLSQP', bounds=bounds, constraints=cons,
+                         options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+        c_vals = constraint_func(res_p.x)
+        if np.all(c_vals >= -1e-6):
+            s_p = -res_p.fun
+            if s_p > best_sum:
+                best_sum = s_p
+                best_v = res_p.x.copy()
+                
+    # Extract results
+    centers = best_v[:2*n].reshape(n, 2)
+    radii = best_v[2*n:]
+    
+    # Strict enforcement of boundary constraints
+    for i in range(n):
+        margin = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        radii[i] = min(radii[i], margin)
+        
+    # Strict enforcement of non-overlap constraints with minimal safety margin
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            if d < radii[i] + radii[j]:
+                shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-7
+                radii[i] = max(0.0, radii[i] - shrink)
+                radii[j] = max(0.0, radii[j] - shrink)
+                
+    return centers, radii, float(np.sum(radii))
+```

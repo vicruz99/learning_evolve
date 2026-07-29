@@ -1,0 +1,313 @@
+# sol_000319 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4e7533ea) state=3238b7f4 sum of radii=2.578513 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_hexagonal_centers(n, spacing=0.15):
+    """
+    Generate center coordinates for a hexagonal packing of n circles.
+    """
+    centers = []
+    row = 0
+    col = 0
+    # Hexagonal spacing: horizontal distance = spacing, vertical = spacing * sqrt(3)/2
+    # Offset every other row by spacing/2
+    h = spacing * np.sqrt(3) / 2
+    
+    # We generate a grid and pick the first n points that fit in a reasonable area
+    # To ensure we get n points, we generate a sufficiently large grid
+    max_points = n + 100 # Buffer
+    while len(centers) < max_points:
+        y = row * h
+        x_offset = (spacing / 2) if row % 2 == 1 else 0
+        # Generate points in this row
+        # We can estimate how many fit in width 1.0, say 10
+        for i in range(15):
+            if len(centers) >= max_points:
+                break
+            x = x_offset + i * spacing
+            centers.append([x, y])
+        row += 1
+        
+    # Trim to n
+    centers = centers[:n]
+    centers = np.array(centers)
+    
+    # Center and scale to fit in unit square with some padding
+    # Find bounding box
+    min_x, min_y = centers.min(axis=0)
+    max_x, max_y = centers.max(axis=0)
+    
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    if width == 0 and height == 0:
+        return centers # Edge case n=1
+        
+    # We want to fit in [pad, 1-pad] roughly. Let's use 0.05 padding.
+    pad = 0.05
+    available_w = 1.0 - 2 * pad
+    available_h = 1.0 - 2 * pad
+    
+    scale_x = available_w / width if width > 0 else 1.0
+    scale_y = available_h / height if height > 0 else 1.0
+    scale = min(scale_x, scale_y)
+    
+    # Center the cluster
+    center_x = (max_x + min_x) / 2
+    center_y = (max_y + min_y) / 2
+    
+    # Apply scaling and translation
+    centers = (centers - np.array([center_x, center_y])) * scale + 0.5
+    
+    return centers
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+    if np.isnan(centers).any() or np.isnan(radii).any():
+        return False
+    for i in range(n):
+        if radii[i] < 0:
+            return False
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-9 or x + r > 1 + 1e-9 or y - r < -1e-9 or y + r > 1 + 1e-9:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-9:
+                return False
+    return True
+
+def run_force_optimization(centers_init, radii_init, n_steps=5000):
+    """
+    Run a force-directed simulation to expand radii and resolve overlaps.
+    """
+    centers = centers_init.copy()
+    radii = radii_init.copy()
+    n = len(radii)
+    
+    # Parameters
+    growth_rate = 1e-4
+    dt = 1e-3
+    damping = 0.9
+    
+    for step in range(n_steps):
+        # 1. Grow radii
+        radii += growth_rate
+        
+        # 2. Calculate forces
+        forces = np.zeros_like(centers)
+        
+        # Pairwise repulsion
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                d_sq = dx*dx + dy*dy
+                d = np.sqrt(d_sq) if d_sq > 1e-12 else 1e-12
+                
+                r_sum = radii[i] + radii[j]
+                overlap = r_sum - d
+                
+                if overlap > 0:
+                    # Force proportional to overlap
+                    # Apply equal and opposite forces
+                    fx = (overlap / d) * dx
+                    fy = (overlap / d) * dy
+                    
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+        
+        # Boundary repulsion
+        for i in range(n):
+            r = radii[i]
+            # Left
+            if centers[i, 0] < r:
+                forces[i, 0] += (r - centers[i, 0])
+            # Right
+            if centers[i, 0] > 1 - r:
+                forces[i, 0] -= (centers[i, 0] - (1 - r))
+            # Bottom
+            if centers[i, 1] < r:
+                forces[i, 1] += (r - centers[i, 1])
+            # Top
+            if centers[i, 1] > 1 - r:
+                forces[i, 1] -= (centers[i, 1] - (1 - r))
+                
+        # 3. Update positions
+        centers += forces * dt
+        # Apply damping to forces for next step? 
+        # Actually, we recompute forces every step, so velocity isn't stored.
+        # But we might want to limit max displacement.
+        
+        # Clamp positions to keep them roughly inside, though forces push them in.
+        # Forces should handle it, but just in case:
+        # centers = np.clip(centers, 0, 1) # Don't clip strictly, let forces handle boundary
+        
+        # Adaptive growth rate: decrease if overlaps are high?
+        # Simple heuristic: check max overlap
+        # This is computationally expensive to do every step, so we skip for simplicity
+        # or do it every 100 steps.
+        
+    return centers, radii
+
+def local_optimization(centers, radii):
+    """
+    Use scipy.optimize to fine-tune the packing.
+    Objective: Maximize sum of radii.
+    Constraints: Non-overlap and boundary.
+    """
+    n = len(radii)
+    
+    # Variables: [x1, y1, r1, x2, y2, r2, ...]
+    # Total 3*N variables
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+        
+    # Bounds
+    bounds = []
+    for i in range(n):
+        # x in [0, 1]
+        bounds.append((0.0, 1.0))
+        # y in [0, 1]
+        bounds.append((0.0, 1.0))
+        # r in [0, 0.5]
+        bounds.append((0.0, 0.5))
+        
+    # Constraints
+    constraints = []
+    
+    # Boundary constraints: r <= x <= 1-r  =>  x - r >= 0, 1 - x - r >= 0
+    # Similarly for y
+    for i in range(n):
+        xi_idx = 3*i
+        yi_idx = 3*i + 1
+        ri_idx = 3*i + 2
+        
+        # x - r >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda x, idx=xi_idx, ridx=ri_idx: x[idx] - x[ridx]
+        })
+        # 1 - x - r >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda x, idx=xi_idx, ridx=ri_idx: 1.0 - x[idx] - x[ridx]
+        })
+        # y - r >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda x, idx=yi_idx, ridx=ri_idx: x[idx] - x[ridx]
+        })
+        # 1 - y - r >= 0
+        constraints.append({
+            'type': 'ineq',
+            'fun': lambda x, idx=yi_idx, ridx=ri_idx: 1.0 - x[idx] - x[ridx]
+        })
+        
+    # Pairwise constraints: dist >= r_i + r_j
+    # dist^2 >= (r_i + r_j)^2
+    # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            xi, yi, ri = 3*i, 3*i+1, 3*i+2
+            xj, yj, rj = 3*j, 3*j+1, 3*j+2
+            
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda x, i=xi, j=xj, yi=yi, yj=yj, ri=ri, rj=rj: 
+                    (x[i]-x[j])**2 + (x[yi]-x[yj])**2 - (x[ri]+x[rj])**2
+            })
+            
+    # Objective: Maximize sum of radii => Minimize -sum(radii)
+    def objective(x):
+        return -sum(x[3*i+2] for i in range(n))
+        
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+                       options={'maxiter': 500, 'ftol': 1e-9})
+        if res.success:
+            centers_opt = np.array([[res.x[3*i], res.x[3*i+1]] for i in range(n)])
+            radii_opt = np.array([res.x[3*i+2] for i in range(n)])
+            return centers_opt, radii_opt
+    except Exception:
+        pass
+        
+    return centers, radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    best_sum_radii = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Hexagonal packing initialization
+    centers_hex = get_hexagonal_centers(n, spacing=0.12)
+    radii_hex = np.ones(n) * 0.05 # Small initial radius
+    
+    # Run force optimization on hex
+    c1, r1 = run_force_optimization(centers_hex, radii_hex, n_steps=2000)
+    c1, r1 = local_optimization(c1, r1)
+    s1 = np.sum(r1)
+    if s1 > best_sum_radii:
+        best_sum_radii = s1
+        best_centers = c1
+        best_radii = r1
+        
+    # Strategy 2: Random initializations (few tries)
+    np.random.seed(42)
+    for _ in range(3):
+        centers_rand = np.random.rand(n, 2)
+        radii_rand = np.ones(n) * 0.02
+        
+        c2, r2 = run_force_optimization(centers_rand, radii_rand, n_steps=3000)
+        c2, r2 = local_optimization(c2, r2)
+        s2 = np.sum(r2)
+        if s2 > best_sum_radii:
+            best_sum_radii = s2
+            best_centers = c2
+            best_radii = r2
+            
+    # Ensure validity and fix any tiny numerical issues
+    # Sometimes optimizer might return radii slightly violating bounds due to float precision
+    # The validate function allows 1e-12 error, so we should be fine.
+    # But let's clamp radii to be safe if any negative
+    best_radii = np.maximum(best_radii, 0.0)
+    
+    # Final validation check
+    if validate_packing(best_centers, best_radii):
+        return best_centers, best_radii, float(np.sum(best_radii))
+    else:
+        # Fallback to a simple grid if optimization failed completely
+        # This is unlikely but safe
+        print("Optimization failed validation, using fallback grid.")
+        centers_fb = np.zeros((n, 2))
+        radii_fb = np.zeros(n)
+        # 5x5 grid + 1
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                if idx < n:
+                    centers_fb[idx] = [0.1 + i*0.2, 0.1 + j*0.2]
+                    radii_fb[idx] = 0.09 # Tight fit
+                    idx += 1
+        if idx < n:
+            centers_fb[idx] = [0.5, 0.5]
+            radii_fb[idx] = 0.05
+            idx += 1
+        return centers_fb, radii_fb, float(np.sum(radii_fb))

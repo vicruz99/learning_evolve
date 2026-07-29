@@ -1,0 +1,195 @@
+
+
+Looking at this problem, I need to pack 26 circles in a unit square to maximize the sum of radii, targeting ~2.636.
+
+**Key observations:**
+1. For equal circles, 26 circles would have radius ~0.061, giving sum ≈ 1.59. To reach 2.636, we need unequal circles with average radius ~0.101.
+2. The optimal arrangement should have larger circles near corners/edges and smaller circles filling gaps.
+3. A hexagonal packing gives highest density (~90.7%), so that's a good starting pattern.
+
+**Strategy:**
+1. Initialize with a hexagonal grid pattern (rows: 6,5,6,5,4 = 26 circles)
+2. Use penalty-based optimization with L-BFGS-B
+3. Run multiple trials with random perturbations
+4. Use a coordinate-descent refinement pass (fix positions, expand radii; fix radii, optimize positions)
+5. Validate and select best solution
+
+<strategy>
+1. Initialize circles in a hexagonal arrangement (5 rows with 6,5,6,5,4 circles)
+2. Use penalty-based L-BFGS-B optimization with multiple random restarts
+3. After optimization, perform a refinement pass where we try to expand each circle individually
+4. Validate all solutions and keep the best valid one
+5. The key is using a very high penalty weight to ensure constraint satisfaction while maximizing radii
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+
+def run_packing():
+    n = 26
+    
+    best_centers = None
+    best_radii = None
+    best_sum = 0
+    
+    for trial in range(80):
+        centers, radii = initialize_hexagonal(n, seed=trial)
+        
+        x0 = np.concatenate([centers.flatten(), radii])
+        
+        # First phase: explore with moderate penalty
+        result1 = minimize(penalty_obj, x0, method='L-BFGS-B',
+                         args=(n, 5000), bounds=get_bounds(n),
+                         options={'maxiter': 20000, 'ftol': 1e-12})
+        
+        # Second phase: refine with high penalty
+        result2 = minimize(penalty_obj, result1.x, method='L-BFGS-B',
+                         args=(n, 100000), bounds=get_bounds(n),
+                         options={'maxiter': 50000, 'ftol': 1e-15})
+        
+        c = result2.x[:2*n].reshape(n, 2)
+        r = np.maximum(result2.x[2*n:], 1e-12)
+        
+        # Clip radii to respect boundaries
+        for i in range(n):
+            r[i] = min(r[i], c[i, 0], 1.0 - c[i, 0], c[i, 1], 1.0 - c[i, 1])
+            r[i] = max(r[i], 1e-12)
+        
+        # Coordinate descent refinement
+        c, r = refine_packing(c, r, n, max_iter=200)
+        
+        # Final clip
+        for i in range(n):
+            r[i] = min(r[i], c[i, 0], 1.0 - c[i, 0], c[i, 1], 1.0 - c[i, 1])
+            r[i] = max(r[i], 0)
+        
+        if is_valid(c, r, n):
+            s = np.sum(r)
+            if s > best_sum:
+                best_sum = s
+                best_centers = c.copy()
+                best_radii = r.copy()
+    
+    if best_centers is None:
+        best_centers, best_radii = initialize_hexagonal(n, seed=0)
+        best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, best_sum
+
+
+def initialize_hexagonal(n, seed=0):
+    np.random.seed(seed * 7 + 13)
+    
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.085
+    
+    idx = 0
+    row_counts = [6, 5, 6, 5, 4]  # Total: 26
+    y_spacing = 0.172
+    x_spacing = 0.172
+    
+    for row, count in enumerate(row_counts):
+        y = 0.085 + row * y_spacing
+        x_start = 0.085 if row % 2 == 0 else 0.16
+        for i in range(count):
+            x = x_start + i * x_spacing
+            centers[idx, 0] = x + np.random.uniform(-0.012, 0.012)
+            centers[idx, 1] = y + np.random.uniform(-0.012, 0.012)
+            idx += 1
+    
+    return centers, radii
+
+
+def penalty_obj(x, n, weight):
+    c = x[:2 * n].reshape(n, 2)
+    r = np.maximum(x[2 * n:], 1e-10)
+    
+    p = 0.0
+    
+    # Boundary violations
+    for i in range(n):
+        p += max(0.0, r[i] - c[i, 0]) ** 2
+        p += max(0.0, c[i, 0] + r[i] - 1.0) ** 2
+        p += max(0.0, r[i] - c[i, 1]) ** 2
+        p += max(0.0, c[i, 1] + r[i] - 1.0) ** 2
+    
+    # Overlap violations
+    for i in range(n):
+        for j in range(i + 1, n):
+            d2 = np.sum((c[i] - c[j]) ** 2)
+            d = np.sqrt(max(d2, 1e-20))
+            min_d = r[i] + r[j]
+            if d < min_d:
+                p += (min_d - d) ** 2
+    
+    return -np.sum(r) + weight * p
+
+
+def get_bounds(n):
+    return [(0.0, 1.0)] * (2 * n) + [(0.0, 0.5)] * n
+
+
+def is_valid(centers, radii, n):
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if r < -1e-12:
+            return False
+        if x - r < -1e-9 or x + r > 1.0 + 1e-9:
+            return False
+        if y - r < -1e-9 or y + r > 1.0 + 1e-9:
+            return False
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-9:
+                return False
+    
+    return True
+
+
+def refine_packing(centers, radii, n, max_iter=200):
+    """Coordinate descent refinement: expand radii, then optimize positions."""
+    centers = centers.copy()
+    radii = radii.copy()
+    
+    for iteration in range(max_iter):
+        improved = False
+        
+        # Step 1: For each circle, compute max possible radius
+        new_radii = radii.copy()
+        for i in range(n):
+            max_r = min(centers[i, 0], 1.0 - centers[i, 0],
+                       centers[i, 1], 1.0 - centers[i, 1])
+            for j in range(n):
+                if i != j:
+                    d = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                    max_r = min(max_r, d - radii[j])
+            new_radii[i] = max(0.0, max_r)
+        
+        radii = new_radii
+        
+        # Step 2: Small random perturbation and local optimization
+        perturbed = centers + np.random.uniform(-0.002, 0.002, (n, 2))
+        perturbed = np.clip(perturbed, radii, 1.0 - radii)
+        
+        # Check if perturbation improves sum of radii
+        valid = True
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((perturbed[i] - perturbed[j]) ** 2))
+                if d < radii[i] + radii[j] - 1e-10:
+                    valid = False
+                    break
+            if not valid:
+                break
+        
+        if valid:
+            centers = perturbed
+            improved = True
+    
+    return centers, radii
+```

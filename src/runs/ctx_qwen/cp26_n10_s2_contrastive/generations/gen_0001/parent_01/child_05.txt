@@ -1,0 +1,174 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that avoids local minima and handles the non-convex constraints efficiently. 
+
+Key improvements over previous attempts:
+1. **Vectorized Constraint Evaluation**: Instead of looping over pairs in Python, we use precomputed triangular indices and `numpy` vectorization to evaluate all 325 pairwise overlap constraints and 104 boundary constraints in a single array. This drastically speeds up each iteration of SLSQP.
+2. **Diverse Intelligent Initializations**: We generate multiple starting configurations:
+   - Hexagonal lattice patterns with varying row distributions (e.g., 6-5-6-5-4, 5-6-5-6-4, etc.) that naturally mimic dense packings.
+   - Random initializations with a quick feasibility projection to ensure radii start within bounds.
+   - Symmetry breaking via small random perturbations to prevent the optimizer from getting stuck in degenerate states.
+3. **Robust SLSQP Configuration**: We use `SLSQP` with high iteration limits and tight tolerances. The constraints are formulated as `distance - (r_i + r_j) >= 0`, which provides well-behaved gradients when circles are near contact.
+4. **Post-Optimization Safety Corrections**: A lightweight projection step ensures strict feasibility against numerical drift, fixing any residual overlaps by selectively reducing radii rather than globally shrinking, preserving the objective value.
+5. **Top-Level Design**: All helper functions are defined at the module level without closures, adhering to strict guidelines while maintaining performance.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+I_IDX, J_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(x):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints(x):
+    """Vectorized inequality constraints: g(x) >= 0"""
+    cx = x[0::3]
+    cy = x[1::3]
+    cr = x[2::3]
+    n = N_CIRCLES
+    n_pairs = len(I_IDX)
+    
+    c = np.empty(n_pairs + 4 * n)
+    
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c[:n] = cx - cr
+    c[n:2*n] = 1.0 - cx - cr
+    c[2*n:3*n] = cy - cr
+    c[3*n:4*n] = 1.0 - cy - cr
+    
+    # Overlap constraints: dist(i,j) >= r_i + r_j
+    dx = cx[I_IDX] - cx[J_IDX]
+    dy = cy[I_IDX] - cy[J_IDX]
+    c[4*n:] = np.hypot(dx, dy) - (cr[I_IDX] + cr[J_IDX])
+    
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    inits = []
+    
+    # 1. Hexagonal lattice patterns with various row distributions
+    row_configs = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [4, 6, 5, 6, 5],
+        [5, 5, 5, 5, 6], [6, 6, 4, 5, 5], [7, 5, 6, 4, 4],
+        [5, 4, 6, 5, 6], [4, 5, 6, 5, 6], [6, 5, 5, 5, 5],
+        [5, 6, 4, 6, 5], [6, 4, 6, 5, 5], [5, 5, 6, 4, 6]
+    ]
+    
+    for rows in row_configs:
+        r_est = 0.10
+        dy = r_est * np.sqrt(3)
+        y_start = r_est + (1.0 - 2*r_est - (len(rows)-1)*dy) / 2.0
+        
+        centers = []
+        for row_idx, count in enumerate(rows):
+            y = y_start + row_idx * dy
+            dx = 2 * r_est
+            shift = dx / 2 if row_idx % 2 == 1 else 0
+            x_span = 1.0 - 2 * r_est - shift
+            step = x_span / max(count - 1, 1)
+            x_start_pos = r_est + shift
+            for col in range(count):
+                x = x_start_pos + col * step
+                centers.append([x, y])
+                
+        if len(centers) >= n:
+            cx = np.array([c[0] for c in centers[:n]])
+            cy = np.array([c[1] for c in centers[:n]])
+            cr = np.full(n, r_est)
+            x0 = np.empty(3 * n)
+            x0[0::3] = cx
+            x0[1::3] = cy
+            x0[2::3] = cr
+            
+            # Break symmetry to avoid singular Hessians
+            x0[0::3] += np.random.uniform(-0.015, 0.015, n)
+            x0[1::3] += np.random.uniform(-0.015, 0.015, n)
+            x0[0::3] = np.clip(x0[0::3], 0.06, 0.94)
+            x0[1::3] = np.clip(x0[1::3], 0.06, 0.94)
+            inits.append(x0)
+            
+    # 2. Random initializations with feasibility projection
+    for seed in range(20):
+        np.random.seed(seed * 13 + 7)
+        cx = np.random.uniform(0.18, 0.82, n)
+        cy = np.random.uniform(0.18, 0.82, n)
+        cr = np.ones(n) * 0.06
+        
+        # Quick iterative projection to make starting point feasible
+        for _ in range(8):
+            diff_x = cx[:, None] - cx[None, :]
+            diff_y = cy[:, None] - cy[None, :]
+            dists = np.hypot(diff_x, diff_y)
+            np.fill_diagonal(dists, np.inf)
+            
+            min_pair_dist = dists.min(axis=1)
+            wall_dist = np.minimum(np.minimum(cx, 1.0 - cx), np.minimum(cy, 1.0 - cy))
+            cr = np.minimum(cr, np.minimum(min_pair_dist, wall_dist) * 0.45)
+            
+        x0 = np.empty(3 * n)
+        x0[0::3] = cx
+        x0[1::3] = cy
+        x0[2::3] = cr
+        inits.append(x0)
+        
+    best_sum = 0.0
+    best_x = None
+    
+    # Multi-start optimization
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False})
+            curr_sum = np.sum(res.x[2::3])
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_x = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback if all optimizations fail (unlikely)
+    if best_x is None:
+        best_x = inits[0]
+        
+    cx = best_x[0::3].copy()
+    cy = best_x[1::3].copy()
+    cr = best_x[2::3].copy()
+    cr = np.maximum(cr, 1e-9)
+    
+    # Strict boundary enforcement
+    wall_r = np.minimum(np.minimum(cx, 1.0 - cx), np.minimum(cy, 1.0 - cy))
+    cr = np.minimum(cr, wall_r - 1e-10)
+    
+    # Targeted overlap resolution (preserves sum better than global scaling)
+    for _ in range(200):
+        dx_all = cx[:, None] - cx[None, :]
+        dy_all = cy[:, None] - cy[None, :]
+        dist_all = np.hypot(dx_all, dy_all)
+        r_sum = cr[:, None] + cr[None, :]
+        overlap = r_sum - dist_all
+        np.fill_diagonal(overlap, -np.inf)
+        upper_ov = np.triu(overlap)
+        max_ov = np.max(upper_ov)
+        
+        if max_ov <= 1e-10:
+            break
+            
+        idx = np.unravel_index(np.argmax(upper_ov), upper_ov.shape)
+        i, j = idx
+        excess = overlap[i, j]
+        cr[i] -= excess / 2.0
+        cr[j] -= excess / 2.0
+        
+    cr = np.maximum(cr, 1e-9)
+    centers = np.column_stack((cx, cy))
+    return centers, cr, float(np.sum(cr))
+```

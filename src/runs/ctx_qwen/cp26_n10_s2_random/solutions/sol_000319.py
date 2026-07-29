@@ -1,0 +1,226 @@
+# sol_000319 | problem=circle_packing_26 entrypoint=run_packing
+# generation=12 parent=sol_000291 (state e7ab877e) state=cb4583c9 sum of radii=2.307501 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+N = 26
+NUM_PAIRS = N * (N - 1) // 2
+
+# Precompute LP constraint matrix structure globally for speed
+A_LP = np.zeros((NUM_PAIRS + 4 * N, N))
+PAIR_IDX = []
+idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_LP[idx, i] = 1.0
+        A_LP[idx, j] = 1.0
+        PAIR_IDX.append((i, j))
+        idx += 1
+for i in range(N):
+    base = NUM_PAIRS + 4 * i
+    A_LP[base, i] = 1.0
+    A_LP[base + 1, i] = 1.0
+    A_LP[base + 2, i] = 1.0
+    A_LP[base + 3, i] = 1.0
+
+def solve_lp_and_grad(centers):
+    """Solves LP for maximal radii given fixed centers and computes exact subgradient via duals."""
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-12)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.zeros(NUM_PAIRS + 4 * N)
+    k = 0
+    for i, j in PAIR_IDX:
+        b[k] = dists[i, j]
+        k += 1
+    for i in range(N):
+        b[k] = centers[i, 0]; k += 1
+        b[k] = 1.0 - centers[i, 0]; k += 1
+        b[k] = centers[i, 1]; k += 1
+        b[k] = 1.0 - centers[i, 1]; k += 1
+        
+    res = linprog(-np.ones(N), A_ub=A_LP, b_ub=b, 
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    if not res.success:
+        return np.zeros(N), 0.0, np.zeros_like(centers)
+        
+    radii = res.x
+    s_sum = np.sum(radii)
+    
+    duals = np.zeros(len(b))
+    if hasattr(res, 'marginals') and res.marginals is not None:
+        duals = res.marginals.ineqlin
+    elif hasattr(res, 'ineqlin') and res.ineqlin is not None:
+        duals = res.ineqlin.marginals
+        
+    grad = np.zeros_like(centers)
+    k = 0
+    for i, j in PAIR_IDX:
+        mu = duals[k]
+        if mu > 1e-9:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+        k += 1
+        
+    b_start = NUM_PAIRS
+    for i in range(N):
+        grad[i, 0] += duals[b_start + 4*i] - duals[b_start + 4*i + 1]
+        grad[i, 1] += duals[b_start + 4*i + 2] - duals[b_start + 4*i + 3]
+    return radii, s_sum, grad
+
+def gradient_ascent(c0, max_iter=1000, init_lr=0.008):
+    """Adaptive gradient ascent to maximize sum of radii."""
+    c = c0.copy()
+    _, curr_sum, grad = solve_lp_and_grad(c)
+    best_c = c.copy()
+    best_sum = curr_sum
+    lr = init_lr
+    
+    for k in range(max_iter):
+        g_norm = np.linalg.norm(grad)
+        if g_norm < 1e-11:
+            break
+            
+        step = lr / (1.0 + k * 0.005)
+        c_new = c + step * grad / g_norm
+        c_new = np.clip(c_new, 1e-5, 1.0 - 1e-5)
+        
+        _, s_new, g_new = solve_lp_and_grad(c_new)
+        if s_new > curr_sum:
+            c = c_new
+            curr_sum = s_new
+            grad = g_new
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_c = c.copy()
+            lr = min(lr * 1.02, 0.03)
+        else:
+            lr *= 0.9
+            
+        if lr < 1e-10:
+            break
+    return best_c, best_sum
+
+def perturb_and_optimize(c_best, rng, n_tries=5, pert_scale=0.005, max_iter=300):
+    """Tries random perturbations followed by short gradient ascent."""
+    best_c = c_best.copy()
+    _, best_sum, _ = solve_lp_and_grad(best_c)
+    
+    for _ in range(n_tries):
+        c_try = best_c + rng.normal(0, pert_scale, best_c.shape)
+        c_try = np.clip(c_try, 0.01, 0.99)
+        c_opt, s_opt = gradient_ascent(c_try, max_iter=max_iter, init_lr=0.004)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+    return best_c, best_sum
+
+def run_packing():
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+    
+    best_c = None
+    best_r = None
+    best_s = -1.0
+    
+    # --- Phase 0: Generate Diverse Initial Configurations ---
+    starts = []
+    patterns = [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6], 
+                [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 5, 6, 5, 5]]
+    for pat in patterns:
+        for r0 in [0.088, 0.095, 0.102, 0.108]:
+            c = []
+            y = r0
+            for ri, cnt in enumerate(pat):
+                sh = r0 if ri % 2 == 1 else 0.0
+                x = r0 + sh
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            starts.append(np.array(c[:N]) + rng.normal(0, 0.002, (N, 2)))
+            
+    for _ in range(10):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        # Quick force repulsion to spread points
+        for _ in range(300):
+            f = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i+1, N):
+                    dv = c[i] - c[j]
+                    d = np.linalg.norm(dv)
+                    if d < 0.18 and d > 1e-4:
+                        push = (0.18 - d) * 0.02 / (d + 1e-4)
+                        f[i] += dv / d * push
+                        f[j] -= dv / d * push
+            c += f
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+        
+    # --- Phase 1: Multi-start Gradient Ascent ---
+    for c_init in starts:
+        c_opt, s_opt = gradient_ascent(c_init, max_iter=1500, init_lr=0.006)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # --- Phase 2: Decaying Perturbation Search (Basin Hopping) ---
+    for step in range(60):
+        scale = 0.012 * (0.90 ** step)
+        c_opt, s_opt = perturb_and_optimize(best_c, rng, n_tries=5, pert_scale=scale, max_iter=200)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # --- Phase 3: Coordinate-wise Fine Tuning ---
+    for _ in range(40):
+        c_try = best_c.copy()
+        idx = rng.integers(N)
+        for dim in range(2):
+            delta = rng.uniform(-0.004, 0.004)
+            c_try[idx, dim] += delta
+        c_try = np.clip(c_try, 0.01, 0.99)
+        c_opt, s_opt = gradient_ascent(c_try, max_iter=500, init_lr=0.003)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # --- Final Radii Computation ---
+    best_r, final_s, _ = solve_lp_and_grad(best_c)
+    
+    # --- Phase 4: Strict Numerical Repair ---
+    radii = best_r.copy()
+    centers = best_c.copy()
+    for _ in range(150):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-11:
+                    shrink = (req - d) * 0.5 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))

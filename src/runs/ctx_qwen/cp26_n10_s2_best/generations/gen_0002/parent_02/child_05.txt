@@ -1,0 +1,157 @@
+
+
+<strategy>
+To improve the circle packing sum of radii beyond the current ~2.628, we need a more robust optimization strategy that escapes local minima and aggressively pushes the packing boundary.
+
+Key improvements implemented:
+1. **Diverse Multi-Start Initialization**: We generate 60 distinct initial configurations mixing hexagonal lattices, square grids, corner-focused placements, and random scatter. This covers different topological basins of attraction.
+2. **Feasible Radius Initialization**: Instead of uniform small radii, we compute the maximum feasible radius for each circle given its neighbors and walls, then scale down by 60%. This guarantees a strictly feasible starting point for SLSQP, preventing early termination.
+3. **Aggressive Inflation Phase**: After finding the best local optimum, we iteratively scale all radii up by ~0.3%, add slight center noise, and re-optimize. This "pushes" the packing outward, forcing circles to rearrange into denser configurations and escape shallow local minima.
+4. **Vectorized & Stable Constraints**: Constraints are pre-allocated and computed using squared distances `dist^2 >= (r_i + r_j)^2` to avoid square root singularities and improve gradient smoothness.
+5. **Strict Post-Processing**: A deterministic shrinkage loop guarantees exact compliance with the validator's `1e-12` tolerance, preventing numerical drift from invalidating an otherwise good solution.
+
+These steps systematically explore the configuration space and refine the best packing, reliably pushing the sum of radii closer to the theoretical optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """Inequality constraints: boundaries and non-overlap (squared)."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    m = 4*N + N*(N-1)//2
+    c = np.empty(m)
+    
+    # Boundary constraints
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    # Pairwise non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    idx = np.triu_indices(N, k=1)
+    dx = x[idx[0]] - x[idx[1]]
+    dy = y[idx[0]] - y[idx[1]]
+    dr = r[idx[0]] + r[idx[1]]
+    c[4*N:] = dx**2 + dy**2 - dr**2
+    
+    return c
+
+def get_initial(seed, layout):
+    """Generates a feasible initial configuration."""
+    np.random.seed(seed)
+    if layout == 'hex':
+        r0 = 0.095
+        pts = []
+        y = r0
+        row = 0
+        while len(pts) < N + 10:
+            x_start = r0 + (row % 2) * r0
+            x = x_start
+            while x <= 1 - r0:
+                pts.append([x, y])
+                x += 2 * r0
+            y += r0 * np.sqrt(3)
+            row += 1
+        centers = np.array(pts[:N])
+    elif layout == 'grid':
+        centers = np.array([[0.1 + i*0.16, 0.1 + j*0.2] for i in range(6) for j in range(5)])[[:N]]
+    elif layout == 'corner':
+        centers = np.array([[0.1,0.1],[0.9,0.1],[0.1,0.9],[0.9,0.9],
+                            [0.5,0.1],[0.5,0.9],[0.1,0.5],[0.9,0.5],[0.5,0.5]])
+        centers = np.vstack([centers, np.random.uniform(0.2,0.8,(N-9,2))])
+    else:
+        centers = np.random.uniform(0.05, 0.95, (N, 2))
+        
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    centers = np.clip(centers, 0.02, 0.98)
+    
+    # Compute strictly feasible initial radii
+    r_init = np.full(N, 0.1)
+    for i in range(N):
+        r_init[i] = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        for j in range(i+1, N):
+            d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+            val = d/2.0
+            if val < r_init[i]: r_init[i] = val
+            if val < r_init[j]: r_init[j] = val
+    r_init *= 0.6  # Leave slack for optimizer
+    return np.concatenate([centers[:,0], centers[:,1], r_init])
+
+def run_packing():
+    bounds = [(0.0, 1.0)]*(2*N) + [(0.0, 0.5)]*N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # Phase 1: Multi-start optimization
+    for s in range(60):
+        layout = ['hex', 'grid', 'corner', 'rand'][s % 4]
+        v0 = get_initial(s, layout)
+        try:
+            res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-12, 'disp': False})
+            if -res.fun > best_sum:
+                if np.min(constraints(res.x)) >= -1e-6:
+                    best_sum = -res.fun
+                    best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Inflation & Local Refinement
+    if best_v is not None:
+        curr = best_v.copy()
+        for _ in range(12):
+            # Slightly scale up radii to force expansion/rearrangement
+            curr[2*N:] *= 1.003
+            # Perturb centers to escape local traps
+            curr[:2*N] += np.random.uniform(-0.001, 0.001, 2*N)
+            curr[:2*N] = np.clip(curr[:2*N], 0.01, 0.99)
+            
+            try:
+                res = minimize(objective, curr, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 6000, 'ftol': 1e-12, 'disp': False})
+                if -res.fun > best_sum:
+                    if np.min(constraints(res.x)) >= -1e-6:
+                        best_sum = -res.fun
+                        best_v = res.x.copy()
+                        curr = best_v.copy()
+            except Exception:
+                pass
+    else:
+        # Fallback
+        best_v = get_initial(0, 'hex')
+        
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:]
+    
+    # Phase 3: Strict validity enforcement
+    # Boundary constraints
+    cr = np.minimum(cr, np.minimum(cx, 1.0-cx))
+    cr = np.minimum(cr, np.minimum(cy, 1.0-cy))
+    
+    # Non-overlap constraints
+    for _ in range(15):
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(cx[i]-cx[j], cy[i]-cy[j])
+                if cr[i] + cr[j] > d:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + 1e-9
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    
+    centers = np.column_stack((cx, cy))
+    return centers, cr, float(np.sum(cr))
+```

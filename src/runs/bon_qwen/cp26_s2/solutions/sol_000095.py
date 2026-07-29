@@ -1,0 +1,132 @@
+# sol_000095 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 8101c7b4) state=9ad56273 sum of radii=2.557122 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_constraints(x):
+    """
+    Computes all inequality constraints for the circle packing problem.
+    Returns an array where all elements must be >= 0.
+    
+    x: flattened array of [x0, y0, r0, x1, y1, r1, ...] or separated [X, Y, R].
+    Here we expect the variables to be passed in the format used by minimize,
+    but to align with the solver setup, we'll define the variable layout.
+    We will use layout: [x0...x25, y0...y25, r0...r25] (size 78).
+    """
+    n = 26
+    X = x[0:n]
+    Y = x[n:2*n]
+    R = x[2*n:3*n]
+
+    constraints = []
+
+    # 1. Boundary Constraints
+    # x - r >= 0  => circle inside left boundary
+    constraints.append(X - R)
+    # 1 - x - r >= 0 => circle inside right boundary
+    constraints.append(1 - X - R)
+    # y - r >= 0 => circle inside bottom boundary
+    constraints.append(Y - R)
+    # 1 - y - r >= 0 => circle inside top boundary
+    constraints.append(1 - Y - R)
+
+    # 2. Non-overlap Constraints
+    # (xi - xj)^2 + (yi - yj)^2 >= (ri + rj)^2
+    # Vectorized computation
+    # X_diff shape (26, 26)
+    X_diff = X[:, np.newaxis] - X
+    Y_diff = Y[:, np.newaxis] - Y
+    
+    # Squared Euclidean distance matrix
+    dist_sq = X_diff**2 + Y_diff**2
+    
+    # Sum of radii squared matrix
+    R_sum = R[:, np.newaxis] + R
+    r_sum_sq = R_sum**2
+    
+    # Constraint value: dist_sq - r_sum_sq
+    # We need upper triangle (i < j)
+    diff = dist_sq - r_sum_sq
+    
+    # Extract upper triangle excluding diagonal
+    tri_indices = np.triu_indices(n, k=1)
+    constraints.append(diff[tri_indices])
+
+    return np.concatenate(constraints)
+
+def objective(x):
+    """
+    Objective function to minimize.
+    We want to maximize sum of radii, so we minimize negative sum of radii.
+    Variables layout: [x0...x25, y0...y25, r0...r25]
+    """
+    n = 26
+    R = x[2*n:3*n]
+    return -np.sum(R)
+
+def run_packing():
+    # Number of circles
+    n = 26
+    
+    # --- Initialization ---
+    # We create a grid of points to serve as initial centers.
+    # A 6x5 grid gives 30 points. We pick the first 26.
+    # Coordinates chosen to be well within [0,1] but spread out.
+    
+    # X coordinates: 6 points
+    x_coords = np.linspace(0.1, 0.9, 6)
+    # Y coordinates: 5 points
+    y_coords = np.linspace(0.1, 0.9, 5)
+    
+    # Create meshgrid
+    xv, yv = np.meshgrid(x_coords, y_coords)
+    
+    # Flatten and take first 26
+    init_centers = np.column_stack((xv.flatten(), yv.flatten()))[:n]
+    
+    init_x = init_centers[:, 0]
+    init_y = init_centers[:, 1]
+    init_r = np.full(n, 0.05) # Initial small radius to ensure no overlap
+    
+    # Flatten variables: [x0...x25, y0...y25, r0...r25]
+    x0 = np.concatenate([init_x, init_y, init_r])
+    
+    # --- Bounds ---
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0, 1)] * n + [(0, 1)] * n + [(0, 0.5)] * n
+    
+    # --- Constraints ---
+    # Inequality constraints: g(x) >= 0
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    # --- Optimization ---
+    # Use SLSQP which supports bounds and constraints
+    try:
+        res = minimize(objective, 
+                       x0, 
+                       method='SLSQP', 
+                       bounds=bounds, 
+                       constraints=cons,
+                       options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+        
+        # Extract results
+        opt_x = res.x[0:n]
+        opt_y = res.x[n:2*n]
+        opt_r = res.x[2*n:3*n]
+        
+        centers = np.column_stack((opt_x, opt_y))
+        radii = opt_r
+        
+    except Exception:
+        # Fallback to initial configuration if optimization fails
+        centers = init_centers
+        radii = init_r
+
+    # Calculate sum of radii
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii

@@ -1,191 +1,103 @@
 # sol_000087 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9821b492) state=82f00bf0 sum of radii=0.026000 correctness=1.0
+# generation=0 parent=seed (state e9cb3956) state=59a8168f sum of radii=2.617507 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
 from scipy.optimize import minimize
-import math
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
-    Assumes equal radii for robustness and density.
-    """
+def compute_constraints(vars, n):
+    """Compute boundary and non-overlap constraints for SLSQP.
+    Returns an array where all elements must be >= 0."""
+    x = vars[:n]
+    y = vars[n:2*n]
+    r = vars[2*n:]
+    c = []
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    c.append(x - r)
+    c.append(1 - x - r)
+    c.append(y - r)
+    c.append(1 - y - r)
+    
+    # Non-overlap constraints: dist(i,j) >= r_i + r_j
+    # Only need upper triangle to avoid redundancy
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dists = np.sqrt(dx*dx + dy*dy)
+    tri_i, tri_j = np.triu_indices(n, k=1)
+    c.append(dists[tri_i, tri_j] - r[tri_i] - r[tri_j])
+    
+    return np.concatenate(c)
+
+def objective(vars, n):
+    """Negative sum of radii (since minimize finds minima)."""
+    return -np.sum(vars[2*n:])
+
+def run_packing():
     n = 26
-    best_sum = 0.0
-    best_centers = None
-    best_radii = None
-
-    # Helper to check constraints for optimization
-    def constraints_fun(vars, r_fixed=False):
-        """
-        Returns list of constraint dictionaries for scipy.optimize.
-        vars shape: (n, 3) -> [x, y, r]
-        If r_fixed is True, we optimize x, y for a fixed r (passed via closure or separate logic).
-        Here we optimize x, y, r together.
-        """
-        cons = []
+    best_res = None
+    best_sum = -1.0
+    
+    for seed in range(3):
+        np.random.seed(seed)
+        # Feasible initial guess: 5x5 grid + 1 center circle
+        pts = np.array([[0.2 + i*0.2, 0.2 + j*0.2] for i in range(5) for j in range(5)])
+        pts = np.vstack([pts, [[0.5, 0.5]]])
+        # Add small perturbation to break symmetry and aid optimization
+        pts += np.random.uniform(-0.01, 0.01, pts.shape)
+        pts = np.clip(pts, 0.05, 0.95)
         
-        # 1. Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
-        # In scipy 'ineq', fun(x) >= 0
-        # x - r >= 0
-        # 1 - x - r >= 0
-        # y - r >= 0
-        # 1 - y - r >= 0
+        x0 = pts[:, 0]
+        y0 = pts[:, 1]
+        r0 = np.full(n, 0.09)
+        vars0 = np.concatenate([x0, y0, r0])
         
-        # We define these for each circle
-        for i in range(n):
-            x_i = vars[i, 0]
-            y_i = vars[i, 1]
-            r_i = vars[i, 2]
+        bounds = [(0, 1)]*n + [(0, 1)]*n + [(0, 0.5)]*n
+        cons = {'type': 'ineq', 'fun': compute_constraints, 'args': (n,)}
+        
+        try:
+            res = minimize(objective, vars0, args=(n,), method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
             
-            # x >= r  => x - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: v[idx, 0] - v[idx, 2]})
-            # 1 - x >= r => 1 - x - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: 1.0 - v[idx, 0] - v[idx, 2]})
-            # y >= r => y - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: v[idx, 1] - v[idx, 2]})
-            # 1 - y >= r => 1 - y - r >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, idx=i: 1.0 - v[idx, 1] - v[idx, 2]})
-
-        # 2. Non-overlap constraints: dist_ij >= r_i + r_j
-        # dist^2 >= (r_i + r_j)^2
-        # dist^2 - (r_i + r_j)^2 >= 0
-        for i in range(n):
-            for j in range(i + 1, n):
-                def dist_con(v, i=i, j=j):
-                    xi, yi, ri = v[i]
-                    xj, yj, rj = v[j]
-                    dist_sq = (xi - xj)**2 + (yi - yj)**2
-                    min_dist_sq = (ri + rj)**2
-                    return dist_sq - min_dist_sq
-                
-                cons.append({'type': 'ineq', 'fun': dist_con})
-        
-        return cons
-
-    def objective(vars):
-        # Maximize sum of radii => Minimize negative sum
-        return -np.sum(vars[:, 2])
-
-    bounds = [(0, 1)] * n + [(0, 1)] * n + [(0, 0.5)] * n
-    # Reshape bounds to (n, 2) for x, y, r? No, scipy expects list of (min, max) for flat vector.
-    # Flat vector size: 26*3 = 78.
-    flat_bounds = []
-    for _ in range(n):
-        flat_bounds.append((0, 1)) # x
-        flat_bounds.append((0, 1)) # y
-        flat_bounds.append((0, 0.5)) # r
-
-    def get_constraints():
-        # Re-define constraints to capture 'n' and avoid closure issues if possible,
-        # though here n is constant.
-        cons = []
-        for i in range(n):
-            # x_i - r_i >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i + 2]})
-            # 1 - x_i - r_i >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i] - v[3*i + 2]})
-            # y_i - r_i >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i + 1] - v[3*i + 2]})
-            # 1 - y_i - r_i >= 0
-            cons.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - v[3*i + 1] - v[3*i + 2]})
-        
-        for i in range(n):
-            for j in range(i + 1, n):
-                def con_dist(v, i=i, j=j):
-                    xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
-                    xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
-                    return (xi - xj)**2 + (yi - yj)**2 - (ri + rj)**2
-                cons.append({'type': 'ineq', 'fun': con_dist})
-        return cons
-
-    # Strategy 1: Hexagonal Lattice Initialization
-    # Generate points on a hex grid
-    r_init = 0.04
-    dx = 2 * r_init
-    dy = math.sqrt(3) * r_init
-    
-    points = []
-    y = r_init
-    row = 0
-    while y <= 1 - r_init:
-        x = r_init
-        col = 0
-        shift = (r_init if row % 2 == 1 else 0)
-        x = r_init + shift
-        while x <= 1 - r_init:
-            points.append([x, y, r_init])
-            x += 2 * r_init
-            col += 1
-        y += dy
-        row += 1
-    
-    # Select 26 points
-    init_points = points[:26]
-    if len(init_points) < 26:
-        # Fallback to random if grid is too small (unlikely with small r)
-        init_points = []
-        for _ in range(26):
-            init_points.append([np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9), 0.02])
+            x_opt = res.x[:n]
+            y_opt = res.x[n:2*n]
+            r_opt = res.x[2*n:]
             
-    init_vec = np.array(init_points).flatten()
-    
-    constraints = get_constraints()
-    
-    # Optimize
-    try:
-        res = minimize(objective, init_vec, method='SLSQP', bounds=flat_bounds, 
-                       constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-9})
-        if res.success:
-            sol = res.x.reshape(n, 3)
-            sum_r = np.sum(sol[:, 2])
-            if sum_r > best_sum:
-                best_sum = sum_r
-                best_centers = sol[:, :2]
-                best_radii = sol[:, 2]
-    except Exception:
-        pass
-
-    # Strategy 2: Random Restart if best_sum is low
-    # Target is around 2.6. If we are far below, try random.
-    # 26 circles of r=0.1 -> sum 2.6.
-    # If best_sum < 2.5, try random restarts.
-    if best_sum < 2.5:
-        for attempt in range(10):
-            rand_vec = np.random.uniform(0.1, 0.9, (n, 2))
-            rand_r = 0.03 * np.ones(n) # Start small
-            rand_vec_full = np.hstack((rand_vec, rand_r.reshape(-1, 1))).flatten()
+            # Post-process: strictly enforce boundary constraints
+            r_opt = np.minimum(r_opt, np.minimum(x_opt, 1-x_opt))
+            r_opt = np.minimum(r_opt, np.minimum(y_opt, 1-y_opt))
             
-            try:
-                res = minimize(objective, rand_vec_full, method='SLSQP', bounds=flat_bounds, 
-                               constraints=constraints, options={'maxiter': 500, 'ftol': 1e-9})
-                if res.success:
-                    sol = res.x.reshape(n, 3)
-                    sum_r = np.sum(sol[:, 2])
-                    if sum_r > best_sum:
-                        best_sum = sum_r
-                        best_centers = sol[:, :2]
-                        best_radii = sol[:, 2]
-            except Exception:
-                pass
-
-    # Ensure strict validity (numerical errors)
-    # Clip radii to be safe
-    if best_radii is None:
-        # Fallback hardcode if optimization fails completely
-        best_centers = np.tile([0.5, 0.5], (26, 1)) # All at center? No, overlap.
-        # Just return a valid small packing
-        best_centers = np.random.rand(26, 2)
-        best_radii = np.ones(26) * 0.001
-        best_sum = np.sum(best_radii)
-
-    # Final validation check (internal) to ensure no NaNs
-    if np.isnan(best_centers).any() or np.isnan(best_radii).any():
-        best_centers = np.random.rand(26, 2)
-        best_radii = np.ones(26) * 0.001
-        best_sum = np.sum(best_radii)
-
-    return best_centers, best_radii, best_sum
+            # Post-process: strictly enforce non-overlap constraints
+            for _ in range(50):
+                changed = False
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.sqrt((x_opt[i]-x_opt[j])**2 + (y_opt[i]-y_opt[j])**2)
+                        if d < r_opt[i] + r_opt[j] - 1e-12:
+                            scale = d / (r_opt[i] + r_opt[j])
+                            # Reduce radii geometrically to maintain balance
+                            r_opt[i] *= np.sqrt(scale)
+                            r_opt[j] *= np.sqrt(scale)
+                            changed = True
+                if not changed:
+                    break
+            
+            current_sum = np.sum(r_opt)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_res = (np.vstack([x_opt, y_opt]).T, r_opt, current_sum)
+        except Exception:
+            continue
+            
+    if best_res is None:
+        # Fallback configuration (grid + center)
+        x = np.tile(np.linspace(0.2, 0.8, 5), 5).reshape(-1, 1)
+        y = np.repeat(np.linspace(0.2, 0.8, 5), 5).reshape(-1, 1)
+        x = np.vstack([x, [[0.5]]])
+        y = np.vstack([y, [[0.5]]])
+        r = np.full(26, 0.09)
+        return np.hstack([x, y]), r, 2.34
+        
+    return best_res

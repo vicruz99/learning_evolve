@@ -1,0 +1,268 @@
+
+
+<strategy>
+To improve the packing sum beyond 2.636, I will employ a hybrid optimization strategy that combines efficient global exploration with high-precision local refinement:
+
+1. **LP-based Center Evaluation**: For any fixed set of centers, the optimal radii can be found exactly and rapidly using Linear Programming (`scipy.optimize.linprog`). This transforms the problem into optimizing centers to maximize the LP sum of radii.
+2. **Diverse Initialization & Filtering**: Generate a wide variety of initial configurations (hexagonal lattices with varied row counts/rotations, force-directed layouts, perturbed grids). Evaluate each with the LP solver and keep only the top candidates to save computation time.
+3. **Nelder-Mead Center Optimization**: Run derivative-free Nelder-Mead optimization on the filtered centers. This handles the non-smooth nature of the LP-sum objective effectively and navigates the complex landscape of circle packing.
+4. **SLSQP Joint Polishing**: Once good centers are found, switch to a joint nonlinear optimization (`SLSQP`) on $(x, y, r)$ variables with explicit inequality constraints. This precisely pushes circles against each other and boundaries to squeeze out maximum radius sum.
+5. **Perturbation Escapes**: Apply controlled random perturbations to the joint variables and re-optimize to escape local minima that Nelder-Mead or SLSQP might settle into.
+6. **High-Precision Final Polish**: A final SLSQP run with tight tolerances ensures numerical validity and maximizes the objective within machine precision.
+
+This approach leverages the exactness of LP for radii assignment, the robustness of Nelder-Mead for center placement, and the gradient-following precision of SLSQP for final tightening. It avoids parameterization pitfalls and directly respects geometric constraints.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def get_max_radii_sum(centers):
+    """Solves LP to find optimal radii for fixed centers, returning (sum_radii, radii)."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    num_constraints = 4 * n + n * (n - 1) // 2
+    A_ub = np.zeros((num_constraints, n))
+    b_ub = np.zeros(num_constraints)
+    
+    k = 0
+    for i in range(n):
+        x, y = centers[i]
+        # Boundary constraints: r_i <= dist to wall
+        vals = [x, 1.0 - x, y, 1.0 - y]
+        for val in vals:
+            A_ub[k, i] = 1.0
+            b_ub[k] = max(1e-9, val)
+            k += 1
+            
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    dx = centers[:, 0, np.newaxis] - centers[np.newaxis, :, 0]
+    dy = centers[:, 1, np.newaxis] - centers[np.newaxis, :, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = max(1e-9, dists[i, j])
+            k += 1
+            
+    bounds = [(0.0, None)] * n
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    if res.success:
+        return -res.fun, res.x
+    return 0.0, np.zeros(n)
+
+def objective_centers(params):
+    """Objective for center optimization: minimize negative LP sum of radii."""
+    centers = params.reshape(N, 2)
+    centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    s, _ = get_max_radii_sum(centers)
+    return -s
+
+def joint_objective(v):
+    """Objective for joint SLSQP optimization: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def joint_constraints(v):
+    """Inequality constraints for SLSQP: boundaries and non-overlap."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = []
+    # Boundary containment
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    c.append(dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2)
+    return np.concatenate(c)
+
+def generate_hex_centers(seed, rot=0.0, scale=1.0, pattern=None):
+    """Generates a hexagonal lattice initialization."""
+    rng = np.random.RandomState(seed)
+    if pattern is None:
+        pattern = [6, 5, 6, 5, 4]
+        
+    pts = []
+    r_est = 0.095
+    y = r_est
+    for r_idx, cnt in enumerate(pattern):
+        shift = (r_idx % 2) * r_est
+        x = r_est + shift
+        for _ in range(cnt):
+            if len(pts) < N:
+                pts.append([x, y])
+            x += 2.0 * r_est
+        y += r_est * np.sqrt(3.0)
+        
+    pts = np.array(pts[:N])
+    pts = (pts - 0.5) * scale + 0.5
+    
+    if rot != 0.0:
+        c_val, s_val = np.cos(rot), np.sin(rot)
+        pts = (pts - 0.5) @ np.array([[c_val, -s_val], [s_val, c_val]]) + 0.5
+        
+    pts += rng.uniform(-0.02, 0.02, pts.shape)
+    return np.clip(pts, 0.01, 0.99)
+
+def generate_force_centers(seed, steps=300):
+    """Generates a tightly packed configuration using force-directed layout."""
+    rng = np.random.RandomState(seed)
+    pts = rng.uniform(0.1, 0.9, (N, 2))
+    r_curr = np.full(N, 0.05)
+    
+    for step in range(steps):
+        diff = pts[:, None, :] - pts[None, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        dists = np.maximum(dists, 1e-8)
+        rep = 1.0 / dists**2
+        np.fill_diagonal(rep, 0.0)
+        forces = np.sum(rep[:, :, None] * diff / dists[:, :, None], axis=1)
+        
+        for d in range(2):
+            forces[:, d] += 20.0 * np.maximum(0, r_curr - pts[:, d])
+            forces[:, d] -= 20.0 * np.maximum(0, pts[:, d] - (1.0 - r_curr))
+            
+        step_size = 0.01 * (0.995**step)
+        pts += step_size * forces
+        pts = np.clip(pts, 0.01, 0.99)
+        
+        for i in range(N):
+            d_wall = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+            dists_others = np.linalg.norm(pts[i] - pts, axis=1)
+            dists_others[i] = np.inf
+            d_pair = np.min(dists_others)
+            r_curr[i] = 0.85 * min(d_wall, d_pair/2.0)
+            
+    return pts
+
+def run_packing():
+    np.random.seed(42)
+    best_sum = -np.inf
+    best_centers = None
+    best_radii = None
+    
+    rng = np.random.RandomState(42)
+    candidates = []
+    
+    # 1. Generate diverse initial configurations
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5],
+        [5,5,5,5,6], [6,4,6,5,5], [5,6,4,6,5],
+        [4,5,6,5,6], [6,6,5,5,4], [5,5,6,5,5],
+        [7,5,5,5,4], [4,5,5,5,7], [5,7,5,5,4]
+    ]
+    
+    for s in range(15):
+        for pat in patterns:
+            rot = rng.uniform(-0.25, 0.25)
+            sc = rng.uniform(0.90, 1.10)
+            candidates.append(generate_hex_centers(s, rot, sc, pat).flatten())
+            
+    for s in range(10):
+        candidates.append(generate_force_centers(s).flatten())
+        
+    for s in range(5):
+        pts = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)])
+        pts = np.vstack([pts, [0.5, 0.5]])
+        pts += rng.uniform(-0.02, 0.02, (N, 2))
+        pts = np.clip(pts, 0.05, 0.95)
+        candidates.append(pts.flatten())
+        
+    # 2. Filter candidates by initial LP sum to focus computation
+    scored = []
+    for params in candidates:
+        s, _ = get_max_radii_sum(params.reshape(N, 2))
+        scored.append((s, params))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    
+    # 3. Nelder-Mead optimization on top candidates
+    top_k = min(15, len(scored))
+    for _, init_params in scored[:top_k]:
+        try:
+            res = minimize(objective_centers, init_params, method='Nelder-Mead',
+                           options={'maxiter': 600, 'xatol': 1e-7, 'fatol': 1e-9})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            continue
+            
+    if best_centers is None:
+        best_centers = generate_hex_centers(0).copy()
+        _, best_radii = get_max_radii_sum(best_centers)
+        best_sum = np.sum(best_radii)
+    else:
+        _, best_radii = get_max_radii_sum(best_centers)
+        
+    # 4. SLSQP Joint Optimization Polish
+    v0 = np.zeros(3 * N)
+    v0[0::3] = best_centers[:, 0]
+    v0[1::3] = best_centers[:, 1]
+    v0[2::3] = best_radii * 0.99
+    
+    bounds_slqp = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': joint_constraints}
+    
+    try:
+        res_slqp = minimize(joint_objective, v0, method='SLSQP', bounds=bounds_slqp,
+                            constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+        if res_slqp.success:
+            c_val = joint_constraints(res_slqp.x)
+            if np.min(c_val) >= -1e-7:
+                curr_sum = -res_slqp.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_centers = np.column_stack((res_slqp.x[0::3], res_slqp.x[1::3]))
+                    best_radii = res_slqp.x[2::3]
+    except Exception:
+        pass
+        
+    # 5. Perturbation Escapes
+    for _ in range(15):
+        v_p = v0.copy()
+        v_p += rng.randn(3 * N) * 0.004
+        v_p[0::3] = np.clip(v_p[0::3], 0.01, 0.99)
+        v_p[1::3] = np.clip(v_p[1::3], 0.01, 0.99)
+        v_p[2::3] = np.clip(v_p[2::3], 1e-6, 0.5)
+        
+        try:
+            res_p = minimize(joint_objective, v_p, method='SLSQP', bounds=bounds_slqp,
+                             constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            if res_p.success:
+                if np.min(joint_constraints(res_p.x)) >= -1e-7:
+                    s = -res_p.fun
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = np.column_stack((res_p.x[0::3], res_p.x[1::3]))
+                        best_radii = res_p.x[2::3]
+        except Exception:
+            continue
+            
+    # 6. High-precision Final Polish
+    try:
+        res_f = minimize(joint_objective, v0, method='SLSQP', bounds=bounds_slqp,
+                         constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+        if res_f.success and np.min(joint_constraints(res_f.x)) >= -1e-9:
+            best_centers = np.column_stack((res_f.x[0::3], res_f.x[1::3]))
+            best_radii = res_f.x[2::3]
+            best_sum = -res_f.fun
+    except Exception:
+        pass
+        
+    best_radii = np.maximum(best_radii, 0.0)
+    return best_centers, best_radii, float(best_sum)
+```

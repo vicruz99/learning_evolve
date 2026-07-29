@@ -1,0 +1,174 @@
+# sol_000114 | problem=circle_packing_26 entrypoint=run_packing
+# generation=4 parent=sol_000076 (state b16097a6) state=32a365d2 sum of radii=1.810349 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def get_radii(centers):
+    """Computes the maximum valid radius for each circle given fixed centers."""
+    c = centers
+    # Distance to boundaries: min(x, 1-x, y, 1-y)
+    xb = np.minimum(c[:, 0], 1.0 - c[:, 0])
+    yb = np.minimum(c[:, 1], 1.0 - c[:, 1])
+    rb = np.minimum(xb, yb)
+    
+    # Distance to nearest neighbor
+    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dist, np.inf)
+    rn = 0.5 * np.min(dist, axis=1)
+    
+    return np.minimum(rb, rn)
+
+def objective(v):
+    """Objective to minimize: negative sum of radii."""
+    return -np.sum(get_radii(v.reshape(26, 2)))
+
+def hex_init(r_est, noise, seed=0):
+    """Generates initial centers from a hexagonal lattice with noise."""
+    rng = np.random.default_rng(seed)
+    pts = []
+    y = r_est
+    row = 0
+    while len(pts) < 30:  # Generate slightly more than needed
+        shift = r_est if row % 2 == 1 else 0.0
+        x = r_est + shift
+        while x + r_est <= 1.0:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += r_est * np.sqrt(3)
+        row += 1
+        
+    pts = np.array(pts[:26])
+    pts += rng.normal(0, noise, pts.shape)
+    return np.clip(pts, 0.01, 0.99)
+
+def repulsion_init(seed):
+    """Generates initial centers via force-directed repulsion."""
+    rng = np.random.default_rng(seed)
+    c = rng.uniform(0.1, 0.9, (26, 2))
+    for _ in range(400):
+        force = np.zeros_like(c)
+        for i in range(26):
+            diff = c[i] - c
+            dist = np.sqrt(np.sum(diff**2, axis=1))
+            dist[i] = np.inf
+            inv_dist = 1.0 / (dist + 0.04)**2
+            force[i] += np.sum(diff * inv_dist[:, np.newaxis], axis=0) * 0.01
+            # Gentle push away from boundaries to explore interior
+            x, y = c[i]
+            force[i, 0] += (0.5 - x) * 0.02
+            force[i, 1] += (0.5 - y) * 0.02
+        c += force * 0.1
+        c = np.clip(c, 0.05, 0.95)
+    return c
+
+def polish_centers(centers):
+    """Subgradient ascent to inflate circles and resolve tight spots."""
+    c = centers.copy()
+    n = c.shape[0]
+    lr = 0.004
+    for _ in range(150):
+        grad = np.zeros_like(c)
+        for i in range(n):
+            min_r = np.inf
+            active_grads = []
+            
+            # Boundary constraints
+            x, y = c[i]
+            for val, gv in [(x, [-1.0, 0.0]), (1.0-x, [1.0, 0.0]), 
+                            (y, [0.0, -1.0]), (1.0-y, [0.0, 1.0])]:
+                if val < min_r - 1e-7:
+                    min_r = val
+                    active_grads = [gv]
+                elif abs(val - min_r) < 1e-6:
+                    active_grads.append(gv)
+                    
+            # Neighbor constraints
+            diff = c[i] - c
+            dist = np.sqrt(np.sum(diff**2, axis=1))
+            dist[i] = np.inf
+            half_dist = 0.5 * dist
+            
+            for j in range(n):
+                if j == i: continue
+                if half_dist[j] < min_r - 1e-7:
+                    min_r = half_dist[j]
+                    active_grads = [0.5 * diff[j] / dist[j]]
+                elif abs(half_dist[j] - min_r) < 1e-6:
+                    active_grads.append(0.5 * diff[j] / dist[j])
+                    
+            if active_grads:
+                grad[i] = np.mean(active_grads, axis=0)
+                
+        c += lr * grad
+        c = np.clip(c, 1e-5, 1.0 - 1e-5)
+    return c
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    best_c = None
+    best_sum = -np.inf
+    
+    starts = []
+    # Hexagonal lattices with varying densities and noise levels
+    for r in [0.088, 0.092, 0.096, 0.100, 0.105, 0.110]:
+        for noise in [0.001, 0.004, 0.008]:
+            starts.append(hex_init(r, noise, seed=int(r*1000)+int(noise*10000)))
+            
+    # Force-directed repulsion starts
+    for s in range(12):
+        starts.append(repulsion_init(seed=s))
+        
+    bounds = [(0.001, 0.999)] * 52
+    
+    # Phase 1: Multi-start Powell optimization
+    for c0 in starts:
+        try:
+            res = minimize(objective, c0.flatten(), method='Powell',
+                          bounds=bounds, options={'maxiter': 2500, 'ftol': 1e-12, 'xtol': 1e-12})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_c = res.x.reshape(26, 2)
+        except Exception:
+            continue
+            
+    if best_c is None:
+        best_c = starts[0]
+        
+    # Phase 2: Gradient polish to inflate packing
+    best_c = polish_centers(best_c)
+    best_sum = np.sum(get_radii(best_c))
+    
+    # Phase 3: Perturbation search to escape local minima
+    rng = np.random.default_rng(123)
+    for _ in range(20):
+        pert_c = best_c + rng.normal(0, 0.0025, best_c.shape)
+        pert_c = np.clip(pert_c, 0.01, 0.99)
+        try:
+            res = minimize(objective, pert_c.flatten(), method='Powell',
+                          bounds=bounds, options={'maxiter': 1500, 'ftol': 1e-12})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_c = res.x.reshape(26, 2)
+        except Exception:
+            continue
+            
+    # Final radius computation and strict validation repair
+    final_radii = get_radii(best_c)
+    
+    # Micro-clamp centers to guarantee boundary constraints pass
+    for i in range(26):
+        x, y = best_c[i]
+        r = final_radii[i]
+        best_c[i, 0] = np.clip(x, r + 1e-9, 1.0 - r - 1e-9)
+        best_c[i, 1] = np.clip(y, r + 1e-9, 1.0 - r - 1e-9)
+        
+    # Recompute radii after clamping to ensure absolute consistency
+    final_radii = get_radii(best_c)
+    final_sum = float(np.sum(final_radii))
+    
+    return best_c, final_radii, final_sum

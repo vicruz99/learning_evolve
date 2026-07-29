@@ -1,0 +1,194 @@
+# sol_000027 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2d17cbe8) state=927358f5 sum of radii=2.560680 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def compute_sum_of_radii_and_penalties(params, n):
+    """
+    Computes the negative sum of radii (to be minimized) and a penalty for overlaps.
+    params: 1D array of shape (3*n,) containing [x1, y1, r1, x2, y2, r2, ...]
+    n: number of circles
+    Returns: (negative_sum_radii, penalty)
+    """
+    # Reshape params to (n, 3)
+    pts = params.reshape((n, 3))
+    x = pts[:, 0]
+    y = pts[:, 1]
+    r = pts[:, 2]
+    
+    # Objective: Maximize sum of radii -> Minimize -sum(r)
+    obj = -np.sum(r)
+    
+    # Penalty for constraints
+    penalty = 0.0
+    penalty_weight = 1000.0
+    
+    # Boundary constraints: r <= x, r <= 1-x, r <= y, r <= 1-y
+    # Violation: if r > x, then x - r < 0. Penalty on (x-r)^2 if x-r < 0.
+    # Actually, simpler: penalty on max(0, r - x)^2 etc.
+    # But for smooth optimization, we can just use a large weight on distance violations.
+    
+    # Boundary penalties
+    # x >= r => x - r >= 0
+    # x <= 1 - r => 1 - r - x >= 0 => 1 - x - r >= 0
+    # y >= r => y - r >= 0
+    # y <= 1 - r => 1 - y - r >= 0
+    
+    boundary_violations = np.maximum(0, r - x) + \
+                          np.maximum(0, r - (1 - x)) + \
+                          np.maximum(0, r - y) + \
+                          np.maximum(0, r - (1 - y))
+    penalty += penalty_weight * np.sum(boundary_violations**2)
+    
+    # Overlap constraints: dist >= r_i + r_j
+    # dist^2 >= (r_i + r_j)^2
+    # We compute distance and check violation
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = math.sqrt((x[i] - x[j])**2 + (y[i] - y[j])**2)
+            min_dist = r[i] + r[j]
+            if dist < min_dist:
+                overlap = min_dist - dist
+                penalty += penalty_weight * overlap**2
+                
+    return obj, penalty
+
+def run_packing():
+    """
+    Returns (centers, radii, sum_radii) for 26 circles packed in a unit square.
+    """
+    n = 26
+    np.random.seed(42) # For reproducibility
+    
+    # 1. Initialization
+    # Start with a 5x5 grid for 25 circles and add 1 in a gap
+    centers = []
+    # 5x5 grid centers
+    grid_vals = np.linspace(0.1, 0.9, 5)
+    for y in grid_vals:
+        for x in grid_vals:
+            centers.append([x, y])
+    
+    # Add 26th circle in a gap, e.g., at (0.2, 0.2) roughly
+    # The gap between (0.1, 0.1), (0.3, 0.1), (0.1, 0.3), (0.3, 0.3) is at (0.2, 0.2)
+    # But (0.2, 0.2) is equidistant. Let's place it there.
+    centers.append([0.2, 0.2])
+    
+    centers = np.array(centers)
+    
+    # Initial radii: 0.1 for grid, smaller for the extra one to avoid immediate overlap penalty
+    radii = np.full(n, 0.1)
+    radii[-1] = 0.01 
+    
+    # Combine into params: [x1, y1, r1, x2, y2, r2, ...]
+    params = np.hstack([centers, radii.reshape(-1, 1)]).flatten()
+    
+    # 2. Optimization
+    # We want to minimize the penalized objective
+    def objective(p):
+        obj, pen = compute_sum_of_radii_and_penalties(p, n)
+        return obj + pen
+
+    # Bounds for variables: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r
+    
+    # Run optimization
+    # Using SLSQP or L-BFGS-B. L-BFGS-B handles bounds well.
+    # We might need multiple restarts or a good initial guess.
+    
+    result = minimize(objective, params, method='L-BFGS-B', bounds=bounds, 
+                      options={'maxiter': 1000, 'ftol': 1e-9})
+    
+    best_params = result.x
+    
+    # 3. Extract results
+    best_params = best_params.reshape((n, 3))
+    final_centers = best_params[:, :2]
+    final_radii = best_params[:, 2]
+    
+    # 4. Refine/Validate and ensure strict constraints
+    # The penalty method might allow tiny violations. We can clamp radii to satisfy constraints strictly.
+    # However, the optimizer should have pushed them to boundary.
+    # Let's do a safety check and adjustment.
+    
+    # Re-calculate valid radii based on positions to ensure validity
+    # For each circle, radius is limited by walls and other circles
+    for i in range(n):
+        # Wall constraints
+        r_limit = min(final_centers[i, 0], 1 - final_centers[i, 0],
+                      final_centers[i, 1], 1 - final_centers[i, 1])
+        
+        # Neighbor constraints
+        for j in range(n):
+            if i == j: continue
+            dist = np.linalg.norm(final_centers[i] - final_centers[j])
+            # r_i + r_j <= dist => r_i <= dist - r_j
+            # But r_j is also a variable.
+            # A safe lower bound for r_i given fixed positions and current r_j is dist - r_j
+            # But since we want to maximize sum, and we just optimized, 
+            # we can just take the minimum of these bounds.
+            # However, r_j might be invalid if we change r_i.
+            # To be safe, we can just ensure r_i <= dist/2 (assuming r_j >= 0) is a very loose bound.
+            # Better: r_i <= dist - r_j. But r_j is current value.
+            # If we shrink r_i, we might need to shrink r_j?
+            # Actually, if the solution is valid, r_i <= dist - r_j holds.
+            # If not, we might have overlap.
+            # Let's just enforce r_i <= dist - r_j using current r_j values.
+            # This might underestimate r_i if r_j was too large, but ensures no overlap.
+            pass 
+        
+        # A more robust post-processing:
+        # Compute max possible radius for each circle given fixed centers and assuming others are at current radii?
+        # No, that's circular.
+        # Instead, let's just return the optimized values, but clamp r to ensure non-negativity.
+        # And check for overlaps. If overlaps exist, reduce radii slightly.
+        
+        # Simple check: ensure r_i <= distance to any other center / 2 (worst case if other r=0)
+        # But we have specific r_j.
+        
+        # Let's trust the optimizer with high penalty weight.
+        final_radii[i] = max(0.0, final_radii[i]) # Ensure non-negative
+
+    # Final validation and slight adjustment if needed
+    # Check overlaps and shrink if necessary
+    for _ in range(10): # Iterative shrink
+        changed = False
+        for i in range(n):
+            # Check wall
+            r_wall = min(final_centers[i, 0], 1 - final_centers[i, 0],
+                         final_centers[i, 1], 1 - final_centers[i, 1])
+            
+            # Check neighbors
+            r_neighbors = np.inf
+            for j in range(n):
+                if i == j: continue
+                dist = np.linalg.norm(final_centers[i] - final_centers[j])
+                max_r = dist - final_radii[j]
+                if max_r < r_neighbors:
+                    r_neighbors = max_r
+            
+            new_r = min(r_wall, r_neighbors)
+            if new_r < final_radii[i] - 1e-7:
+                final_radii[i] = max(0, new_r)
+                changed = True
+        if not changed:
+            break
+            
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii
+
+# To test locally, uncomment:
+# centers, radii, s = run_packing()
+# import numpy as np
+# print(validate_packing(centers, radii))
+# print(s)

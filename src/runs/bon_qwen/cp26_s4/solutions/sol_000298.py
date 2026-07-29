@@ -1,0 +1,342 @@
+# sol_000298 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state bdf692b1) state=41f19b8b sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    n = 26
+    
+    # --- 1. Initialization ---
+    # We start with a hexagonal lattice arrangement to provide a dense, valid starting configuration.
+    # We generate more points than needed and select the best ones, or just fit 26.
+    # A simple approach: Create a grid of points and pick 26.
+    
+    # Let's try a hexagonal pattern.
+    # Spacing s. We want to fit points in [0, 1]x[0, 1].
+    # Let's estimate s. For N=26, r approx 0.1, so diameter 0.2. s approx 0.2.
+    s = 0.15 # Initial spacing
+    
+    centers = []
+    y = 0.0
+    row = 0
+    while len(centers) < n:
+        x_offset = (s / 2) if row % 2 == 1 else 0.0
+        x = x_offset
+        while x <= 1.0:
+            # Check if center is within [0,1]x[0,1] (actually we need margin for radius, but for initialization 0-1 is fine)
+            # We clamp to small epsilon to avoid boundary issues initially
+            cx = np.clip(x, 0.001, 0.999)
+            cy = np.clip(y, 0.001, 0.999)
+            centers.append([cx, cy])
+            x += s
+        y += s * np.sqrt(3) / 2
+        row += 1
+    
+    # If we have too many, truncate. If too few (unlikely with s=0.15), add random.
+    if len(centers) > n:
+        # Select a subset that is well distributed? 
+        # Just taking the first n is okay for initialization.
+        centers = centers[:n]
+    elif len(centers) < n:
+        # Add random points if needed
+        np.random.seed(42)
+        while len(centers) < n:
+            centers.append([np.random.uniform(0.01, 0.99), np.random.uniform(0.01, 0.99)])
+            
+    centers_init = np.array(centers[:n])
+    
+    # Initial radii: small value to ensure valid start
+    r_init = np.full(n, 0.02)
+    
+    # Flatten variables: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.concatenate([centers_init.flatten(), r_init])
+    
+    # --- 2. Constraints and Objective ---
+    
+    def objective(vars_flat):
+        # Maximize sum of radii -> Minimize negative sum
+        r = vars_flat[2::3] # radii are at indices 2, 5, 8...
+        return -np.sum(r)
+    
+    def grad_objective(vars_flat):
+        # Gradient of -sum(r)
+        g = np.zeros_like(vars_flat)
+        g[2::3] = -1.0
+        return g
+
+    # Inequality constraints: g(vars) >= 0 for SLSQP? 
+    # SLSQP expects constraints as dict with 'fun' returning >= 0.
+    # Constraint: dist >= r_i + r_j  =>  dist - (r_i + r_j) >= 0
+    # Constraint: x >= r => x - r >= 0
+    # Constraint: 1-x >= r => 1 - x - r >= 0
+    
+    cons = []
+    
+    # Boundary constraints
+    for i in range(n):
+        idx_x = i * 3
+        idx_y = i * 3 + 1
+        idx_r = i * 3 + 2
+        
+        # x - r >= 0
+        def make_bc_x(i):
+            def bc_x(vars_flat):
+                return vars_flat[i*3] - vars_flat[i*3+2]
+            return bc_x
+        
+        # 1 - x - r >= 0
+        def make_bc_1mx(i):
+            def bc_1mx(vars_flat):
+                return 1.0 - vars_flat[i*3] - vars_flat[i*3+2]
+            return bc_1mx
+            
+        # y - r >= 0
+        def make_bc_y(i):
+            def bc_y(vars_flat):
+                return vars_flat[i*3+1] - vars_flat[i*3+2]
+            return bc_y
+            
+        # 1 - y - r >= 0
+        def make_bc_1my(i):
+            def bc_1my(vars_flat):
+                return 1.0 - vars_flat[i*3+1] - vars_flat[i*3+2]
+            return bc_1my
+            
+        cons.append({'type': 'ineq', 'fun': make_bc_x(i)})
+        cons.append({'type': 'ineq', 'fun': make_bc_1mx(i)})
+        cons.append({'type': 'ineq', 'fun': make_bc_y(i)})
+        cons.append({'type': 'ineq', 'fun': make_bc_1my(i)})
+        
+        # r >= 0 (handled by bounds usually, but can add constraint)
+        # SLSQP bounds are better for r >= 0
+
+    # Non-overlap constraints
+    # (xi - xj)^2 + (yi - yj)^2 >= (ri + rj)^2
+    # Let's use a simplified constraint: dist >= ri + rj
+    # dist - ri - rj >= 0
+    # However, dist is sqrt(...).
+    # To avoid sqrt in constraint (which is fine but derivative is tricky at 0), we can use squared form?
+    # SLSQP needs function value.
+    # Let's use sqrt. It's smooth enough for non-zero distance.
+    
+    # Optimization: Only check pairs that are close? No, must check all.
+    # 26*25/2 = 325 constraints. Might be slow but let's try.
+    
+    # To speed up, we can use a vectorized approach inside the constraint function?
+    # But SLSQP calls 'fun' per constraint or per vector? 
+    # If 'fun' returns scalar, it's one constraint.
+    # If we pass a list of dicts, it's multiple.
+    # Creating 325 lambda functions or closures might be heavy but acceptable for N=26.
+    
+    # Let's define a function that returns an array of constraint violations for all pairs?
+    # SLSQP does not support vector constraints directly in the same way.
+    # But we can combine them? No.
+    # We have to list them.
+    
+    # Alternative: Use a penalty method or a different solver?
+    # Or reduce constraints?
+    # Maybe just use bounds and a penalty in objective?
+    # Objective: -sum(r) - penalty * sum(max(0, ri+rj - dist)^2)
+    # This avoids explicit constraints and might be faster/more robust for large N.
+    # Let's try penalty method with L-BFGS-B.
+    
+    def objective_penalty(vars_flat):
+        xs = vars_flat[0::3]
+        ys = vars_flat[1::3]
+        rs = vars_flat[2::3]
+        
+        # Boundary penalty
+        # x < r -> x - r < 0. Penalty (max(0, r - x))^2
+        pen = 0.0
+        pen += np.sum(np.maximum(0, rs - xs)**2)
+        pen += np.sum(np.maximum(0, rs - (1.0 - xs))**2)
+        pen += np.sum(np.maximum(0, rs - ys)**2)
+        pen += np.sum(np.maximum(0, rs - (1.0 - ys))**2)
+        
+        # Overlap penalty
+        # dist < ri + rj -> ri + rj - dist > 0. Penalty (max(0, ri + rj - dist))^2
+        # Compute pairwise distances
+        # Efficiently:
+        # C = np.vstack([xs, ys]).T  (n, 2)
+        # dists = cdist(C, C)
+        # But cdist not available? numpy has np.linalg.norm?
+        # Let's do loops or broadcasting.
+        
+        # Broadcasting
+        # xs_diff = xs[:, None] - xs[None, :]  # (n, n)
+        # ys_diff = ys[:, None] - ys[None, :]
+        # dists = np.sqrt(xs_diff**2 + ys_diff**2)
+        # sum_rs = rs[:, None] + rs[None, :]
+        # overlaps = np.maximum(0, sum_rs - dists)
+        # pen += np.sum(overlaps**2)
+        
+        # To save memory/time, only upper triangle?
+        # sum(overlaps**2) over all i,j counts each pair twice (i,j) and (j,i) and zeros on diagonal.
+        # That's fine for penalty.
+        
+        xs_diff = xs[:, None] - xs[None, :]
+        ys_diff = ys[:, None] - ys[None, :]
+        dists = np.sqrt(xs_diff**2 + ys_diff**2)
+        
+        sum_rs = rs[:, None] + rs[None, :]
+        
+        # Penalty weight
+        # If penalty is too high, it dominates. If too low, constraints violated.
+        # We can start low and increase, or use a large constant.
+        penalty_weight = 1000.0
+        
+        overlap = np.maximum(0, sum_rs - dists)
+        pen += penalty_weight * np.sum(overlap**2)
+        
+        # Also penalty for negative radius?
+        pen += penalty_weight * np.sum(np.maximum(0, -rs)**2)
+        
+        return -np.sum(rs) - pen
+
+    # However, gradient of penalty is needed for L-BFGS-B.
+    # Calculating gradient of penalty manually is tedious.
+    # But L-BFGS-B can use numerical gradients if jac is not provided? 
+    # It does use numerical gradients by default? No, it might be slow.
+    # But for 78 vars, it's okay.
+    
+    # Let's try SLSQP with explicit constraints first, but maybe simplified.
+    # Actually, penalty method with L-BFGS-B is often easier to implement without gradient code.
+    # Let's use minimize with method 'L-BFGS-B' and no jac (numerical diff).
+    
+    # Bounds
+    bounds = [(0, 1)] * (2 * n) + [(0, 0.5)] * n
+    # x, y in [0, 1], r in [0, 0.5]
+    
+    # We need to reshape bounds to list of tuples
+    bounds_list = []
+    for i in range(n):
+        bounds_list.append((0.0, 1.0)) # x
+        bounds_list.append((0.0, 1.0)) # y
+        bounds_list.append((0.0, 0.5)) # r
+
+    # Let's use the penalty method.
+    # We might need to tune penalty_weight.
+    # A very large weight might cause numerical issues.
+    # But let's try.
+    
+    # Also, we can run multiple restarts.
+    
+    best_res = None
+    best_val = -np.inf
+    
+    # Run 3 times with slightly different seeds/initializations
+    for k in range(3):
+        if k == 0:
+            x0_curr = x0.copy()
+        else:
+            # Perturb
+            noise = np.random.uniform(-0.01, 0.01, size=x0.shape)
+            # Clamp bounds
+            x0_curr = np.clip(x0 + noise, 
+                              [0]*n + [0]*n + [0]*n, 
+                              [1]*n + [1]*n + [0.5]*n)
+            # Actually bounds are per var.
+            for i in range(n):
+                x0_curr[i*3] = np.clip(x0_curr[i*3], 0, 1)
+                x0_curr[i*3+1] = np.clip(x0_curr[i*3+1], 0, 1)
+                x0_curr[i*3+2] = np.clip(x0_curr[i*3+2], 0, 0.5)
+
+        # Increase penalty weight to enforce constraints strictly
+        # We can define objective with closure over penalty_weight
+        # But let's just use a large number.
+        # Actually, for circle packing, a sequential increase of penalty is good.
+        # But single run might suffice.
+        
+        # Let's define objective with weight
+        def obj_pen(vars, w=1000.0):
+            xs = vars[0::3]
+            ys = vars[1::3]
+            rs = vars[2::3]
+            
+            val = -np.sum(rs)
+            
+            # Boundary
+            val -= w * np.sum(np.maximum(0, rs - xs)**2)
+            val -= w * np.sum(np.maximum(0, rs - (1.0 - xs))**2)
+            val -= w * np.sum(np.maximum(0, rs - ys)**2)
+            val -= w * np.sum(np.maximum(0, rs - (1.0 - ys))**2)
+            
+            # Overlap
+            # Use broadcasting
+            # xs_diff shape (n, n)
+            xs_diff = xs[:, None] - xs[None, :]
+            ys_diff = ys[:, None] - ys[None, :]
+            dists = np.sqrt(xs_diff**2 + ys_diff**2)
+            
+            sum_rs = rs[:, None] + rs[None, :]
+            
+            overlap = np.maximum(0, sum_rs - dists)
+            # Sum over all i,j. Diagonal is 0.
+            val -= w * np.sum(overlap**2)
+            
+            # Radius non-negativity
+            val -= w * np.sum(np.maximum(0, -rs)**2)
+            
+            return val
+
+        try:
+            res = minimize(obj_pen, x0_curr, method='L-BFGS-B', bounds=bounds_list, 
+                           options={'maxiter': 1000, 'ftol': 1e-12})
+            
+            if -res.fun > best_val:
+                best_val = -res.fun
+                best_res = res.x
+        except Exception:
+            pass
+
+    if best_res is None:
+        # Fallback to initial
+        best_res = x0
+
+    # Extract results
+    centers_opt = np.zeros((n, 2))
+    radii_opt = np.zeros(n)
+    for i in range(n):
+        centers_opt[i, 0] = best_res[i*3]
+        centers_opt[i, 1] = best_res[i*3+1]
+        radii_opt[i] = best_res[i*3+2]
+
+    sum_radii = np.sum(radii_opt)
+    
+    # Post-processing: Ensure strict validity by clamping if necessary
+    # The optimizer might leave tiny violations.
+    # We can shrink radii slightly to be safe.
+    # Check overlaps and shrink
+    for _ in range(10):
+        changed = False
+        for i in range(n):
+            # Boundary
+            r = radii_opt[i]
+            x = centers_opt[i, 0]
+            y = centers_opt[i, 1]
+            
+            max_r = min(x, 1-x, y, 1-y)
+            if r > max_r + 1e-9:
+                radii_opt[i] = max_r
+                changed = True
+                
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.sqrt(np.sum((centers_opt[i] - centers_opt[j])**2))
+                r_sum = radii_opt[i] + radii_opt[j]
+                if dist < r_sum - 1e-9:
+                    # Shrink both equally or proportionally?
+                    # Simplest: scale down sum to dist
+                    scale = dist / r_sum
+                    radii_opt[i] *= scale
+                    radii_opt[j] *= scale
+                    changed = True
+        if not changed:
+            break
+            
+    sum_radii = np.sum(radii_opt)
+    return centers_opt, radii_opt, sum_radii

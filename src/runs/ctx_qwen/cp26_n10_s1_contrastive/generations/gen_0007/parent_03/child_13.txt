@@ -1,0 +1,264 @@
+
+
+<strategy>
+To improve upon the current packing sum of radii (~2.627) and target >2.636, I will implement a robust hybrid optimization strategy combining Linear Programming (LP), coordinate ascent local search, and sequential quadratic programming (SLSQP).
+
+Key improvements:
+1. **LP-driven Local Search**: For fixed centers, the optimal radii form a Linear Programming problem. I will use this to rapidly evaluate configurations. A coordinate ascent algorithm will iteratively move circles (with adaptive step sizes and occasional swaps to change contact topology) to maximize the LP sum of radii. This efficiently navigates the center space.
+2. **Diverse Initializations**: Generate ~40 starting configurations using hexagonal lattices (with varied row counts, rotations, and scales), force-directed layouts (with corner/edge bias), and perturbed grids. This covers different packing topologies.
+3. **Boundary-safe SLSQP Refinement**: Use the parameterization $x_i = r_i + u_i(1-2r_i)$, $y_i = r_i + v_i(1-2r_i)$ with $u_i, v_i \in [0,1]$. This automatically satisfies boundary constraints $r_i \le x_i \le 1-r_i$, drastically reducing constraint count and improving SLSQP stability. Only pairwise non-overlap constraints are passed to the optimizer.
+4. **Perturbation & Polish Loop**: After finding a strong local optimum via LP search, convert to SLSQP parameters, shrink radii slightly for strict interior feasibility, and run multiple perturbation+optimization cycles to escape shallow local minima. Finish with a high-precision polish.
+5. **Robustness**: All helper functions are top-level. No closures or lambdas. Comprehensive error handling and fallbacks ensure valid output.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solves LP to find radii maximizing sum(r_i)."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    num_constr = 4 * n + n * (n - 1) // 2
+    A_ub = np.zeros((num_constr, n))
+    b_ub = np.zeros(num_constr)
+    k = 0
+    
+    # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    for i in range(n):
+        x, y = centers[i]
+        b_ub[k:k+4] = [x, 1.0 - x, y, 1.0 - y]
+        A_ub[k:k+4, i] = 1.0
+        k += 4
+        
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    dx = centers[:, 0, None] - centers[None, :, 0]
+    dy = centers[:, 1, None] - centers[None, :, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = dists[i, j]
+            k += 1
+            
+    bounds_r = [(0.0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+    return np.full(n, 1e-5), 1e-5
+
+def centers_to_params(centers, radii):
+    """Converts physical centers/radii to (r, u, v) optimization parameters."""
+    r = radii.copy()
+    denom = np.clip(1.0 - 2.0 * r, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / denom, 0.0, 1.0)
+    params = np.empty(3 * N)
+    params[0::3] = r
+    params[1::3] = u
+    params[2::3] = v
+    return params
+
+def params_to_centers(params):
+    """Converts (r, u, v) parameters back to physical centers and radii."""
+    r = params[0::3]
+    u = params[1::3]
+    v = params[2::3]
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    return np.column_stack((x, y)), r
+
+def obj(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[0::3])
+
+def constr(params):
+    """Inequality constraints: pairwise non-overlap. Boundaries handled by parameterization."""
+    r = params[0::3]
+    u = params[1::3]
+    v = params[2::3]
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    return dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2
+
+def local_search(c0, rng, n_iter=800):
+    """LP-driven coordinate ascent with adaptive steps and swaps."""
+    c = c0.copy()
+    r, best_sum = solve_lp_radii(c)
+    step = 0.04
+    
+    for _ in range(n_iter):
+        idx = rng.randint(N)
+        old_c = c[idx].copy()
+        best_move = None
+        best_move_sum = best_sum
+        
+        # Try multiple random displacements
+        for _ in range(3):
+            nc = c.copy()
+            nc[idx] += rng.normal(0, step, 2)
+            nc[idx] = np.clip(nc[idx], 0.005, 0.995)
+            _, s = solve_lp_radii(nc)
+            if s > best_move_sum + 1e-9:
+                best_move_sum = s
+                best_move = nc[idx].copy()
+                
+        if best_move is not None:
+            c[idx] = best_move
+            r, best_sum = solve_lp_radii(c)
+            step *= 0.95
+        else:
+            step = min(0.08, step * 1.03)
+            
+        # Occasional swap to change contact topology
+        if rng.rand() < 0.12:
+            i, j = rng.choice(N, 2, replace=False)
+            nc = c.copy()
+            nc[i], nc[j] = c[j].copy(), c[i].copy()
+            _, s = solve_lp_radii(nc)
+            if s > best_sum + 1e-9:
+                c = nc
+                r, best_sum = solve_lp_radii(c)
+                
+    return c, r, best_sum
+
+def generate_hex(rng, row_counts, rot=0.0, scale=1.0):
+    """Generates a hexagonal lattice initialization."""
+    pts = []
+    r_est = 0.095
+    y = r_est
+    for r_idx, cnt in enumerate(row_counts):
+        shift = (r_idx % 2) * r_est
+        x = r_est + shift
+        for _ in range(cnt):
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+    pts = np.array(pts[:N])
+    pts = (pts - 0.5) * scale + 0.5
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+    pts += rng.uniform(-0.015, 0.015, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def generate_force(rng):
+    """Generates a force-directed layout initialization with corner bias."""
+    pts = rng.uniform(0.05, 0.95, (N, 2))
+    for _ in range(400):
+        f = np.zeros_like(pts)
+        diff = pts[:, None, :] - pts[None, :, :]
+        dist = np.sqrt(np.sum(diff**2, axis=2)) + 1e-8
+        rep = 1.0 / (dist**2)
+        np.fill_diagonal(rep, 0.0)
+        f += np.sum(rep[:, :, None] * diff / dist[:, :, None], axis=1)
+        # Corner/edge attraction to encourage boundary packing
+        for d in range(2):
+            f[:, d] += 8.0 * np.maximum(0, 0.18 - pts[:, d])
+            f[:, d] -= 8.0 * np.maximum(0, pts[:, d] - 0.82)
+        pts += 0.004 * f
+        pts = np.clip(pts, 0.02, 0.98)
+    return pts
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    bounds = [(1e-6, 0.49), (0.0, 1.0), (0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constr}
+    
+    best_sum = -np.inf
+    best_params = None
+    
+    inits = []
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [5,5,5,5,6], [6,4,6,5,5],
+        [5,6,4,6,5], [4,5,6,5,6], [6,6,5,5,4], [5,5,6,5,5], [6,5,5,5,5],
+        [7,5,5,5,4], [4,5,5,5,7], [5,7,5,5,4], [4,5,5,7,5], [6,6,6,4,4]
+    ]
+    
+    # Generate diverse hexagonal starts
+    for pat in patterns:
+        for s in range(4):
+            rot = rng.uniform(-0.25, 0.25)
+            sc = rng.uniform(0.90, 1.10)
+            inits.append(generate_hex(rng, pat, rot, sc))
+            
+    # Generate force-directed starts
+    for s in range(12):
+        inits.append(generate_force(rng))
+        
+    # Phase 1: LP-driven local search on centers
+    for c0 in inits:
+        c_opt, r_opt, s_opt = local_search(c0, rng, n_iter=900)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            # Shrink radii slightly to ensure strict interior feasibility for SLSQP
+            best_params = centers_to_params(c_opt, r_opt * 0.99)
+            
+    # Phase 2: SLSQP refinement
+    if best_params is not None:
+        x0 = best_params.copy()
+        try:
+            res = minimize(obj, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            if res.success and np.min(constr(res.x)) >= -1e-7:
+                curr = -res.fun
+                if curr > best_sum:
+                    best_sum = curr
+                    best_params = res.x.copy()
+        except Exception:
+            pass
+            
+        # Phase 3: Perturbation & SLSQP loop to escape local minima
+        for k in range(50):
+            x_p = best_params.copy()
+            x_p[0::3] += rng.normal(0, 0.001, N)  # radii
+            x_p[1::3] += rng.normal(0, 0.04, N)   # u
+            x_p[2::3] += rng.normal(0, 0.04, N)   # v
+            x_p[0::3] = np.clip(x_p[0::3], 1e-6, 0.49)
+            x_p[1::3] = np.clip(x_p[1::3], 0.0, 1.0)
+            x_p[2::3] = np.clip(x_p[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(obj, x_p, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                if res.success and np.min(constr(res.x)) >= -1e-7:
+                    curr = -res.fun
+                    if curr > best_sum:
+                        best_sum = curr
+                        best_params = res.x.copy()
+            except Exception:
+                pass
+                
+        # Phase 4: High-precision final polish
+        try:
+            res = minimize(obj, best_params, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            if res.success and np.min(constr(res.x)) >= -1e-8:
+                best_params = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+            
+    # Fallback configuration
+    if best_params is None:
+        c_f = np.array([[0.1 + i*0.2, 0.1 + j*0.2] for i in range(5) for j in range(5)])
+        c_f = np.vstack([c_f, [0.5, 0.5]])
+        r_f, _ = solve_lp_radii(c_f)
+        best_params = centers_to_params(c_f, r_f)
+        best_sum = np.sum(r_f)
+        
+    centers, radii = params_to_centers(best_params)
+    return centers, radii, float(best_sum)
+```

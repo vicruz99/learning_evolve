@@ -1,0 +1,88 @@
+# sol_000214 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 722eaafb) state=45005598 sum of radii=2.627845 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(X):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(X[2 * N_CIRCLES:])
+
+def get_constraints(X):
+    """Compute inequality constraints: g(X) >= 0 for SLSQP."""
+    centers = X[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = X[2 * N_CIRCLES:]
+    c = []
+    
+    # Boundary constraints: circles inside [0,1]^2
+    c.append(centers[:, 0] - radii)
+    c.append(1.0 - centers[:, 0] - radii)
+    c.append(centers[:, 1] - radii)
+    c.append(1.0 - centers[:, 1] - radii)
+    
+    # Overlap constraints: distance between centers >= sum of radii
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    idx = np.triu_indices(N_CIRCLES, k=1)
+    c.append(dists[idx] - radii[idx[0]] - radii[idx[1]])
+    
+    return np.concatenate(c)
+
+def run_packing():
+    # Initialize centers on a hex-like grid pattern for good spatial distribution
+    pts = []
+    y = 0.1
+    row_idx = 0
+    while len(pts) < N_CIRCLES:
+        shift = 0.08 if row_idx % 2 == 1 else 0.0
+        x = 0.1
+        while len(pts) < N_CIRCLES and x <= 0.9:
+            pts.append([x, y])
+            x += 0.17
+        y += 0.15
+        row_idx += 1
+
+    pts = np.array(pts[:N_CIRCLES])
+    # Normalize to fit comfortably inside the unit square, leaving margin for expansion
+    pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.7 + 0.15
+
+    # Initial variable vector: [x0, y0, ..., x25, y25, r0, ..., r25]
+    X0 = np.concatenate([pts.flatten(), np.full(N_CIRCLES, 0.02)])
+    bounds = [(0.0, 1.0)] * (2 * N_CIRCLES) + [(0.0, 0.5)] * N_CIRCLES
+
+    best_sum = -np.inf
+    best_X = None
+    np.random.seed(42)
+
+    # Multiple restarts to escape local optima
+    for seed in range(15):
+        X0_pert = X0.copy()
+        X0_pert[:2 * N_CIRCLES] += np.random.randn(2 * N_CIRCLES) * 0.01
+        X0_pert[:N_CIRCLES] = np.clip(X0_pert[:N_CIRCLES], 0.1, 0.9)
+        X0_pert[N_CIRCLES:2 * N_CIRCLES] = np.clip(X0_pert[N_CIRCLES:2 * N_CIRCLES], 0.1, 0.9)
+        X0_pert[2 * N_CIRCLES:] = np.full(N_CIRCLES, 0.02 + seed * 0.002)
+
+        try:
+            res = minimize(objective, X0_pert, method='SLSQP', bounds=bounds,
+                           constraints={'type': 'ineq', 'fun': get_constraints},
+                           options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_X = res.x
+        except Exception:
+            pass
+
+    # Fallback optimization if restarts fail
+    if best_X is None:
+        res = minimize(objective, X0, method='SLSQP', bounds=bounds,
+                       constraints={'type': 'ineq', 'fun': get_constraints})
+        best_X = res.x
+
+    centers = best_X[:2 * N_CIRCLES].reshape(N_CIRCLES, 2)
+    radii = best_X[2 * N_CIRCLES:]
+    return centers, radii, np.sum(radii)

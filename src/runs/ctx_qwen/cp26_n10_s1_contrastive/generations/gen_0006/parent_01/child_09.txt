@@ -1,0 +1,161 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.636, I will employ a hybrid optimization strategy that combines global exploration with exact local refinement:
+
+1. **Linear Programming for Radii**: For any fixed set of centers, the optimal radii that maximize the sum while respecting boundary and non-overlap constraints can be found exactly and rapidly using an LP (`scipy.optimize.linprog`). This transforms the problem into optimizing the 52 center coordinates.
+
+2. **Global Search via Differential Evolution**: The objective function (LP sum of radii) is non-smooth and piecewise linear, making gradient-based methods prone to local minima. Differential Evolution (DE) is robust for this type of landscape. I'll run DE on the center coordinates to find a high-quality global configuration.
+
+3. **Coordinate Ascent Local Search**: After DE, I'll perform a targeted coordinate ascent (perturb one circle at a time, accept if LP sum increases). This efficiently navigates the piecewise-linear landscape and tightens the packing further before smoothing optimization.
+
+4. **SLSQP Joint Polishing**: Finally, I'll transition to a joint constrained optimization using `SLSQP` on interleaved `[x, y, r]` variables. This smooths out the final configuration, resolves numerical tightness, and extracts the absolute maximum sum of radii within tolerance.
+
+This pipeline leverages the exactness of LP for radius allocation, the global reach of DE, the granularity of coordinate ascent, and the precision of SLSQP to push past previous local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+N = 26
+
+# Precompute triangular indices for pairwise constraints
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def get_lp_sum_and_radii(centers):
+    """Solves LP to find optimal radii for fixed centers maximizing sum(r_i)."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    num_cons = 4 * n + n * (n - 1) // 2
+    A_ub = np.zeros((num_cons, n))
+    b_ub = np.zeros(num_cons)
+    k = 0
+    
+    # Boundary constraints: r_i <= dist_to_wall
+    for i in range(n):
+        x, y = centers[i]
+        for b in [x, 1.0 - x, y, 1.0 - y]:
+            A_ub[k, i] = 1.0
+            b_ub[k] = b
+            k += 1
+            
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = dists[i, j]
+            k += 1
+            
+    bounds = [(0.0, None)] * n
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return -res.fun, res.x
+    except Exception:
+        pass
+    return 0.0, np.full(n, 1e-5)
+
+def de_objective(x_flat):
+    """Objective for DE: minimize negative LP sum of radii."""
+    centers = x_flat.reshape(N, 2)
+    s, _ = get_lp_sum_and_radii(centers)
+    return -s
+
+def constraints_slqp(v):
+    """Inequality constraints g(v) >= 0 for SLSQP."""
+    cx = v[0::3]
+    cy = v[1::3]
+    r = v[2::3]
+    
+    c = []
+    # Boundary containment
+    c.append(cx - r)
+    c.append(1.0 - cx - r)
+    c.append(cy - r)
+    c.append(1.0 - cy - r)
+    
+    # Pairwise non-overlap: dist^2 >= (r_i + r_j)^2
+    dx = cx[:, np.newaxis] - cx[np.newaxis, :]
+    dy = cy[:, np.newaxis] - cy[np.newaxis, :]
+    dist2 = dx**2 + dy**2
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    c.append(dist2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2)
+    return np.concatenate(c)
+
+def objective_slqp(v):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def run_packing():
+    np.random.seed(42)
+    
+    # Phase 1: Global search on centers using Differential Evolution
+    bounds_de = [(0.0, 1.0)] * (2 * N)
+    res_de = differential_evolution(
+        de_objective, bounds_de, popsize=20, maxiter=100, 
+        mutation=(0.5, 1.0), recombination=0.7, seed=42, 
+        polishing=False, workers=1
+    )
+    best_c = res_de.x.reshape(N, 2)
+    best_s, best_r = get_lp_sum_and_radii(best_c)
+    
+    # Phase 2: Coordinate Ascent to refine centers and navigate piecewise-linear landscape
+    current_c = best_c.copy()
+    current_s = best_s
+    step = 0.02
+    for _ in range(3000):
+        idx = np.random.randint(N)
+        direction = np.random.randn(2)
+        direction /= np.linalg.norm(direction)
+        
+        new_c = current_c.copy()
+        new_c[idx] = np.clip(new_c[idx] + step * direction, 0.001, 0.999)
+        
+        s_new, r_new = get_lp_sum_and_radii(new_c)
+        if s_new > current_s + 1e-6:
+            current_c = new_c
+            current_s = s_new
+            step = max(0.001, step * 0.95)
+        else:
+            step = min(0.05, step * 1.02)
+            
+    best_c = current_c
+    best_s, best_r = get_lp_sum_and_radii(best_c)
+    
+    # Phase 3: SLSQP Joint Polish for high-precision optimization
+    # Interleaved structure: [x1, y1, r1, x2, y2, r2, ...]
+    bounds_slqp = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    
+    v0 = np.zeros(3 * N)
+    v0[0::3] = best_c[:, 0]
+    v0[1::3] = best_c[:, 1]
+    v0[2::3] = best_r * 0.995  # Slight shrink ensures strict interior feasibility
+    
+    res_slqp = minimize(
+        objective_slqp, v0, method='SLSQP', bounds=bounds_slqp,
+        constraints={'type': 'ineq', 'fun': constraints_slqp},
+        options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False}
+    )
+    
+    if res_slqp.success:
+        v_opt = res_slqp.x
+        if np.min(constraints_slqp(v_opt)) >= -1e-7:
+            best_r = v_opt[2::3]
+            best_c = np.column_stack((v_opt[0::3], v_opt[1::3]))
+            best_s = np.sum(best_r)
+            
+    # Fallback (should not be reached given robust phases)
+    if best_s < 1.0:
+        grid = np.array([[0.1 + 0.2*i, 0.1 + 0.2*j] for i in range(5) for j in range(5)])
+        grid = np.vstack([grid, [0.5, 0.5]])
+        best_c = grid
+        best_s, best_r = get_lp_sum_and_radii(best_c)
+        
+    return best_c, np.maximum(best_r, 0.0), float(best_s)
+```

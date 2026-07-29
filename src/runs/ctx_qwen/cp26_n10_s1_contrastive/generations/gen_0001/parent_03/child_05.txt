@@ -1,0 +1,159 @@
+
+
+<strategy>
+To improve the sum of radii from ~2.59 to the target ~2.636, we need a more robust global optimization strategy. Circle packing is highly non-convex with many local minima. The key improvements will be:
+
+1. **Diverse Initializations**: Combine hexagonal, grid, and corner-biased layouts. Different topologies often lead to different local optima.
+2. **Multi-Restart with Perturbation**: Run the constrained optimizer (SLSQP) multiple times from slightly perturbed versions of each initial configuration. This helps escape shallow local minima.
+3. **Iterative Refinement**: After finding the best solution, apply controlled random perturbations to both centers and radii, then re-optimize. This "basin-hopping" style approach often pushes the solution into a deeper optimum.
+4. **Strict Feasibility Management**: Start with small, strictly feasible radii to ensure the optimizer begins in the valid region, allowing it to safely expand circles.
+5. **Tight Tolerances & Higher Iterations**: Increase `maxiter` and decrease `ftol` to allow the solver to converge more precisely to the constraint boundaries where the maximum sum is achieved.
+
+The constraint formulation remains vectorized and efficient. We hardcode $N=26$ for speed and clarity, ensuring all helper functions are top-level with no closures.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraints(vars):
+    """Compute all inequality constraints: boundary and separation."""
+    n = 26
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    c = []
+    # Boundary constraints: x >= r, x <= 1-r, y >= r, y <= 1-r
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    # Pairwise separation: dist_sq >= (r_i + r_j)^2
+    i_idx, j_idx = np.triu_indices(n, 1)
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    r_sum = r[i_idx] + r[j_idx]
+    c.append(dx**2 + dy**2 - r_sum**2)
+    
+    return np.concatenate(c)
+
+def get_hex_init(n):
+    """Hexagonal lattice initialization."""
+    pts = np.zeros((n, 2))
+    idx = 0
+    r0 = 0.09
+    y = r0
+    row = 0
+    while idx < n:
+        shift = r0 if row % 2 == 1 else 0.0
+        x = r0 + shift
+        while x <= 1.0 - r0 and idx < n:
+            pts[idx] = [x, y]
+            idx += 1
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+    # Normalize to [0.1, 0.9] to leave expansion room
+    pts = (pts - pts.min(axis=0)) / (pts.max(axis=0) - pts.min(axis=0)) * 0.8 + 0.1
+    return pts
+
+def get_grid_init(n):
+    """5x5 grid + center initialization."""
+    pts = np.zeros((n, 2))
+    idx = 0
+    for i in range(5):
+        for j in range(5):
+            pts[idx] = [0.1 + 0.2 * i, 0.1 + 0.2 * j]
+            idx += 1
+    pts[-1] = [0.5, 0.5]
+    return pts
+
+def get_corner_bias_init(n, seed):
+    """Random initialization biased towards corners and edges."""
+    np.random.seed(seed)
+    pts = np.zeros((n, 2))
+    # Place 4 in corners
+    pts[0] = [0.1, 0.1]
+    pts[1] = [0.9, 0.1]
+    pts[2] = [0.1, 0.9]
+    pts[3] = [0.9, 0.9]
+    # Place 8 on edges
+    edge_pts = []
+    for _ in range(4):
+        edge_pts.append([np.random.uniform(0.2, 0.8), 0.1])
+        edge_pts.append([np.random.uniform(0.2, 0.8), 0.9])
+        edge_pts.append([0.1, np.random.uniform(0.2, 0.8)])
+        edge_pts.append([0.9, np.random.uniform(0.2, 0.8)])
+    pts[4:12] = edge_pts
+    # Place remaining randomly in center
+    pts[12:] = np.random.uniform(0.3, 0.7, size=(n-12, 2))
+    return pts
+
+def run_packing():
+    n = 26
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -np.inf
+    best_vars = None
+    
+    # Base initializations
+    inits = [get_hex_init(n), get_grid_init(n)]
+    for s in range(4):
+        inits.append(get_corner_bias_init(n, seed=s))
+        
+    # Phase 1: Multi-restart optimization
+    for seed in range(20):
+        np.random.seed(seed)
+        for pts in inits:
+            x0 = np.zeros(3 * n)
+            x0[0::3] = pts[:, 0]
+            x0[1::3] = pts[:, 1]
+            x0[2::3] = 0.05  # Strictly feasible small radius
+            
+            # Perturb to break symmetry and explore nearby basins
+            x0 += np.random.normal(0, 0.006, 3 * n)
+            x0 = np.clip(x0, 0.02, 0.98)
+            x0[2::3] = np.maximum(x0[2::3], 0.02)
+            
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 4000, 'ftol': 1e-13})
+            
+            if res.success:
+                s_val = -res.fun
+                if s_val > best_sum:
+                    best_sum = s_val
+                    best_vars = res.x.copy()
+                    
+    # Phase 2: Iterative refinement / Basin hopping
+    if best_vars is not None:
+        for _ in range(25):
+            # Perturb centers and radii slightly
+            x0 = best_vars.copy()
+            x0 += np.random.normal(0, 0.002, 3 * n)
+            x0 = np.clip(x0, 0.0, 1.0)
+            x0[2::3] = np.maximum(x0[2::3], 0.01)
+            
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-13})
+            if res.success and -res.fun > best_sum:
+                best_sum = -res.fun
+                best_vars = res.x.copy()
+                
+    # Fallback if optimization fails completely
+    if best_vars is None:
+        centers = get_hex_init(n)
+        radii = np.full(n, 0.05)
+        return centers, radii, np.sum(radii)
+        
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    
+    return centers, radii, float(best_sum)
+```

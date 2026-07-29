@@ -1,112 +1,105 @@
 # sol_000167 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 1d84d4eb) state=abffbbfa sum of radii=2.531813 correctness=1.0
+# generation=0 parent=seed (state 6d8d18a8) state=0684d9d4 sum of radii=1.496434 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import minimize
 
-N = 26
+def compute_repulsion(centers, radii):
+    """Compute net repulsive forces between overlapping circles."""
+    n = len(radii)
+    diff = centers[:, None, :] - centers[None, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    dist = np.sqrt(np.maximum(dist_sq, 1e-12))
+    
+    # Mask diagonal to avoid self-interaction
+    mask = ~np.eye(n, dtype=bool)
+    dist = np.where(mask, dist, np.inf)
+    
+    sum_r = radii[:, None] + radii[None, :]
+    overlap = np.maximum(sum_r - dist, 0.0)
+    overlap = np.where(mask, overlap, 0.0)
+    
+    dir_vec = np.where(mask[:, :, None], diff / dist[:, :, None], 0.0)
+    forces = overlap[:, :, None] * dir_vec
+    
+    net_force = np.sum(forces, axis=0)
+    return net_force
 
-def constraint_fn(vars):
-    """Evaluate all inequality constraints for the circle packing problem.
-    Returns an array where all elements must be >= 0 for feasibility."""
-    centers = vars[:2*N].reshape(N, 2)
-    radii = vars[2*N:]
-    
-    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, etc.
-    c1 = centers[:, 0] - radii
-    c2 = 1.0 - centers[:, 0] - radii
-    c3 = centers[:, 1] - radii
-    c4 = 1.0 - centers[:, 1] - radii
-    
-    # Pairwise non-overlap constraints: dist^2 - (r1 + r2)^2 >= 0
-    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dist_sq = np.sum(diffs**2, axis=2)
-    r_sums = radii[:, np.newaxis] + radii[np.newaxis, :]
-    pair_cons = dist_sq - r_sums**2
-    
-    # Extract upper triangle to avoid duplicate constraints and self-interaction
-    i, j = np.triu_indices(N, k=1)
-    pair_flat = pair_cons[i, j]
-    
-    return np.concatenate([c1, c2, c3, c4, pair_flat])
+def apply_boundary_constraints(centers, radii):
+    """Clamp centers to stay within [0,1] considering radii."""
+    centers[:, 0] = np.clip(centers[:, 0], radii, 1.0 - radii)
+    centers[:, 1] = np.clip(centers[:, 1], radii, 1.0 - radii)
+    return centers
 
-def objective_fn(vars):
-    """Objective function: minimize negative sum of radii."""
-    return -np.sum(vars[2*N:])
+def is_valid_packing(centers, radii, tol=1e-11):
+    """Check if packing satisfies non-overlap and boundary constraints."""
+    # Boundary check
+    if np.any(centers < radii[:, None] - tol) or np.any(centers > 1.0 - radii[:, None] + tol):
+        return False
+    # Overlap check
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    if np.any(dists < radii[:, None] + radii[None, :] - tol):
+        return False
+    return True
 
-def run_packing():
-    np.random.seed(42)
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    n = 26
     
-    # Phase 1: Physics-based simulation to find a good initial configuration
-    centers = np.zeros((N, 2))
-    radii = np.ones(N) * 0.035
+    # Initialize hexagonal-ish grid
+    centers = np.zeros((n, 2))
+    idx = 0
+    row = 0
+    while idx < n:
+        cols = 6 if row % 2 == 0 else 5
+        for c in range(cols):
+            if idx >= n:
+                break
+            x = 0.08 + c * 0.16 + (0.08 if row % 2 != 0 else 0.0)
+            y = 0.08 + row * 0.16
+            centers[idx] = [x, y]
+            idx += 1
+        row += 1
+        
+    # Add initial perturbation
+    centers += rng.uniform(-0.03, 0.03, size=centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
     
-    # Grid initialization with slight perturbation to break symmetry
-    for k in range(N):
-        centers[k, 0] = 0.1 + (k % 5) * 0.2
-        centers[k, 1] = 0.1 + (k // 5) * 0.2
-    centers += np.random.rand(N, 2) * 0.01
+    radii = np.full(n, 0.05)
     
-    velocities = np.random.randn(N, 2) * 0.005
-    growth = 1e-4
-    damping = 0.92
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    best_sum = 0.0
     
-    for step in range(4000):
+    max_iters = 6000
+    for step in range(max_iters):
+        # Radius growth with exponential decay
+        growth = 0.00015 * (0.9995 ** step)
         radii += growth
-        if step > 2000:
-            growth *= 0.99  # Slow down growth as we approach tight packing
+        
+        # Compute and apply repulsion
+        forces = compute_repulsion(centers, radii)
+        step_size = 0.008 * (0.999 ** step)
+        centers += step_size * forces
+        
+        # Enforce boundaries
+        apply_boundary_constraints(centers, radii)
+        
+        # Random perturbation to escape local minima
+        if step % 1500 == 0 and step > 0:
+            centers += rng.normal(0, 0.005, size=centers.shape)
+            apply_boundary_constraints(centers, radii)
             
-        forces = np.zeros((N, 2))
-        
-        # Pairwise repulsion
-        for i in range(N):
-            for j in range(i+1, N):
-                dx = centers[j, 0] - centers[i, 0]
-                dy = centers[j, 1] - centers[i, 1]
-                dist = np.sqrt(dx*dx + dy*dy) + 1e-9
-                min_d = radii[i] + radii[j]
-                if dist < min_d:
-                    f = (min_d - dist) / dist * 8.0
-                    forces[i, 0] += dx * f
-                    forces[i, 1] += dy * f
-                    forces[j, 0] -= dx * f
-                    forces[j, 1] -= dy * f
-                    
-        # Wall repulsion
-        for i in range(N):
-            if centers[i, 0] - radii[i] < 0:
-                forces[i, 0] += 15.0 * (radii[i] - centers[i, 0])
-            if centers[i, 0] + radii[i] > 1:
-                forces[i, 0] -= 15.0 * (centers[i, 0] + radii[i] - 1)
-            if centers[i, 1] - radii[i] < 0:
-                forces[i, 1] += 15.0 * (radii[i] - centers[i, 1])
-            if centers[i, 1] + radii[i] > 1:
-                forces[i, 1] -= 15.0 * (centers[i, 1] + radii[i] - 1)
+        # Validate and record best
+        if is_valid_packing(centers, radii):
+            current_sum = np.sum(radii)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
                 
-        velocities *= damping
-        velocities += forces
-        centers += velocities
-        
-        # Project positions to feasible region relative to current radii
-        centers[:, 0] = np.clip(centers[:, 0], radii, 1 - radii)
-        centers[:, 1] = np.clip(centers[:, 1], radii, 1 - radii)
-
-    # Phase 2: Mathematical optimization to maximize sum of radii
-    x0 = np.concatenate([centers.flatten(), radii])
-    bounds = [(0, 1)] * (2*N) + [(0, 0.5)] * N
-    cons = {'type': 'ineq', 'fun': constraint_fn}
-    
-    res = minimize(objective_fn, x0, bounds=bounds, constraints=cons, 
-                   method='SLSQP', options={'maxiter': 300, 'ftol': 1e-9})
-    
-    final_vars = res.x
-    final_centers = final_vars[:2*N].reshape(N, 2)
-    final_radii = final_vars[2*N:]
-    
-    # Apply a tiny safety shrink to guarantee feasibility within 1e-12 tolerance
-    final_radii *= 0.999999
-    
-    return final_centers, final_radii, np.sum(final_radii)
+    return best_centers, best_radii, best_sum

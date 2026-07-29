@@ -1,136 +1,108 @@
 # sol_000008 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 6882cd8b) state=86dd3944 sum of radii=1.991282 correctness=1.0
+# generation=0 parent=seed (state e6663bde) state=fef51320 sum of radii=2.620431 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
+from scipy.optimize import minimize
 
-def run_packing():
-    np.random.seed(42)
+def compute_constraints(vars):
     n = 26
+    radii = vars[2*n:]
+    nc = 4*n + n*(n-1)//2
+    c = np.empty(nc)
+    idx = 0
     
-    best_sum = 0.0
+    # Boundary constraints: x - r >= 0, 1 - x - r >= 0, y - r >= 0, 1 - y - r >= 0
+    c[idx:idx+n] = vars[:n] - radii
+    idx += n
+    c[idx:idx+n] = 1.0 - vars[:n] - radii
+    idx += n
+    c[idx:idx+n] = vars[n:2*n] - radii
+    idx += n
+    c[idx:idx+n] = 1.0 - vars[n:2*n] - radii
+    idx += n
+    
+    # Non-overlap constraints: dist^2 >= (r1 + r2)^2
+    for i in range(n):
+        xi, yi = vars[i], vars[n+i]
+        ri = radii[i]
+        for j in range(i+1, n):
+            dx = xi - vars[j]
+            dy = yi - vars[n+j]
+            c[idx] = dx*dx + dy*dy - (ri + radii[j])**2
+            idx += 1
+    return c
+
+def constraint_func(vars):
+    return compute_constraints(vars)
+
+def objective(vars):
+    n = 26
+    return -np.sum(vars[2*n:])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
     best_centers = None
     best_radii = None
+    max_sum_r = -1.0
     
-    # Generate diverse initial configurations
-    inits = []
+    bounds = [(0, 1)] * (2*n) + [(0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
     
-    # 1. Hexagonal lattice packing
-    c_hex = np.zeros((n, 2))
-    idx = 0
-    for row in range(6):
-        count = 5 if row % 2 == 0 else 4
-        for col in range(count):
-            if idx < n:
-                x = 0.15 + col * 0.2
-                y = 0.15 + row * 0.173205
-                c_hex[idx] = [x, y]
-                idx += 1
-    inits.append(c_hex)
-    
-    # 2. 5x5 Grid + center
-    xs = np.linspace(0.1, 0.9, 5)
-    ys = np.linspace(0.1, 0.9, 5)
-    c_grid = np.column_stack(np.meshgrid(xs, ys)).reshape(-1, 2)
-    c_grid = np.vstack([c_grid, [0.5, 0.5]])
-    inits.append(c_grid)
-    
-    # 3. Random uniform inside [0.1, 0.9]
-    c_rand = np.random.rand(n, 2) * 0.8 + 0.1
-    inits.append(c_rand)
-    
-    for init_centers in inits:
-        centers = init_centers.copy()
-        radii = np.full(n, 0.05)
-        dt = 0.02
+    for seed in range(40):
+        np.random.seed(seed)
         
-        for it in range(6000):
-            # Vectorized boundary constraints
-            b_x = centers[:, 0]
-            b_1x = 1.0 - centers[:, 0]
-            b_y = centers[:, 1]
-            b_1y = 1.0 - centers[:, 1]
+        if seed < 15:
+            # Random initialization in central region
+            x = np.random.uniform(0.2, 0.8, n)
+            y = np.random.uniform(0.2, 0.8, n)
+        elif seed < 25:
+            # Hexagonal-inspired initialization
+            x, y = [], []
+            row_counts = [5, 6, 5, 6, 4]
+            for r_idx, cnt in enumerate(row_counts):
+                if len(x) + cnt > n: cnt = n - len(x)
+                y_val = 0.2 + r_idx * 0.16
+                offset = 0.08 if r_idx % 2 == 1 else 0.0
+                x_vals = np.linspace(0.15 + offset, 0.85 + offset, cnt)
+                x.extend(x_vals)
+                y.extend([y_val]*cnt)
+            x, y = np.array(x[:n]), np.array(y[:n])
+        else:
+            # Wider random initialization
+            x = np.random.uniform(0.1, 0.9, n)
+            y = np.random.uniform(0.1, 0.9, n)
             
-            # Vectorized inter-circle distance matrix
-            diff = centers[:, None, :] - centers[None, :, :]
-            D = np.sqrt(np.sum(diff**2, axis=2))
-            np.fill_diagonal(D, np.inf)
-            
-            # Max allowed radius for each circle considering neighbors
-            # r_i <= D[i,j] - r_j  =>  r_i + r_j <= D[i,j]
-            min_neighbor = np.min(D - radii[None, :], axis=1)
-            
-            # Combine constraints
-            max_allowed = b_x
-            max_allowed = np.minimum(max_allowed, b_1x)
-            max_allowed = np.minimum(max_allowed, b_y)
-            max_allowed = np.minimum(max_allowed, b_1y)
-            max_allowed = np.minimum(max_allowed, min_neighbor)
-            
-            # Grow radii
-            expansion = np.maximum(max_allowed - radii, 0.0)
-            growth = np.minimum(expansion, 0.002)
-            radii += growth
-            
-            # Compute repulsion forces for overlaps
-            forces = np.zeros_like(centers)
-            sum_r = radii[:, None] + radii[None, :]
-            
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = D[i, j]
-                    if d < sum_r[i, j] and d > 1e-9:
-                        overlap = sum_r[i, j] - d
-                        diff_vec = centers[i] - centers[j]
-                        # Strong repulsion to resolve overlaps quickly
-                        f = diff_vec / d * overlap * 8.0
-                        forces[i] += f
-                        forces[j] -= f
-                        
-            # Boundary repulsion forces
-            for i in range(n):
-                for dim in range(2):
-                    if centers[i, dim] < radii[i]:
-                        forces[i, dim] += (radii[i] - centers[i, dim]) * 8.0
-                    elif centers[i, dim] > 1 - radii[i]:
-                        forces[i, dim] -= (centers[i, dim] - (1 - radii[i])) * 8.0
-                        
-            # Update positions
-            centers += dt * forces
-            centers = np.clip(centers, 1e-8, 1 - 1e-8)
-            
-            # Decay step size for convergence
-            dt *= 0.9996
-            
-        # Evaluate current packing
-        current_sum = np.sum(radii)
-        if current_sum > best_sum:
-            best_sum = current_sum
-            best_centers = centers.copy()
-            best_radii = radii.copy()
-            
-    centers = best_centers
-    radii = best_radii
-    
-    # Final safety shrink to guarantee strict validity with tolerance
-    max_violation = 0.0
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        margin = min(x, 1-x, y, 1-y)
-        if margin < r:
-            max_violation = max(max_violation, r - margin + 1e-6)
-            
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            req = radii[i] + radii[j]
-            if dist < req:
-                max_violation = max(max_violation, (req - dist)/2 + 1e-6)
-                
-    if max_violation > 0:
-        radii -= max_violation
-        radii = np.maximum(radii, 1e-6)
+        r_init = np.full(n, 0.06)
+        vars0 = np.concatenate([x, y, r_init])
         
-    return centers, radii, np.sum(radii)
+        try:
+            res = minimize(objective, vars0, method='SLSQP', 
+                          bounds=bounds, constraints=cons, 
+                          options={'maxiter': 2000, 'ftol': 1e-10, 'disp': False})
+            
+            curr_sum = -res.fun
+            if curr_sum > max_sum_r:
+                c_vals = compute_constraints(res.x)
+                if np.all(c_vals >= -1e-6):
+                    max_sum_r = curr_sum
+                    best_centers = np.column_stack((res.x[:n], res.x[n:2*n])).copy()
+                    best_radii = res.x[2*n:].copy()
+        except Exception:
+            continue
+            
+    if best_centers is None:
+        # Fallback to structured grid
+        best_centers = np.zeros((n, 2))
+        best_radii = np.full(n, 0.05)
+        idx = 0
+        for i in range(5):
+            for j in range(6):
+                if idx < n:
+                    best_centers[idx] = [0.1 + j*0.15, 0.1 + i*0.2]
+                    idx += 1
+        max_sum_r = np.sum(best_radii)
+        
+    return best_centers, best_radii, max_sum_r

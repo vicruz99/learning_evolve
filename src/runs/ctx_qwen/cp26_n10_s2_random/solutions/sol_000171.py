@@ -1,0 +1,225 @@
+# sol_000171 | problem=circle_packing_26 entrypoint=run_packing
+# generation=8 parent=sol_000160 (state 08773110) state=03c20cc2 sum of radii=2.239335 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+N = 26
+
+# Precompute upper triangle indices for pairwise constraints
+PAIR_IDX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(PAIR_IDX[0])
+
+# Precompute LP constraint matrix structure (constant across runs)
+A_LP = np.zeros((NUM_PAIRS + 4 * N, N))
+for k in range(NUM_PAIRS):
+    i, j = PAIR_IDX[0][k], PAIR_IDX[1][k]
+    A_LP[k, i] = 1.0
+    A_LP[k, j] = 1.0
+for i in range(N):
+    base = NUM_PAIRS + 4 * i
+    for _ in range(4):
+        A_LP[base + _, i] = 1.0
+
+def solve_lp_and_grad(centers):
+    """
+    Solves LP for optimal radii given fixed centers and computes the exact gradient 
+    of the sum of radii with respect to center positions using LP dual variables.
+    """
+    n = centers.shape[0]
+    # Upper bound for each radius based on distance to square boundaries
+    ub_r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                      np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub_r = np.maximum(ub_r, 1e-9)
+    
+    # Pairwise distances
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    
+    # Construct right-hand side of LP constraints
+    b_ub = np.zeros(A_LP.shape[0])
+    b_ub[:NUM_PAIRS] = dists[PAIR_IDX]
+    idx = NUM_PAIRS
+    for i in range(n):
+        b_ub[idx] = centers[i, 0]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        b_ub[idx] = centers[i, 1]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    # Solve LP: maximize sum(r) subject to r_i + r_j <= dist_ij and boundary constraints
+    res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b_ub, 
+                  bounds=[(0, u) for u in ub_r], method='highs')
+    
+    if not res.success:
+        return np.zeros(n), 0.0, np.zeros_like(centers)
+        
+    radii = res.x
+    
+    # Extract dual marginals (handles different scipy versions gracefully)
+    try:
+        duals = res.ineqlin.marginals
+    except AttributeError:
+        duals = getattr(getattr(res, 'marginals', None), 'ineqlin', np.zeros(A_LP.shape[0]))
+        
+    grad = np.zeros_like(centers)
+    
+    # Pairwise gradient contribution from distance constraints
+    for k in range(NUM_PAIRS):
+        lam = duals[k]
+        if lam > 1e-8:
+            i, j = PAIR_IDX[0][k], PAIR_IDX[1][k]
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+                
+    # Boundary gradient contribution from wall constraints
+    b_start = NUM_PAIRS
+    for i in range(n):
+        grad[i, 0] += duals[b_start + 4 * i] - duals[b_start + 4 * i + 1]
+        grad[i, 1] += duals[b_start + 4 * i + 2] - duals[b_start + 4 * i + 3]
+        
+    return radii, np.sum(radii), grad
+
+def gradient_ascent(c0, rng, max_iter=1800):
+    """Runs gradient ascent on centers to maximize sum of radii."""
+    c = c0.copy()
+    best_c, best_s = c.copy(), -1.0
+    step = 0.018
+    no_improve = 0
+    
+    for k in range(max_iter):
+        _, s, g = solve_lp_and_grad(c)
+        if s > best_s + 1e-9:
+            best_s = s
+            best_c = c.copy()
+            no_improve = 0
+        else:
+            no_improve += 1
+            
+        # Adaptive step decay to refine precision when stuck
+        if no_improve > 25:
+            step *= 0.78
+        elif no_improve > 60:
+            step *= 0.5
+            
+        if step < 1e-7:
+            break
+            
+        g_norm = np.linalg.norm(g)
+        if g_norm > 1e-9:
+            c += step * (g / g_norm)
+            
+        # Periodic noise to escape local subgradient plateaus
+        if k % 50 == 0:
+            c += rng.normal(0, 0.004, c.shape)
+            
+        c = np.clip(c, 0.02, 0.98)
+        
+    return best_c, best_s
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    
+    # Hexagonal lattice patterns (promote high density)
+    patterns = [
+        [5,6,5,6,4], [6,5,6,5,4], [5,5,5,5,6], [4,6,6,6,4], 
+        [6,5,5,5,5], [5,5,5,6,5], [6,6,4,5,5], [5,6,4,5,6],
+        [5,5,6,5,5], [6,4,6,5,5], [4,5,6,5,6], [5,5,4,6,6]
+    ]
+    for pat in patterns:
+        for r0 in [0.09, 0.095, 0.10, 0.105]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x + rng.normal(0, 0.003), y + rng.normal(0, 0.003)])
+                    x += 2.0 * r0
+                y += r0 * 1.7320508
+            starts.append(np.array(c[:N]))
+            
+    # Force-directed repulsion spread (avoids clustering)
+    for _ in range(8):
+        c = rng.uniform(0.2, 0.8, (N, 2))
+        for _ in range(150):
+            f = np.zeros_like(c)
+            diff = c[:, None, :] - c[None, :, :]
+            dist = np.linalg.norm(diff, axis=2)
+            dist = np.maximum(dist, 1e-4)
+            f = np.sum(diff / (dist ** 2)[:, :, None], axis=1)
+            c += 0.006 * f
+            c = np.clip(c, 0.1, 0.9)
+        starts.append(c)
+        
+    # Dense random starts
+    for _ in range(10):
+        starts.append(rng.uniform(0.15, 0.85, (N, 2)))
+        
+    return starts
+
+def repair(centers, radii):
+    """Deterministic repair to ensure strict validity within 1e-12 tolerance."""
+    radii = radii.copy()
+    for _ in range(50):
+        changed = False
+        # Resolve pairwise overlaps by symmetric shrinking
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-11:
+                    shrink = (req - d) / 2.0 + 1e-10
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        # Clamp to boundaries
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_s = -1.0
+    best_r = None
+    
+    # Phase 1: Gradient ascent from multiple diverse starts
+    starts = generate_starts(rng)
+    for c0 in starts:
+        c_opt, s_opt = gradient_ascent(c0, rng)
+        if s_opt > best_s:
+            best_s = s_opt
+            best_c = c_opt.copy()
+            
+    # Phase 2: Targeted perturbation around the best configuration to escape shallow minima
+    c_curr = best_c.copy()
+    for _ in range(15):
+        c_pert = c_curr + rng.normal(0, 0.006, c_curr.shape)
+        c_pert = np.clip(c_pert, 0.02, 0.98)
+        c_ref, s_ref = gradient_ascent(c_pert, rng, max_iter=1200)
+        if s_ref > best_s:
+            best_s = s_ref
+            best_c = c_ref.copy()
+            c_curr = best_c.copy()
+            
+    # Phase 3: Exact LP resolution for final radii
+    r_lp, s_lp, _ = solve_lp_and_grad(best_c)
+    best_r = r_lp
+    
+    # Phase 4: Strict numerical repair to guarantee validator tolerance compliance
+    radii = repair(best_c, best_r)
+    
+    return best_c, radii, float(np.sum(radii))

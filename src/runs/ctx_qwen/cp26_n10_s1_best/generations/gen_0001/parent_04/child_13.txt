@@ -1,0 +1,184 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we address the non-convex nature of the problem by combining three key techniques:
+1. **Diverse High-Quality Initialization**: Generate initial configurations using rotated and scaled hexagonal lattices, which naturally approximate dense packings. This covers multiple basins of attraction in the solution space.
+2. **Constraint-Based Local Optimization (SLSQP)**: Use `scipy.optimize.minimize` with `SLSQP` to optimize both centers and radii simultaneously. Constraints are formulated as $(x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 \ge 0$ for smooth differentiability.
+3. **Homotopy Expansion & Position Refinement**: After finding a local optimum, iteratively scale up all radii by a small factor and fix them while optimizing only positions using L-BFGS-B on a smooth penalty function. This gradually "pushes" the packing to higher densities without violating constraints abruptly, effectively escaping local minima that trap simultaneous optimization. A final SLSQP polish adjusts individual radii to exploit any remaining slack.
+
+All helper functions are defined at the top level without closures or lambdas to comply with strict coding rules.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(vars):
+    """Objective to minimize: -sum(radii)"""
+    return -np.sum(vars[2::3])
+
+def constraints(vars):
+    """Returns array of constraint values (must be >= 0)"""
+    cons = []
+    for i in range(N):
+        x, y, r = vars[3*i], vars[3*i+1], vars[3*i+2]
+        cons.extend([x - r, 1 - x - r, y - r, 1 - y - r])
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = vars[3*i] - vars[3*j]
+            dy = vars[3*i+1] - vars[3*j+1]
+            dr = vars[3*i+2] + vars[3*j+2]
+            cons.append(dx*dx + dy*dy - dr*dr)
+    return np.array(cons)
+
+def penalty_fixed_r(centers_flat, radii):
+    """Smooth penalty for boundary and overlap violations for fixed radii"""
+    centers = centers_flat.reshape(N, 2)
+    x = centers[:, 0]
+    y = centers[:, 1]
+    r = radii
+    
+    # Boundary penalties
+    p = np.sum(np.maximum(0, r - x)**2) + np.sum(np.maximum(0, x - (1-r))**2)
+    p += np.sum(np.maximum(0, r - y)**2) + np.sum(np.maximum(0, y - (1-r))**2)
+    
+    # Overlap penalties
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    min_dist = r[:, None] + r[None, :]
+    triu = np.triu(np.ones((N, N), dtype=bool), k=1)
+    overlaps = np.maximum(0, min_dist - dist)
+    p += np.sum(overlaps[triu]**2)
+    
+    return p
+
+def run_packing():
+    np.random.seed(42)
+    bounds = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+    
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+
+    inits = []
+    # Generate diverse hexagonal initial configurations
+    for scale in [0.95, 1.0, 1.05, 1.1]:
+        for angle in [0.0, 0.15, 0.3, np.pi/6]:
+            pts = []
+            r0 = 0.085 * scale
+            y_step = np.sqrt(3) * r0
+            for row in range(12):
+                y = r0 + row * y_step
+                if y > 1 - r0:
+                    break
+                shift = r0 if row % 2 == 1 else 0
+                for col in range(12):
+                    x = r0 + shift + col * 2 * r0
+                    if x > 1 - r0:
+                        break
+                    cx, cy = 0.5, 0.5
+                    dx, dy = x - cx, y - cy
+                    rx = dx * np.cos(angle) - dy * np.sin(angle) + cx
+                    ry = dx * np.sin(angle) + dy * np.cos(angle) + cy
+                    if 0 <= rx <= 1 and 0 <= ry <= 1:
+                        pts.append([rx, ry])
+                if len(pts) >= N:
+                    break
+            if len(pts) >= N:
+                c_init = np.array(pts[:N])
+                r_init = np.full(N, r0)
+                inits.append((c_init, r_init))
+            else:
+                # Fallback to random valid
+                c_init = np.random.uniform(0.1, 0.9, (N, 2))
+                r_init = np.full(N, 0.06)
+                inits.append((c_init, r_init))
+
+    # Add pure random starts
+    for _ in range(5):
+        c_init = np.random.uniform(0.15, 0.85, (N, 2))
+        r_init = np.full(N, 0.07)
+        inits.append((c_init, r_init))
+
+    # SLSQP optimization on each initialization
+    for c0, r0 in inits:
+        vars0 = np.zeros(3 * N)
+        vars0[0::3] = c0[:, 0]
+        vars0[1::3] = c0[:, 1]
+        vars0[2::3] = r0
+        try:
+            res = minimize(objective, vars0, method='SLSQP',
+                           bounds=bounds, constraints={'type': 'ineq', 'fun': constraints},
+                           options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+            if not np.isnan(res.fun):
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_c = np.column_stack((res.x[0::3], res.x[1::3]))
+                    best_r = res.x[2::3].copy()
+        except Exception:
+            pass
+
+    # Iterative radius expansion with position adjustment (Homotopy method)
+    if best_c is not None:
+        curr_c = best_c.copy()
+        curr_r = best_r.copy()
+        for _ in range(30):
+            curr_r *= 1.002
+            res_pos = minimize(penalty_fixed_r, curr_c.ravel(), args=(curr_r,),
+                               method='L-BFGS-B', bounds=[(0.0, 1.0)] * (2 * N),
+                               options={'maxiter': 500, 'ftol': 1e-15})
+            curr_c = res_pos.x.reshape(N, 2)
+            if res_pos.fun > 1e-5:
+                curr_r /= 1.002
+                break
+        if np.sum(curr_r) > best_sum:
+            best_sum = np.sum(curr_r)
+            best_c = curr_c
+            best_r = curr_r
+
+        # Final polish with SLSQP
+        vars0 = np.zeros(3 * N)
+        vars0[0::3] = best_c[:, 0]
+        vars0[1::3] = best_c[:, 1]
+        vars0[2::3] = best_r
+        vars0 += np.random.normal(0, 1e-5, 3 * N)  # Tiny noise to escape local min
+        try:
+            res = minimize(objective, vars0, method='SLSQP',
+                           bounds=bounds, constraints={'type': 'ineq', 'fun': constraints},
+                           options={'maxiter': 3000, 'ftol': 1e-14, 'disp': False})
+            s = -res.fun
+            if s > best_sum:
+                best_sum = s
+                best_c = np.column_stack((res.x[0::3], res.x[1::3]))
+                best_r = res.x[2::3].copy()
+        except Exception:
+            pass
+
+    # Safety shrinkage for numerical precision
+    for _ in range(20):
+        valid = True
+        for i in range(N):
+            x, y, r = best_c[i, 0], best_c[i, 1], best_r[i]
+            if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                valid = False
+                break
+        if valid:
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.sqrt((best_c[i,0]-best_c[j,0])**2 + (best_c[i,1]-best_c[j,1])**2)
+                    if d < best_r[i] + best_r[j] - 1e-12:
+                        valid = False
+                        break
+                if not valid:
+                    break
+        if valid:
+            break
+        best_r *= 0.999
+        best_sum = np.sum(best_r)
+
+    return best_c, best_r, float(best_sum)
+```

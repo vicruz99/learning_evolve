@@ -1,228 +1,200 @@
 # sol_000206 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state cccf4974) state=24c80e14 sum of radii=2.608881 correctness=1.0
+# generation=0 parent=seed (state c1389c4d) state=564aae86 sum of radii=1.300000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-import math
 from scipy.optimize import minimize
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
     """
-    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a hexagonal initial layout and optimizes positions to maximize the minimum distance.
     """
     n_circles = 26
     
-    # Initial configuration
-    # We start with a grid-like distribution. 
-    # Since 26 is not a perfect square, we try a hexagonal-ish layout or a dense grid.
-    # A 5x5 grid fits 25 circles with radius 0.1. 
-    # We start with a slightly smaller radius to ensure feasibility and then optimize.
+    # 1. Initialize centers in a hexagonal pattern
+    # We need to fit 26 circles. 
+    # Approximate layout: 6 rows. 
+    # Row lengths could be 5, 4, 5, 4, 5, 4? Sum = 27. 
+    # Or 5, 5, 5, 5, 4, 2? 
+    # Let's try a standard hexagonal grid approach and trim/adjust.
     
-    # Create a grid of points
-    # We want to place 26 points. 5x5 = 25. 
-    # Let's try to distribute them somewhat evenly.
-    # A perturbed hexagonal packing might be better, but a grid is a valid start.
+    centers = []
     
-    # Let's create a 5x6 grid and select 26? No, too crowded.
-    # Let's just create a 5x5 grid and put one in the middle?
-    # Or better, just random valid positions?
-    # Let's try a dense grid initialization.
+    # Parameters for hexagonal lattice
+    # Horizontal spacing = 1 (will scale later)
+    # Vertical spacing = sqrt(3)/2
     
-    # Initialize positions in a grid pattern, scaled to fit with some margin
-    # We'll use a radius of 0.08 initially (diameter 0.16) to give plenty of space.
-    # 1 / 0.16 = 6.25, so we can fit 6 circles.
-    # Let's do 5 rows. 
-    # Rows 1,3,5 have 5 circles. Rows 2,4 have 5 circles. Total 25.
-    # Wait, 5x5 is 25. We need 26.
-    # Let's place 25 in a grid and 1 somewhere, or just 26 random points.
+    # Let's generate a grid of points and pick the best 26 that fit in a square
+    # Or just construct rows.
+    # Try to fit 5 circles in a row. Width = 4 * 2r + 2r? No, centers spacing 2r.
+    # Let's just generate points with spacing 1.0 and scale them to fit.
     
-    # Better initialization: Hexagonal packing approximation
-    # Rows of circles.
+    # Hexagonal lattice generation
+    # Row i: y = i * sqrt(3)/2
+    # Cols j: x = j + (i % 2) * 0.5
+    
+    # We need to select 26 points.
+    # Let's try to form a shape close to a square.
+    # 5x5 grid is 25. Add 1.
+    # Hexagonal 5x5ish.
+    
+    # Let's generate a list of potential centers based on a dense grid
+    # and pick 26 that are well spaced?
+    # Actually, let's just generate a specific hexagonal arrangement.
+    
+    # Try 6 rows with alternating 5 and 4 circles?
     # Row 0: 5 circles
-    # Row 1: 5 circles
-    # ...
-    # But 5 circles of diameter 0.16 don't fit (width 0.80 + margins?). 
-    # 5 circles diameter 0.16 -> width 0.80. Fits easily.
+    # Row 1: 4 circles
+    # Row 2: 5 circles
+    # Row 3: 4 circles
+    # Row 4: 5 circles
+    # Row 5: 3 circles (total 26) -> 5+4+5+4+5+3 = 26.
+    # This seems reasonable.
     
-    # Let's just generate random valid positions to break symmetry.
-    np.random.seed(42) # Fixed seed for reproducibility
+    rows_config = [5, 4, 5, 4, 5, 3]
     
-    centers = np.zeros((n_circles, 2))
-    radii = np.zeros(n_circles)
+    # Generate initial coordinates
+    # We want them centered in [0,1]x[0,1] roughly.
+    # Let's place them in a relative coordinate system first.
     
-    # Initialize with a grid of roughly 5x5 but with extra space
-    # We'll place them in a 5x6 grid subset or just random.
-    # Let's try a structured approach: 5 rows.
-    # Row 0: 5 circles at y=0.1
-    # Row 1: 5 circles at y=0.3
-    # ...
-    # But 26 circles. 5 rows of 5 is 25. Put 26th in middle?
-    # If we start with radius 0.05, diameter 0.1.
-    # 10 circles fit in width 1.0.
-    # So we can fit them easily.
+    points = []
+    y_step = np.sqrt(3) / 2.0
     
-    # Let's create a dense random packing to start, ensuring no overlaps.
-    # Or just a grid.
+    for i, count in enumerate(rows_config):
+        y = i * y_step
+        # Center the row horizontally
+        # x coordinates for 'count' circles with spacing 1.0
+        # indices 0, 1, ..., count-1
+        # shift by 0.5 if row index is odd (staggered)
+        if i % 2 == 1:
+            x_offset = 0.5
+        else:
+            x_offset = 0.0
+        
+        # Generate x coords
+        # To center, we can subtract mean
+        xs = np.arange(count) + x_offset
+        # But let's just generate them and we will scale/shift later.
+        for x_rel in xs:
+            points.append([x_rel, y])
+            
+    points = np.array(points)
     
-    # Grid initialization:
-    # Place 26 circles.
-    # 5 columns, 6 rows? 30 spots.
-    # Let's fill first 26 spots of a 6x6 grid scaled down?
-    # Actually, let's just use a simple grid of size 5x6 (30) and pick 26?
-    # No, let's just place them in a 5x5 grid and add one.
+    # Normalize points to fit in [0,1]x[0,1] with some margin
+    # Find bounding box
+    min_x, min_y = points.min(axis=0)
+    max_x, max_y = points.max(axis=0)
     
-    # Initialize centers
-    # Let's try to pack them in a 5x5 grid (25) + 1 center?
-    # Grid step 0.2. Radius 0.08.
-    # x in [0.08, 0.28, 0.48, 0.68, 0.88] -> 5 points.
-    # y in [0.08, 0.28, 0.48, 0.68, 0.88] -> 5 points.
-    # Total 25.
-    # 26th at (0.5, 0.5)? Distance to (0.48, 0.48) is sqrt(0.02^2 + 0.02^2) ~ 0.028 < 0.16. Overlap.
-    # So we need more space.
+    width = max_x - min_x
+    height = max_y - min_y
     
-    # Let's use a larger grid spacing.
-    # Diameter 0.15. Radius 0.075.
-    # 6 circles fit in 1.0 (6*0.15 = 0.9).
-    # 6x5 grid = 30 circles. We pick 26.
+    # Scale to fit in [0,1] with a small margin for optimization room
+    # If we scale too tightly, optimizer might struggle with boundaries.
+    # But we want to maximize radius, so tight packing is good.
+    # Let's scale such that the bounding box fits in [0.05, 0.95] roughly?
+    # Actually, the optimizer will move them.
+    # Let's just scale to fit in [0,1] with a factor of 0.95 to keep inside.
     
-    step = 0.15
-    r_init = 0.075
+    scale = min((0.95 - 0.05) / width, (0.95 - 0.05) / height) # Fit in 0.1 to 0.9
     
-    x_vals = np.arange(5) * step + (1.0 - 5*step)/2 + step/2
-    y_vals = np.arange(6) * step + (1.0 - 6*step)/2 + step/2
+    # Apply scale and shift
+    centers_init = (points - np.array([min_x, min_y])) * scale + 0.05
     
-    # Create all combinations
-    grid_points = []
-    for x in x_vals:
-        for y in y_vals:
-            grid_points.append([x, y])
-    
-    # We have 30 points. We need 26.
-    # Just take first 26.
-    selected_centers = np.array(grid_points[:n_circles])
-    
-    # Add some noise to break symmetry
-    noise = np.random.uniform(-0.01, 0.01, selected_centers.shape)
-    selected_centers += noise
-    
-    # Clip to valid range [r, 1-r]
-    selected_centers = np.clip(selected_centers, r_init, 1.0 - r_init)
-    
-    radii = np.full(n_circles, r_init)
-    
-    # Variables: [x1, y1, r1, x2, y2, r2, ...]
-    # Total 3 * 26 = 78 variables.
-    # But constraints are easier on x, y, r separately?
-    # Let's flatten.
-    
-    def flatten(centers, radii):
-        # centers: (N, 2), radii: (N,)
-        # Output: [x1, y1, r1, x2, y2, r2, ...]
-        out = []
-        for i in range(len(radii)):
-            out.append(centers[i, 0])
-            out.append(centers[i, 1])
-            out.append(radii[i])
-        return np.array(out)
+    # Ensure we have exactly 26
+    if len(centers_init) > n_circles:
+        # This shouldn't happen with our config sum=26
+        centers_init = centers_init[:n_circles]
+    elif len(centers_init) < n_circles:
+        # Pad with center if needed (shouldn't happen)
+        pad = np.tile([0.5, 0.5], n_circles - len(centers_init)).reshape(-1, 2)
+        centers_init = np.vstack([centers_init, pad])
 
-    def unflatten(vars):
-        # vars: (3*N,)
-        n = len(vars) // 3
-        centers = np.zeros((n, 2))
-        radii = np.zeros(n)
-        for i in range(n):
-            centers[i, 0] = vars[3*i]
-            centers[i, 1] = vars[3*i+1]
-            radii[i] = vars[3*i+2]
-        return centers, radii
-
-    initial_vars = flatten(selected_centers, radii)
-
-    # Bounds for variables
-    # x, y in [0, 1], r in [0, 0.5] (max possible radius is 0.5)
-    # Actually r <= 0.5. And x >= r, x <= 1-r.
-    # We can enforce bounds on x, y, r directly.
-    # x: [0, 1], y: [0, 1], r: [0, 0.5]
-    # But we have constraints linking them.
+    # Reshape to 1D for optimizer
+    x0 = centers_init.flatten()
     
-    bounds = []
-    for i in range(n_circles):
-        bounds.append((0.0, 1.0)) # x
-        bounds.append((0.0, 1.0)) # y
-        bounds.append((0.0, 0.5)) # r
-
-    # Constraints
-    # 1. Circle inside square: x >= r, x <= 1-r, y >= r, y <= 1-r
-    # Equivalent to: r - x <= 0, x + r - 1 <= 0, r - y <= 0, y + r - 1 <= 0
+    # Define objective function: Minimize negative of minimum distance
+    # We want to maximize min_dist between centers AND distance to walls.
+    # Actually, let's just maximize min_dist between centers.
+    # The wall constraints will be handled by bounds or a penalty.
+    # But SLSQP can handle bounds.
     
-    # 2. Non-overlap: dist >= r_i + r_j
-    # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+    # However, to maximize radius, we care about distance to walls too.
+    # Let's define a function that returns the "radius capacity" of the configuration.
+    # r = min( min_{i!=j} dist(i,j)/2, min_i dist(i, wall) )
+    # We want to maximize r.
+    # Equivalently, minimize -r.
     
-    cons = []
+    def objective(vars_1d):
+        centers = vars_1d.reshape(n_circles, 2)
+        
+        # 1. Check distances between circles
+        # Vectorized distance calculation
+        # Compute all pairwise distances
+        # Using broadcasting
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :] # (N, N, 2)
+        dists = np.sqrt(np.sum(diff**2, axis=2)) # (N, N)
+        
+        # Mask out diagonal (distance to self)
+        np.fill_diagonal(dists, np.inf)
+        min_pair_dist = np.min(dists)
+        
+        # 2. Check distance to walls
+        # Distance to left (x) and right (1-x), bottom (y) and top (1-y)
+        # r <= x, r <= 1-x, r <= y, r <= 1-y
+        # So max r from walls is min(x, 1-x, y, 1-y) for each circle
+        wall_dists = np.minimum(
+            np.minimum(centers[:, 0], 1 - centers[:, 0]),
+            np.minimum(centers[:, 1], 1 - centers[:, 1])
+        )
+        min_wall_dist = np.min(wall_dists)
+        
+        # The feasible radius is limited by pair distance / 2 and wall distance
+        # Actually, pair distance constraint is 2r <= d_ij => r <= d_ij / 2
+        # Wall constraint is r <= dist_to_wall
+        # So r_max = min( min_pair_dist / 2, min_wall_dist )
+        
+        r_capacity = min(min_pair_dist / 2.0, min_wall_dist)
+        
+        # We want to maximize r_capacity, so minimize negative
+        return -r_capacity
+
+    # Bounds: centers must be in [0, 1]
+    bounds = [(0.0, 1.0) for _ in range(2 * n_circles)]
     
-    # Boundary constraints
-    for i in range(n_circles):
-        # r - x <= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: v[3*i+0] - v[3*i+2] # x - r >= 0
-        })
-        # x + r - 1 <= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: 1.0 - (v[3*i+0] + v[3*i+2]) # 1 - (x+r) >= 0
-        })
-        # r - y <= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: v[3*i+1] - v[3*i+2] # y - r >= 0
-        })
-        # y + r - 1 <= 0
-        cons.append({
-            'type': 'ineq',
-            'fun': lambda v, i=i: 1.0 - (v[3*i+1] + v[3*i+2]) # 1 - (y+r) >= 0
-        })
-
-    # Overlap constraints
-    for i in range(n_circles):
-        for j in range(i + 1, n_circles):
-            cons.append({
-                'type': 'ineq',
-                'fun': lambda v, i=i, j=j: 
-                    (v[3*i+0] - v[3*j+0])**2 + (v[3*i+1] - v[3*j+1])**2 - (v[3*i+2] + v[3*j+2])**2
-            })
-
-    # Objective: Maximize sum of radii -> Minimize -sum(radii)
-    def objective(v):
-        _, r = unflatten(v)
-        return -np.sum(r)
-
-    # Run optimization
-    # SLSQP is good for constrained problems
-    res = minimize(objective, initial_vars, method='SLSQP', bounds=bounds, constraints=cons, 
-                   options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
-
-    if res.success:
-        final_centers, final_radii = unflatten(res.x)
-    else:
-        # If optimization failed, return initial (though it should be valid)
-        final_centers, final_radii = selected_centers, radii
-
-    # Validate and clean up small negative radii if any (due to numerical issues)
-    final_radii = np.maximum(final_radii, 0.0)
+    # Optimization
+    # Use SLSQP
+    result = minimize(
+        objective, 
+        x0, 
+        method='SLSQP', 
+        bounds=bounds, 
+        options={'maxiter': 1000, 'ftol': 1e-9}
+    )
     
-    # Ensure strict constraints are met (clip centers if slightly out due to precision)
-    # Although SLSQP should handle it, let's be safe.
-    # Actually, re-validation is done by the user.
+    # Extract optimized centers
+    best_centers = result.x.reshape(n_circles, 2)
     
-    sum_radii = np.sum(final_radii)
+    # Calculate the final radius
+    # Recompute capacity to be sure
+    diff = best_centers[:, np.newaxis, :] - best_centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_pair_dist = np.min(dists)
     
-    return final_centers, final_radii, sum_radii
-
-# Helper to run and check locally if needed
-if __name__ == "__main__":
-    c, r, s = run_packing()
-    print(f"Sum of radii: {s}")
-    print(f"Min radius: {np.min(r)}, Max radius: {np.max(r)}")
+    wall_dists = np.minimum(
+        np.minimum(best_centers[:, 0], 1 - best_centers[:, 0]),
+        np.minimum(best_centers[:, 1], 1 - best_centers[:, 1])
+    )
+    min_wall_dist = np.min(wall_dists)
+    
+    optimal_r = min(min_pair_dist / 2.0, min_wall_dist)
+    
+    # Radii array
+    radii = np.full(n_circles, optimal_r)
+    
+    sum_radii = np.sum(radii)
+    
+    return best_centers, radii, sum_radii

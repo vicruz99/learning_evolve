@@ -1,0 +1,167 @@
+
+
+<strategy>
+To improve upon the current best sum of radii (~2.618), we need a more robust optimization strategy that efficiently navigates the highly non-convex constraint landscape. The previous approaches used SLSQP, which is appropriate, but suffered from limited restart diversity and potential symmetry traps.
+
+Key improvements in this strategy:
+1. **Vectorized Constraints**: We compute all boundary and pairwise constraints in a single pass using NumPy indexing. This drastically reduces overhead per iteration compared to Python loops.
+2. **Structured Multi-Start**: We initialize from perturbed hexagonal lattices, which are known to yield dense packings. We run multiple seeds and also perform a "refinement" phase: taking the best found configuration, applying controlled noise, and re-optimizing to escape shallow local minima.
+3. **Squared Distance Constraints**: We use `dist^2 >= (r_i + r_j)^2` instead of `dist >= r_i + r_j`. This removes the square root, making the constraint surface smoother and derivatives more stable for SLSQP.
+4. **Strict Post-Processing**: A deterministic shrink loop guarantees that all constraints strictly satisfy the validator's `1e-12` tolerance, preventing false negatives due to floating-point drift.
+5. **No Closures/Lambdas**: All helpers are top-level functions to comply with restrictions and ensure clean execution.
+
+This approach systematically explores the configuration space with mathematically sound initial conditions and aggressive local refinement, targeting the 2.63+ range.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective_func(v, n):
+    """Minimize negative sum of radii."""
+    return -np.sum(v[2*n:])
+
+def constraint_boundaries(v, n):
+    """Ensure circles stay within [0,1]x[0,1]."""
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    c = np.empty(4*n)
+    c[0::4] = x - r
+    c[1::4] = 1.0 - x - r
+    c[2::4] = y - r
+    c[3::4] = 1.0 - y - r
+    return c
+
+def constraint_pairs(v, n, i_idx, j_idx):
+    """Ensure non-overlap using squared distances for smoothness."""
+    x = v[:n]
+    y = v[n:2*n]
+    r = v[2*n:]
+    dx = x[i_idx] - x[j_idx]
+    dy = y[i_idx] - y[j_idx]
+    dr = r[i_idx] + r[j_idx]
+    return dx**2 + dy**2 - dr**2
+
+def run_packing():
+    n = 26
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Variable bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    # Pre-configure constraints
+    cons = [
+        {'type': 'ineq', 'fun': constraint_boundaries, 'args': (n,)},
+        {'type': 'ineq', 'fun': constraint_pairs, 'args': (n, i_idx, j_idx)}
+    ]
+    
+    best_sum = 0.0
+    best_v = None
+    
+    # Phase 1: Broad exploration with hexagonal lattice starts
+    for seed in range(12):
+        np.random.seed(seed)
+        
+        # Hexagonal lattice generation
+        r_init = 0.06
+        centers = []
+        y_pos = r_init
+        row = 0
+        while len(centers) < n + 10:
+            x_start = r_init + (row % 2) * r_init
+            x_pos = x_start
+            while x_pos <= 1.0 - r_init:
+                centers.append([x_pos, y_pos])
+                x_pos += 2.0 * r_init
+            y_pos += np.sqrt(3.0) * r_init
+            row += 1
+            
+        centers = np.array(centers[:n])
+        
+        # Break symmetry with jitter
+        centers += np.random.uniform(-0.015, 0.015, centers.shape)
+        centers = np.clip(centers, 0.05, 0.95)
+        
+        # Shuffle order to prevent index-bias in optimizer
+        perm = np.random.permutation(n)
+        centers = centers[perm]
+        
+        v0 = np.concatenate([centers[:, 0], centers[:, 1], np.full(n, 0.05)])
+        
+        try:
+            res = minimize(objective_func, v0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 6000, 'ftol': 1e-12, 'disp': False})
+            
+            if np.isfinite(res.fun):
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    # Verify feasibility
+                    b = constraint_boundaries(res.x, n)
+                    p = constraint_pairs(res.x, n, i_idx, j_idx)
+                    if np.all(b >= -1e-5) and np.all(p >= -1e-5):
+                        best_sum = current_sum
+                        best_v = res.x.copy()
+        except Exception:
+            continue
+
+    # Phase 2: Refinement around best solution to escape local optima
+    if best_v is not None:
+        for ref_seed in range(5):
+            np.random.seed(100 + ref_seed)
+            v_pert = best_v.copy()
+            # Perturb centers more than radii
+            v_pert[:2*n] += np.random.uniform(-0.005, 0.005, 2*n)
+            v_pert[2*n:] += np.random.uniform(-0.002, 0.002, n)
+            v_pert = np.clip(v_pert, 0.01, 0.99) # Keep strictly inside
+            
+            try:
+                res = minimize(objective_func, v_pert, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 5000, 'ftol': 1e-12, 'disp': False})
+                
+                if np.isfinite(res.fun):
+                    current_sum = -res.fun
+                    if current_sum > best_sum:
+                        b = constraint_boundaries(res.x, n)
+                        p = constraint_pairs(res.x, n, i_idx, j_idx)
+                        if np.all(b >= -1e-5) and np.all(p >= -1e-5):
+                            best_sum = current_sum
+                            best_v = res.x.copy()
+            except Exception:
+                continue
+
+    if best_v is None:
+        # Fallback valid configuration
+        centers = np.array([[0.5, 0.5]] * n)
+        radii = np.zeros(n)
+        return centers, radii, 0.0
+
+    x_sol = best_v[:n]
+    y_sol = best_v[n:2*n]
+    r_sol = best_v[2*n:]
+    
+    # Strict post-processing to guarantee validator tolerance
+    for _ in range(10):
+        changed = False
+        for i in range(n):
+            # Boundary limits
+            r_lim = min(r_sol[i], x_sol[i], 1.0-x_sol[i], y_sol[i], 1.0-y_sol[i])
+            if r_lim < r_sol[i] - 1e-9:
+                r_sol[i] = r_lim
+                changed = True
+                
+            # Pairwise limits
+            for j in range(i+1, n):
+                dist = np.hypot(x_sol[i]-x_sol[j], y_sol[i]-y_sol[j])
+                sum_r = r_sol[i] + r_sol[j]
+                if sum_r > dist:
+                    shrink = (sum_r - dist) / 2.0 + 1e-9
+                    r_sol[i] = max(0.0, r_sol[i] - shrink)
+                    r_sol[j] = max(0.0, r_sol[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+            
+    final_centers = np.column_stack([x_sol, y_sol])
+    return final_centers, r_sol, float(np.sum(r_sol))
+```

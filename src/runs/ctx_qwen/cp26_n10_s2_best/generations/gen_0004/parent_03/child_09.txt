@@ -1,0 +1,308 @@
+
+
+Looking at the current solutions, they're all converging around sum of radii ≈ 2.631-2.636. To push beyond this, I need a more strategic approach:
+
+<strategy>
+1. **Diverse initial configurations**: Generate more hexagonal patterns with varying densities, rotations, and shifts. Also try concentric and corner-focused arrangements.
+
+2. **Trust-constr optimizer**: Use scipy's trust-constr which handles nonlinear constraints more robustly than SLSQP for this type of problem.
+
+3. **Two-phase optimization**: 
+   - Phase 1: SLSQP with squared constraints (smooth gradients)
+   - Phase 2: Linear distance constraints with larger perturbations to escape local minima
+
+4. **Systematic perturbation with cooling**: Use decreasing perturbation scales, but with occasional "jumps" to explore new regions.
+
+5. **Better initial radii computation**: Start closer to feasible maximum to give optimizer better headroom.
+
+6. **Multiple restart strategies**: After finding a local optimum, deliberately perturb it in multiple ways and re-optimize.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+PAIR_I, PAIR_J = np.triu_indices(N, k=1)
+
+def objective(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2*N:])
+
+def constraints_sq(v):
+    """Squared distance constraints for SLSQP."""
+    x = v[:N]
+    y = v[N:2*N]
+    r = v[2*N:]
+    
+    c = np.empty(4*N + len(PAIR_I))
+    c[:N] = x - r
+    c[N:2*N] = 1.0 - x - r
+    c[2*N:3*N] = y - r
+    c[3*N:4*N] = 1.0 - y - r
+    
+    dx = x[PAIR_I] - x[PAIR_J]
+    dy = y[PAIR_I] - y[PAIR_J]
+    r_sum = r[PAIR_I] + r[PAIR_J]
+    c[4*N:] = dx**2 + dy**2 - r_sum**2
+    return c
+
+def compute_feasible_radii(centers, shrink_factor=0.82):
+    """Compute feasible initial radii based on geometry."""
+    r = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                   np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    
+    dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+    r = np.minimum(r, np.min(dists, axis=1) / 2.0)
+    
+    return np.clip(r * shrink_factor, 0.001, 0.25)
+
+def hex_lattice_config(r0, angle=0.0, shift=(0.0, 0.0)):
+    """Generate hexagonal lattice configuration."""
+    pts = []
+    y = r0 + shift[1]
+    row = 0
+    while len(pts) < N + 10:
+        x_start = r0 + shift[0] + (row % 2) * r0
+        x = x_start
+        while x <= 1.0 - r0 and len(pts) < N + 10:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += r0 * np.sqrt(3.0)
+        row += 1
+    
+    pts = np.array(pts[:N])
+    
+    if angle != 0.0:
+        cx, cy = 0.5, 0.5
+        pts[:, 0] -= cx
+        pts[:, 1] -= cy
+        c_val, s_val = np.cos(angle), np.sin(angle)
+        pts = pts @ np.array([[c_val, -s_val], [s_val, c_val]])
+        pts[:, 0] += cx
+        pts[:, 1] += cy
+    
+    return np.clip(pts, 0.01, 0.99)
+
+def repulsion_layout(seed, steps=600):
+    """Generate layout using repulsive forces."""
+    np.random.seed(seed)
+    pts = np.random.uniform(0.1, 0.9, (N, 2))
+    
+    for step in range(steps):
+        lr = 0.04 * (1.0 - step / steps)
+        forces = np.zeros_like(pts)
+        
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pts[i, 0] - pts[j, 0]
+                dy = pts[i, 1] - pts[j, 1]
+                d = np.hypot(dx, dy)
+                if d < 0.22 and d > 1e-6:
+                    f = (0.22 - d) / (d * d + 1e-10) * 0.3
+                    forces[i, 0] += f * dx
+                    forces[i, 1] += f * dy
+                    forces[j, 0] -= f * dx
+                    forces[j, 1] -= f * dy
+        
+        # Wall repulsion
+        pts[:, 0] = np.clip(pts[:, 0] + forces[:, 0] * lr, 0.05, 0.95)
+        pts[:, 1] = np.clip(pts[:, 1] + forces[:, 1] * lr, 0.05, 0.95)
+    
+    return pts
+
+def grid_config(rows, cols, jitter=0.005):
+    """Generate staggered grid configuration."""
+    pts = []
+    total = 0
+    for row_idx in range(rows):
+        count = cols + (1 if row_idx % 2 == 1 else 0)
+        x_start = 0.07 if row_idx % 2 == 0 else 0.13
+        for c in range(count):
+            if total >= N:
+                break
+            x = x_start + c * 0.15
+            y = 0.07 + row_idx * 0.17
+            pts.append([x, y])
+            total += 1
+    
+    pts = np.array(pts[:N])
+    pts += np.random.uniform(-jitter, jitter, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def optimize_from(v0, maxiter=8000, ftol=1e-13):
+    """Run SLSQP optimization from initial point."""
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.25)] * N
+    cons = {'type': 'ineq', 'fun': constraints_sq}
+    
+    try:
+        res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': maxiter, 'ftol': ftol, 'disp': False})
+        return res
+    except Exception:
+        return None
+
+def enforce_constraints(centers, radii, tol=1e-10):
+    """Enforce all constraints strictly."""
+    cx = centers[:, 0].copy()
+    cy = centers[:, 1].copy()
+    cr = radii.copy()
+    
+    # Boundary constraints
+    for i in range(N):
+        cr[i] = min(cr[i], cx[i] - tol, 1.0 - cx[i] - tol, 
+                    cy[i] - tol, 1.0 - cy[i] - tol)
+        cr[i] = max(cr[i], 0.0)
+    
+    # Non-overlap constraints
+    for _ in range(30):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(cx[i] - cx[j], cy[i] - cy[j])
+                if cr[i] + cr[j] > d + tol:
+                    shrink = (cr[i] + cr[j] - d) / 2.0 + tol
+                    cr[i] = max(0.0, cr[i] - shrink)
+                    cr[j] = max(0.0, cr[j] - shrink)
+                    changed = True
+        if not changed:
+            break
+    
+    return np.column_stack((cx, cy)), cr
+
+def run_packing():
+    """Optimizes packing of 26 circles in a unit square."""
+    np.random.seed(42)
+    
+    best_sum = -1.0
+    best_v = None
+    
+    # Generate initial configurations
+    inits = []
+    
+    # 1. Hexagonal lattices with various parameters
+    for r0 in np.linspace(0.075, 0.115, 11):
+        for angle in np.linspace(-0.3, 0.3, 9):
+            for sx in [-0.03, -0.015, 0.0, 0.015, 0.03]:
+                for sy in [-0.03, -0.015, 0.0, 0.015, 0.03]:
+                    c = hex_lattice_config(r0, angle, (sx, sy))
+                    r = compute_feasible_radii(c, 0.85)
+                    inits.append(np.concatenate([c[:, 0], c[:, 1], r]))
+    
+    # 2. Repulsion-based layouts
+    for s in range(20):
+        c = repulsion_layout(s, steps=800)
+        r = compute_feasible_radii(c, 0.88)
+        inits.append(np.concatenate([c[:, 0], c[:, 1], r]))
+    
+    # 3. Grid configurations with variations
+    for jitter in [0.0, 0.003, 0.007, 0.012]:
+        c = grid_config(6, 5, jitter=jitter)
+        r = compute_feasible_radii(c, 0.85)
+        inits.append(np.concatenate([c[:, 0], c[:, 1], r]))
+    
+    # 4. Random configurations with repulsion
+    for s in range(15):
+        c = repulsion_layout(100 + s, steps=400)
+        r = compute_feasible_radii(c, 0.85)
+        inits.append(np.concatenate([c[:, 0], c[:, 1], r]))
+    
+    # Phase 1: Multi-start optimization
+    print(f"Starting optimization with {len(inits)} initial configurations...")
+    for idx, v0 in enumerate(inits):
+        if idx % 50 == 0:
+            print(f"Processing init {idx}/{len(inits)}")
+        
+        res = optimize_from(v0, maxiter=10000, ftol=1e-13)
+        if res is not None:
+            s = -res.fun
+            cv = constraints_sq(res.x)
+            if np.min(cv) >= -1e-6 and s > best_sum:
+                best_sum = s
+                best_v = res.x.copy()
+    
+    print(f"Phase 1 best sum: {best_sum:.6f}")
+    
+    # Phase 2: Perturbation refinement
+    if best_v is not None:
+        current_v = best_v.copy()
+        
+        # Multiple perturbation scales
+        for scale_idx, noise_scale in enumerate([0.008, 0.006, 0.004, 0.003, 0.002, 0.001]):
+            for step in range(20):
+                np.random.seed(scale_idx * 100 + step + 1000)
+                pert = current_v.copy()
+                
+                # Perturb centers
+                pert[:2*N] += np.random.uniform(-noise_scale, noise_scale, 2*N)
+                pert[:2*N] = np.clip(pert[:2*N], 0.02, 0.98)
+                
+                # Shrink radii and recompute
+                c_pts = pert[:2*N].reshape(N, 2)
+                pert[2*N:] = compute_feasible_radii(c_pts, 0.88)
+                
+                res = optimize_from(pert, maxiter=8000, ftol=1e-13)
+                if res is not None:
+                    s = -res.fun
+                    cv = constraints_sq(res.x)
+                    if np.min(cv) >= -1e-6 and s > best_sum:
+                        best_sum = s
+                        best_v = res.x.copy()
+                        current_v = best_v.copy()
+                        print(f"  Improved at scale {noise_scale}, step {step}: {best_sum:.6f}")
+    
+    # Phase 3: Targeted perturbation - try moving subsets of circles
+    if best_v is not None:
+        cx = best_v[:N]
+        cy = best_v[N:2*N]
+        cr = best_v[2*N:]
+        centers = np.column_stack((cx, cy))
+        
+        for trial in range(30):
+            np.random.seed(3000 + trial)
+            new_v = best_v.copy()
+            
+            # Select random subset of circles to move
+            n_move = np.random.randint(3, 8)
+            indices = np.random.choice(N, n_move, replace=False)
+            
+            # Perturb selected circles more aggressively
+            new_v[indices] += np.random.uniform(-0.03, 0.03, n_move)  # x
+            new_v[N + indices] += np.random.uniform(-0.03, 0.03, n_move)  # y
+            new_v[:2*N] = np.clip(new_v[:2*N], 0.02, 0.98)
+            
+            # Shrink radii
+            new_v[2*N:] *= 0.90
+            
+            res = optimize_from(new_v, maxiter=6000, ftol=1e-13)
+            if res is not None:
+                s = -res.fun
+                cv = constraints_sq(res.x)
+                if np.min(cv) >= -1e-6 and s > best_sum:
+                    best_sum = s
+                    best_v = res.x.copy()
+                    print(f"  Targeted perturbation improved: {best_sum:.6f}")
+    
+    print(f"Phase 2+3 best sum: {best_sum:.6f}")
+    
+    # Extract final configuration
+    if best_v is None:
+        # Fallback
+        c = repulsion_layout(0, 400)
+        r = compute_feasible_radii(c, 0.8)
+        best_v = np.concatenate([c[:, 0], c[:, 1], r])
+    
+    cx = best_v[:N]
+    cy = best_v[N:2*N]
+    cr = best_v[2*N:].copy()
+    centers = np.column_stack((cx, cy))
+    
+    # Final strict enforcement
+    centers, cr = enforce_constraints(centers, cr, tol=1e-11)
+    
+    sum_radii = float(np.sum(cr))
+    print(f"Final sum of radii: {sum_radii:.6f}")
+    
+    return centers, cr, sum_radii
+```

@@ -1,0 +1,126 @@
+# sol_000046 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000044 (state 69bc282d) state=2237a454 sum of radii=1.836613 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_radii(centers):
+    """
+    Computes the maximum valid radius for each circle given fixed centers.
+    r_i = min(dist to boundary, 0.5 * dist to nearest neighbor)
+    """
+    n = centers.shape[0]
+    # Distance to boundaries: min(x, 1-x, y, 1-y)
+    xb = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
+    yb = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+    r_bound = np.minimum(xb, yb)
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)  # Ignore self-distance
+    
+    # Radius limited by half the distance to the nearest neighbor
+    r_pair = 0.5 * np.min(dists, axis=1)
+    
+    return np.minimum(r_bound, r_pair)
+
+def objective(centers_flat):
+    """
+    Objective function for minimization: maximize sum of radii.
+    """
+    centers = centers_flat.reshape(-1, 2)
+    # Strictly keep centers inside the unit square to ensure valid radii
+    centers = np.clip(centers, 1e-7, 1.0 - 1e-7)
+    radii = compute_radii(centers)
+    return -np.sum(radii)
+
+def run_packing():
+    n = 26
+    bounds = [(1e-5, 1.0 - 1e-5)] * (2 * n)
+    
+    np.random.seed(42)
+    best_val = np.inf
+    best_centers = None
+    
+    # Generate diverse initial configurations
+    starts = []
+    
+    # 1. Hexagonal lattices with various densities
+    for r_init in [0.08, 0.09, 0.10, 0.105, 0.11]:
+        pts = []
+        y = r_init
+        row = 0
+        while len(pts) < n:
+            x = r_init if row % 2 == 0 else 2 * r_init
+            while x + r_init <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2 * r_init
+            y += np.sqrt(3) * r_init
+            row += 1
+        starts.append(np.array(pts[:n]).flatten())
+        
+    # 2. Square grids
+    for r_init in [0.08, 0.09, 0.10]:
+        pts = []
+        y = r_init
+        row = 0
+        while len(pts) < n:
+            x = r_init
+            while x + r_init <= 1.0 and len(pts) < n:
+                pts.append([x, y])
+                x += 2 * r_init
+            y += 2 * r_init
+            row += 1
+        starts.append(np.array(pts[:n]).flatten())
+        
+    # 3. Random starts (good for exploring non-lattice optima)
+    for _ in range(15):
+        starts.append(np.random.rand(2 * n).flatten())
+        
+    # 4. Corner-pushed configurations (helps fill corners efficiently)
+    for _ in range(10):
+        c = np.random.rand(2 * n).reshape(n, 2)
+        idx = np.random.choice(n, 4, replace=False)
+        corners = [[0.1, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.9]]
+        for i, corner in zip(idx, corners):
+            c[i] = corner
+        starts.append(c.flatten())
+
+    # Optimization loop over diverse starts
+    for s in starts:
+        s_pert = s.copy()
+        s_pert += np.random.normal(0, 0.001, s_pert.shape)
+        s_pert = np.clip(s_pert, 1e-5, 1 - 1e-5)
+        
+        try:
+            res = minimize(objective, s_pert, method='Powell', bounds=bounds,
+                           options={'maxiter': 2000, 'ftol': 1e-13, 'xtol': 1e-13})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_centers = res.x.reshape(-1, 2)
+        except Exception:
+            continue
+            
+    # Local refinement: perturb best configuration and re-optimize to escape local minima
+    best_c = best_centers.copy()
+    for _ in range(30):
+        pert = best_c.copy()
+        pert += np.random.normal(0, 0.002, pert.shape)
+        pert = np.clip(pert, 1e-5, 1 - 1e-5)
+        try:
+            res = minimize(objective, pert.flatten(), method='Powell', bounds=bounds,
+                           options={'maxiter': 2000, 'ftol': 1e-13})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_c = res.x.reshape(-1, 2)
+        except Exception:
+            pass
+            
+    # Compute final radii exactly for the optimized centers
+    final_radii = compute_radii(best_c)
+    
+    return best_c, final_radii, float(np.sum(final_radii))

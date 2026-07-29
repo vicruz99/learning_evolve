@@ -1,0 +1,191 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we exploit a key mathematical insight: **for any fixed set of centers, finding the optimal radii is a Linear Programming (LP) problem.** This decouples the non-linear geometric constraints from the radius optimization, making the search much more robust and efficient.
+
+1. **LP Formulation for Radii**: Given centers $C$, we solve:
+   $\max \sum r_i$ subject to $r_i + r_j \le \|c_i - c_j\|$ for all $i<j$, and $r_i \le \min(x_i, 1-x_i, y_i, 1-y_i)$. This guarantees that for any center configuration, the radii are absolutely optimal and feasible.
+2. **Center Optimization**: We then maximize the LP objective over the center coordinates. Since the landscape is rugged, we combine:
+   - **Differential Evolution (DE)** for global exploration of the 52-dimensional center space.
+   - **Powell's Method** for fast, precise local refinement.
+   - **Multi-start heuristics** (hexagonal lattices, grids, random dense) to escape local minima.
+3. **Safety & Validation**: A final pass ensures strict compliance with the checker's $10^{-12}$ tolerance by slightly shrinking radii if any numerical drift occurs, though the LP inherently produces valid solutions.
+
+This approach consistently outperforms joint non-linear optimization because it removes constraint-violating steps during center updates and directly targets the theoretical upper bound for each configuration.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog, differential_evolution
+
+def get_optimal_radii(centers):
+    """
+    Given fixed centers, solve an LP to find the maximum possible sum of radii.
+    Constraints: r_i + r_j <= dist(i,j) and r_i <= boundary_distance(i).
+    """
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    A_ub_list = []
+    b_ub_list = []
+    
+    # Pairwise distance constraints
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub_list.append(row)
+            b_ub_list.append(dists[i, j])
+            
+    # Boundary constraints
+    for i in range(n):
+        b_dist = min(centers[i, 0], 1.0 - centers[i, 0],
+                     centers[i, 1], 1.0 - centers[i, 1])
+        row = np.zeros(n)
+        row[i] = 1.0
+        A_ub_list.append(row)
+        b_ub_list.append(b_dist)
+        
+    A_ub = np.array(A_ub_list)
+    b_ub = np.array(b_ub_list)
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=(0, None), method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    # Fallback heuristic if LP fails
+    radii = np.zeros(n)
+    for i in range(n):
+        radii[i] = min(centers[i, 0], 1.0 - centers[i, 0],
+                       centers[i, 1], 1.0 - centers[i, 1], 0.5)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            if d < radii[i] + radii[j] - 1e-12:
+                shrink = (radii[i] + radii[j] - d) / 2.0
+                radii[i] -= shrink
+                radii[j] -= shrink
+    radii = np.maximum(radii, 1e-9)
+    return radii, np.sum(radii)
+
+def objective(centers_flat):
+    """Objective for center optimization: minimize negative sum of optimal radii."""
+    centers = centers_flat.reshape(-1, 2)
+    _, s = get_optimal_radii(centers)
+    return -s
+
+def hex_init(n):
+    """Generate a perturbed hexagonal lattice initialization."""
+    r_est = 0.105
+    dy = r_est * np.sqrt(3)
+    dx = 2.0 * r_est
+    pts = []
+    row = 0
+    while len(pts) < n:
+        y = r_est + row * dy
+        if y + r_est > 0.95:
+            row += 1
+            continue
+        offset = dx / 2.0 if row % 2 == 1 else 0.0
+        x = r_est + offset
+        while x + r_est <= 0.95 and len(pts) < n:
+            pts.append([x, y])
+            x += dx
+        row += 1
+    while len(pts) < n:
+        pts.append([np.random.rand() * 0.8 + 0.1, np.random.rand() * 0.8 + 0.1])
+    return np.array(pts[:n])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    
+    # Keep centers away from exact boundaries to stabilize LP
+    bounds = [(0.05, 0.95)] * (2 * n)
+    
+    np.random.seed(42)
+    
+    # 1. Global search with Differential Evolution
+    try:
+        de_res = differential_evolution(objective, bounds, seed=42, popsize=15, 
+                                        maxiter=200, tol=1e-8, polish=False)
+        best_centers = de_res.x.reshape(n, 2)
+        _, best_sum = get_optimal_radii(best_centers)
+    except Exception:
+        best_centers = hex_init(n)
+        _, best_sum = get_optimal_radii(best_centers)
+        
+    # 2. Local refinement with Powell's method
+    try:
+        res = minimize(objective, best_centers.flatten(), method='Powell',
+                       bounds=bounds, options={'maxiter': 3000, 'ftol': 1e-12})
+        if -res.fun > best_sum:
+            best_centers = res.x.reshape(n, 2)
+            _, best_sum = get_optimal_radii(best_centers)
+    except Exception:
+        pass
+        
+    # 3. Multi-start from diverse heuristic configurations
+    starts = [hex_init(n)]
+    
+    # Structured grid
+    x_g = np.linspace(0.12, 0.88, 5)
+    y_g = np.linspace(0.12, 0.88, 5)
+    cx, cy = np.meshgrid(x_g, y_g)
+    grid = np.column_stack((cx.flatten(), cy.flatten()))
+    grid = np.vstack([grid, [0.5, 0.5]])
+    starts.append(grid[:n])
+    
+    # Random dense packs
+    for _ in range(3):
+        starts.append(np.random.rand(n, 2) * 0.8 + 0.1)
+        
+    for cfg in starts:
+        for _ in range(3):
+            cfg_pert = cfg + np.random.normal(0, 0.005, cfg.shape)
+            cfg_pert = np.clip(cfg_pert, 0.05, 0.95)
+            try:
+                res = minimize(objective, cfg_pert.flatten(), method='Powell',
+                               bounds=bounds, options={'maxiter': 2000, 'ftol': 1e-12})
+                if -res.fun > best_sum:
+                    best_centers = res.x.reshape(n, 2)
+                    _, best_sum = get_optimal_radii(best_centers)
+            except Exception:
+                pass
+                
+    # 4. Final radius computation and strict validation
+    radii, final_sum = get_optimal_radii(best_centers)
+    
+    # Safety pass to guarantee validation passes within numerical tolerance
+    for _ in range(10):
+        valid = True
+        for i in range(n):
+            x, y, r = best_centers[i, 0], best_centers[i, 1], radii[i]
+            if x - r < -1e-12 or x + r > 1.0 + 1e-12 or y - r < -1e-12 or y + r > 1.0 + 1e-12:
+                valid = False
+                break
+        if not valid:
+            break
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                                best_centers[i, 1] - best_centers[j, 1])
+                if dist < radii[i] + radii[j] - 1e-12:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            break
+        radii *= 0.999
+        
+    return best_centers, radii, float(np.sum(radii))
+```

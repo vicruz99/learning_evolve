@@ -1,176 +1,237 @@
 # sol_000179 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state b137705a) state=f9355564 sum of radii=0.003443 correctness=1.0
+# generation=0 parent=seed (state 8fc41863) state=2d51dcbf sum of radii=1.823350 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import minimize
 
 def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize sum of radii.
+    Uses a custom optimization starting from a perturbed grid.
+    """
     n = 26
-    # 1. Initialization: 5x5 grid + 1 gap circle
-    centers = np.zeros((n, 2))
-    radii = np.zeros(n)
     
-    # 5x5 grid (first 25 circles)
-    count = 0
+    # Initial guess: 5x5 grid with slight random perturbation to break symmetry
+    # and a 26th circle squeezed into a gap.
+    # We'll use 25 circles of radius ~0.095 and 1 small one.
+    
+    # Generate 5x5 grid
+    pts = []
     for i in range(5):
         for j in range(5):
-            centers[count, 0] = 0.1 + 0.2 * i
-            centers[count, 1] = 0.1 + 0.2 * j
-            radii[count] = 0.1
-            count += 1
-            
-    # 26th circle in a gap (e.g., center of the first grid cell)
-    # Grid centers are at 0.1, 0.3. Midpoint is 0.2.
-    centers[25, 0] = 0.2
-    centers[25, 1] = 0.2
-    radii[25] = 0.0414  # Initial valid radius for the gap
+            pts.append([0.1 + 0.2 * i, 0.1 + 0.2 * j])
     
-    # 2. Force-Directed Optimization
-    # Parameters
-    dt = 0.005
-    repulsion_strength = 5.0
-    friction = 0.95
-    n_steps = 2000
+    # Remove the center one (25th) to make space, or just add 26th?
+    # 5x5 has 25. We need 26.
+    # Let's keep 25 in grid, add 26th in center.
+    # But center is occupied.
+    # Let's just randomize positions slightly to allow optimizer to find a better layout.
     
-    # Compute distances matrix once to reuse logic (though distances change)
-    # We will compute forces dynamically
+    np.random.seed(42)
+    centers = np.array(pts)
+    # Add 26th point near a gap (e.g., 0.2, 0.2)
+    centers = np.vstack([centers, [0.2, 0.2]])
     
-    for step in range(n_steps):
-        forces = np.zeros_like(centers)
+    # Initial radii: all small to avoid overlap
+    radii = np.full(n, 0.04)
+    
+    # Optimization Objective: Maximize sum of radii
+    # We can parameterize the problem by fixing relative positions or optimizing centers and radii.
+    # Since it's non-convex, we use a simple iterative repulsion-based expansion.
+    
+    # Better approach: Use scipy minimize with constraints? 
+    # Constraints are non-linear. 
+    # Let's use a "simulated annealing" style or "repulsion force" simulation.
+    
+    # Force-based simulation
+    # Each circle pushes others away and tries to expand against walls.
+    
+    # Set bounds for centers
+    low_bound = radii
+    high_bound = 1 - radii
+    
+    def get_energy(centers, radii):
+        # Negative of sum of radii
+        # Plus penalty for overlap and boundary violation
+        energy = -np.sum(radii)
+        penalty = 0.0
         
-        # Calculate repulsion forces between all pairs
+        # Boundary penalties
         for i in range(n):
-            for j in range(i + 1, n):
-                dx = centers[i, 0] - centers[j, 0]
-                dy = centers[i, 1] - centers[j, 1]
-                dist_sq = dx*dx + dy*dy
-                dist = np.sqrt(dist_sq)
-                
-                sum_radii = radii[i] + radii[j]
-                
-                # If they overlap or are close, push apart
-                # Use a force that is strong when tight, zero when far
-                if dist > 0:
-                    # "Tightness" factor
-                    tightness = sum_radii / dist
-                    if tightness > 1.0 - 1e-6: # Overlapping or touching
-                        # Direction vector normalized
-                        fx = dx / dist
-                        fy = dy / dist
-                        
-                        # Force magnitude based on how much they need to separate
-                        # We want to increase sum_radii, so we push them apart to create room
-                        # Simple repulsion
-                        force_mag = repulsion_strength * (tightness - 0.95) 
-                        if force_mag < 0: force_mag = 0
-                        
-                        forces[i, 0] += fx * force_mag
-                        forces[i, 1] += fy * force_mag
-                        forces[j, 0] -= fx * force_mag
-                        forces[j, 1] -= fy * force_mag
-
-        # Apply forces with boundary clipping
-        # Instead of moving centers and then clipping, we apply boundary forces
-        for i in range(n):
-            # Boundary repulsion (virtual walls)
-            # Push away from boundaries if close
-            x, y = centers[i]
             r = radii[i]
+            x, y = centers[i]
+            # Soft constraints
+            if x < r: penalty += (r - x)**2
+            if x > 1-r: penalty += (x - (1-r))**2
+            if y < r: penalty += (r - y)**2
+            if y > 1-r: penalty += (y - (1-r))**2
             
-            # Left wall (x=0)
-            if x - r < 0.001:
-                forces[i, 0] += 10.0 * (0.001 - (x - r))
-            # Right wall (x=1)
-            if x + r > 0.999:
-                forces[i, 0] -= 10.0 * ((x + r) - 0.999)
-            # Bottom wall (y=0)
-            if y - r < 0.001:
-                forces[i, 1] += 10.0 * (0.001 - (y - r))
-            # Top wall (y=1)
-            if y + r > 0.999:
-                forces[i, 1] -= 10.0 * ((y + r) - 0.999)
-                
-        # Update centers
-        centers += forces * dt
-        centers *= friction # Damping to help convergence
-        
-        # Hard clip centers to [0, 1]
-        np.clip(centers, 0, 1, out=centers)
-        
-        # Update radii to be maximal allowed by current positions (Greedy local expansion)
-        # This step tries to inflate circles as the gaps open up
+        # Overlap penalties
         for i in range(n):
-            max_r = 1.0
-            # Boundary constraints
-            max_r = min(max_r, centers[i, 0])
-            max_r = min(max_r, 1.0 - centers[i, 0])
-            max_r = min(max_r, centers[i, 1])
-            max_r = min(max_r, 1.0 - centers[i, 1])
-            
-            # Neighbor constraints
-            for j in range(n):
-                if i == j: continue
+            for j in range(i+1, n):
                 dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                max_r = min(max_r, dist - radii[j])
-            
-            # Clamp radius to be at least previous radius (prevent shrinking)
-            # But also respect the calculated max
-            # Actually, in force-directed, radii might need to adjust dynamically.
-            # We set it to the calculated max to maximize sum.
-            if max_r < 0: max_r = 0 # Should not happen if valid
-            radii[i] = max(radii[i], max_r) # Grow if possible, keep if not
-            
-            # Note: Growing one circle might violate constraints for others.
-            # The force repulsion handles this by pushing centers apart.
-            # However, for stability, we might just clamp to max allowed.
-            radii[i] = max_r # Aggressively fill space.
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist:
+                    penalty += (min_dist - dist)**2
+                    
+        return energy + penalty * 100.0 # Weight for penalty
 
-    # 3. Final LP Optimization to maximize sum of radii given final centers
-    # This ensures we extract the absolute maximum sum for the converged positions
-    c = -np.ones(n) # Maximize sum(r) -> Minimize -sum(r)
+    # We will optimize positions for a given set of radii, then increase radii.
+    # Or optimize both.
     
-    A_ub = []
-    b_ub = []
+    # Let's use a simplified "expanding" simulation
+    # 1. Fix radii to a target sum.
+    # 2. Optimize centers to minimize overlaps.
+    # 3. If valid, increase radii.
     
-    # Constraints: r_i + r_j <= dist_ij
-    for i in range(n):
-        for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            row = np.zeros(n)
-            row[i] = 1
-            row[j] = 1
-            A_ub.append(row)
-            b_ub.append(dist)
+    current_radii = np.full(n, 0.05) # Start small
+    current_centers = np.copy(centers)
+    
+    # Shuffle centers to randomize
+    np.random.shuffle(current_centers)
+    
+    best_sum = 0.0
+    best_centers = current_centers
+    best_radii = current_radii
+    
+    # Iterative expansion
+    for step in range(200):
+        # Try to increase radii slightly
+        target_r = current_radii * 1.01
+        
+        # Optimize centers to fit these radii
+        # We use a simple gradient descent on the overlap function
+        centers_opt = np.copy(current_centers)
+        
+        for _ in range(50): # Inner optimization steps
+            # Calculate repulsion forces
+            forces = np.zeros_like(centers_opt)
             
-    # Constraints: r_i <= x_i, r_i <= 1-x_i, etc.
-    # These are bounds in LP, but we can handle them as A_ub or bounds
-    # Let's use bounds for r_i >= 0 and constraints for upper bounds if needed,
-    # but standard LP bounds are easier.
-    
-    # However, standard linprog bounds are (lower, upper) for each variable.
-    # But r_i depends on x_i which is fixed now.
-    # So for each i, r_i <= min(x_i, 1-x_i, y_i, 1-y_i).
-    
-    bounds = []
-    for i in range(n):
-        max_r_boundary = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
-        bounds.append((0, max_r_boundary))
+            # Boundary forces (push inward if touching)
+            for i in range(n):
+                r = target_r[i]
+                x, y = centers_opt[i]
+                # Left wall
+                if x - r < 0:
+                    forces[i, 0] += (r - x) * 10
+                # Right wall
+                if x + r > 1:
+                    forces[i, 0] -= (x + r - 1) * 10
+                # Bottom wall
+                if y - r < 0:
+                    forces[i, 1] += (r - y) * 10
+                # Top wall
+                if y + r > 1:
+                    forces[i, 1] -= (y + r - 1) * 10
+            
+            # Circle-circle repulsion
+            for i in range(n):
+                for j in range(i+1, n):
+                    vec = centers_opt[i] - centers_opt[j]
+                    dist = np.linalg.norm(vec)
+                    if dist == 0:
+                        dist = 1e-9
+                        vec = np.random.rand(2) * 0.01 # Break symmetry
+                    
+                    min_dist = target_r[i] + target_r[j]
+                    if dist < min_dist:
+                        # Repulsion force proportional to overlap
+                        repulsion = (min_dist - dist) / dist # normalized force
+                        # Apply force to move apart
+                        forces[i] += vec * repulsion * 5.0
+                        forces[j] -= vec * repulsion * 5.0
+            
+            # Update positions
+            step_size = 0.005
+            centers_opt += forces * step_size
+            
+            # Clamp to bounds [0, 1]
+            # Actually, we want centers to stay within [r, 1-r] ideally, 
+            # but forces handle it. Just clamp to [0, 1] for safety.
+            centers_opt = np.clip(centers_opt, 0, 1)
+            
+            # Also ensure radii constraints are roughly met by center clamping
+            for i in range(n):
+                r = target_r[i]
+                centers_opt[i, 0] = np.clip(centers_opt[i, 0], r, 1-r)
+                centers_opt[i, 1] = np.clip(centers_opt[i, 1], r, 1-r)
         
-    # Solve LP
-    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-    
-    if res.success:
-        optimal_radii = res.x
-    else:
-        # Fallback to previous radii if LP fails
-        optimal_radii = radii
+        current_centers = centers_opt
+        current_radii = target_r
         
-    # Ensure radii are valid (non-negative)
-    optimal_radii = np.maximum(optimal_radii, 0)
+        # Check if valid (loose check)
+        valid = True
+        for i in range(n):
+            r = current_radii[i]
+            x, y = current_centers[i]
+            if x < r or x > 1-r or y < r or y > 1-r:
+                valid = False
+                break
+            for j in range(i+1, n):
+                dist = np.linalg.norm(current_centers[i] - current_centers[j])
+                if dist < current_radii[i] + current_radii[j] - 1e-6:
+                    valid = False
+                    break
+        
+        if valid:
+            s = np.sum(current_radii)
+            if s > best_sum:
+                best_sum = s
+                best_centers = np.copy(current_centers)
+                best_radii = np.copy(current_radii)
+        else:
+            # If invalid, revert radii increase and maybe decrease slightly
+            current_radii = best_radii
+            current_centers = best_centers
+            # Break if we can't grow further (convergence)
+            # To be safe, just continue but don't update best.
+            # But we might be stuck. Let's restart radii from best and perturb.
+            # For this simple script, we'll just stop growing if it fails consistently.
+            # Actually, let's just keep the best found so far.
+            pass
+
+    # Final polish: Run a few more optimization steps with the best radii to clean up positions
+    # We want to ensure strict non-overlap.
+    # Use a repulsion pass with the final radii.
     
-    sum_radii = np.sum(optimal_radii)
+    final_radii = best_radii
+    final_centers = best_centers
     
-    return centers, optimal_radii, sum_radii
+    # Repulsion pass to ensure no overlaps
+    for _ in range(100):
+        forces = np.zeros_like(final_centers)
+        for i in range(n):
+            r = final_radii[i]
+            x, y = final_centers[i]
+            if x - r < 1e-7: forces[i, 0] += (r - x + 1e-7) * 10
+            if x + r > 1 - 1e-7: forces[i, 0] -= (x + r - 1 + 1e-7) * 10
+            if y - r < 1e-7: forces[i, 1] += (r - y + 1e-7) * 10
+            if y + r > 1 - 1e-7: forces[i, 1] -= (y + r - 1 + 1e-7) * 10
+            
+            for j in range(i+1, n):
+                vec = final_centers[i] - final_centers[j]
+                dist = np.linalg.norm(vec)
+                if dist == 0:
+                    vec = np.random.rand(2) * 0.001
+                    dist = 1e-9
+                min_dist = final_radii[i] + final_radii[j]
+                if dist < min_dist:
+                    repulsion = (min_dist - dist)
+                    forces[i] += vec * repulsion * 10.0
+                    forces[j] -= vec * repulsion * 10.0
+        
+        final_centers += forces * 0.001
+        # Clamp
+        for i in range(n):
+            r = final_radii[i]
+            final_centers[i, 0] = np.clip(final_centers[i, 0], r, 1-r)
+            final_centers[i, 1] = np.clip(final_centers[i, 1], r, 1-r)
+
+    # Verify and return
+    # Recalculate sum
+    final_sum = np.sum(final_radii)
+    
+    return final_centers, final_radii, final_sum

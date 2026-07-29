@@ -1,0 +1,278 @@
+# sol_000304 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 39d28b7b) state=43b1e819 sum of radii=2.617507 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize sum of radii.
+    """
+    n = 26
+    
+    # Helper function to compute constraints
+    # We need to define constraints for the optimizer
+    # Variables: x = [x0, y0, r0, x1, y1, r1, ..., x25, y25, r25]
+    # Length 78
+    
+    def objective(x):
+        # x is flattened array
+        radii = x[2::3]
+        return -np.sum(radii) # Minimize negative sum
+
+    def constraint_non_overlap(x):
+        # Returns array of values >= 0
+        # dist_ij >= ri + rj  =>  dist_ij - ri - rj >= 0
+        constraints = []
+        centers = x.reshape(-1, 3)[:, :2] # (n, 2)
+        radii = x.reshape(-1, 3)[:, 2]    # (n,)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = math.hypot(dx, dy)
+                # dist - (ri + rj) >= 0
+                constraints.append(dist - (radii[i] + radii[j]))
+        return np.array(constraints)
+
+    def constraint_boundaries(x):
+        # x_i - r_i >= 0, 1 - x_i - r_i >= 0, same for y
+        constraints = []
+        centers = x.reshape(-1, 3)[:, :2]
+        radii = x.reshape(-1, 3)[:, 2]
+        
+        for i in range(n):
+            # Left
+            constraints.append(centers[i, 0] - radii[i])
+            # Right
+            constraints.append(1.0 - centers[i, 0] - radii[i])
+            # Bottom
+            constraints.append(centers[i, 1] - radii[i])
+            # Top
+            constraints.append(1.0 - centers[i, 1] - radii[i])
+            # Radius positive
+            constraints.append(radii[i])
+            
+        return np.array(constraints)
+
+    def get_constraints_dict():
+        cons = []
+        # Non-overlap
+        cons.append({
+            'type': 'ineq',
+            'fun': constraint_non_overlap
+        })
+        # Boundaries
+        cons.append({
+            'type': 'ineq',
+            'fun': constraint_boundaries
+        })
+        return cons
+
+    best_sum = 0
+    best_centers = None
+    best_radii = None
+
+    # Try multiple initial configurations to avoid local minima
+    
+    # Initialization Strategy 1: Hexagonal-like grid
+    # Try to fit circles in a way that respects density
+    # 26 circles. Maybe 5 rows?
+    # Row counts: 5, 6, 5, 6, 4 = 26? Or 5,5,5,5,6?
+    # Let's try a simple grid and jitter
+    
+    num_trials = 5
+    
+    for trial in range(num_trials):
+        # Generate initial valid positions
+        # We can use a 5x5 grid for 25 circles and try to fit 26th
+        # Or just random valid placement
+        
+        # Strategy: Place centers on a grid, ensure valid radii initially
+        # A 5x5 grid has spacing 0.2. Radius 0.1 fits exactly.
+        # But we have 26.
+        # Let's use a slightly smaller radius initially, say 0.09
+        
+        # Create a 5x5 grid
+        cols = 5
+        rows = 5
+        # Add extra circle?
+        # Let's just place 26 circles randomly but validly?
+        # Or better: 5x5 grid + 1 in center?
+        
+        centers_init = []
+        radii_init = []
+        
+        # Base radius
+        r_base = 0.08 
+        
+        # Place in a grid pattern
+        # 5x5 = 25 circles
+        for r_idx in range(5):
+            for c_idx in range(5):
+                cx = 0.1 + c_idx * 0.2
+                cy = 0.1 + r_idx * 0.2
+                centers_init.append([cx, cy])
+                radii_init.append(r_base)
+        
+        # Add 26th circle. 
+        # Where? Maybe center? But center is occupied by (0.5, 0.5) in 5x5 grid?
+        # 5x5 grid centers: 0.1, 0.3, 0.5, 0.7, 0.9.
+        # (0.5, 0.5) is occupied.
+        # Maybe shift to make space?
+        # Or place at a corner gap?
+        # Let's just place it at (0.05, 0.05) with small radius?
+        # Or better, use a hexagonal packing initialization.
+        
+        # Let's try a hexagonal packing initialization for 26 circles
+        # Rows with counts 5, 6, 5, 6, 4?
+        # Or 5, 5, 5, 5, 6?
+        
+        # Let's try 5, 5, 5, 5, 6
+        # Row 1: 5 circles
+        # Row 2: 5 circles (shifted)
+        # ...
+        # Row 5: 6 circles
+        
+        centers_init = []
+        radii_init = []
+        
+        # Hex packing parameters
+        # Vertical spacing: r * sqrt(3)
+        # Horizontal spacing: 2*r
+        # We need to estimate r. 
+        # If we have rows of 6, width constraint 6*2r <= 1 => r <= 1/12 = 0.0833
+        # Let's pick r = 0.08
+        
+        r_hex = 0.08
+        dy = r_hex * math.sqrt(3)
+        dx = 2 * r_hex
+        
+        current_y = r_hex
+        
+        row_configs = [5, 5, 5, 5, 6] # Total 26
+        
+        for i, count in enumerate(row_configs):
+            if i % 2 == 1:
+                # Shifted row
+                x_start = r_hex + dx/2
+            else:
+                x_start = r_hex
+            
+            for j in range(count):
+                cx = x_start + j * dx
+                # Check bounds, wrap or truncate?
+                # If cx > 1-r, we might have issues.
+                # With r=0.08, dx=0.16.
+                # Row 1 (5 circles): 0.08, 0.24, 0.40, 0.56, 0.72. Max x center 0.72. Right bound 1-0.08=0.92. OK.
+                # Row 2 (5 circles, shifted): start 0.08+0.08=0.16. Ends at 0.16 + 4*0.16 = 0.80. OK.
+                # Row 5 (6 circles): if shifted? 
+                # Let's check indices.
+                # 0: 5 (unshifted)
+                # 1: 5 (shifted)
+                # 2: 5 (unshifted)
+                # 3: 5 (shifted)
+                # 4: 6 (unshifted) -> start 0.08. 6 circles.
+                # x: 0.08, 0.24, 0.40, 0.56, 0.72, 0.88.
+                # Max center 0.88. Right bound 0.92. OK.
+                
+                # What about y?
+                # 5 rows. y coords: r, r+dy, r+2dy, r+3dy, r+4dy.
+                # r=0.08. dy=0.1385.
+                # y_max = 0.08 + 4*0.1385 = 0.08 + 0.554 = 0.634.
+                # Top bound 1-0.08 = 0.92.
+                # We have plenty of vertical space!
+                # We can increase r significantly.
+                
+                # Actually, if we have vertical space, the optimizer will expand.
+                # But we need to fill the square to get high sum.
+                # With current r=0.08, we are very loose.
+                
+                centers_init.append([cx, current_y])
+                radii_init.append(r_hex)
+            
+            current_y += dy
+            
+        # Flatten initial guess
+        x0 = np.array(centers_init).flatten()
+        r0 = np.array(radii_init)
+        x0_initial = np.empty(3 * n)
+        x0_initial[0::3] = x0[::2] # x coords
+        x0_initial[1::3] = x0[1::2] # y coords
+        x0_initial[2::3] = r0      # radii
+        
+        # Run optimization
+        # Bounds: x in [0,1], y in [0,1], r >= 0
+        bounds = []
+        for i in range(n):
+            bounds.append((0, 1)) # x
+            bounds.append((0, 1)) # y
+            bounds.append((0, 1)) # r (upper bound 1 is loose)
+            
+        cons = get_constraints_dict()
+        
+        try:
+            res = opt.minimize(objective, x0_initial, method='SLSQP', bounds=bounds, constraints=cons, 
+                               options={'maxiter': 1000, 'ftol': 1e-12})
+            
+            if res.success or res.fun < -best_sum: # res.fun is negative sum
+                # Extract solution
+                x_sol = res.x
+                centers_sol = np.array([x_sol[i*3:i*3+2] for i in range(n)])
+                radii_sol = np.array([x_sol[i*3+2] for i in range(n)])
+                current_sum = np.sum(radii_sol)
+                
+                # Validate just in case
+                # Note: We cannot call validate_packing inside the solution code provided to user 
+                # if it's not available, but we can implement a quick check or trust optimizer.
+                # However, constraints might be slightly violated numerically.
+                # We should clamp radii/centers if needed, but optimizer handles bounds.
+                # Overlap constraints are inequality >= 0.
+                
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = centers_sol
+                    best_radii = radii_sol
+        except Exception as e:
+            print(f"Optimization failed in trial {trial}: {e}")
+
+    # Fallback if optimization didn't run or failed (though unlikely with good init)
+    if best_centers is None:
+        # Default to a valid simple packing
+        # 5x5 grid with r=0.099 and 1 small circle?
+        # Actually 26 circles in 5x5 grid is impossible with r=0.1.
+        # Let's just return a valid small packing.
+        centers_fallback = np.random.rand(26, 2)
+        radii_fallback = np.full(26, 0.01) # Tiny circles, definitely valid
+        best_centers = centers_fallback
+        best_radii = radii_fallback
+        best_sum = np.sum(radii_fallback)
+
+    return best_centers, best_radii, best_sum
+
+# To ensure we get the best result, we can try to run the function locally if this were a script.
+# But here we just define it.
+# Note: The prompt implies I should provide the code that *defines* run_packing.
+# The actual execution happens in the environment.
+
+# Let's refine the initialization to be smarter.
+# The hex packing with r=0.08 was very loose vertically.
+# We can scale up.
+# But the optimizer will do that.
+# However, scaling up initial guess helps.
+# In the hex example, height used was ~0.634 for y-range.
+# We can scale coordinates and radii by factor ~1.5?
+# But let's trust the optimizer.
+
+# One improvement: The hex packing had 5 rows.
+# Maybe 6 rows of 4-5 circles?
+# 6, 5, 6, 5, 4 = 26.
+# Let's stick to the code provided.
+
+# We need to make sure we import numpy.
+# The function run_packing is the required output.

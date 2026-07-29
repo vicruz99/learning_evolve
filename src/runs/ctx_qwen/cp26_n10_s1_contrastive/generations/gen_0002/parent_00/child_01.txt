@@ -1,0 +1,192 @@
+
+
+<strategy>
+To improve the circle packing sum of radii, we need better exploration of the configuration space and more robust optimization. The previous approaches relied heavily on static lattice initializations, which can trap the optimizer in local minima that don't fully exploit the square's geometry.
+
+Key improvements in this solution:
+1. **Force-Repulsion Initialization**: Instead of just perturbing fixed lattices, we run a quick, vectorized force-directed simulation for each random seed. This naturally spreads circles to fill available space, avoiding overlaps and placing them in configurations that SLSQP can easily refine to high density.
+2. **Strictly Feasible Starts**: For every initialization (both lattice and force-based), we compute radii as a safe fraction (0.75) of the minimum distance to boundaries and neighbors. This guarantees the initial point is strictly feasible, preventing SLSQP from wasting iterations recovering from infeasibility.
+3. **Diverse Restart Strategy**: We combine hexagonal and grid lattice starts with 30 force-repulsion starts. This covers both structured optimal patterns and irregular "bubble" packings that often yield higher sums.
+4. **Perturbation & High-Precision Refinement**: After finding the best configuration, we apply a small random perturbation and run SLSQP again to escape flat local minima, followed by a final high-precision polish. This squeezes out the last few decimals of the objective function.
+5. **Robust Constraint Handling**: The constraint function remains mathematically equivalent but is structured for efficiency. We use a tight tolerance (`-1e-8`) to validate solutions, matching the validator's allowance for numerical noise.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+i_idx, j_idx = np.triu_indices(N, k=1)
+
+def objective(vars):
+    """Objective function: maximize sum of radii (minimize negative sum)."""
+    return -np.sum(vars[2*N:])
+
+def constraints(vars):
+    """
+    Constraint function: ensures circles are inside the unit square and do not overlap.
+    Returns a 1D array of constraint values that must be >= 0.
+    """
+    centers = vars[:2*N].reshape(N, 2)
+    radii = vars[2*N:]
+    
+    c = []
+    # Boundary constraints: circle inside [0,1]^2
+    c.append(centers[:, 0] - radii)
+    c.append(1.0 - centers[:, 0] - radii)
+    c.append(centers[:, 1] - radii)
+    c.append(1.0 - centers[:, 1] - radii)
+    
+    # Pairwise non-overlap constraints: dist_sq >= (r_i + r_j)^2
+    dx = centers[:, 0, np.newaxis] - centers[:, 0]
+    dy = centers[:, 1, np.newaxis] - centers[:, 1]
+    dist_sq = dx**2 + dy**2
+    
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    c.append(dist_sq[i_idx, j_idx] - r_sum[i_idx, j_idx]**2)
+    
+    return np.concatenate(c)
+
+def get_init_force(seed, steps=150):
+    """Generates an initial configuration using force-directed repulsion."""
+    rng = np.random.RandomState(seed)
+    centers = rng.uniform(0.15, 0.85, (N, 2))
+    dt = 0.005
+    
+    for _ in range(steps):
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        dists[dists < 1e-5] = 1e-5
+        
+        # Coulomb-like repulsion: F ~ 1/d^2
+        force_mag = 1.0 / (dists**2)
+        force_vec = diff * (force_mag / dists)[:, :, np.newaxis]
+        forces = np.sum(force_vec, axis=1)
+        
+        # Wall repulsion to keep circles inside and explore boundaries
+        margin = 0.05
+        wall_f = np.zeros_like(centers)
+        wall_f[:, 0] += np.where(centers[:, 0] < margin, 50.0*(margin - centers[:, 0]), 0.0)
+        wall_f[:, 0] -= np.where(centers[:, 0] > 1-margin, 50.0*(centers[:, 0] - (1-margin)), 0.0)
+        wall_f[:, 1] += np.where(centers[:, 1] < margin, 50.0*(margin - centers[:, 1]), 0.0)
+        wall_f[:, 1] -= np.where(centers[:, 1] > 1-margin, 50.0*(centers[:, 1] - (1-margin)), 0.0)
+        
+        centers += (forces + wall_f) * dt
+        centers = np.clip(centers, 0.02, 0.98)
+        
+    # Compute strictly feasible initial radii
+    radii = np.zeros(N)
+    for i in range(N):
+        d_wall = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1])
+        dists_to_others = np.sqrt(np.sum((centers[i] - centers)**2, axis=1))
+        dists_to_others[i] = np.inf
+        d_min = np.min(dists_to_others)
+        radii[i] = 0.75 * min(d_wall, d_min / 2.0)
+        
+    return np.concatenate([centers.flatten(), radii])
+
+def get_init_lattice(type_, seed):
+    """Generates an initial configuration based on a perturbed lattice."""
+    rng = np.random.RandomState(seed)
+    if type_ == 'hex':
+        counts = [6, 5, 6, 5, 4]
+        r_est = 0.085
+        pts = []
+        y = r_est
+        for k, cnt in enumerate(counts):
+            x_start = r_est if k % 2 == 0 else 2 * r_est
+            for m in range(cnt):
+                pts.append([x_start + m * 2 * r_est, y])
+            y += np.sqrt(3) * r_est
+        pts = np.array(pts[:N])
+        mx, mn = pts.max(axis=0), pts.min(axis=0)
+        pts = (pts - mn) / (mx - mn) * 0.7 + 0.15
+    elif type_ == 'grid':
+        pts = []
+        for i in range(5):
+            for j in range(5):
+                pts.append([0.1 + i*0.2, 0.1 + j*0.2])
+        pts.append([0.5, 0.5])
+        pts = np.array(pts[:N])
+        
+    # Perturb to break symmetry and escape rigid local minima
+    pts += rng.uniform(-0.03, 0.03, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    
+    # Compute strictly feasible initial radii
+    radii = np.zeros(N)
+    for i in range(N):
+        d_wall = min(pts[i,0], 1-pts[i,0], pts[i,1], 1-pts[i,1])
+        dists_to_others = np.sqrt(np.sum((pts[i] - pts)**2, axis=1))
+        dists_to_others[i] = np.inf
+        d_min = np.min(dists_to_others)
+        radii[i] = 0.75 * min(d_wall, d_min / 2.0)
+        
+    return np.concatenate([pts.flatten(), radii])
+
+def run_packing():
+    # Variable bounds: x, y in [0, 1], r in [1e-6, 0.5]
+    bounds = [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_vars = None
+    best_sum = -1.0
+    
+    inits = []
+    # Lattice inits (hex and grid)
+    for t in ['hex', 'grid']:
+        for s in range(5):
+            inits.append(get_init_lattice(t, s))
+            
+    # Force repulsion inits for diverse topological exploration
+    for s in range(30):
+        inits.append(get_init_force(s, steps=150))
+        
+    # Run optimization from each initialization
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            # Check if constraints are satisfied within numerical tolerance
+            if res.success:
+                cons_val = constraints(res.x)
+                if np.min(cons_val) >= -1e-8:
+                    curr_sum = np.sum(res.x[2*N:])
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Fallback if optimization fails completely
+    if best_vars is None:
+        best_vars = inits[0]
+        
+    if best_vars is not None:
+        # Perturb best_vars slightly and try again to escape flat local minima
+        rng_final = np.random.RandomState(99)
+        x_pert = best_vars + rng_final.randn(len(best_vars)) * 0.001
+        x_pert[:2*N] = np.clip(x_pert[:2*N], 0.001, 0.999)
+        x_pert[2*N:] = np.maximum(x_pert[2*N:], 1e-6)
+        
+        res_pert = minimize(objective, x_pert, method='SLSQP', bounds=bounds,
+                            constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13})
+        if res_pert.success and np.min(constraints(res_pert.x)) >= -1e-8:
+            if np.sum(res_pert.x[2*N:]) > best_sum:
+                best_vars = res_pert.x
+                best_sum = np.sum(res_pert.x[2*N:])
+                
+        # Final high-precision refinement
+        try:
+            res_f = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                             constraints=cons, options={'maxiter': 5000, 'ftol': 1e-14})
+            if np.min(constraints(res_f.x)) >= -1e-8:
+                best_vars = res_f.x
+        except Exception:
+            pass
+        
+    centers = best_vars[:2*N].reshape(N, 2)
+    radii = best_vars[2*N:]
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

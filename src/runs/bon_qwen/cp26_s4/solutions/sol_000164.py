@@ -1,0 +1,251 @@
+# sol_000164 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 724447fa) state=7211fc1f sum of radii=2.080000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n_circles = 26
+    
+    # Step 1: Initialize with a hexagonal lattice pattern
+    # This is a dense packing structure that serves as a good starting point.
+    centers = np.zeros((n_circles, 2))
+    radii = np.zeros(n_circles)
+    
+    # Parameters for hexagonal packing
+    # We aim to fit circles with radius ~0.1
+    # Horizontal spacing 2r, Vertical spacing sqrt(3)r
+    # We scale this to fit in the unit square roughly
+    
+    # Let's try to arrange in rows. 
+    # A 5x5 grid fits 25 circles with r=0.1. 
+    # For 26, we might need a slightly tighter packing or hexagonal arrangement.
+    # Let's generate points for a hexagonal grid and select/adjust 26.
+    
+    r_init = 0.095 # Start slightly smaller to ensure fit
+    dx = 2 * r_init
+    dy = math.sqrt(3) * r_init
+    
+    points = []
+    row = 0
+    while len(points) < n_circles:
+        col = 0
+        y = r_init + row * dy
+        # Shift every other row by r_init (dx/2)
+        x_start = r_init + (row % 2) * r_init 
+        
+        while True:
+            x = x_start + col * dx
+            # Check if point is within bounds (loosely)
+            if x > 1.0 + r_init:
+                break
+            points.append([x, y])
+            col += 1
+        row += 1
+        
+    # Take first 26 points and center them if necessary, or just scale
+    # To ensure they are inside, we might need to scale down slightly if they exceed [0,1]
+    # But with r=0.095 and spacing, they should fit reasonably well or be close.
+    # Let's ensure all are in [0,1]
+    
+    valid_points = []
+    for p in points:
+        x, y = p
+        # Clamp to valid range for center? No, just pick points inside.
+        # But we want them distributed.
+        # If a point is out, skip? 
+        # Actually, let's just take the first 26 generated and scale/shift to fit.
+        pass
+    
+    # Let's refine initialization: 
+    # Place points in a grid/hex pattern and scale to fit in [0,1] with margin
+    pts = np.array(points[:n_circles])
+    
+    # Center the configuration in the square
+    min_x, min_y = np.min(pts[:, 0]), np.min(pts[:, 1])
+    max_x, max_y = np.max(pts[:, 0]), np.max(pts[:, 1])
+    
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    # We want to fit these relative positions into the square [r, 1-r] roughly
+    # But let's just scale them to fit in [0.05, 0.95] initially
+    scale_x = (0.95 - 0.05) / width if width > 0 else 1
+    scale_y = (0.95 - 0.05) / height if height > 0 else 1
+    scale = min(scale_x, scale_y)
+    
+    # If scale is too small, it means we generated too wide a pattern.
+    # With r=0.095, 5 rows might be too tall? 
+    # Let's check height: 5 rows * sqrt(3)*0.095 approx 0.8. Fits.
+    
+    # Apply scale
+    pts_scaled = (pts - [min_x, min_y]) * scale + [0.05, 0.05]
+    
+    centers = pts_scaled
+    # Initial radii can be estimated based on min distance to neighbor
+    # Or just start with a small value and let optimizer grow them.
+    # Let's start with r = 0.08
+    radii = np.full(n_circles, 0.08)
+    
+    # Step 2: Local Optimization using scipy
+    # We optimize the vector [x1, y1, r1, x2, y2, r2, ...]
+    # Objective: Maximize sum(r_i) -> Minimize -sum(r_i)
+    # Constraints:
+    # 1. Boundary: r_i <= x_i <= 1-r_i, r_i <= y_i <= 1-r_i
+    # 2. Non-overlap: (x_i-x_j)^2 + (y_i-y_j)^2 >= (r_i+r_j)^2
+    
+    # Flatten variables
+    x0 = np.hstack([centers.flatten(), radii])
+    
+    def objective(vars):
+        # vars layout: x1, y1, r1, x2, y2, r2, ...
+        # radii are at indices 2, 5, 8, ...
+        rad_indices = np.arange(2, len(vars), 3)
+        return -np.sum(vars[rad_indices])
+
+    def constraints_func(vars):
+        constraints = []
+        
+        # Boundary constraints
+        for i in range(n_circles):
+            idx = 3 * i
+            x = vars[idx]
+            y = vars[idx+1]
+            r = vars[idx+2]
+            
+            # x - r >= 0  =>  x - r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+            # x + r <= 1  =>  1 - (x + r) >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - (v[3*i] + v[3*i+2])})
+            # y - r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+            # y + r <= 1
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1.0 - (v[3*i+1] + v[3*i+2])})
+            # r >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+2]})
+            
+        # Non-overlap constraints
+        # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                idx_i = 3 * i
+                idx_j = 3 * j
+                
+                def dist_sq_constraint(v, i=i, j=j):
+                    xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+                    xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+                    return (xi - xj)**2 + (yi - yj)**2 - (ri + rj)**2
+                
+                constraints.append({'type': 'ineq', 'fun': dist_sq_constraint})
+        
+        return constraints
+
+    # Use SLSQP
+    try:
+        res = minimize(objective, x0, method='SLSQP', constraints=constraints_func, options={'maxiter': 1000, 'ftol': 1e-9})
+        if res.success or res.nit > 0:
+            x_opt = res.x
+            centers_opt = np.array([[x_opt[3*i], x_opt[3*i+1]] for i in range(n_circles)])
+            radii_opt = np.array([x_opt[3*i+2] for i in range(n_circles)])
+        else:
+            # Fallback to initial if optimization fails
+            centers_opt = centers
+            radii_opt = radii
+    except Exception:
+        # Fallback
+        centers_opt = centers
+        radii_opt = radii
+
+    # Step 3: Refinement / Cleaning
+    # Ensure validity. If any circle is outside or overlapping, shrink it slightly.
+    # But the constraints should handle it.
+    # Let's verify and repair if needed.
+    
+    centers_final = centers_opt.copy()
+    radii_final = radii_opt.copy()
+    
+    # Repair boundaries
+    for i in range(n_circles):
+        x, y = centers_final[i]
+        r = radii_final[i]
+        
+        # Push inside if needed
+        if x - r < 0:
+            centers_final[i, 0] = r
+        if x + r > 1:
+            centers_final[i, 0] = 1 - r
+        if y - r < 0:
+            centers_final[i, 1] = r
+        if y + r > 1:
+            centers_final[i, 1] = 1 - r
+            
+    # Repair overlaps
+    # Simple iterative repair
+    for _ in range(100): # Iterate a few times
+        changed = False
+        for i in range(n_circles):
+            for j in range(i + 1, n_circles):
+                c1 = centers_final[i]
+                c2 = centers_final[j]
+                r1 = radii_final[i]
+                r2 = radii_final[j]
+                
+                dist_vec = c2 - c1
+                dist = np.linalg.norm(dist_vec)
+                min_dist = r1 + r2
+                
+                if dist < min_dist and dist > 1e-9:
+                    # Overlap detected. Move apart.
+                    # Move both away from each other
+                    overlap = min_dist - dist
+                    # Distribute overlap
+                    shift = (overlap / 2) * (dist_vec / dist)
+                    
+                    # Update centers (tentative)
+                    # But updating one might cause overlap with others.
+                    # For robustness, just reduce radius slightly? 
+                    # Or move. Let's try moving.
+                    
+                    # Move i back, j forward
+                    centers_final[i] -= shift
+                    centers_final[j] += shift
+                    
+                    # Re-check boundaries
+                    for k in [i, j]:
+                        x, y = centers_final[k]
+                        r = radii_final[k]
+                        if x < r: centers_final[k, 0] = r
+                        if x > 1 - r: centers_final[k, 0] = 1 - r
+                        if y < r: centers_final[k, 1] = r
+                        if y > 1 - r: centers_final[k, 1] = 1 - r
+                        
+                    changed = True
+        if not changed:
+            break
+            
+    # Final check for validity using the provided logic (mentally)
+    # If overlaps persist, shrink radii.
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            dist = np.linalg.norm(centers_final[i] - centers_final[j])
+            if dist < radii_final[i] + radii_final[j]:
+                # Shrink the smaller one or both
+                excess = (radii_final[i] + radii_final[j]) - dist
+                radii_final[i] -= excess / 2
+                radii_final[j] -= excess / 2
+    
+    # Ensure non-negative radii
+    radii_final = np.maximum(radii_final, 0.0)
+    
+    # Calculate sum
+    sum_radii = np.sum(radii_final)
+    
+    return centers_final, radii_final, sum_radii

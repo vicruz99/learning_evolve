@@ -1,0 +1,156 @@
+
+
+<strategy>
+To improve the packing beyond the current 2.628 sum, we need a more robust optimization strategy that escapes local minima and aggressively explores the boundary of the feasible region. The key improvements will be:
+
+1. **Vectorized Constraints**: Replace Python loops in constraint evaluation with NumPy vectorization. This drastically speeds up each optimization iteration, allowing for more function evaluations within time limits.
+2. **Multi-start with Diverse Initializations**: Use a hexagonal lattice as a base but apply varied random perturbations across 120 seeds. This ensures we sample different symmetry-breaking configurations.
+3. **Growing Circles Refinement**: After an initial SLSQP optimization, iteratively scale all radii up by a small factor (0.05%) and re-run the optimizer with centers as variables. This "pushes" the circles to fill gaps that the standard optimizer might leave behind, effectively performing a local search along the radial direction.
+4. **Strict Feasibility Repair**: Implement a deterministic post-processing step that resolves any residual overlaps or boundary violations by minimally shrinking radii, guaranteeing the `validate_packing` function passes.
+5. **No Closures/Lambdas**: Adhere strictly to the rule by defining all helper functions at the top level with fixed parameters.
+
+This combination of fast vectorized evaluation, aggressive multi-start sampling, and iterative radius growth typically pushes circle packing solutions close to theoretical bounds for $N=26$.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective_func(vars):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars):
+    """Computes all boundary and non-overlap constraints (must be >= 0)."""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    # Boundary constraints
+    c_bound = np.concatenate([x - r, 1.0 - x - r, y - r, 1.0 - y - r])
+    
+    # Overlap constraints (vectorized)
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dr = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    dist_sq = dx**2 + dy**2
+    sum_r_sq = dr**2
+    
+    return np.concatenate([c_bound, dist_sq[mask] - sum_r_sq[mask]])
+
+def get_initial_config(seed):
+    """Generates a perturbed hexagonal lattice configuration."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    r0 = 0.10
+    y = r0
+    row = 0
+    while len(centers) < N:
+        x = r0
+        if row % 2 == 1:
+            x += r0
+        while x < 1.0 - r0 and len(centers) < N:
+            centers.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3) * r0
+        row += 1
+        
+    centers = np.array(centers[:N])
+    centers += rng.normal(0, 0.015, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    radii = np.full(N, 0.08)
+    
+    vars = np.zeros(3 * N)
+    vars[0::3] = centers[:, 0]
+    vars[1::3] = centers[:, 1]
+    vars[2::3] = radii
+    return vars
+
+def repair_solution(centers, radii):
+    """Iteratively shrinks radii to resolve overlaps and clamp to boundaries."""
+    radii = radii.copy()
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            mx = min(centers[i, 0], 1.0 - centers[i, 0], 
+                     centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mx + 1e-10:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-10:
+                    overlap = radii[i] + radii[j] - d
+                    radii[i] -= overlap * 0.5
+                    radii[j] -= overlap * 0.5
+                    changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize sum of radii."""
+    bounds = [(0.0, 1.0)] * N + [(0.0, 1.0)] * N + [(1e-6, 0.5)] * N
+    constraints = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_vars = None
+    best_sum = -1.0
+    
+    # Phase 1: Multi-start SLSQP
+    for seed in range(120):
+        x0 = get_initial_config(seed)
+        try:
+            res = minimize(objective_func, x0, method='SLSQP',
+                           bounds=bounds, constraints=constraints,
+                           options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            
+            # Verify feasibility within tolerance
+            if np.all(constraint_func(res.x) >= -1e-6):
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_vars is None:
+        best_vars = get_initial_config(0)
+        
+    # Phase 2: Growing Circles Refinement
+    # Iteratively push radii larger and re-optimize centers to fill gaps
+    for _ in range(15):
+        r_current = best_vars[2::3]
+        r_grown = r_current * 1.0005
+        x0_push = best_vars.copy()
+        x0_push[2::3] = r_grown
+        
+        try:
+            res = minimize(objective_func, x0_push, method='SLSQP',
+                           bounds=bounds, constraints=constraints,
+                           options={'maxiter': 2500, 'ftol': 1e-13, 'disp': False})
+            
+            if np.all(constraint_func(res.x) >= -1e-6):
+                curr_sum = -res.fun
+                if curr_sum > best_sum:
+                    best_sum = curr_sum
+                    best_vars = res.x.copy()
+            else:
+                break  # Cannot grow further without violating constraints
+        except Exception:
+            break
+            
+    # Extract and repair final solution
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
+    radii = repair_solution(centers, radii)
+    
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,306 @@
+
+
+<strategy>
+1. **Problem Formulation**: We formulate this as a non-linear programming problem. We want to maximize $\sum r_i$ subject to non-overlap and boundary constraints. This is equivalent to minimizing $-\sum r_i$.
+2. **Constraints**:
+   - Boundary: $0 \le x_i - r_i$ and $x_i + r_i \le 1$, similarly for $y$.
+   - Non-overlap: $(x_i - x_j)^2 + (y_i - y_j)^2 \ge (r_i + r_j)^2$ for all $i < j$.
+3. **Initialization**: A hexagonal lattice is denser than a square grid. We'll initialize 26 circles in a hexagonal pattern with a small feasible radius (e.g., 0.05). This provides a high-quality starting point close to the optimum.
+4. **Optimization**: We'll use `scipy.optimize.minimize` with the SLSQP algorithm, which handles non-linear constraints well. To escape local minima, we'll run the optimizer multiple times with slightly different initial perturbations and keep the best result.
+5. **Validation & Safety**: After optimization, we'll ensure the solution is strictly feasible within the tolerance allowed by the validator (1e-12). If any constraint is marginally violated due to numerical precision, we'll slightly shrink radii to guarantee validity.
+6. **Implementation Constraints**: All helper functions will be top-level, no closures, no lambdas.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+import math
+
+def get_hexagonal_initialization(n_circles, base_radius):
+    """Generate a hexagonal packing initialization for n_circles."""
+    centers = []
+    radii = []
+    
+    # Hexagonal spacing
+    dx = 2.0 * base_radius
+    dy = math.sqrt(3.0) * base_radius
+    
+    row = 0
+    count = 0
+    while count < n_circles:
+        y = base_radius + row * dy
+        # Offset every other row
+        offset = dx / 2.0 if row % 2 == 1 else 0.0
+        
+        col = 0
+        while True:
+            x = base_radius + offset + col * dx
+            if x + base_radius <= 1.0 and y + base_radius <= 1.0:
+                centers.append([x, y])
+                radii.append(base_radius)
+                count += 1
+                if count == n_circles:
+                    break
+            col += 1
+        row += 1
+        # Safety break
+        if row > 10:
+            break
+            
+    # If we didn't get enough circles, fill with grid
+    if count < n_circles:
+        step = 0.2
+        idx = 0
+        r = 0.05
+        y = r
+        while len(centers) < n_circles:
+            x = r
+            while len(centers) < n_circles and x + r <= 1.0:
+                centers.append([x, y])
+                radii.append(r)
+                x += 2 * r
+            y += 2 * r
+    return np.array(centers[:n_circles]), np.array(radii[:n_circles])
+
+def objective(vars, n_circles):
+    """Objective function: minimize negative sum of radii."""
+    radii = vars[2::3]
+    return -np.sum(radii)
+
+def constraint_jac(vars, n_circles, indices):
+    """Compute Jacobian for constraints manually to speed up SLSQP if needed, 
+    but SLSQP finite diff is usually fine. We'll stick to standard form."""
+    pass
+
+def make_constraints(n_circles):
+    """Create list of constraint dictionaries for scipy.optimize."""
+    constraints = []
+    
+    # Boundary constraints for each circle
+    for i in range(n_circles):
+        # x - r >= 0  => x - r >= 0
+        idx_x, idx_y, idx_r = 3*i, 3*i+1, 3*i+2
+        cons = {
+            'type': 'ineq',
+            'fun': lambda v, i=i: v[idx_x] - v[idx_r],
+            'jac': lambda v, i=i: np.zeros(3*n_circles)
+        }
+        # Set jacobian manually for speed/accuracy
+        def jac_x(v, i=i):
+            jac = np.zeros(3*n_circles)
+            jac[3*i] = 1.0
+            jac[3*i+2] = -1.0
+            return jac
+        cons['jac'] = jac_x
+        constraints.append(cons)
+
+        # 1 - x - r >= 0
+        cons = {
+            'type': 'ineq',
+            'fun': lambda v, i=i: 1.0 - v[idx_x] - v[idx_r],
+            'jac': lambda v, i=i: np.zeros(3*n_circles)
+        }
+        def jac_1x(v, i=i):
+            jac = np.zeros(3*n_circles)
+            jac[3*i] = -1.0
+            jac[3*i+2] = -1.0
+            return jac
+        cons['jac'] = jac_1x
+        constraints.append(cons)
+
+        # y - r >= 0
+        cons = {
+            'type': 'ineq',
+            'fun': lambda v, i=i: v[idx_y] - v[idx_r],
+            'jac': lambda v, i=i: np.zeros(3*n_circles)
+        }
+        def jac_y(v, i=i):
+            jac = np.zeros(3*n_circles)
+            jac[3*i+1] = 1.0
+            jac[3*i+2] = -1.0
+            return jac
+        cons['jac'] = jac_y
+        constraints.append(cons)
+
+        # 1 - y - r >= 0
+        cons = {
+            'type': 'ineq',
+            'fun': lambda v, i=i: 1.0 - v[idx_y] - v[idx_r],
+            'jac': lambda v, i=i: np.zeros(3*n_circles)
+        }
+        def jac_1y(v, i=i):
+            jac = np.zeros(3*n_circles)
+            jac[3*i+1] = -1.0
+            jac[3*i+2] = -1.0
+            return jac
+        cons['jac'] = jac_1y
+        constraints.append(cons)
+
+    # Circle-circle non-overlap constraints
+    # (xi-xj)^2 + (yi-yj)^2 >= (ri+rj)^2
+    # Let f = dx^2 + dy^2 - (ri+rj)^2 >= 0
+    for i in range(n_circles):
+        for j in range(i + 1, n_circles):
+            idx_xi, idx_yi, idx_ri = 3*i, 3*i+1, 3*i+2
+            idx_xj, idx_yj, idx_rj = 3*j, 3*j+1, 3*j+2
+            
+            def fun(v, i=i, j=j):
+                dx = v[idx_xi] - v[idx_xj]
+                dy = v[idx_yi] - v[idx_yj]
+                sum_r = v[idx_ri] + v[idx_rj]
+                return dx*dx + dy*dy - sum_r*sum_r
+            
+            def jac(v, i=i, j=j):
+                jac = np.zeros(3*n_circles)
+                dx = v[idx_xi] - v[idx_xj]
+                dy = v[idx_yi] - v[idx_yj]
+                sum_r = v[idx_ri] + v[idx_rj]
+                
+                jac[idx_xi] = 2.0 * dx
+                jac[idx_xj] = -2.0 * dx
+                jac[idx_yi] = 2.0 * dy
+                jac[idx_yj] = -2.0 * dy
+                jac[idx_ri] = -2.0 * sum_r
+                jac[idx_rj] = -2.0 * sum_r
+                return jac
+
+            constraints.append({
+                'type': 'ineq',
+                'fun': fun,
+                'jac': jac
+            })
+            
+    return constraints
+
+def validate_and_adjust(centers, radii, n_circles):
+    """Ensure strict feasibility within tolerance."""
+    # Check for any violations and shrink if necessary
+    # This is a safety net
+    max_violation = -1e-12
+    
+    for i in range(n_circles):
+        r = radii[i]
+        x, y = centers[i]
+        # Boundary
+        margin_x_min = x - r
+        margin_x_max = 1.0 - (x + r)
+        margin_y_min = y - r
+        margin_y_max = 1.0 - (y + r)
+        margin = min(margin_x_min, margin_x_max, margin_y_min, margin_y_max)
+        if margin < max_violation:
+            max_violation = margin
+            
+        for j in range(i + 1, n_circles):
+            dist = np.sqrt((centers[i][0] - centers[j][0])**2 + (centers[i][1] - centers[j][1])**2)
+            margin = dist - (radii[i] + radii[j])
+            if margin < max_violation:
+                max_violation = margin
+                
+    if max_violation < -1e-12:
+        # Violation detected, shrink all radii slightly to make it valid
+        # A uniform shrink is safest
+        shrink_factor = 1.0 - abs(max_violation) / (2.0 * np.max(radii) + 1e-9)
+        radii = radii * max(0.99, shrink_factor)
+        
+    return centers, radii
+
+def run_packing():
+    n_circles = 26
+    
+    # We will run optimization multiple times with different starts
+    best_sum_r = -np.inf
+    best_centers = None
+    best_radii = None
+    
+    constraints = make_constraints(n_circles)
+    
+    # Bounds for variables: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n_circles):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((1e-6, 0.5)) # r
+    
+    # Try multiple initial configurations
+    attempts = 5
+    for attempt in range(attempts):
+        # Hexagonal start
+        init_r = 0.05 + 0.01 * attempt # Slightly vary initial radius to perturb layout
+        c0, r0 = get_hexagonal_initialization(n_circles, init_r)
+        
+        # Add small random noise to break symmetry and avoid local minima
+        np.random.seed(attempt * 12345)
+        noise = np.random.uniform(-0.02, 0.02, size=c0.shape)
+        # Ensure noise keeps centers in bounds
+        c0 = np.clip(c0 + noise, init_r, 1.0 - init_r)
+        
+        # Flatten to 1D array for optimizer
+        vars0 = np.zeros(3 * n_circles)
+        for i in range(n_circles):
+            vars0[3*i] = c0[i, 0]
+            vars0[3*i+1] = c0[i, 1]
+            vars0[3*i+2] = r0[i]
+            
+        # Optimize
+        res = minimize(
+            objective,
+            vars0,
+            args=(n_circles,),
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'maxiter': 200, 'ftol': 1e-12, 'disp': False}
+        )
+        
+        if res.success or -res.fun > best_sum_r:
+            current_sum_r = -res.fun
+            # Reconstruct centers and radii
+            curr_centers = res.x[:2*n_circles].reshape((n_circles, 2))
+            curr_radii = res.x[2*n_circles:] # Every 3rd element starting from index 2? No.
+            # vars layout: x0, y0, r0, x1, y1, r1 ...
+            # radii are at indices 2, 5, 8, ... i.e., 3*i + 2
+            curr_radii = res.x[2::3]
+            
+            # Validate and adjust
+            curr_centers, curr_radii = validate_and_adjust(curr_centers, curr_radii, n_circles)
+            
+            # Check if valid after adjustment
+            # Quick check
+            is_valid = True
+            for i in range(n_circles):
+                if curr_radii[i] <= 0:
+                    is_valid = False; break
+                x, y = curr_centers[i]
+                r = curr_radii[i]
+                if x - r < -1e-14 or x + r > 1 + 1e-14 or y - r < -1e-14 or y + r > 1 + 1e-14:
+                    is_valid = False; break
+                for j in range(i+1, n_circles):
+                    d = np.sqrt(np.sum((curr_centers[i] - curr_centers[j])**2))
+                    if d < curr_radii[i] + curr_radii[j] - 1e-12:
+                        is_valid = False; break
+            if is_valid and current_sum_r > best_sum_r:
+                best_sum_r = current_sum_r
+                best_centers = curr_centers.copy()
+                best_radii = curr_radii.copy()
+                
+    # Fallback if optimization fails completely
+    if best_centers is None:
+        # Return a simple valid grid
+        step = 0.2
+        r = 0.09
+        centers = []
+        radii = []
+        y = r
+        while len(centers) < n_circles and y + r <= 1.0:
+            x = r
+            while len(centers) < n_circles and x + r <= 1.0:
+                centers.append([x, y])
+                radii.append(r)
+                x += 2 * r
+            y += 2 * r
+        best_centers = np.array(centers[:n_circles])
+        best_radii = np.array(radii[:n_circles])
+        best_sum_r = np.sum(best_radii)
+        
+    return best_centers, best_radii, best_sum_r
+```

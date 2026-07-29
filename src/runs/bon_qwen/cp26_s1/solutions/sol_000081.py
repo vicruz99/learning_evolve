@@ -1,5 +1,5 @@
 # sol_000081 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9821b492) state=62d84410 sum of radii=0.000000 correctness=1.0
+# generation=0 parent=seed (state b0810f40) state=78f93b39 sum of radii=2.210000 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
@@ -7,146 +7,223 @@
 import numpy as np
 from scipy.optimize import minimize
 
-def compute_loss_and_grad(params, n=26):
-    centers = params[:2*n].reshape(n, 2)
-    radii = params[2*n:]
-    
-    # Compute pairwise distances
-    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diffs**2, axis=2))
-    dists = np.maximum(dists, 1e-12)
-    np.fill_diagonal(dists, np.inf)
-    
-    # Compute overlaps
-    rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
-    deltas = rad_sum - dists
-    mask = deltas > 0.0
-    deltas_active = np.where(mask, deltas, 0.0)
-    
-    # Overlap penalty
-    o_pen = np.sum(deltas_active**2)
-    
-    # Boundary penalties
-    left = radii - centers[:, 0]
-    right = radii - (1.0 - centers[:, 0])
-    btop = radii - centers[:, 1]
-    bott = radii - (1.0 - centers[:, 1])
-    
-    b_pen = np.sum(np.maximum(left, 0.0)**2 + np.maximum(right, 0.0)**2 + 
-                   np.maximum(btop, 0.0)**2 + np.maximum(bott, 0.0)**2)
-                   
-    lam = 5000.0
-    loss = -np.sum(radii) + lam * (b_pen + o_pen)
-    
-    # Gradients
-    grad = np.zeros_like(params)
-    
-    # d(loss)/d(radii)
-    db_dr = 2.0 * (np.maximum(left, 0.0) + np.maximum(right, 0.0) + 
-                   np.maximum(btop, 0.0) + np.maximum(bott, 0.0))
-    do_dr = 2.0 * np.sum(deltas_active, axis=1)
-    grad[2*n:] = -1.0 + lam * (db_dr + do_dr)
-    
-    # d(loss)/d(x_i)
-    db_dx = -2.0 * np.maximum(left, 0.0) + 2.0 * np.maximum(right, 0.0)
-    dir_x = diffs[:, :, 0] / dists
-    do_dx = 2.0 * np.sum(deltas_active * dir_x, axis=1)
-    grad[:n] = lam * (db_dx + do_dx)
-    
-    # d(loss)/d(y_i)
-    db_dy = -2.0 * np.maximum(btop, 0.0) + 2.0 * np.maximum(bott, 0.0)
-    dir_y = diffs[:, :, 1] / dists
-    do_dy = 2.0 * np.sum(deltas_active * dir_y, axis=1)
-    grad[n:2*n] = lam * (db_dy + do_dy)
-    
-    return loss, grad
-
 def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Returns centers, radii, and sum_radii.
+    """
     n = 26
-    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
-    
-    best_sum = -1.0
-    best_centers = None
-    best_radii = None
-    
-    np.random.seed(42)
-    starts = []
-    
-    # 1. Random starts
-    for _ in range(10):
-        c = np.random.rand(n, 2) * 0.8 + 0.1
-        r = np.full(n, 0.05) + np.random.rand(n) * 0.02
-        starts.append(np.concatenate([c.ravel(), r]))
+    np.random.seed(42) # For reproducibility
+
+    # Function to compute the overlap penalty for a given configuration and radius
+    # Minimizing this function pushes circles apart
+    def compute_penalty(centers, R):
+        penalty = 0.0
+        # Check all pairs
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist < 2 * R:
+                    penalty += (2 * R - dist) ** 2
+        return penalty
+
+    # Function to attempt packing for a fixed radius R
+    # Returns (success, centers, min_penalty)
+    def try_pack_radius(R, restarts=3):
+        best_penalty = float('inf')
+        best_centers = None
         
-    # 2. Hexagonal-ish starts
-    for _ in range(5):
-        c = np.zeros((n, 2))
-        y, x, idx = 0.1, 0.1, 0
+        # Bounds for centers: [R, 1-R] for x and y
+        bounds = [(R, 1 - R) for _ in range(2 * n)]
+        
+        # We will try multiple initial configurations
+        # 1. Random initialization
+        # 2. Hexagonal grid initialization
+        
+        inits = []
+        
+        # Random initialization
+        inits.append(np.random.uniform(R, 1 - R, size=(n, 2)))
+        
+        # Hexagonal grid initialization
+        # Try to fit points in a hex pattern
+        hex_centers = []
+        r_approx = R
+        # Rows
+        rows = 6
+        cols = 5
+        y = r_approx
+        for r_idx in range(rows):
+            x = r_approx
+            # Offset every other row
+            offset = (r_idx % 2) * r_approx
+            current_x = x + offset
+            while current_x + r_approx <= 1.0 and len(hex_centers) < n:
+                hex_centers.append([current_x, y])
+                current_x += 2 * r_approx
+            y += np.sqrt(3) * r_approx
+        
+        if len(hex_centers) >= n:
+            # Take first n
+            inits.append(np.array(hex_centers[:n]))
+        else:
+            # If hex grid didn't fill, pad with random
+            # (Unlikely given R ~ 0.1)
+            pass
+
+        # Add a few more random ones for robustness
+        for _ in range(restarts - 2): # -2 because we added 2 specific inits
+             inits.append(np.random.uniform(R, 1 - R, size=(n, 2)))
+
+        for centers_init in inits:
+            x0 = centers_init.flatten()
+            
+            # Define objective for scipy
+            def obj(x):
+                c = x.reshape(n, 2)
+                # Boundary penalties (soft, though bounds are hard)
+                # Hard bounds are enforced by optimizer, but soft penalty helps gradient
+                # Actually L-BFGS-B handles bounds well, we just need overlap penalty
+                return compute_penalty(c, R)
+
+            try:
+                res = minimize(obj, x0, method='L-BFGS-B', bounds=bounds,
+                               options={'ftol': 1e-12, 'gtol': 1e-8, 'maxiter': 2000})
+                
+                if res.fun < best_penalty:
+                    best_penalty = res.fun
+                    best_centers = res.x.reshape(n, 2)
+                    
+                    # Early exit if very good
+                    if best_penalty < 1e-8:
+                        return True, best_centers, best_penalty
+            except:
+                continue
+                
+        # Check if we found a valid packing
+        # Tolerance for overlap sum. With N=26, small overlaps sum up.
+        # We want max overlap to be small.
+        # A safe heuristic: if penalty is very small, it's likely valid.
+        # But let's check max overlap explicitly.
+        if best_centers is not None:
+            max_overlap = 0.0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.sqrt(np.sum((best_centers[i] - best_centers[j]) ** 2))
+                    if d < 2 * R:
+                        ov = 2 * R - d
+                        if ov > max_overlap:
+                            max_overlap = ov
+            
+            # If max overlap is negligible, success
+            if max_overlap < 1e-7:
+                return True, best_centers, best_penalty
+        
+        return False, best_centers, best_penalty
+
+    # Binary search for optimal R
+    low = 0.05
+    high = 0.12 # Theoretical limit is ~0.105, 0.12 is safe upper bound
+    optimal_R = low
+    optimal_centers = None
+    valid_found = False
+
+    # We can also try to expand high if low succeeds easily, but 0.12 is likely enough.
+    # Let's do a coarser search first to find range, then refine.
+    
+    # Step 1: Find a feasible R
+    # Check mid
+    mid = (low + high) / 2
+    # Check if high is feasible?
+    # If high is feasible, we can go higher. But 0.12 is probably max.
+    
+    # Binary search iterations
+    for _ in range(25):
+        if high - low < 1e-5:
+            break
+            
+        mid = (low + high) / 2
+        
+        # Try to pack with radius mid
+        # Use fewer restarts for speed, or more if stuck?
+        # 3 restarts is a good balance
+        success, centers, penalty = try_pack_radius(mid, restarts=3)
+        
+        if success:
+            optimal_R = mid
+            optimal_centers = centers
+            low = mid
+            valid_found = True
+            # Try slightly larger
+            high = mid + 1e-5 
+        else:
+            high = mid
+
+    # If we didn't find a valid packing in binary search (unlikely), 
+    # fallback to a known good configuration.
+    # But with the loop, we should find something.
+    
+    if not valid_found or optimal_centers is None:
+        # Fallback: Simple grid
+        # 5x5 grid with r=0.1
+        R_fallback = 0.1
+        centers = []
         for i in range(5):
             for j in range(5):
-                if idx >= n: break
-                c[idx, 0] = x + j * 0.2 + (i % 2) * 0.1
-                c[idx, 1] = y + i * 0.25
-                idx += 1
-            if idx >= n: break
-        while idx < n:
-            c[idx] = np.random.rand(2) * 0.8 + 0.1
-            idx += 1
-        c += np.random.randn(n, 2) * 0.02
-        c = np.clip(c, 0.05, 0.95)
-        r = np.full(n, 0.09)
-        starts.append(np.concatenate([c.ravel(), r]))
-        
-    # 3. Grid start
-    c = np.zeros((n, 2))
-    idx = 0
-    for i in range(5):
-        for j in range(5):
-            if idx >= n: break
-            c[idx] = [0.1 + j*0.2, 0.1 + i*0.2]
-            idx += 1
-    c[idx] = [0.6, 0.6]
-    c += np.random.randn(n, 2) * 0.01
-    r = np.full(n, 0.1)
-    starts.append(np.concatenate([c.ravel(), r]))
+                centers.append([0.1 + i*0.2, 0.1 + j*0.2])
+        # We have 25 circles, need 26.
+        # Add one in center? Center is (0.5, 0.5) which is occupied.
+        # Add at (0.5, 0.5) with smaller radius? 
+        # But we want equal radii.
+        # Just randomize 26th
+        centers.append([0.2, 0.2]) # Overlaps, but fallback
+        # This fallback is weak.
+        # Better to rely on optimization.
+        pass
 
-    for x0 in starts:
-        res = minimize(compute_loss_and_grad, x0, method='L-BFGS-B', 
-                       bounds=bounds, jac=True, options={'maxiter': 3000, 'ftol': 1e-15})
+    # Final Refinement
+    # We have a configuration with radius optimal_R that is nearly valid.
+    # We can try to slightly decrease radius to ensure strict validity if needed,
+    # or just trust the optimizer.
+    # To be safe, let's run one more optimization step with the found centers 
+    # and current R to ensure minimal energy.
+    
+    if valid_found:
+        # Re-optimize with found centers as seed to polish
+        R_final = optimal_R
+        # Tighten R slightly if there were any tiny overlaps
+        # But try_pack returned success only if max_overlap < 1e-7
         
-        centers = res.x[:2*n].reshape(n, 2)
-        radii = res.x[2*n:]
+        # Let's verify and adjust R if necessary
+        # Check constraints
+        current_centers = optimal_centers
+        # Check boundaries
+        # Check overlaps
+        max_ov = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((current_centers[i] - current_centers[j]) ** 2))
+                if d < 2 * R_final:
+                    max_ov = max(max_ov, 2 * R_final - d)
         
-        # Quick validation check
-        valid = True
-        for k in range(n):
-            x, y, r = centers[k, 0], centers[k, 1], radii[k]
-            if r < -1e-9 or x - r < -1e-7 or x + r > 1 + 1e-7 or y - r < -1e-7 or y + r > 1 + 1e-7:
-                valid = False
-                break
-        if valid:
-            for k1 in range(n):
-                for k2 in range(k1+1, n):
-                    d = np.hypot(centers[k1,0]-centers[k2,0], centers[k1,1]-centers[k2,1])
-                    if d < radii[k1] + radii[k2] - 1e-7:
-                        valid = False
-                        break
-                if not valid:
-                    break
-                    
-        if valid:
-            s = np.sum(radii)
-            if s > best_sum:
-                best_sum = s
-                best_centers = centers.copy()
-                best_radii = radii.copy()
-                
-    if best_centers is None:
-        best_centers = np.zeros((n, 2))
-        best_radii = np.zeros(n)
-        best_sum = 0.0
-    else:
-        # Slight shrinkage to guarantee strict validity under tolerance
-        best_radii *= 0.9999999
+        # If there is a tiny overlap, reduce R
+        if max_ov > 1e-9:
+            R_final = R_final - max_ov - 1e-10
+            # Re-center? No, just shrinking R fixes overlap relative to centers.
+            # But might cause boundary issues if centers are too close to edge.
+            # However, centers were optimized with bounds [R, 1-R] for the larger R.
+            # So for smaller R, they are strictly inside.
+            
+        # Create radii array
+        radii = np.full(n, R_final)
         
-    return best_centers, best_radii, np.sum(best_radii)
+        # One last check: ensure centers are within [R_final, 1-R_final]
+        # Since we optimized with bounds [optimal_R, 1-optimal_R] and optimal_R >= R_final,
+        # centers are valid.
+        
+        sum_radii = np.sum(radii)
+        
+        return current_centers, radii, sum_radii
+
+    # Fallback return (should not be reached if logic is correct)
+    return np.random.rand(26, 2) * 0.8 + 0.1, np.ones(26) * 0.05, 1.3

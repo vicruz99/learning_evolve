@@ -1,0 +1,279 @@
+# sol_000139 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 466799c7) state=592105e1 sum of radii=1.600440 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    # Number of circles
+    N = 26
+    
+    # Initialize centers in a hexagonal packing pattern
+    # We want to fit 26 circles. A 6x5 or similar arrangement.
+    # Let's try to distribute them somewhat evenly.
+    # Hexagonal packing: rows are shifted.
+    # Let's estimate a starting radius to spread them out.
+    # If we assume r ~ 0.1, diameter 0.2.
+    # 6 circles width 1.2 (too big), 5 circles width 1.0.
+    # So maybe 5-6-5-5-5? Or 6-5-5-5-5 (26)?
+    # 6 circles in a row requires width ~ 1.2, but if staggered, maybe we can fit?
+    # Actually, for optimization, a dense random start or grid start works.
+    # Let's start with a perturbed grid.
+    
+    centers = np.zeros((N, 2))
+    radii = np.zeros(N)
+    
+    # Initial guess: hexagonal grid
+    # Let's place them in rows
+    # Row 0: 6 circles? Width constraint is tight.
+    # Let's try 5, 6, 5, 6, 4 ? Total 26.
+    # Or just a simple dense packing initialization.
+    
+    # Let's use a simple grid initialization that is slightly compressed
+    # to allow the optimizer to expand them.
+    # 6 columns, 5 rows = 30 slots, we use 26.
+    cols = 6
+    rows = 5
+    
+    r_start = 0.08 # Smaller than optimal to ensure no overlap initially
+    
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            if idx < N:
+                # Hexagonal shift for odd rows
+                shift = 0.0
+                if r % 2 == 1:
+                    shift = r_start * 1.732 / 2 # half width of circle approx
+                    
+                x = (c + 0.5) * (1.0 / cols) + shift
+                y = (r + 0.5) * (1.0 / rows)
+                
+                # Keep within bounds roughly
+                x = np.clip(x, r_start + 0.001, 1.0 - r_start - 0.001)
+                y = np.clip(y, r_start + 0.001, 1.0 - r_start - 0.001)
+                
+                centers[idx] = [x, y]
+                radii[idx] = r_start
+                idx += 1
+                
+    # Optimization loop
+    # We want to maximize sum of radii.
+    # This is equivalent to maximizing the minimum clearance if radii are equal,
+    # but here radii can vary.
+    # However, for sum maximization, equal radii is usually near optimal.
+    # We can perform a local search: move centers to increase min distance to neighbors/bounds.
+    
+    num_iterations = 800
+    step_size = 0.005
+    decay = 0.995
+    
+    # Precompute indices for distance checks
+    indices = np.arange(N)
+    
+    for t in range(num_iterations):
+        # Calculate current max possible radius for each circle based on positions
+        # r_i = min( dist(i, j) - r_j ) ... this is coupled.
+        # Instead, let's calculate the "available space" around each circle.
+        # Available space = min(dist(i, j), dist(i, boundary))
+        # If all radii were equal R, R = 0.5 * min_available_space.
+        # But radii are different.
+        # Let's compute the maximum radius each circle COULD have if others were points?
+        # No, that's not right.
+        
+        # Let's use a repulsion force method.
+        # Force on circle i from circle j: repulsive if dist < r_i + r_j.
+        # But we want to maximize r.
+        # Heuristic: move circle i away from circle j if they are close.
+        
+        # Calculate current radii based on constraints?
+        # Let's define a "target radius" for each circle as limited by neighbors.
+        # But neighbors have radii too.
+        
+        # Simplified approach:
+        # 1. Calculate current valid radii assuming current positions.
+        #    r_i = min over j!=i (dist(i,j) - r_j) ? No, circular dependency.
+        #    Let's assume radii are roughly equal to an average r_avg.
+        #    Actually, let's just calculate the distance to nearest neighbor and boundary.
+        #    Let d_i = min( dist(i, boundary), min_j(dist(i, j)) )
+        #    If we set r_i = d_i / 2, then circles would touch.
+        #    But sum r_i = 0.5 * sum d_i.
+        #    We want to maximize sum d_i by moving centers.
+        
+        # Let's compute gradients of sum of distances?
+        # Or just use a simple iterative repulsion.
+        
+        # Calculate distances
+        dists = np.zeros((N, N))
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                dists[i, j] = d
+                dists[j, i] = d
+        
+        # Calculate min distance to boundary
+        dist_boundary = np.minimum(
+            np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+            np.minimum(centers[:, 1], 1.0 - centers[:, 1])
+        )
+        
+        # Update radii to be consistent with current packing
+        # We want r_i + r_j <= dist(i,j).
+        # A safe update: r_i = min(dist(i, boundary), min_j(dist(i,j) - r_j))
+        # But this is sequential.
+        # Let's just estimate r_i based on current geometry assuming equal size locally?
+        # Actually, for the optimization, we can just move centers to increase the "clearance".
+        
+        # Let's compute the "bottleneck" distance for each circle.
+        # b_i = min(dist(i, boundary), min_j(dist(i, j)))
+        # If we move i away from its bottleneck, we can increase its radius.
+        # The radius would be roughly b_i / 2 if neighbors were points, 
+        # but neighbors have size.
+        # Let's approximate: current_radius[i] = min(b_i, min_j(dists[i,j] - current_radius[j]))
+        # This is hard to solve simultaneously.
+        
+        # Alternative: Assume all radii are equal to R.
+        # R = 0.5 * min(b_i, min_j(dists[i,j]))
+        # We want to maximize this global R.
+        # But we want sum of radii.
+        # If we allow unequal radii, sum might be higher?
+        # Usually equal is best.
+        # Let's try to maximize the minimum distance between any pair and any boundary,
+        # effectively maximizing the radius of equal circles.
+        
+        # Let's compute the "pressure" on each point.
+        # Pressure comes from the closest neighbor or boundary.
+        
+        forces = np.zeros_like(centers)
+        
+        # We want to push points away from each other and boundaries.
+        # This maximizes the minimum distance, which correlates with radius.
+        
+        # However, since we have 26 points, the "min distance" might be determined by a specific pair.
+        # Moving points to equalize distances is good.
+        
+        # Let's compute a "local radius" for each point assuming it's constrained by its nearest neighbor.
+        # local_r[i] = min(dist_boundary[i], min_j(dists[i,j])) / 2.0 
+        # This is an upper bound on radius if other circles were points.
+        # It's a valid heuristic to maximize sum of local_r?
+        # No, sum of radii is sum(r_i).
+        # If we maximize sum(local_r), we might get a good packing.
+        
+        # Let's compute gradients for sum of (min distance) / 2?
+        # That's non-differentiable.
+        
+        # Let's use a simpler repulsion:
+        # If dist(i,j) < 2 * target_r, repel.
+        # But target_r is unknown.
+        
+        # Let's just perform a standard "maximize minimum distance" optimization (Tammes problem style).
+        # This maximizes the radius of equal circles.
+        # Sum = 26 * r.
+        
+        # Identify the pair/boundary that limits the radius the most.
+        # Limit is L = min( min_ij(dist(i,j)), min_i(dist(i, boundary)) )
+        # We want to maximize L.
+        # Gradient of L wrt center i?
+        # If L is determined by pair (i,j), moving i and j apart increases L.
+        # If L is determined by boundary of i, moving i inward increases L.
+        
+        current_L = np.inf
+        
+        # Find limiting constraints
+        # We can just push all pairs apart and all points away from boundaries.
+        # Weight the pushes?
+        
+        # Repulsion strength could be inverse square of distance.
+        
+        for i in range(N):
+            # Boundary repulsion
+            # Push away from x=0, x=1, y=0, y=1
+            # Force magnitude proportional to 1/dist
+            x, y = centers[i]
+            fx, fy = 0.0, 0.0
+            
+            # Left
+            d = x
+            if d < 0.5:
+                fx += 1.0 / (d + 1e-5)
+            # Right
+            d = 1.0 - x
+            if d < 0.5:
+                fx -= 1.0 / (d + 1e-5)
+            # Bottom
+            d = y
+            if d < 0.5:
+                fy += 1.0 / (d + 1e-5)
+            # Top
+            d = 1.0 - y
+            if d < 0.5:
+                fy -= 1.0 / (d + 1e-5)
+            
+            forces[i, 0] += fx
+            forces[i, 1] += fy
+            
+            # Neighbor repulsion
+            for j in range(N):
+                if i == j: continue
+                dx = centers[i, 0] - centers[j, 0]
+                dy = centers[i, 1] - centers[j, 1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                if dist < 1.0: # Only consider reasonably close neighbors
+                    # Repulsion force
+                    # If dist is small, force is large
+                    force_mag = 1.0 / (dist*dist + 1e-5)
+                    fx += force_mag * dx / dist
+                    fy += force_mag * dy / dist
+            
+            forces[i, 0] += fx
+            forces[i, 1] += fy
+            
+        # Normalize forces
+        norms = np.linalg.norm(forces, axis=1, keepdims=True)
+        norms[norms < 1e-9] = 1e-9
+        forces = forces / norms
+        
+        # Move centers
+        centers += forces * step_size
+        
+        # Clip to boundaries
+        centers = np.clip(centers, 0.001, 0.999)
+        
+        # Decay step size
+        step_size *= decay
+
+    # Final calculation of radii
+    # Now that centers are optimized for spacing, calculate max radii.
+    # We want to maximize sum of radii.
+    # We can solve this as a linear program or just iterate.
+    # r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
+    # r_i + r_j <= dist(i,j)
+    
+    # Simple iterative update to find consistent radii
+    # Initialize radii with a small value
+    r_current = np.full(N, 0.05)
+    
+    for _ in range(100):
+        for i in range(N):
+            # Max radius allowed by boundaries
+            max_r = np.minimum(
+                np.minimum(centers[i, 0], 1.0 - centers[i, 0]),
+                np.minimum(centers[i, 1], 1.0 - centers[i, 1])
+            )
+            
+            # Max radius allowed by neighbors
+            for j in range(N):
+                if i == j: continue
+                dist = np.linalg.norm(centers[i] - centers[j])
+                max_r = np.minimum(max_r, dist - r_current[j])
+            
+            r_current[i] = max_r
+            
+    # Sort radii to match order? No need.
+    # The problem asks for centers and radii.
+    
+    sum_radii = np.sum(r_current)
+    
+    return centers, r_current, sum_radii

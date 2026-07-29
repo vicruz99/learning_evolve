@@ -1,109 +1,135 @@
 
 
 <strategy>
-To pack 26 circles in a unit square maximizing the sum of radii, I will use a two-phase optimization strategy:
+To maximize the sum of radii for 26 circles in a unit square, we treat this as a constrained non-convex optimization problem. The objective is to maximize $\sum r_i$, which is equivalent to minimizing $-\sum r_i$. Constraints include boundary conditions ($r_i \le x_i \le 1-r_i$, $r_i \le y_i \le 1-r_i$) and non-overlap ($\text{dist}_{ij} \ge r_i + r_j$).
 
-1. **Initialization**: Generate a high-quality starting configuration using a perturbed hexagonal lattice. Hexagonal packing is the densest circle packing in 2D, providing a strong geometric prior that avoids poor local optima common in random initializations. I'll place circles with ~0.2 spacing, slightly perturbed to break symmetry, and start with small radii (0.06) to ensure all constraints are initially satisfied.
-
-2. **Constraint Formulation**: 
-   - Pairwise non-overlap: $\|c_i - c_j\|^2 \ge (r_i + r_j)^2$ for all $i < j$
-   - Boundary containment: $r_i \le x_i \le 1-r_i$ and $r_i \le y_i \le 1-r_i$
-   These are formulated as smooth inequality constraints to be used with a gradient-based optimizer.
-
-3. **Optimization**: Use `scipy.optimize.minimize` with the `trust-constr` method, which is well-suited for problems with many nonlinear inequality constraints. The objective is to maximize $\sum r_i$ (minimize negative sum). I'll run it with a high iteration limit to allow the radii to expand until they naturally jam against each other and the boundaries.
-
-4. **Post-processing**: Clip centers to strictly satisfy boundary constraints relative to their final radii, ensure non-negative radii, and return the configuration. This approach leverages numerical optimization to push the boundaries of feasible packing space efficiently.
+Strategy:
+1. **Penalty Method**: Transform constraints into penalty terms added to the objective function. This allows the use of unconstrained gradient-based optimizers (`L-BFGS-B`) which handle the smooth penalty landscape efficiently.
+2. **Annealing Schedule**: Start with a small penalty multiplier `mu` to allow the optimizer to explore the configuration space freely, then gradually increase `mu` (doubling each step) to strictly enforce constraints as the solution converges.
+3. **Multiple Initializations**: Circle packing has many local minima. We initialize from different structured layouts (hexagonal lattice, grid) and random seeds, running the optimization schedule on each, and keep the best result.
+4. **Vectorization**: Compute pairwise distances and penalties using NumPy matrix operations for speed.
+5. **Final Projection**: After optimization, strictly clamp radii to satisfy boundary constraints exactly, ensuring validity per the checker's tolerance.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize, NonlinearConstraint
+from scipy.optimize import minimize
 
-def _constraint_fun(vars):
-    """Compute all pairwise and boundary constraints."""
-    n = 26
-    c = vars[:2*n].reshape(n, 2)
-    r = vars[2*n:]
+def get_loss(vars, n, mu):
+    """Compute objective + penalty for constraints"""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
     
-    # Pairwise non-overlap: dist_sq >= (r_i + r_j)^2
-    diffs = c[:, np.newaxis, :] - c[np.newaxis, :, :]
-    dist_sq = np.sum(diffs**2, axis=2)
-    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
-    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
-    cons_pair = dist_sq[mask] - r_sum[mask]**2
+    # Objective: maximize sum of radii -> minimize -sum(r)
+    loss = -np.sum(r)
     
-    # Boundary containment: c - r >= 0 and 1 - c - r >= 0
-    cons_bound = np.concatenate([
-        c[:, 0] - r,
-        1.0 - c[:, 0] - r,
-        c[:, 1] - r,
-        1.0 - c[:, 1] - r
-    ])
+    # Boundary penalties: r <= x, r <= 1-x, r <= y, r <= 1-y, r >= 0
+    loss += mu * np.sum(np.maximum(0, r - x)**2)
+    loss += mu * np.sum(np.maximum(0, r - (1 - x))**2)
+    loss += mu * np.sum(np.maximum(0, r - y)**2)
+    loss += mu * np.sum(np.maximum(0, r - (1 - y))**2)
+    loss += mu * np.sum(np.maximum(0, -r)**2)
     
-    return np.concatenate([cons_pair, cons_bound])
+    # Overlap penalties: dist(i,j) >= r_i + r_j
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2 + 1e-12)
+    r_sum = r[:, None] + r[None, :]
+    overlap = r_sum - dist
+    
+    # Only consider upper triangle to avoid double counting
+    tri = np.triu_indices(n, k=1)
+    loss += mu * np.sum(np.maximum(0, overlap[tri])**2)
+    
+    return loss
 
-def _objective(vars):
-    """Maximize sum of radii by minimizing negative sum."""
-    return -np.sum(vars[52:])
+def initialize_hex(n=26):
+    """Hexagonal lattice initialization"""
+    rows = [5, 5, 6, 5, 5]
+    pos = []
+    r0 = 0.05
+    dx = 2.1 * r0
+    dy = 1.8 * r0
+    y = 0.15
+    for i, count in enumerate(rows):
+        x = 0.15 + (i % 2) * dx / 2
+        for _ in range(count):
+            pos.append([x, y, r0])
+            x += dx
+        y += dy
+    return np.array(pos).flatten()
 
-def _generate_hex_centers(n):
-    """Generate initial centers in a perturbed hexagonal pattern."""
-    centers = []
-    r_approx = 0.1
-    dx = 2.0 * r_approx
-    dy = np.sqrt(3.0) * r_approx
-    
-    row = 0
-    col = 0
-    while len(centers) < n:
-        y = 0.05 + row * dy
-        if y > 0.95:
-            row += 1
-            col = 0
-            continue
-            
-        x = 0.05 + col * dx + (0.5 * dx if row % 2 else 0.0)
-        if x <= 0.95:
-            centers.append([x, y])
-            col += 1
-        else:
-            row += 1
-            col = 0
-            
-    centers = np.array(centers[:n])
-    if len(centers) < n:
-        pad = np.random.uniform(0.1, 0.9, (n - len(centers), 2))
-        centers = np.vstack([centers, pad])
-    return centers
+def initialize_grid(n=26):
+    """Uniform grid initialization"""
+    pos = []
+    r0 = 0.04
+    cols = 6
+    rows = (n + cols - 1) // cols
+    dx = 1.0 / (cols + 1)
+    dy = 1.0 / (rows + 1)
+    idx = 0
+    for i in range(rows):
+        for j in range(cols):
+            if idx < n:
+                pos.append([dx * (j + 1), dy * (i + 1), r0])
+                idx += 1
+    return np.array(pos).flatten()
+
+def initialize_random(n=26, seed=42):
+    """Random initialization"""
+    rng = np.random.RandomState(seed)
+    x = rng.rand(n) * 0.6 + 0.2
+    y = rng.rand(n) * 0.6 + 0.2
+    r = np.full(n, 0.03)
+    return np.column_stack((x, y, r)).flatten()
+
+def optimize_from(init_vars, n=26):
+    """Run penalty annealing optimization from initial configuration"""
+    vars = init_vars.copy()
+    mu = 10.0
+    # Gradually increase penalty to enforce constraints
+    for _ in range(18):
+        res = minimize(get_loss, vars, args=(n, mu), method='L-BFGS-B', 
+                       options={'maxiter': 3000, 'ftol': 1e-12})
+        vars = res.x
+        mu *= 2.0
+    return vars
 
 def run_packing():
     n = 26
-    np.random.seed(42)
+    best_vars = None
+    best_loss = np.inf
     
-    # 1. Initialize with hexagonal packing pattern + small jitter
-    centers_init = _generate_hex_centers(n)
-    centers_init += np.random.uniform(-0.01, 0.01, centers_init.shape)
-    centers_init = np.clip(centers_init, 0.1, 0.9)
+    # Try multiple starting configurations to escape local minima
+    inits = [
+        initialize_hex(n),
+        initialize_grid(n),
+        initialize_random(n, seed=1),
+        initialize_random(n, seed=2),
+        initialize_random(n, seed=3)
+    ]
     
-    radii_init = np.full(n, 0.06)
-    x0 = np.concatenate([centers_init.flatten(), radii_init])
+    for init in inits:
+        vars = optimize_from(init, n)
+        # Evaluate with high mu to verify constraint satisfaction
+        loss = get_loss(vars, n, 100000.0)
+        if loss < best_loss:
+            best_loss = loss
+            best_vars = vars.copy()
+            
+    # Extract centers and radii
+    centers = np.column_stack((best_vars[0::3], best_vars[1::3]))
+    radii = best_vars[2::3]
     
-    # 2. Define bounds and constraints
-    bounds = [(0.0, 1.0) for _ in range(2*n)] + [(0.0, 0.5) for _ in range(n)]
-    nl_con = NonlinearConstraint(_constraint_fun, 0, np.inf)
+    # Ensure non-negative radii
+    radii = np.maximum(radii, 0.0)
     
-    # 3. Optimize using trust-constr method
-    res = minimize(_objective, x0, method='trust-constr', bounds=bounds, 
-                   constraints=nl_con, options={'maxiter': 2500})
-                   
-    c_final = res.x[:2*n].reshape(n, 2)
-    r_final = res.x[2*n:]
-    
-    # 4. Post-process to guarantee strict validity
-    r_final = np.maximum(r_final, 1e-7)
+    # Strict projection to guarantee boundary constraints are met
     for i in range(n):
-        c_final[i, 0] = np.clip(c_final[i, 0], r_final[i], 1.0 - r_final[i])
-        c_final[i, 1] = np.clip(c_final[i, 1], r_final[i], 1.0 - r_final[i])
-        
-    return c_final, r_final, float(np.sum(r_final))
+        max_r = min(centers[i,0], 1-centers[i,0], centers[i,1], 1-centers[i,1], radii[i])
+        if max_r < radii[i]:
+            radii[i] = max_r
+            
+    return centers, radii, np.sum(radii)
 ```

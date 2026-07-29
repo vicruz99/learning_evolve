@@ -1,0 +1,212 @@
+# sol_000137 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 24d569ae) state=602213f8 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def solve_lp_radii(centers):
+    """
+    Solves the LP to find optimal radii for fixed centers.
+    Maximize sum(r_i) subject to r_i + r_j <= dist(i,j) and boundary constraints.
+    """
+    n = centers.shape[0]
+    c = np.ones(n) # Objective: maximize sum(r), so minimize -sum(r)
+    
+    # Constraints matrix A_ub * r <= b_ub
+    # We need to construct all pairwise distance constraints and boundary constraints
+    
+    # Number of constraints: n pairs + 4*n boundaries
+    # Actually, we can construct A and b dynamically or use sparse, but n=26 is small.
+    
+    m_pairs = n * (n - 1) // 2
+    m_bound = 4 * n
+    A_ub = np.zeros((m_pairs + m_bound, n))
+    b_ub = np.zeros(m_pairs + m_pairs) # placeholder
+    
+    # Pairwise constraints: r_i + r_j <= d_ij
+    row_idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            A_ub[row_idx, i] = 1.0
+            A_ub[row_idx, j] = 1.0
+            b_ub[row_idx] = dist
+            row_idx += 1
+            
+    # Boundary constraints:
+    # x_i - r_i >= 0  => -r_i <= -x_i
+    # x_i + r_i <= 1  => r_i <= 1 - x_i
+    # y_i - r_i >= 0  => -r_i <= -y_i
+    # y_i + r_i <= 1  => r_i <= 1 - y_i
+    
+    b_ub = np.zeros(m_pairs + m_bound) # Resize b_ub
+    
+    for i in range(n):
+        x, y = centers[i]
+        
+        # 1. r_i <= x_i  (from x_i - r_i >= 0) -> -r_i <= -x_i
+        # Wait, standard form is A x <= b.
+        # r_i <= x_i  => [0..1..0] r <= x_i
+        A_ub[m_pairs + 4*i, i] = 1.0
+        b_ub[m_pairs + 4*i] = x
+        
+        # 2. r_i <= 1 - x_i
+        A_ub[m_pairs + 4*i + 1, i] = 1.0
+        b_ub[m_pairs + 4*i + 1] = 1.0 - x
+        
+        # 3. r_i <= y_i
+        A_ub[m_pairs + 4*i + 2, i] = 1.0
+        b_ub[m_pairs + 4*i + 2] = y
+        
+        # 4. r_i <= 1 - y_i
+        A_ub[m_pairs + 4*i + 3, i] = 1.0
+        b_ub[m_pairs + 4*i + 3] = 1.0 - y
+
+    # Bounds for radii: r_i >= 0
+    bounds = [(0, None) for _ in range(n)]
+    
+    # Solve LP
+    try:
+        res = opt.linprog(-c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            radii = res.x
+            return radii, -res.fun
+        else:
+            # Fallback if LP fails (shouldn't happen with valid centers)
+            return np.zeros(n), 0.0
+    except Exception:
+        return np.zeros(n), 0.0
+
+def run_packing():
+    """
+    Runs the packing optimization.
+    """
+    n = 26
+    centers = np.zeros((n, 2))
+    
+    # 1. Initial Configuration: Hexagonal Packing
+    # We want to fit 26 circles.
+    # Pattern: Rows of 5, 6, 5, 6, 4? Sum = 26.
+    # Or 6, 5, 6, 5, 4?
+    # Let's try to fit them in a square.
+    # A 5x5 grid is 25 circles.
+    # Let's start with a perturbed 5x5 grid + 1 circle.
+    # Or better, a hexagonal lattice fill.
+    
+    # Let's generate points in a hex lattice and scale to fit [0,1]x[0,1]
+    # Then we let the optimizer move them.
+    
+    rows = []
+    # Try to fit as many as possible in a hex pattern
+    # Row 0: 6 circles
+    # Row 1: 5 circles
+    # Row 2: 6 circles
+    # Row 3: 5 circles
+    # Row 4: 4 circles
+    # Total 26
+    
+    row_counts = [6, 5, 6, 5, 4]
+    idx = 0
+    for r_idx, count in enumerate(row_counts):
+        y = r_idx * math.sqrt(3)/2 # Vertical spacing
+        offset = 0.5 if r_idx % 2 == 1 else 0.0
+        for c_idx in range(count):
+            x = c_idx + offset
+            centers[idx] = [x, y]
+            idx += 1
+            
+    # Scale and center to fit in [0,1]
+    # Find bounds
+    min_x = centers[:, 0].min()
+    max_x = centers[:, 0].max()
+    min_y = centers[:, 0].min() # typo, should be centers[:, 1]
+    max_y = centers[:, 1].max()
+    min_y = centers[:, 1].min()
+    
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    # Add some margin
+    margin = 0.05
+    target_w = 1.0 - 2*margin
+    target_h = 1.0 - 2*margin
+    
+    scale_x = target_w / width
+    scale_y = target_h / height
+    scale = min(scale_x, scale_y)
+    
+    centers[:, 0] = (centers[:, 0] - min_x) * scale + margin
+    centers[:, 1] = (centers[:, 1] - min_y) * scale + margin
+    
+    # 2. Optimization Loop
+    # We will perform a local search.
+    # In each iteration, pick a random center, perturb it, solve LP, accept if better.
+    
+    current_radii, current_score = solve_lp_radii(centers)
+    best_centers = centers.copy()
+    best_radii = current_radii.copy()
+    best_score = current_score
+    
+    # Perturbation step size
+    step_size = 0.05
+    n_iterations = 2000 # Reasonable number for local search
+    
+    for it in range(n_iterations):
+        # Decay step size
+        current_step = step_size * (1.0 - it / n_iterations) + 0.001
+        
+        # Pick random circle
+        i = np.random.randint(n)
+        original_pos = centers[i].copy()
+        
+        # Perturb
+        dx = np.random.uniform(-current_step, current_step)
+        dy = np.random.uniform(-current_step, current_step)
+        
+        centers[i, 0] = np.clip(original_pos[0] + dx, 0.0, 1.0)
+        centers[i, 1] = np.clip(original_pos[1] + dy, 0.0, 1.0)
+        
+        # Solve LP
+        new_radii, new_score = solve_lp_radii(centers)
+        
+        if new_score > best_score:
+            best_centers = centers.copy()
+            best_radii = new_radii.copy()
+            best_score = new_score
+        else:
+            # Revert
+            centers[i] = original_pos
+            
+    # Final optimization using scipy minimize on centers
+    # Objective: maximize sum of radii (returned by solve_lp_radii)
+    # We need to wrap it for minimize (which minimizes)
+    
+    def objective(x_flat):
+        x = x_flat.reshape((n, 2))
+        r, score = solve_lp_radii(x)
+        return -score # Minimize negative score
+    
+    # Initial guess
+    x0 = best_centers.flatten()
+    
+    # Bounds for centers
+    bnds = [(0, 1) for _ in range(2*n)]
+    
+    try:
+        res = opt.minimize(objective, x0, method='Nelder-Mead', 
+                           options={'maxiter': 1000, 'xatol': 1e-6, 'fatol': 1e-6})
+        if res.success or (-res.fun > best_score):
+            final_centers = res.x.reshape((n, 2))
+            final_radii, final_score = solve_lp_radii(final_centers)
+            if final_score > best_score:
+                best_centers = final_centers
+                best_radii = final_radii
+                best_score = final_score
+    except Exception:
+        pass
+
+    return best_centers, best_radii, best_score

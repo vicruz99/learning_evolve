@@ -1,0 +1,349 @@
+# sol_000225 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state f043a2e3) state=9ea7bce1 sum of radii=1.300000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    Uses a force-directed simulation with gradually increasing radius.
+    """
+    n = 26
+    
+    # Simulation parameters
+    dt = 0.005
+    damping = 0.92
+    k_rep = 50.0      # Repulsion stiffness between circles
+    k_wall = 100.0    # Repulsion stiffness from walls
+    max_iter = 15000  # Total simulation steps
+    
+    # Initial setup
+    # We start with a small radius and a hexagonal-like grid placement
+    # to give the optimizer a good starting point.
+    r_target = 0.05
+    
+    # Generate initial positions on a hexagonal lattice
+    # Spacing for r=0.05 is 0.1 horizontally, 0.05*sqrt(3) vertically
+    centers = np.zeros((n, 2))
+    
+    idx = 0
+    y_step = r_target * np.sqrt(3)
+    x_step = 2 * r_target
+    
+    # We place rows. Even rows start at x=r, odd rows at x=2r (shifted)
+    # Actually standard hex: row 0 at x=0, row 1 at x=1 (in units of 2r)
+    # Let's just fill a grid loosely.
+    
+    row = 0
+    col = 0
+    # Try to fit in [r_target, 1-r_target]
+    # But since r_target is small, we can just place in [0,1]
+    
+    # A simple hex packing generation
+    current_y = r_target
+    while idx < n and current_y < 1 - r_target:
+        row_parity = int(row % 2)
+        # For even rows, start at r. For odd rows, shift by r (center at 2r from start?)
+        # Distance between centers horizontally is 2r.
+        # Shift for odd row is r. So start at 2r.
+        start_x = r_target + row_parity * r_target
+        
+        current_x = start_x
+        while current_x < 1 - r_target and idx < n:
+            centers[idx] = [current_x, current_y]
+            idx += 1
+            current_x += x_step
+        
+        row += 1
+        current_y += y_step
+        
+    # If we didn't fill 26 (unlikely with small r), fill remaining randomly
+    while idx < n:
+        centers[idx] = [np.random.uniform(0.1, 0.9), np.random.uniform(0.1, 0.9)]
+        idx += 1
+
+    radii = np.full(n, r_target)
+    
+    velocities = np.zeros_like(centers)
+    
+    best_valid_r = r_target
+    best_centers = centers.copy()
+    best_radii = radii.copy()
+    
+    # Radius growth parameters
+    r_increment = 0.0002
+    r_decrement = 0.001
+    
+    # To track if we are stuck
+    stuck_counter = 0
+    
+    for step in range(max_iter):
+        # Current radius to enforce
+        r = r_target
+        
+        forces = np.zeros_like(centers)
+        
+        # 1. Compute Inter-circle repulsion forces
+        # Vectorized pair iteration might be slow to write cleanly for N=26,
+        # but explicit loop is fine.
+        # Optimization: only check if dist < 2r
+        
+        # Precompute positions for speed
+        xs = centers[:, 0]
+        ys = centers[:, 1]
+        
+        # Using numpy broadcasting for pairwise distances
+        # dist_matrix shape (n, n)
+        # This is O(N^2) but fast for N=26
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        
+        # We need to handle the diagonal (dist=0)
+        np.fill_diagonal(dist_sq, np.inf)
+        dist = np.sqrt(dist_sq)
+        
+        # Find pairs where dist < 2r
+        # We only need upper triangle
+        mask = (dist < 2 * r) & (dist > 1e-9)
+        
+        # Get indices of pairs
+        i_idx, j_idx = np.where(mask)
+        
+        # Since mask is symmetric, we might process pairs twice if we iterate all.
+        # np.where on full matrix gives both (i,j) and (j,i).
+        # We can just iterate and sum forces, it will double count but direction handles it?
+        # Actually, if we add force to i from j, and j from i, it's correct.
+        # But if we iterate (i,j) and (j,i), we add twice.
+        # Let's filter to i < j
+        
+        valid_pairs = i_idx[i_idx < j_idx]
+        pair_i = valid_pairs # Wait, i_idx and j_idx are arrays from np.where on full matrix?
+        # np.where returns arrays of indices for rows and cols.
+        # i_idx is row index (circle i), j_idx is col index (circle j).
+        
+        # We need to filter i < j
+        mask_ij = i_idx < j_idx
+        p_i = i_idx[mask_ij]
+        p_j = j_idx[mask_ij]
+        
+        d = dist[p_i, p_j]
+        
+        if len(p_i) > 0:
+            # Overlap amount
+            overlap = 2 * r - d
+            # Force magnitude
+            f_mag = k_rep * overlap
+            
+            # Direction vector (j - i)
+            dx = centers[p_j, 0] - centers[p_i, 0]
+            dy = centers[p_j, 1] - centers[p_i, 1]
+            
+            # Normalize
+            # Avoid division by zero (d > 1e-9 check in mask ensures this)
+            inv_d = 1.0 / d
+            fx = f_mag * dx * inv_d
+            fy = f_mag * dy * inv_d
+            
+            # Apply forces
+            # Circle i is pushed away from j (negative direction of dx, dy)
+            # Circle j is pushed away from i (positive direction)
+            forces[p_i, 0] -= fx
+            forces[p_i, 1] -= fy
+            forces[p_j, 0] += fx
+            forces[p_j, 1] += fy
+
+        # 2. Boundary repulsion forces
+        # x bounds: [r, 1-r]
+        # If x < r, push right. Force = k_wall * (r - x)
+        # If x > 1-r, push left. Force = k_wall * (x - (1-r))
+        
+        # Left wall
+        mask_left = xs < r
+        if np.any(mask_left):
+            penetration = r - xs[mask_left]
+            forces[mask_left, 0] += k_wall * penetration
+            
+        # Right wall
+        mask_right = xs > (1.0 - r)
+        if np.any(mask_right):
+            penetration = xs[mask_right] - (1.0 - r)
+            forces[mask_right, 0] -= k_wall * penetration
+            
+        # Bottom wall
+        mask_bottom = ys < r
+        if np.any(mask_bottom):
+            penetration = r - ys[mask_bottom]
+            forces[mask_bottom, 1] += k_wall * penetration
+            
+        # Top wall
+        mask_top = ys > (1.0 - r)
+        if np.any(mask_top):
+            penetration = ys[mask_top] - (1.0 - r)
+            forces[mask_top, 1] -= k_wall * penetration
+            
+        # 3. Update velocities and positions
+        velocities = velocities * damping + forces * dt
+        centers += velocities * dt
+        
+        # 4. Check validity and adjust radius
+        # Check for overlaps
+        # Re-evaluate distances for validity check
+        # We can reuse dist matrix or compute max overlap
+        # Max overlap is max(0, 2r - dist)
+        
+        # We already have dist matrix. 
+        # Note: dist was computed before force application, but for validity check of current state, 
+        # we should compute distances of updated centers.
+        # However, computing full matrix every step is costly? N=26 is small.
+        
+        # Let's just check a subset or approximate.
+        # Actually, for strict validity at the end, we need to check.
+        # During simulation, we just want to grow r.
+        
+        # Check max violation
+        # Recompute dist for current centers
+        diff_new = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq_new = np.sum(diff_new**2, axis=2)
+        np.fill_diagonal(dist_sq_new, np.inf)
+        dist_new = np.sqrt(dist_sq_new)
+        
+        # Overlaps
+        overlaps = 2 * r - dist_new
+        overlaps[overlaps < 0] = 0
+        
+        # Boundary violations
+        violations_x = np.maximum(0, r - xs) + np.maximum(0, xs - (1.0 - r))
+        violations_y = np.maximum(0, r - ys) + np.maximum(0, ys - (1.0 - r))
+        boundary_viol = np.maximum(violations_x, violations_y)
+        
+        max_violation = max(np.max(overlaps), np.max(boundary_viol))
+        
+        if max_violation < 1e-5:
+            # Valid (or very close), try to increase radius
+            r_target += r_increment
+            stuck_counter = 0
+        else:
+            # Invalid, maybe decrease radius or wait
+            # If violation is huge, decrease
+            if max_violation > 0.05:
+                r_target -= r_decrement
+            else:
+                # Small violation, just hold radius
+                pass
+            # Keep radius within bounds
+            r_target = max(r_target, 0.01)
+            
+            stuck_counter += 1
+            
+            # If stuck for too long with high violation, maybe we hit limit?
+            # But we might just need more time.
+            # Let's not decrease r too aggressively.
+        
+        # Save best valid state
+        # We consider it valid if max_violation is extremely small
+        if max_violation < 1e-7:
+            if r > best_valid_r:
+                best_valid_r = r
+                best_centers = centers.copy()
+                best_radii = np.full(n, r)
+                
+        # Periodic check to save valid state even if slight numeric error
+        if step % 100 == 0 and max_violation < 1e-6:
+             if r > best_valid_r:
+                best_valid_r = r
+                best_centers = centers.copy()
+                best_radii = np.full(n, r)
+
+    # Final Validation and Cleanup
+    # The simulation might end with a slight violation or the best state might be slightly off.
+    # We should ensure the returned state is strictly valid.
+    # If best_radii sum is low, maybe we can do better? 
+    # But let's trust the simulation.
+    
+    # Let's do a final quick validation of best_centers and best_radii
+    # If invalid, we might need to shrink radii slightly.
+    
+    final_centers = best_centers
+    final_radii = best_radii
+    
+    # Check strict validity
+    # Recompute constraints
+    valid = True
+    n_circles = n
+    xs = final_centers[:, 0]
+    ys = final_centers[:, 1]
+    rs = final_radii
+    
+    # Check boundaries
+    for i in range(n_circles):
+        r = rs[i]
+        x, y = xs[i], ys[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            # Shrink radius slightly to fix
+            # Calculate max penetration
+            pen_x_left = r - x
+            pen_x_right = x - (1 - r)
+            pen_y_bottom = r - y
+            pen_y_top = y - (1 - r)
+            pen = max(0, pen_x_left, pen_x_right, pen_y_bottom, pen_y_top)
+            rs[i] -= pen + 1e-9 # Shrink to be safe
+    
+    # Check overlaps
+    # If overlap, shrink smaller circle? Or both.
+    # Simple strategy: shrink all circles slightly if any overlap.
+    
+    # Check overlaps
+    diff = final_centers[:, np.newaxis, :] - final_centers[np.newaxis, :, :]
+    dist_sq = np.sum(diff**2, axis=2)
+    np.fill_diagonal(dist_sq, np.inf)
+    dist = np.sqrt(dist_sq)
+    
+    radii_sum_vec = rs[:, np.newaxis] + rs[np.newaxis, :]
+    needed_dist = radii_sum_vec
+    
+    # Find overlaps
+    mask = dist < needed_dist - 1e-12
+    
+    if np.any(mask):
+        # Overlaps exist. We need to reduce radii.
+        # A simple fix: scale down all radii uniformly until valid?
+        # Or just reduce by max overlap amount.
+        
+        # Find max violation amount
+        violation = needed_dist - dist
+        violation[violation < 0] = 0
+        max_viol = np.max(violation)
+        
+        if max_viol > 0:
+            # Reduce all radii by half the max violation (shared responsibility)
+            # Actually, reducing sum of radii by max_viol ensures dist >= r1 + r2?
+            # (r1-delta) + (r2-delta) = r1+r2 - 2delta.
+            # We need r1+r2 - 2delta <= dist => 2delta >= r1+r2 - dist = violation.
+            # So delta >= violation / 2.
+            reduction = max_viol / 2 + 1e-9
+            rs = np.maximum(0, rs - reduction)
+            # Update centers in final_radii array
+            final_radii = rs
+
+    # Re-verify
+    # Just to be safe, run the validator logic mentally or strictly.
+    # But we modified rs in place? No, rs is a view of final_radii if not careful.
+    # Let's be explicit.
+    
+    final_radii = rs.copy()
+    
+    # One last check to ensure no negative radii
+    final_radii = np.maximum(final_radii, 1e-9)
+    
+    # Calculate sum
+    sum_radii = np.sum(final_radii)
+    
+    # If sum is too low, it means we shrank too much.
+    # But we want to maximize it.
+    # The simulation should have found a valid state near max_r.
+    # The shrinking is just a safety net.
+    
+    return final_centers, final_radii, sum_radii

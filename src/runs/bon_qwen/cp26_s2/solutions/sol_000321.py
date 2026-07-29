@@ -1,0 +1,310 @@
+# sol_000321 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state ef4a4e64) state=c0f519ce sum of radii=1.553723 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def solve_lp_for_radii(centers):
+    """
+    Given fixed centers, find radii that maximize sum of radii.
+    Problem:
+    Maximize sum(r_i)
+    Subject to:
+      r_i + r_j <= distance(i, j) for all i < j
+      r_i <= min(x_i, 1-x_i, y_i, 1-y_i) for all i
+      r_i >= 0
+    """
+    n = centers.shape[0]
+    
+    # Compute pairwise distances
+    # dist_matrix[i, j] = Euclidean distance between center i and j
+    dist_matrix = np.sqrt(((centers[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))
+    
+    # Prepare LP constraints: A_ub @ r <= b_ub
+    # We need constraints for pairs (i, j) and boundaries
+    
+    num_constraints = 0
+    
+    # 1. Pairwise constraints: r_i + r_j <= d_ij
+    for i in range(n):
+        for j in range(i + 1, n):
+            num_constraints += 1
+            
+    # 2. Boundary constraints: r_i <= boundary_dist
+    # We can add these as simple upper bounds in linprog, but to be safe and uniform
+    # let's add them to A_ub or handle via bounds.
+    # Handling via bounds is more efficient.
+    
+    # Construct A_ub and b_ub for pairwise constraints
+    A_ub = []
+    b_ub = []
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            row = [0.0] * n
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(dist_matrix[i, j])
+            
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    
+    # Bounds for r_i: 0 <= r_i <= boundary_limit
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        # Distance to walls
+        d_left = x
+        d_right = 1.0 - x
+        d_down = y
+        d_up = 1.0 - y
+        limit = min(d_left, d_right, d_down, d_up)
+        # Ensure limit is non-negative (in case center is slightly out)
+        limit = max(0.0, limit)
+        bounds.append((0.0, limit))
+        
+    # Objective: maximize sum(r_i) => minimize -sum(r_i)
+    c = np.ones(n) * -1.0
+    
+    # Solve LP
+    # Using 'highs' method if available, otherwise 'simplex' or 'interior-point'
+    # 'highs' is generally robust and fast.
+    try:
+        res = opt.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    except ValueError:
+        # Fallback if highs not available (older scipy)
+        res = opt.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='interior-point')
+        
+    if res.success:
+        return res.fun * -1.0, res.x
+    else:
+        # If LP fails, return 0 and zeros
+        return 0.0, np.zeros(n)
+
+def run_packing():
+    """
+    Main function to pack 26 circles.
+    """
+    n_circles = 26
+    np.random.seed(42) # For reproducibility
+    
+    # 1. Initialization: Hexagonal Lattice
+    # We want to place 26 points in a hexagonal pattern.
+    # Let's try to fit a grid.
+    
+    centers = np.zeros((n_circles, 2))
+    
+    # Try to determine spacing.
+    # Approx area per circle ~ 1/26. Radius ~ 0.1. Diameter 0.2.
+    # Spacing 0.2.
+    # Let's generate a hex grid with spacing s.
+    # We can iterate to find good s or just place them.
+    
+    # Simple heuristic: Place points in a roughly uniform distribution
+    # using a jittered grid or just hexagonal.
+    
+    # Let's try to generate points on a hex grid and select/scale to fit.
+    # Grid spacing roughly 0.15?
+    
+    points = []
+    # Generate points in a hex grid covering slightly larger area
+    spacing = 0.14 
+    # Hex grid generation
+    rows = 10
+    cols = 10
+    for r in range(rows):
+        for c in range(cols):
+            x = c * spacing
+            y = r * spacing * np.sqrt(3) / 2.0
+            if c % 2 == 1:
+                x += spacing / 2.0
+            points.append([x, y])
+    
+    points = np.array(points)
+    
+    # Filter points that are roughly inside [0, 1]x[0, 1] (with some margin)
+    # Actually, we just want to select 26 points that are well distributed.
+    # Let's scale the points to fit in [0.05, 0.95] roughly.
+    
+    # Filter points inside unit square first
+    mask = (points[:, 0] >= 0) & (points[:, 0] <= 1) & (points[:, 1] >= 0) & (points[:, 1] <= 1)
+    valid_points = points[mask]
+    
+    # If we have more than 26, we can thin them out or just pick 26.
+    # If fewer, we need to generate more.
+    
+    # A better initialization:
+    # Place 5x5 grid (25) and add 1 in center?
+    # Or just random uniform initialization might be safer to avoid local minima of grid.
+    # But hex grid is better.
+    
+    # Let's construct a specific layout:
+    # 5 rows.
+    # Row 0: 5 circles
+    # Row 1: 5 circles
+    # Row 2: 5 circles
+    # Row 3: 5 circles
+    # Row 4: 6 circles? No, width constraint.
+    # Maybe 5, 5, 5, 5, 6 is hard.
+    # How about 6, 5, 5, 5, 5?
+    
+    # Let's just use a random initialization with a repulsive force to spread them out initially.
+    centers = np.random.uniform(0.1, 0.9, size=(n_circles, 2))
+    
+    # Simple spreading step
+    for _ in range(100):
+        for i in range(n_circles):
+            force = np.zeros(2)
+            for j in range(n_circles):
+                if i == j: continue
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                if dist < 0.05: # Too close
+                    force += diff / (dist**2 + 1e-9) # Repulsion
+            centers[i] += force * 0.01
+            centers[i] = np.clip(centers[i], 0.05, 0.95)
+
+    # 2. Optimization Loop
+    # We will perform an iterative optimization.
+    # In each step, we compute radii, then move centers to increase radii sum.
+    
+    best_sum = 0.0
+    best_centers = centers.copy()
+    best_radii = np.zeros(n_circles)
+    
+    # Optimization parameters
+    step_size = 0.005
+    iterations = 500
+    
+    # To speed up, we can skip LP if we just want a valid packing, 
+    # but we need to maximize sum, so LP is good.
+    # However, calling LP 500 times might be slow in pure Python if not careful.
+    # 26 vars, ~350 constraints. It's fast enough.
+    
+    for it in range(iterations):
+        # Solve for optimal radii given current centers
+        current_sum, radii = solve_lp_for_radii(centers)
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = centers.copy()
+            best_radii = radii.copy()
+        
+        # If we found a valid packing (sum > 0), try to improve
+        if current_sum > 0:
+            # Gradient-like step
+            # If circles are touching, they constrain each other.
+            # We want to increase distance between touching circles.
+            
+            # Compute forces based on "slack" or contact
+            # A simple heuristic: Move circles apart if they are limiting radii.
+            # Actually, just repulsion based on 1/distance^2 is a good proxy for packing density.
+            # But we want to maximize radii.
+            
+            # Let's use a force model:
+            # Force on i from j is proportional to (r_i + r_j - d_ij) if positive?
+            # But radii are computed to satisfy constraints, so r_i + r_j <= d_ij.
+            # Usually tight constraints are active.
+            
+            # Let's just use a repulsive force that depends on current radii.
+            # If two circles are large and close, push them apart.
+            
+            forces = np.zeros_like(centers)
+            for i in range(n_circles):
+                for j in range(i + 1, n_circles):
+                    r_sum = radii[i] + radii[j]
+                    diff = centers[i] - centers[j]
+                    dist = np.linalg.norm(diff)
+                    if dist < 1e-12: dist = 1e-12
+                    
+                    # Repulsion strength: stronger if circles are large and close
+                    # We want to increase dist to allow larger radii.
+                    # Ideally we want dist > r_i + r_j.
+                    # If dist is close to r_i + r_j, we are constrained.
+                    
+                    # Heuristic force
+                    overlap = r_sum - dist
+                    # If overlap > 0, it's invalid (should not happen with LP solution)
+                    # But LP ensures r_i + r_j <= dist.
+                    # The tighter the constraint (overlap close to 0), the more we want to separate?
+                    # Actually, if overlap is 0 (touching), we are limited.
+                    # Moving apart increases dist, potentially allowing larger r.
+                    
+                    # Let's push apart with force inversely proportional to distance squared?
+                    # Or just a constant push if touching?
+                    
+                    # Let's try: Force = k * (1/dist^2) * direction
+                    # But we need to be careful not to explode.
+                    
+                    # Better: Force proportional to radii?
+                    force_mag = (radii[i] + radii[j]) / (dist**2 + 0.01)
+                    
+                    dir_vec = diff / dist
+                    forces[i] += dir_vec * force_mag
+                    forces[j] -= dir_vec * force_mag
+            
+            # Apply forces
+            centers += forces * step_size
+            
+            # Clip to boundaries
+            centers = np.clip(centers, 0.01, 0.99)
+            
+            # Maybe reduce step size over time
+            if it % 100 == 0:
+                step_size *= 0.8
+
+    # Final validation and return
+    # Re-solve LP for best centers to get consistent radii
+    final_sum, final_radii = solve_lp_for_radii(best_centers)
+    
+    # Ensure strict validity for the validator
+    # The LP solution satisfies r_i + r_j <= dist exactly (within tolerance).
+    # But due to float precision, we might have tiny overlaps in validator check (dist < r1+r2 - 1e-12).
+    # The LP ensures r1+r2 <= dist. So dist >= r1+r2.
+    # The check is dist < r1+r2 - 1e-12.
+    # If dist = r1+r2, then dist is NOT < r1+r2 - 1e-12 (since 0 < -1e-12 is false).
+    # Wait, if dist = r1+r2, then dist - (r1+r2) = 0.
+    # 0 < -1e-12 is False. So it passes.
+    # If dist is slightly smaller due to error?
+    # LP should be accurate.
+    
+    # Just to be safe, we can slightly shrink radii if needed, but LP should be safe.
+    # However, boundary checks: x - r < -1e-12.
+    # LP ensures r <= x. So x - r >= 0.
+    # 0 < -1e-12 is False. Passes.
+    
+    # But wait, LP bounds are inclusive. r <= x.
+    # If r = x, then x - r = 0.
+    # Check: x - r < -1e-12 => 0 < -1e-12 False.
+    # So it is valid.
+    
+    # One issue: LP might return r_i such that r_i + r_j is extremely close to dist,
+    # and floating point subtraction might result in dist < r_i + r_j - 1e-12?
+    # If dist = r_i + r_j, then dist - (r_i + r_j) = 0.
+    # Floating point might give -1e-16.
+    # -1e-16 < -1e-12 is True.
+    # So it might fail.
+    # We should shrink radii slightly to be safe?
+    # Or just trust it.
+    # To be safe, let's reduce radii by a tiny epsilon.
+    final_radii *= 0.9999
+    
+    # Check if valid
+    # We can run the validator logic mentally.
+    # With 0.9999 factor, r_i + r_j is strictly less than dist (since dist was >= original sum).
+    # dist >= r_orig_i + r_orig_j = r_new_i/0.9999 + ...
+    # dist > r_new_i + r_new_j.
+    # So dist - (r_new_i + r_new_j) > 0.
+    # Should pass.
+    
+    # However, shrinking reduces sum.
+    # Maybe just return as is. The tolerance 1e-12 is quite generous for exact matches.
+    # But strict inequality check is `dist < sum - 1e-12`.
+    # If `dist == sum`, `sum < sum - 1e-12` is False.
+    # So exact match is fine.
+    
+    return best_centers, final_radii, final_sum

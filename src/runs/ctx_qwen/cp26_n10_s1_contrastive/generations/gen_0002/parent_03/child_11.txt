@@ -1,0 +1,194 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.625299) and target >2.636, I will employ a hybrid optimization strategy:
+1. **Parameterization**: Continue using the smart parameterization `x = r + u*(1-2r)`, `y = r + v*(1-2r)` with `u,v ∈ [0,1]`. This automatically satisfies all boundary constraints, reducing the problem to only enforcing pairwise non-overlap.
+2. **Two-Phase Optimization**: 
+   - Phase 1: Use `L-BFGS-B` with a smooth penalty function on the pairwise overlap constraints. This method is fast, handles bounds efficiently, and is excellent at escaping local minima to find a highly feasible region.
+   - Phase 2: Take the best points from Phase 1 and refine them using `SLSQP` with hard inequality constraints. SLSQP is precise and will polish the solution to tight numerical tolerance.
+3. **Diverse Initializations**: Generate 31 structured starts (hexagonal, grid, random) plus 20 targeted perturbations of the best found solution. This covers the search space thoroughly and breaks symmetry traps.
+4. **Robustness**: Add strict feasibility checks, numerical clipping, and a fallback configuration. Use `np.triu_indices` for efficient constraint evaluation.
+
+This approach leverages the global search strength of penalty-based gradient descent with the local precision of constrained quadratic programming, consistently pushing circle packing sums past previous local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars_vec):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Constraints: pairwise non-overlap.
+    Boundary constraints are satisfied automatically by parameterization.
+    Returns array of values that must be >= 0.
+    """
+    n = 26
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Map normalized coordinates to actual positions inside [r, 1-r]
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum_sq = (r[:, np.newaxis] + r[np.newaxis, :])**2
+    
+    # Upper triangular indices for i < j
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[i_idx, j_idx] - r_sum_sq[i_idx, j_idx]
+
+def penalty_objective(vars_vec):
+    """Unconstrained objective with penalty for overlapping circles."""
+    n = 26
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    dist = np.sqrt(np.maximum(dist_sq, 0.0))
+    
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    # Overlap amount (positive when circles intersect)
+    overlap = np.maximum(0.0, r_sum[i_idx, j_idx] - dist[i_idx, j_idx])
+    
+    # Quadratic penalty
+    penalty = 1e5 * np.sum(overlap**2)
+    return -np.sum(r) + penalty
+
+def run_packing():
+    n = 26
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * n
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sol = None
+    best_val = -np.inf
+    
+    # --- Generate Diverse Initial Configurations ---
+    inits = []
+    
+    # 1. Hexagonal lattice
+    r0 = 0.09
+    pts = []
+    y = r0
+    row = 0
+    while len(pts) < n:
+        x = r0 + (row % 2) * r0
+        while x <= 1.0 - r0 and len(pts) < n:
+            pts.append([x, y])
+            x += 2.0 * r0
+        y += np.sqrt(3.0) * r0
+        row += 1
+    pts = np.array(pts[:n])
+    u0 = (pts[:, 0] - r0) / (1.0 - 2.0 * r0)
+    v0 = (pts[:, 1] - r0) / (1.0 - 2.0 * r0)
+    inits.append(np.concatenate([np.full(n, r0), u0, v0]))
+    
+    # 2. Grids & Randoms
+    for seed in range(30):
+        np.random.seed(seed)
+        r0 = 0.06 + 0.04 * np.random.rand()
+        
+        if seed < 10:  # Structured grid
+            cols, rows = 5, 6
+            sx = (1.0 - 2.0 * r0) / (cols - 1)
+            sy = (1.0 - 2.0 * r0) / (rows - 1)
+            pts = []
+            for i in range(rows):
+                for j in range(cols):
+                    if len(pts) < n:
+                        pts.append([r0 + j * sx, r0 + i * sy])
+            pts = np.array(pts)
+        else:  # Random feasible placement
+            pts = np.random.uniform(r0, 1.0 - r0, (n, 2))
+            
+        u0 = (pts[:, 0] - r0) / (1.0 - 2.0 * r0)
+        v0 = (pts[:, 1] - r0) / (1.0 - 2.0 * r0)
+        inits.append(np.concatenate([np.full(n, r0), u0, v0]))
+        
+    # --- Phase 1: Penalty-based L-BFGS-B for global search & feasibility ---
+    for x0 in inits:
+        # Slight random perturbation to break exact symmetries
+        x0 = x0 + np.random.randn(len(x0)) * 0.01
+        x0 = np.clip(x0, [1e-6, 0, 0]*n, [0.5, 1, 1]*n)
+        
+        try:
+            res_lbfgs = minimize(penalty_objective, x0, method='L-BFGS-B', bounds=bounds,
+                                 options={'maxiter': 3000, 'ftol': 1e-12})
+            
+            # Only proceed to Phase 2 if the solution is nearly feasible
+            pen_val = penalty_objective(res_lbfgs.x)
+            obj_val = -np.sum(res_lbfgs.x[0::3])
+            if pen_val <= obj_val + 1e-4:  # Penalty contribution is negligible
+                # --- Phase 2: SLSQP refinement with hard constraints ---
+                res_slsqp = minimize(objective, res_lbfgs.x, method='SLSQP', bounds=bounds,
+                                     constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13})
+                c_val = constraint_func(res_slsqp.x)
+                if np.min(c_val) >= -1e-7:
+                    val = -res_slsqp.fun
+                    if val > best_val:
+                        best_val = val
+                        best_sol = res_slsqp.x.copy()
+        except Exception:
+            continue
+            
+    # --- Phase 3: Local perturbation & refinement on best found ---
+    if best_sol is not None:
+        for _ in range(20):
+            x_pert = best_sol.copy()
+            # Perturb a random subset of variables to escape local minima
+            mask = np.random.rand(len(x_pert)) > 0.6
+            x_pert[mask] += np.random.randn(mask.sum()) * 0.008
+            x_pert = np.clip(x_pert, [1e-6, 0, 0]*n, [0.5, 1, 1]*n)
+            
+            try:
+                res = minimize(objective, x_pert, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13})
+                c_val = constraint_func(res.x)
+                if np.min(c_val) >= -1e-7:
+                    val = -res.fun
+                    if val > best_val:
+                        best_val = val
+                        best_sol = res.x.copy()
+            except Exception:
+                continue
+                
+    # Fallback if optimization completely fails (should not happen)
+    if best_sol is None:
+        r_f = 0.04
+        centers = np.random.rand(n, 2)
+        centers = np.clip(centers, r_f, 1.0 - r_f)
+        best_sol = np.zeros(n * 3)
+        best_sol[0::3] = r_f
+        best_sol[1::3] = (centers[:, 0] - r_f) / (1.0 - 2.0 * r_f)
+        best_sol[2::3] = (centers[:, 1] - r_f) / (1.0 - 2.0 * r_f)
+        best_val = np.sum(r_f)
+        
+    # Reconstruct centers from optimized parameters
+    r_opt = best_sol[0::3]
+    u_opt = best_sol[1::3]
+    v_opt = best_sol[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    
+    return centers, r_opt, float(np.sum(r_opt))
+```

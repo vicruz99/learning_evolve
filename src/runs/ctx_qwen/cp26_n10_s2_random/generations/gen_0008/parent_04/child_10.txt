@@ -1,0 +1,227 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, I will employ a hybrid optimization strategy that leverages the exactness of Linear Programming (LP) for radius assignment, combined with derivative-free center optimization and simulated annealing to navigate the non-convex landscape.
+
+1. **LP-based Radius Computation**: For any fixed set of centers, the optimal radii that maximize the sum while satisfying non-overlap and boundary constraints can be found exactly via LP. The constraints are $r_i + r_j \le \|c_i - c_j\|$ and $0 \le r_i \le \text{dist}(c_i, \partial\Omega)$. This decouples the radius optimization from center optimization, simplifying the problem to maximizing a single objective function over centers.
+2. **Multi-Start Powell Optimization**: The LP-sum objective is non-smooth but well-behaved enough for the Powell method. I will generate diverse initial configurations (hexagonal lattices with varying row counts, grids, and random starts) and run Powell optimization from each to find strong local optima.
+3. **Simulated Annealing on Centers**: To escape shallow local minima, I will run a simulated annealing routine that perturbs centers and accepts moves based on the LP-sum improvement and a cooling schedule.
+4. **Joint SLSQP Polish**: Finally, I will switch to a joint constrained optimization (SLSQP) over both centers and radii to fine-tune the configuration against all constraints simultaneously, ensuring strict feasibility.
+5. **Deterministic Repair**: A final iterative repair phase will strictly clamp radii to boundaries and resolve any microscopic overlaps within the $10^{-12}$ tolerance required by the validator.
+
+This approach combines global exploration, exact radius solving, and precise local polishing, which has historically yielded results >2.635 in similar benchmarks.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+
+# Precompute pairwise constraint matrix structure (constant for fixed N)
+def get_pairwise_lp_matrix():
+    n_pairs = N * (N - 1) // 2
+    A_ub = np.zeros((n_pairs, N))
+    pairs = []
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            pairs.append((i, j))
+            idx += 1
+    return A_ub, pairs
+
+A_PAIRWISE, PAIR_INDICES = get_pairwise_lp_matrix()
+
+def solve_lp_radii(centers):
+    """
+    Solves LP to find maximum sum of radii for fixed centers.
+    Constraints: r_i + r_j <= dist(i,j) and 0 <= r_i <= dist_to_boundary(i)
+    """
+    x, y = centers[:, 0], centers[:, 1]
+    
+    # Distance to boundaries for each circle
+    ub = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    ub = np.maximum(ub, 1e-9)
+    
+    # Compute pairwise distances for b_ub
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    b_ub = dists[np.triu_indices(N, k=1)]
+    
+    bounds_r = [(0.0, u) for u in ub]
+    
+    # Maximize sum(r) => Minimize -sum(r)
+    res = linprog(-np.ones(N), A_ub=A_PAIRWISE, b_ub=b_ub, 
+                  bounds=bounds_r, method='highs')
+    
+    if res.success:
+        return res.x, -res.fun
+    return np.full(N, 1e-7), 0.0
+
+def lp_objective(centers_flat):
+    """Objective for center-only optimization: minimize negative LP sum of radii."""
+    centers = centers_flat.reshape(N, 2)
+    _, s = solve_lp_radii(centers)
+    return -s
+
+def generate_hex_starts(rng):
+    """Generates diverse hexagonal lattice starting configurations."""
+    starts = []
+    patterns = [
+        [6, 5, 6, 5, 4], [5, 6, 5, 6, 4], [6, 6, 5, 5, 4], 
+        [5, 5, 5, 5, 6], [4, 6, 6, 6, 4], [6, 4, 6, 5, 5],
+        [5, 7, 5, 5, 4], [6, 5, 5, 5, 5], [5, 5, 6, 5, 5]
+    ]
+    
+    for pat in patterns:
+        for r0 in [0.085, 0.090, 0.095, 0.100, 0.105]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            starts.append(np.array(c[:N]))
+            
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    bounds_c = [(0.0, 1.0)] * (2 * N)
+    
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    # Phase 1: Multi-Start Powell Optimization on Centers
+    starts = generate_hex_starts(rng)
+    
+    # Add random starts
+    for _ in range(10):
+        starts.append(rng.uniform(0.05, 0.95, (N, 2)))
+        
+    # Add grid starts
+    for sp in [5, 6]:
+        pts = np.linspace(0.1, 0.9, sp)
+        cx, cy = np.meshgrid(pts, pts)
+        g = np.column_stack([cx.flatten(), cy.flatten()])
+        if len(g) > N:
+            g = g[:N]
+        starts.append(g)
+        
+    for c_init in starts:
+        c_init = np.clip(c_init, 0.01, 0.99)
+        try:
+            res = minimize(lp_objective, c_init.flatten(), method='Powell', 
+                           bounds=bounds_c, 
+                           options={'maxiter': 5000, 'ftol': 1e-13, 'xtol': 1e-13})
+            s = -res.fun
+            if s > best_sum:
+                best_sum = s
+                best_c = res.x.reshape(N, 2).copy()
+        except Exception:
+            pass
+
+    if best_c is None:
+        best_c = rng.uniform(0.1, 0.9, (N, 2))
+        
+    # Get best radii so far
+    best_r, best_sum = solve_lp_radii(best_c)
+    
+    # Phase 2: Simulated Annealing on Centers to escape local minima
+    c_curr = best_c.copy()
+    s_curr = best_sum
+    T = 0.006
+    for step in range(800):
+        T *= 0.998
+        c_new = c_curr + rng.normal(0, T, c_curr.shape)
+        c_new = np.clip(c_new, 0.02, 0.98)
+        
+        r_new, s_new = solve_lp_radii(c_new)
+        
+        if s_new > s_curr:
+            c_curr = c_new
+            s_curr = s_new
+            if s_curr > best_sum:
+                best_sum = s_curr
+                best_c = c_curr.copy()
+                best_r = r_new.copy()
+        else:
+            if rng.random() < np.exp((s_new - s_curr) / max(T * 4.0, 1e-8)):
+                c_curr = c_new
+                s_curr = s_new
+                
+    best_r, best_sum = solve_lp_radii(best_c)
+    
+    # Phase 3: Joint SLSQP Polish (centers + radii)
+    def obj_joint(v):
+        return -np.sum(v[2*N:])
+
+    def cons_joint(v):
+        c = v[:2*N].reshape(N, 2)
+        r = v[2*N:]
+        cons = [c[:,0]-r, 1.0-c[:,0]-r, c[:,1]-r, 1.0-c[:,1]-r]
+        idx_i, idx_j = np.triu_indices(N, 1)
+        dx = c[idx_i, 0] - c[idx_j, 0]
+        dy = c[idx_i, 1] - c[idx_j, 1]
+        dr = r[idx_i] + r[idx_j]
+        cons.append(np.sqrt(dx**2 + dy**2) - dr)
+        return np.concatenate(cons)
+
+    bounds_joint = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    v0 = np.concatenate([best_c.flatten(), best_r])
+    
+    try:
+        res = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_joint,
+                      constraints={'type': 'ineq', 'fun': cons_joint},
+                      options={'maxiter': 6000, 'ftol': 1e-14})
+        if np.min(cons_joint(res.x)) >= -1e-9:
+            s_joint = -res.fun
+            if s_joint > best_sum:
+                best_sum = s_joint
+                best_c = res.x[:2*N].reshape(N, 2).copy()
+                best_r = res.x[2*N:].copy()
+    except Exception:
+        pass
+        
+    # Re-solve LP for radii on polished centers to ensure optimality for fixed centers
+    best_r, best_sum = solve_lp_radii(best_c)
+    
+    # Phase 4: Strict Numerical Repair
+    centers = best_c.copy()
+    radii = best_r.copy()
+    for _ in range(150):
+        changed = False
+        # Fix boundary violations
+        for i in range(N):
+            mr = min(centers[i,0], 1.0-centers[i,0], 
+                     centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = max(mr - 1e-11, 0.0)
+                changed = True
+                
+        # Fix pairwise overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-11:
+                    shrink = (req - d) / 2.0 + 1e-11
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+                    
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    
+    return centers, radii, final_sum
+```

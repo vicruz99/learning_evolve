@@ -1,0 +1,132 @@
+
+
+<strategy>
+The previous attempts achieved a sum of radii around 2.61-2.62. To push beyond 2.63, we need a more robust global optimization strategy. The main challenges are the non-convex nature of the problem and the high dimensionality (78 variables). 
+
+Strategy:
+1. **High-Quality Initializations**: Start from structured hexagonal lattices (which approximate optimal packing density) with controlled perturbations. Also include random starts to escape symmetric traps.
+2. **Feasible Starting Points**: Ensure every initial guess strictly satisfies constraints by computing radii as a fraction of the minimum distance to boundaries and neighbors. This prevents SLSQP from wasting iterations repairing infeasible starts.
+3. **Multi-Restart Local Search**: Run SLSQP 40 times with different seeds/perturbations. SLSQP is fast and effective for constrained problems if started near a feasible region.
+4. **Adaptive Refinement**: The later iterations will perturb the best solution found so far, allowing fine-tuning and exploration of nearby optima.
+5. **Vectorized Constraints**: Use numpy broadcasting and precomputed triangle indices to evaluate 351 constraints rapidly, enabling more optimization iterations within the time limit.
+6. **No Closures/Lambdas**: Adhere strictly to the requirement by using global constants for fixed arrays and top-level functions.
+
+This approach balances exploration (random/hex starts) and exploitation (perturbing best found), significantly increasing the chance of finding a configuration with sum of radii > 2.63.
+</strategy>
+
+```python
+import numpy as np
+import math
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+TRIU_IDX = np.triu_indices(N_CIRCLES, k=1)
+
+def objective(v):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def constraint_fun(v):
+    """Compute boundary and non-overlap constraints."""
+    n = N_CIRCLES
+    P = v.reshape(n, 3)
+    C = P[:, :2]
+    R = P[:, 2]
+    
+    # Boundary constraints: r <= min(x, 1-x, y, 1-y)  =>  min(...) - r >= 0
+    b = np.minimum(np.minimum(C[:, 0], 1.0 - C[:, 0]), 
+                   np.minimum(C[:, 1], 1.0 - C[:, 1])) - R
+    
+    # Overlap constraints: dist(i,j) >= r_i + r_j  =>  dist - (r_i + r_j) >= 0
+    diff = C[:, np.newaxis, :] - C[np.newaxis, :, :]
+    D = np.sqrt(np.sum(diff**2, axis=2))
+    o = D[TRIU_IDX] - (R[TRIU_IDX[0]] + R[TRIU_IDX[1]])
+    
+    return np.concatenate([b, o])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = N_CIRCLES
+    bounds = [(0, 1), (0, 1), (0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': constraint_fun}
+    
+    best_val = -np.inf
+    best_x = None
+    
+    np.random.seed(42)
+    
+    for trial in range(40):
+        if trial < 15:
+            # Hexagonal lattice initialization with perturbation
+            pts = []
+            r_est = 0.09
+            y = r_est
+            row = 0
+            while len(pts) < 30:
+                x = r_est
+                if row % 2 == 1:
+                    x += r_est
+                while x <= 1.0 - r_est and len(pts) < 30:
+                    pts.append([x + np.random.uniform(-0.005, 0.005), 
+                                y + np.random.uniform(-0.005, 0.005)])
+                    x += 2 * r_est
+                y += r_est * math.sqrt(3)
+                row += 1
+            arr = np.array(pts[:n])
+            mn, mx = arr.min(axis=0), arr.max(axis=0)
+            arr = (arr - mn) / (mx - mn + 1e-9)
+            arr = arr * 0.88 + 0.06
+            r_bound = np.minimum(np.minimum(arr[:, 0], 1.0 - arr[:, 0]), 
+                                 np.minimum(arr[:, 1], 1.0 - arr[:, 1]))
+            diff = arr[:, np.newaxis, :] - arr[np.newaxis, :, :]
+            D = np.sqrt(np.sum(diff**2, axis=2))
+            np.fill_diagonal(D, np.inf)
+            r_pair = 0.5 * D.min(axis=1)
+            r_init = np.minimum(r_bound, r_pair) * 0.9
+            x0 = np.concatenate([arr.flatten(), r_init])
+            
+        elif trial < 25:
+            # Random initialization
+            arr = np.random.rand(n, 2) * 0.8 + 0.1
+            r_bound = np.minimum(np.minimum(arr[:, 0], 1.0 - arr[:, 0]), 
+                                 np.minimum(arr[:, 1], 1.0 - arr[:, 1]))
+            diff = arr[:, np.newaxis, :] - arr[np.newaxis, :, :]
+            D = np.sqrt(np.sum(diff**2, axis=2))
+            np.fill_diagonal(D, np.inf)
+            r_pair = 0.5 * D.min(axis=1)
+            r_init = np.minimum(r_bound, r_pair) * 0.5
+            x0 = np.concatenate([arr.flatten(), r_init])
+        else:
+            # Perturb best found solution
+            if best_x is not None:
+                x0 = best_x + np.random.normal(0, 0.005, n * 3)
+                x0 = np.clip(x0, 0, 1)
+                x0[2::3] = np.clip(x0[2::3], 0, 0.5)
+            else:
+                x0 = np.random.rand(n * 3)
+                x0[::3] = np.clip(x0[::3], 0.1, 0.9)
+                x0[1::3] = np.clip(x0[1::3], 0.1, 0.9)
+                x0[2::3] = np.clip(x0[2::3], 0.02, 0.2)
+
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+            
+            if -res.fun > best_val:
+                c_val = constraint_fun(res.x)
+                if np.all(c_val >= -1e-6):
+                    best_val = -res.fun
+                    best_x = res.x.copy()
+        except Exception:
+            pass
+
+    if best_x is None:
+        arr = np.random.rand(n, 2) * 0.6 + 0.2
+        best_x = np.concatenate([arr.flatten(), np.full(n, 0.02)])
+        
+    centers = best_x.reshape(n, 3)[:, :2]
+    radii = best_x.reshape(n, 3)[:, 2]
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

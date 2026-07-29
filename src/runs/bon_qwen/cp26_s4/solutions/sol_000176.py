@@ -1,0 +1,233 @@
+# sol_000176 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 64b41a5f) state=14b8abf0 sum of radii=2.187456 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii using 
+    a force-directed expansion and relaxation algorithm.
+    """
+    n = 26
+    
+    # 1. Initialization: Hexagonal Grid
+    # We arrange circles in staggered rows.
+    # For N=26, a 5x5 hexagonal layout (rows of 5, 5, 5, 5, 5, 1) or similar works well.
+    # Let's try to fit 26 circles in a compact hexagonal pattern.
+    # Approximate radius for packing 25 circles is 0.1. For 26, slightly less, say 0.09.
+    
+    r_init = 0.09
+    centers = np.zeros((n, 2))
+    radii = np.full(n, r_init)
+    
+    # Layout: 5 rows of 5, 1 row of 1? Or 6 rows?
+    # Let's try 5 rows of 5 (25 circles) and 1 small one? 
+    # Actually, a 6-row hexagonal packing is denser.
+    # Row counts: 5, 5, 5, 5, 4, 2 -> 26.
+    # Or 5, 5, 5, 5, 5, 1.
+    # Let's generate a generic hex grid and trim/pad to 26.
+    
+    # Generate a large hex grid and pick the first 26 that fit in [0,1]
+    # But we need to position them inside [0,1].
+    
+    # Simple 5x5 grid + 1 is easier to control, but hex is better.
+    # Let's construct a 5-row hex grid with 5 circles in first 4 rows, 6 in last?
+    # Let's just place them in a 5x5 square grid first, then perturb. 
+    # Actually, hex grid is better.
+    
+    # Hex Grid Generation
+    # Row height = sqrt(3) * r
+    row_counts = [5, 5, 5, 5, 4, 2] # Sum = 26
+    idx = 0
+    for i, count in enumerate(row_counts):
+        y = r_init + i * r_init * np.sqrt(3)
+        # Shift odd rows
+        x_start = r_init + (0.5 if i % 2 == 1 else 0.0) * 2 * r_init
+        # Wait, standard hex shift is r (half diameter) if diameter is 2r.
+        # Distance between centers is 2r.
+        # If row 0 centers at r, 3r, 5r...
+        # Row 1 centers at 2r, 4r... (shifted by r)
+        
+        # Let's refine coordinates
+        # Base x for even row: r
+        # Base x for odd row: 2r (which is r + r)
+        
+        if i % 2 == 0:
+            x_start = r_init
+        else:
+            x_start = 2 * r_init # shift by r? No, 2r is diameter. Shift should be r?
+            # Distance between (r, y0) and (x, y1) should be 2r.
+            # dy = r*sqrt(3). dx = sqrt( (2r)^2 - (r*sqrt(3))^2 ) = sqrt(r^2) = r.
+            # So x shift is r.
+            # If row 0 starts at r, row 1 starts at r + r = 2r.
+            
+        for j in range(count):
+            if idx < n:
+                x = x_start + j * 2 * r_init
+                centers[idx] = [x, y]
+                idx += 1
+    
+    # If we didn't fill 26, add remaining randomly in gaps
+    while idx < n:
+        # Random position
+        cx = np.random.uniform(0, 1)
+        cy = np.random.uniform(0, 1)
+        centers[idx] = [cx, cy]
+        idx += 1
+
+    # Ensure initial centers are valid (clamp to boundaries with some margin)
+    # And radii are small enough to not overlap initially?
+    # The grid construction above might go out of bounds if r_init is too big or layout is wrong.
+    # Let's scale down if needed.
+    max_coord = np.max(centers)
+    if max_coord + r_init > 1.0:
+        scale = (1.0 - r_init) / max_coord
+        centers *= scale
+        radii *= scale # This changes radius, let's just reset radii to a safe value
+        radii = np.full(n, 0.05) # Safe small radius
+
+    # 2. Simulation
+    # We will iterate: expand radii -> resolve overlaps
+    
+    dt_expand = 0.0005 # Rate of radius increase
+    dt_force = 0.1     # Force step size
+    
+    # Run for a number of steps
+    steps = 2000
+    
+    for step in range(steps):
+        # Expand radii uniformly (or based on space)
+        # To maximize sum, we increase all radii.
+        # But we must check validity.
+        # Instead of hard constraint check every time, we use repulsion.
+        
+        # Increase radii
+        radii += dt_expand * (1.0 - np.sum(radii) / 3.0) # Slow down as sum approaches 3.0
+        
+        # Calculate forces
+        # Pairwise repulsion if overlapping
+        # Boundary repulsion
+        
+        forces = np.zeros_like(centers)
+        
+        # Vectorized pairwise distance
+        # dist^2 = (x1-x2)^2 + (y1-y2)^2
+        # req_dist = r1 + r2
+        
+        # To avoid O(N^2) python loop, we can use broadcasting, but N=26 is small.
+        # Let's use loops for clarity and control.
+        
+        for i in range(n):
+            xi, yi = centers[i]
+            ri = radii[i]
+            
+            # Boundary forces (push back if touching)
+            # We want to keep circle inside [0,1]
+            # If xi - ri < 0, force +x
+            # If xi + ri > 1, force -x
+            
+            k_wall = 100.0
+            if xi - ri < 0:
+                forces[i, 0] += k_wall * (ri - xi)
+            if xi + ri > 1:
+                forces[i, 0] -= k_wall * (xi + ri - 1)
+            if yi - ri < 0:
+                forces[i, 1] += k_wall * (ri - yi)
+            if yi + ri > 1:
+                forces[i, 1] -= k_wall * (yi + ri - 1)
+                
+            for j in range(i + 1, n):
+                xj, yj = centers[j]
+                rj = radii[j]
+                
+                dx = xi - xj
+                dy = yi - yj
+                dist_sq = dx*dx + dy*dy
+                dist = np.sqrt(dist_sq)
+                req_dist = ri + rj
+                
+                if dist < req_dist and dist > 1e-9:
+                    overlap = req_dist - dist
+                    # Repulsive force proportional to overlap
+                    # F = overlap * normalized_vector
+                    # Direction is from j to i (dx, dy)
+                    fx = overlap * (dx / dist)
+                    fy = overlap * (dy / dist)
+                    
+                    forces[i, 0] += fx
+                    forces[i, 1] += fy
+                    forces[j, 0] -= fx
+                    forces[j, 1] -= fy
+                elif dist < 1e-9:
+                    # Same position, random push
+                    forces[i, 0] += np.random.randn() * 0.1
+                    forces[i, 1] += np.random.randn() * 0.1
+                    forces[j, 0] -= np.random.randn() * 0.1
+                    forces[j, 1] -= np.random.randn() * 0.1
+
+        # Apply forces
+        centers += dt_force * forces
+        
+        # Clamp centers to valid range [r_i, 1-r_i]
+        # Actually, the forces should handle it, but clamping ensures safety
+        for i in range(n):
+            r = radii[i]
+            centers[i, 0] = np.clip(centers[i, 0], r, 1 - r)
+            centers[i, 1] = np.clip(centers[i, 1], r, 1 - r)
+            
+        # Clamp radii to non-negative
+        radii = np.maximum(radii, 0.0)
+
+    # 3. Final Clean-up / Validation Adjustment
+    # The simulation might leave tiny overlaps due to numerical error or step size.
+    # We can run a few iterations of a stricter solver or just ensure constraints.
+    # Since we need to return valid centers/radii, let's do a quick fix.
+    
+    # If any circle is outside, shrink it
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        # Ensure inside
+        if x - r < 0: r = x
+        if x + r > 1: r = 1 - x
+        if y - r < 0: r = y
+        if y + r > 1: r = 1 - y
+        radii[i] = max(r, 0.0)
+
+    # Remove overlaps by shrinking larger circles slightly if needed
+    # This is a heuristic.
+    for _ in range(100):
+        overlap_found = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                sum_r = radii[i] + radii[j]
+                if dist < sum_r - 1e-12:
+                    # Overlap
+                    overlap = sum_r - dist
+                    # Shrink both equally
+                    shrink = overlap / 2 + 1e-5
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    overlap_found = True
+        if not overlap_found:
+            break
+            
+    # Final clamp
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        radii[i] = min(r, x, 1-x, y, 1-y)
+        radii[i] = max(radii[i], 0.0)
+
+    total_sum = np.sum(radii)
+    
+    return centers, radii, total_sum
+
+# Note: The random initialization and simulation parameters might need tuning.
+# The above logic provides a robust framework. 
+# For the specific target of 2.636, equal circles of radius ~0.1014 are needed.
+# This is likely achievable with a dense hexagonal packing optimized properly.

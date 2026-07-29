@@ -1,0 +1,227 @@
+
+
+<strategy>
+To push the sum of radii from ~2.628 to the target ~2.636, we need a more systematic and robust optimization strategy. The previous approaches relied heavily on direct joint optimization (centers + radii) from heuristic starts, which often gets trapped in local minima due to the high non-convexity of the squared-distance constraints.
+
+**Key Improvements:**
+1. **Two-Stage Optimization**: 
+   - **Stage 1 (Center Optimization)**: First, optimize *only* the circle centers to maximize the minimum distance to boundaries and neighbors. This is equivalent to finding the optimal configuration for *equal* circles, which provides a highly structured, well-spaced geometric foundation. We use `Powell` (derivative-free, robust for non-smooth min-functions) on multiple diverse starts (hexagonal lattices with varied row counts, and force-repulsion randomized starts).
+   - **Stage 2 (Radius Optimization via LP)**: Given the optimized centers, solve a Linear Programming problem to maximize the sum of radii. This is convex and guarantees the mathematically optimal radii for those fixed centers, often yielding unequal radii that efficiently fill gaps.
+   - **Stage 3 (Joint Refinement)**: Use the LP solution as a high-quality initial guess for a constrained non-linear optimizer (`SLSQP`) that simultaneously tweaks centers and radii. This fine-tunes the configuration to squeeze out the remaining ~0.008 sum.
+2. **Robust Initialization**: Generate 9 distinct hexagonal row patterns and 10 force-repulsion configurations. This ensures we explore different symmetry classes (e.g., 5-6-5-6-4 vs 6-5-5-5-5) which can lead to different local optima.
+3. **Constraint Handling**: Use squared-distance constraints `(dx² + dy² - (r₁+r₂)²) ≥ 0` for smooth gradients in SLSQP. Slightly shrink radii before passing to SLSQP to guarantee strict feasibility at the start.
+4. **Numerical Repair**: An iterative shrinking/clamping routine ensures the final output strictly passes the validation function's tolerance checks without sacrificing meaningful sum.
+
+This pipeline decouples the hard geometric placement problem from the radius allocation problem, dramatically improving convergence to near-global optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def get_min_dist(centers):
+    """Computes the bottleneck distance for equal-circle packing."""
+    # Distance to boundaries
+    dists = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                       np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    # Pairwise Euclidean distances
+    diff = centers[:, None, :] - centers[None, :, :]
+    pdists = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(pdists, np.inf)
+    pdists = pdists.min(axis=1)
+    return np.min(np.minimum(dists, pdists))
+
+def obj_equal(centers_flat):
+    """Objective for center optimization: maximize minimum distance."""
+    centers = centers_flat.reshape(N, 2)
+    centers = np.clip(centers, 1e-6, 1.0 - 1e-6)
+    return -get_min_dist(centers)
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 0.0)
+    
+    diff = centers[:, None, :] - centers[None, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    
+    constraints = []
+    rhs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            constraints.append(row)
+            rhs.append(dists[i, j])
+            
+    A_ub = np.array(constraints)
+    b_ub = np.array(rhs)
+    c_obj = -np.ones(n)
+    
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=[(0, u) for u in ub], method='highs')
+    if res.success:
+        return -res.fun, res.x
+    return 0.0, np.zeros(n)
+
+def joint_constraints(v):
+    """Computes boundary and pairwise non-overlap constraints (must be >= 0)."""
+    x = v[0::3]
+    y = v[1::3]
+    r = v[2::3]
+    c = []
+    c.append(x - r)
+    c.append(1.0 - x - r)
+    c.append(y - r)
+    c.append(1.0 - y - r)
+    
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c.append((dx**2 + dy**2 - dr**2)[mask])
+    return np.concatenate(c)
+
+def joint_obj(v):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(v[2::3])
+
+def repair_solution(centers, radii):
+    """Iteratively shrinks radii to resolve overlaps and clamp to boundaries."""
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-9:
+                    shrink = (radii[i] + radii[j] - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            if radii[i] > mr - 1e-9:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    radii = np.maximum(radii, 0.0)
+    return radii
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    
+    # Phase 1: Optimize centers for equal radii (maximize bottleneck distance)
+    starts = []
+    patterns = [[5,6,5,6,4], [6,5,6,5,4], [5,5,5,5,6], [6,5,5,5,5], [5,5,5,6,5], 
+                [4,6,6,6,4], [6,6,4,6,4], [5,7,5,5,4], [7,5,5,5,4]]
+    for pat in patterns:
+        c = []
+        y = 0.08
+        for r_idx, cnt in enumerate(pat):
+            shift = 0.04 if r_idx % 2 == 1 else 0.0
+            x = 0.08 + shift
+            for _ in range(cnt):
+                if len(c) >= N: break
+                c.append([x, y])
+                x += 0.14
+            y += 0.14 * np.sqrt(3)
+        c = np.array(c[:N])
+        starts.append(c.flatten())
+        
+    for _ in range(10):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        for _ in range(300):
+            forces = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i+1, N):
+                    d_vec = c[i] - c[j]
+                    d = np.linalg.norm(d_vec)
+                    if d < 0.2:
+                        push = (0.2 - d) * 0.1
+                        f = d_vec / d * push
+                        forces[i] += f
+                        forces[j] -= f
+            c += forces
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c.flatten())
+        
+    best_eq_dist = 0.0
+    best_eq_centers = None
+    
+    for sf in starts:
+        try:
+            res = minimize(obj_equal, sf, method='Powell', 
+                           options={'maxiter': 8000, 'ftol': 1e-12})
+            d = -res.fun
+            if d > best_eq_dist:
+                best_eq_dist = d
+                best_eq_centers = res.x.reshape(N, 2)
+        except Exception:
+            pass
+            
+    if best_eq_centers is None:
+        # Fallback to safe grid if optimization fails
+        ys = np.linspace(0.15, 0.85, 6)
+        xs = np.linspace(0.15, 0.85, 5)
+        grid = np.column_stack(np.meshgrid(xs, ys)).flatten().reshape(-1, 2)[:N]
+        best_eq_centers = grid
+        
+    # Phase 2: Solve LP for optimal unequal radii on best centers
+    lp_sum, lp_radii = solve_lp_radii(best_eq_centers)
+    best_sum = lp_sum
+    best_centers = best_eq_centers
+    best_radii = lp_radii
+    
+    # Phase 3: Joint refinement using SLSQP
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': joint_constraints}
+    
+    v0 = np.zeros(3*N)
+    v0[0::3] = best_centers[:, 0]
+    v0[1::3] = best_centers[:, 1]
+    v0[2::3] = best_radii * 0.995  # Slight shrink to guarantee strict feasibility
+    
+    try:
+        res = minimize(joint_obj, v0, method='SLSQP', bounds=bounds,
+                       constraints=cons, options={'maxiter': 20000, 'ftol': 1e-13})
+        if -res.fun > best_sum:
+            cvals = joint_constraints(res.x)
+            if np.min(cvals) >= -1e-7:
+                best_sum = -res.fun
+                best_centers = res.x[:2*N].reshape(N, 2)
+                best_radii = res.x[2*N:]
+    except Exception:
+        pass
+        
+    # Phase 4: Local perturbation search to escape shallow local minima
+    for _ in range(50):
+        v_trial = np.concatenate([best_centers.flatten(), best_radii])
+        v_trial += rng.normal(0, 0.0015, v_trial.shape)
+        v_trial[0::3] = np.clip(v_trial[0::3], 0.01, 0.99)
+        v_trial[1::3] = np.clip(v_trial[1::3], 0.01, 0.99)
+        v_trial[2::3] = np.clip(v_trial[2::3], 0.01, 0.45)
+        
+        try:
+            res = minimize(joint_obj, v_trial, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 15000, 'ftol': 1e-13})
+            if -res.fun > best_sum:
+                cvals = joint_constraints(res.x)
+                if np.min(cvals) >= -1e-7:
+                    best_sum = -res.fun
+                    best_centers = res.x[:2*N].reshape(N, 2)
+                    best_radii = res.x[2*N:]
+        except Exception:
+            pass
+
+    # Phase 5: Strict numerical repair for validation guarantee
+    best_radii = repair_solution(best_centers, best_radii)
+    final_sum = float(np.sum(best_radii))
+    
+    return best_centers, best_radii, final_sum
+```

@@ -1,0 +1,99 @@
+# sol_000016 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state ad74c980) state=cd280fc5 sum of radii=2.477183 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_penalty(x, r, n):
+    """
+    Computes a smooth penalty for boundary violations and circle overlaps.
+    Lower penalty indicates better packing for the given radius r.
+    """
+    centers = x.reshape(n, 2)
+    p = 0.0
+    
+    # Boundary penalties: circles must stay within [r, 1-r]
+    x_c = centers[:, 0]
+    y_c = centers[:, 1]
+    p += np.sum(np.maximum(0.0, r - x_c)**2)
+    p += np.sum(np.maximum(0.0, x_c - (1.0 - r))**2)
+    p += np.sum(np.maximum(0.0, r - y_c)**2)
+    p += np.sum(np.maximum(0.0, y_c - (1.0 - r))**2)
+    
+    # Overlap penalties: distance between centers must be >= 2r
+    c1 = centers[:, np.newaxis, :]
+    c2 = centers[np.newaxis, :, :]
+    diffs = c1 - c2
+    d_sq = np.sum(diffs**2, axis=2)
+    
+    # Only consider lower triangle to avoid double counting and self-distance
+    idx = np.tril_indices(n, -1)
+    min_d_sq = (2 * r)**2
+    violations = np.maximum(0.0, min_d_sq - d_sq[idx])
+    p += np.sum(violations**2)
+    
+    return p
+
+def run_packing():
+    n = 26
+    np.random.seed(42)
+    
+    # 1. Initial hexagonal arrangement
+    centers = []
+    rows = [6, 5, 6, 5, 4]  # Sums to 26
+    y_step = 0.85 / (len(rows) - 1)
+    x_step = 0.8 / 5
+    
+    for i, count in enumerate(rows):
+        y = 0.075 + i * y_step
+        x_start = 0.1 + (0.0 if i % 2 == 0 else x_step / 2)
+        for j in range(count):
+            centers.append([x_start + j * x_step, y])
+            
+    centers = np.array(centers)
+    # Add small random noise to break exact symmetry and prevent grid-locking
+    centers += np.random.normal(0, 0.001, centers.shape)
+    
+    # 2. Iteratively expand radius while optimizing positions
+    current_r = 0.09
+    delta_r = 0.001
+    
+    for _ in range(120):
+        x0 = centers.flatten()
+        res = minimize(compute_penalty, x0, args=(current_r, n), method='L-BFGS-B',
+                       bounds=[(0.0, 1.0)] * (2 * n),
+                       options={'maxiter': 1500, 'ftol': 1e-10})
+        centers = res.x.reshape(n, 2)
+        
+        if res.fun < 1e-6:
+            current_r += delta_r
+        else:
+            # If stuck, step back slightly and perturb to find a better basin
+            current_r -= delta_r * 0.5
+            centers += np.random.normal(0, 0.002, centers.shape)
+            if current_r < 0.09:
+                break
+                
+    # 3. Final polishing run at best feasible radius
+    r_final = current_r - delta_r
+    res = minimize(compute_penalty, centers.flatten(), args=(r_final, n), method='L-BFGS-B',
+                   bounds=[(0.0, 1.0)] * (2 * n),
+                   options={'maxiter': 2500, 'ftol': 1e-14})
+    centers = res.x.reshape(n, 2)
+    
+    # 4. Compute exact individual radii for maximum validity and sum
+    radii = np.zeros(n)
+    for i in range(n):
+        cx, cy = centers[i]
+        max_r = min(cx, 1.0 - cx, cy, 1.0 - cy)
+        for j in range(n):
+            if i != j:
+                d = np.sqrt((centers[i, 0] - centers[j, 0])**2 + (centers[i, 1] - centers[j, 1])**2)
+                if d / 2.0 < max_r:
+                    max_r = d / 2.0
+        radii[i] = max_r
+        
+    return centers, radii, np.sum(radii)

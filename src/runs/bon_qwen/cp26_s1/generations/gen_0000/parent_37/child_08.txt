@@ -1,995 +1,116 @@
 
 
 <strategy>
-1.  **Problem Analysis**: We need to pack 26 circles in a unit square to maximize the sum of radii. This is a non-convex optimization problem with many local minima. A uniform grid of 25 circles of radius 0.1 yields a sum of 2.5. With 26 circles, we expect a slightly smaller radius but denser packing (hexagonal) might compensate, aiming for a sum > 2.636.
-2.  **Optimization Formulation**: We treat centers $(x_i, y_i)$ and radii $r_i$ as variables. We maximize $\sum r_i$ subject to boundary constraints ($r_i \le x_i, 1-x_i, \dots$) and non-overlap constraints ($\|c_i - c_j\| \ge r_i + r_j$).
-3.  **Solver Choice**: `scipy.optimize.minimize` with the 'SLSQP' method is suitable for non-linear constraints. However, with 26 circles, there are $\approx 330$ inequality constraints. To ensure robustness and speed, we will:
-    *   Use a vectorized constraint evaluation.
-    *   Perform multiple restarts with different initial configurations (random, grid, hexagonal) to escape local optima.
-    *   Use a large penalty method or simply rely on SLSQP's ability to handle constraints, but adding a small regularization or using a robust initialization is key.
-    *   Specifically, I will implement a "hybrid" approach: Run a local optimizer (SLSQP) starting from a perturbed hexagonal lattice, which is known to be dense.
-4.  **Implementation Details**:
-    *   Variables: 78 (26 x, 26 y, 26 r).
-    *   Constraints: 104 boundary + 325 pairwise distance = 429 constraints.
-    *   To speed up, we can optimize radii derived from centers? No, explicit radii optimization is better for the sum objective.
-    *   However, 429 constraints is heavy. I will group them.
-    *   Actually, a safer and often faster approach for packing is to fix the radii logic: given centers, radii are determined by the "tightest" neighbor. But that's non-smooth.
-    *   I will stick to the explicit optimization but maybe reduce constraint complexity by only enforcing "active" constraints? No, hard to track.
-    *   I will implement the explicit constraints but vectorized.
-    *   I will also add a fallback: if optimization fails or is slow, use a force-directed simulation (repulsive forces) which is very robust for packing.
-    *   **Decision**: Use a force-directed simulation (Langevin dynamics or simple gradient ascent on repulsion) to find a dense configuration, then refine with a local solver if possible, or just output the result of the simulation if it's stable. Force-based methods are often more robust for high-dimensional packing than gradient-based solvers with hundreds of constraints.
-    *   **Refined Strategy**:
-        1.  Initialize centers on a hexagonal grid.
-        2.  Initialize radii to a small value.
-        3.  Run an iterative process:
-            *   Calculate repulsive forces between overlapping circles.
-            *   Apply forces to move centers.
-            *   Update radii to be the maximum possible given current centers (min distance to neighbors/boundary).
-            *   Repeat until convergence.
-        4.  This "radius-adaptation" method is very effective. It effectively solves $\max \sum r_i(c)$ where $r_i(c)$ is the feasible radius.
-        5.  To optimize the sum, we can use a simple gradient ascent or even random perturbations (Simulated Annealing) on the centers.
-        6.  Actually, simply placing centers and computing max radii is a valid valid packing. We just need to find centers that maximize the sum of these max radii.
-        7.  I will use `scipy.optimize` to maximize the sum of "max feasible radii" given centers. This reduces variables to 52 (centers only). The objective function computes radii on the fly. This avoids the 300+ constraints.
-        8.  The objective function will be non-smooth (due to min), so I'll use `Nelder-Mead` or `Powell`.
+To maximize the sum of radii for 26 circles in a unit square, we formulate the problem as a non-linear optimization task. We aim to maximize $\sum r_i$ subject to geometric constraints: each circle must lie within $[0,1]^2$ and no two circles may overlap.
 
-5.  **Final Plan**:
-    *   Define a function `get_sum_radii(centers)` that calculates the largest valid radius for each circle given the centers, and sums them.
-    *   Use `scipy.optimize.minimize` (method='Powell' or 'Nelder-Mead') to maximize this function over the 52 center coordinates.
-    *   Initialize with a hexagonal grid.
-    *   Run multiple random restarts to find the global maximum.
-    *   Return the best centers and corresponding radii.
-
-    *Self-Correction*: The `min` function in `get_sum_radii` might create plateaus. However, moving centers apart strictly increases the "min distance", so it works.
-    *Refinement*: To help the optimizer, we can smooth the min function slightly or just rely on derivative-free methods. Powell is a good choice.
-
-    Let's write the code based on this plan.
-</strategy>
-
-```python
-import numpy as np
-from scipy.optimize import minimize, differential_evolution
-
-def run_packing():
-    """
-    Packs 26 circles in a unit square to maximize sum of radii.
-    Strategy: Optimize centers to maximize the sum of the maximum feasible radii.
-    """
-    n_circles = 26
-    
-    # Helper to compute max feasible radii for given centers
-    def compute_radii_and_sum(centers):
-        """
-        Given an array of centers (n, 2), compute the largest radius for each circle
-        such that they don't overlap and stay inside [0,1]x[0,1].
-        Returns (radii_array, sum_radii).
-        """
-        n = centers.shape[0]
-        radii = np.zeros(n)
-        
-        # Compute distance to boundaries for each circle
-        # dist to left: x, right: 1-x, bottom: y, top: 1-y
-        dist_to_boundary = np.min(np.array([
-            centers[:, 0], 
-            1 - centers[:, 0], 
-            centers[:, 1], 
-            1 - centers[:, 1]
-        ]), axis=0)
-        
-        # Initialize radii with boundary distances
-        radii = dist_to_boundary.copy()
-        
-        # Iterate to reduce radii based on pairwise distances
-        # Since radii depend on each other, we might need iterative update or just take min
-        # Actually, the constraint is r_i + r_j <= dist_ij.
-        # This is a system of inequalities. 
-        # A simple greedy approach: r_i = min(dist_to_boundary_i, min_j(dist_ij/2))
-        # Wait, r_i + r_j <= dist_ij. If we set r_i = dist_ij/2 for all j, it satisfies r_i+r_j = dist_ij.
-        # But r_i must satisfy this for ALL j. So r_i <= dist_ij/2 for all j.
-        # Thus r_i = min(dist_to_boundary_i, min_{j!=i} (dist_ij / 2)) is a VALID assignment.
-        # Is it optimal for the SUM?
-        # Not necessarily. We could have r_i large and r_j small if dist_ij allows?
-        # No, because dist_ij is fixed. r_i + r_j <= dist_ij.
-        # To maximize r_i + r_j, we need r_i + r_j = dist_ij (if constrained by distance) 
-        # or r_i = boundary, r_j = boundary.
-        # However, if we set r_i = dist_ij/2, we force equality.
-        # If we have a triangle of circles, forcing r_i = d_ij/2 for all pairs might be restrictive.
-        # Example: 3 circles in a triangle. Distances d12, d23, d31.
-        # Constraints: r1+r2<=d12, r2+r3<=d23, r3+r1<=d31.
-        # Sum = 2(r1+r2+r3) <= d12+d23+d31 => Sum <= (d12+d23+d31)/2.
-        # The assignment r_k = min(d/2) might not achieve this sum if the "min" picks different constraints.
-        # However, finding the exact max sum radii for fixed centers is a Linear Programming problem.
-        # Maximize sum(r) s.t. r_i + r_j <= dist_ij, r_i <= bound_i, r_i >= 0.
-        # This is small (26 vars, ~330 constraints). We can solve this LP for fixed centers!
-        
-        # Let's use scipy.linprog to find optimal radii for fixed centers.
-        # This is much more accurate than the heuristic r_i = min(dist/2).
-        
-        # Variables: r_0 ... r_25
-        # Objective: maximize sum(r) -> minimize -sum(r)
-        # c_obj = [-1] * n
-        
-        # Constraints:
-        # r_i >= 0 (bounds)
-        # r_i <= bound_i (upper bounds)
-        # r_i + r_j <= dist_ij -> [1, 1] @ [r_i, r_j] <= dist_ij
-        
-        # Matrix form A_ub @ r <= b_ub
-        # A_ub rows for each pair (i, j): row has 1 at i, 1 at j.
-        # b_ub entry: dist_ij
-        
-        # Also r_i <= bound_i is just upper bound in linprog.
-        
-        c_obj = -np.ones(n)
-        
-        # Bounds for LP: (0, bound_i)
-        bounds = [(0, b) for b in dist_to_boundary]
-        
-        # Inequality constraints A_ub @ r <= b_ub
-        # Number of pairs
-        pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
-        m = len(pairs)
-        
-        # Compute pairwise distances
-        # dist_matrix[i, j]
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff**2, axis=2))
-        
-        A_ub = np.zeros((m, n))
-        b_ub = np.zeros(m)
-        
-        idx = 0
-        for i, j in pairs:
-            A_ub[idx, i] = 1
-            A_ub[idx, j] = 1
-            b_ub[idx] = dists[i, j]
-            idx += 1
-            
-        from scipy.optimize import linprog
-        
-        # Solve LP
-        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        
-        if res.success:
-            radii = res.x
-            return radii, np.sum(radii)
-        else:
-            # Fallback if LP fails (shouldn't happen)
-            radii = np.full(n, 0.001)
-            return radii, 0.0
-
-    # Objective function for center optimization: maximize sum of radii
-    # We minimize negative sum
-    def objective(centers_flat):
-        centers = centers_flat.reshape(-1, 2)
-        _, sum_r = compute_radii_and_sum(centers)
-        return -sum_r
-
-    # We need to optimize 52 variables (26 x, 26 y)
-    # Using differential evolution for global search might be good but slow for 52 vars?
-    # Maybe multiple local optimizations from good starts.
-    
-    best_sum = 0
-    best_centers = None
-    
-    # Strategy: Generate several starting configurations
-    # 1. Random
-    # 2. Hexagonal grid
-    # 3. Perturbed grid
-    
-    def hexagonal_grid(n, seed=0):
-        # Try to fit n circles in a hex grid
-        # Estimate spacing
-        # Area ~ 1. n * pi * (s/2)^2 ~ 1? No.
-        # Just place them.
-        rng = np.random.RandomState(seed)
-        
-        # Approximate radius for 26 circles ~ 0.1
-        # Spacing ~ 0.2
-        # Grid points
-        pts = []
-        # Try a grid of size 6x5
-        rows = 6
-        cols = 5
-        x_step = 0.2
-        y_step = 0.2 * np.sqrt(3)/2 # ~0.1732
-        
-        # Center the grid
-        width = (cols - 1) * x_step
-        height = (rows - 1) * y_step
-        x_offset = (1.0 - width) / 2
-        y_offset = (1.0 - height) / 2
-        
-        count = 0
-        centers = np.zeros((n, 2))
-        for r in range(rows):
-            for c in range(cols):
-                if count >= n: break
-                x = x_offset + c * x_step + (r % 2) * (x_step / 2)
-                y = y_offset + r * y_step
-                centers[count] = [x, y]
-                count += 1
-            if count >= n: break
-            
-        # Add some noise
-        centers += rng.uniform(-0.02, 0.02, size=centers.shape)
-        # Clip to valid range (leaving margin for radius)
-        centers = np.clip(centers, 0.05, 0.95)
-        return centers.flatten()
-
-    # Optimization loop
-    n_restarts = 10
-    
-    for i in range(n_restarts):
-        # Initial guess
-        if i == 0:
-            x0 = hexagonal_grid(n_circles, seed=i)
-        else:
-            # Random initialization
-            rng = np.random.RandomState(i)
-            x0 = rng.uniform(0.1, 0.9, size=(n_circles * 2))
-        
-        # Bounds for centers [0, 1]
-        bounds = [(0, 1)] * (n_circles * 2)
-        
-        # Use Powell method (derivative free)
-        # Nelder-Mead is also good.
-        try:
-            res = minimize(objective, x0, method='Powell', 
-                           bounds=bounds, 
-                           options={'maxiter': 1000, 'ftol': 1e-9})
-            
-            current_sum = -res.fun
-            if current_sum > best_sum:
-                best_sum = current_sum
-                best_centers = res.x.reshape(n_circles, 2)
-        except Exception as e:
-            pass
-
-    # Final refinement:
-    # We have best_centers. Compute radii using LP again to get exact valid radii.
-    # But wait, the LP inside objective finds optimal radii for THOSE centers.
-    # So best_sum is the max sum for best_centers.
-    # However, we should ensure the returned radii are valid.
-    
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Double check validity
-    # The LP guarantees r_i + r_j <= dist_ij and r_i <= bounds.
-    # But numerical precision?
-    # Let's clamp radii slightly to be safe.
-    # Actually, LP is robust.
-    
-    # One last check: is the sum better if we just output what LP found?
-    # Yes.
-    
-    # However, the objective optimization might have drifted centers slightly outside [0,1] 
-    # if bounds were not strictly enforced by Powell? 
-    # Powell supports bounds in newer scipy versions. 
-    # If not, we clip.
-    best_centers = np.clip(best_centers, 0, 1)
-    
-    # Recompute radii with clipped centers to be safe
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Check for any NaN or invalid
-    if np.isnan(radii).any() or np.any(radii < 0):
-        # Fallback to a safe grid packing
-        # This shouldn't happen
-        grid = hexagonal_grid(n_circles, seed=42).reshape(n_circles, 2)
-        grid = np.clip(grid, 0.1, 0.9)
-        radii = np.full(n_circles, 0.05) # Small safe radius
-        final_sum = 0 # Will be recomputed
-        # Actually just return a valid small packing
-        # Let's try to compute radii for grid
-        radii, final_sum = compute_radii_and_sum(grid)
-        best_centers = grid
-
-    return best_centers, radii, float(np.sum(radii))
-
-# Note: The validate_packing function checks dist < r1 + r2 - 1e-12.
-# Our LP ensures r1 + r2 <= dist. So dist >= r1 + r2.
-# This satisfies dist >= r1 + r2 - 1e-12 (since dist >= r1+r2).
-# Wait, if dist == r1+r2 exactly, it passes.
-# Floating point might make dist slightly less than r1+r2 due to precision?
-# LP uses Highs solver which is precise, but converting back to float might introduce error.
-# To be safe, we can shrink radii by a tiny epsilon.
-# But the validate function allows 1e-12 slack.
-# It should be fine.
-
-# However, to be extremely safe against floating point issues where dist might be 1.9999999999999 * (r1+r2)/2?
-# No, LP constraint is linear.
-# But dist calculation in validation is sqrt.
-# In LP we used dists[i,j] which was sqrt precomputed?
-# In my LP code above: `b_ub[idx] = dists[i, j]` where dists was computed using sqrt.
-# So LP enforces r_i + r_j <= sqrt(...).
-# Validation checks sqrt(...) < r_i + r_j - 1e-12.
-# If LP satisfies r_i + r_j <= sqrt(...), then sqrt(...) >= r_i + r_j.
-# So sqrt(...) < r_i + r_j is False.
-# So it is valid.
-```
-
-Wait, I used `dists` computed with `np.sqrt` in the LP.
-`dists = np.sqrt(np.sum(diff**2, axis=2))`
-So the constraint is `r_i + r_j <= sqrt((x_i-x_j)^2 + ...)`.
-This is mathematically correct for non-overlap.
-However, `linprog` works with linear constraints. The coefficients in `A_ub` are 1, and `b_ub` are constants (distances).
-So it solves `r_i + r_j <= constant`.
-This is correct.
-
-One small optimization:
-In the LP, `b_ub` contains distances.
-If centers move, distances change.
-The `compute_radii_and_sum` recomputes LP from scratch every time.
-This is $O(N_{iter} \cdot N_{LP})$.
-LP for 26 vars, 325 constraints is very fast.
-It should be fine.
-
-Let's double check the imports and function structure.
-I need to import `linprog` inside or at top. Top is better.
-Also `np` and `minimize`.
-
-One potential issue: `method='highs'` in `linprog` is available in SciPy >= 1.6.0. It's standard now.
-If not, `method='simplex'` or `highs` fallback. I'll stick to default or 'highs'.
-
-Also, `minimize` with Powell might be slow if objective is expensive (LP call).
-But 1000 iterations is max.
-Maybe reduce maxiter or rely on convergence.
-Given the target is 2.636, and grid gives 2.5, we need some improvement.
-The LP-based radius computation allows non-uniform radii which is powerful.
-
-Let's refine the initialization.
-Hexagonal grid is good.
-Maybe also try a "circle packing" initialization using `scipy.spatial`? No, too complex.
-Just random restarts.
-
-One detail: `best_centers` might be `None` if all optimizations fail.
-Initialize `best_centers` with a valid configuration.
-
-```python
-import numpy as np
-from scipy.optimize import minimize
-from scipy.optimize import linprog
-
-def run_packing():
-    n_circles = 26
-    
-    def compute_radii_and_sum(centers):
-        n = centers.shape[0]
-        # Distance to boundaries
-        x = centers[:, 0]
-        y = centers[:, 1]
-        dist_boundary = np.minimum(np.minimum(x, 1 - x), np.minimum(y, 1 - y))
-        
-        # Pairwise distances
-        # Efficient computation
-        # (n, 1, 2) - (1, n, 2) -> (n, n, 2)
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
-        
-        # LP Setup
-        # Maximize sum(r) subject to r_i + r_j <= dist_ij, 0 <= r_i <= dist_boundary_i
-        c_obj = -np.ones(n)
-        bounds = [(0, db) for db in dist_boundary]
-        
-        # Inequalities: r_i + r_j <= dist_ij
-        # A_ub @ r <= b_ub
-        # Indices
-        rows, cols = np.triu_indices(n, k=1)
-        m = len(rows)
-        A_ub = np.zeros((m, n))
-        b_ub = dist_matrix[rows, cols]
-        
-        for idx, (i, j) in enumerate(zip(rows, cols)):
-            A_ub[idx, i] = 1
-            A_ub[idx, j] = 1
-            
-        # Solve
-        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        
-        if res.success:
-            return res.x, np.sum(res.x)
-        else:
-            # Fallback
-            r = np.full(n, 0.0001)
-            return r, 0.0
-
-    def objective(centers_flat):
-        centers = centers_flat.reshape(-1, 2)
-        _, s = compute_radii_and_sum(centers)
-        return -s
-
-    best_sum = 0
-    best_centers = None
-    
-    # Try multiple starts
-    starts = []
-    
-    # 1. Hexagonal grid
-    rng = np.random.RandomState(42)
-    h_centers = np.zeros((n_circles, 2))
-    # Packing 26 circles
-    # 5 rows of 5 or 6
-    # Row 0: 5, Row 1: 5, Row 2: 6, Row 3: 5, Row 4: 5? Total 26.
-    # Or just dense packing.
-    # Let's use a simple grid and jitter.
-    rows = 5
-    cols = 6 # 30 spots, take 26
-    # Scale to fit
-    x_spacing = 1.0 / (cols - 1 + 2*0.1) # approximate
-    y_spacing = 1.0 / (rows - 1 + 2*0.1)
-    
-    # Better: Just place in [0.1, 0.9]
-    pts = []
-    for r in range(rows):
-        for c in range(cols):
-            x = 0.1 + c * 0.15 + (r % 2) * 0.075
-            y = 0.1 + r * 0.17
-            if 0 <= x <= 1 and 0 <= y <= 1:
-                pts.append([x, y])
-    # Take first 26
-    if len(pts) >= 26:
-        h_centers = np.array(pts[:26])
-    else:
-        # Fill remaining
-        h_centers = np.random.rand(26, 2) * 0.8 + 0.1
-        
-    # Jitter
-    h_centers += rng.uniform(-0.01, 0.01, size=h_centers.shape)
-    starts.append(h_centers.flatten())
-    
-    # 2. Random starts
-    for i in range(5):
-        r_centers = rng.uniform(0.1, 0.9, size=(26, 2))
-        starts.append(r_centers.flatten())
-    
-    bounds = [(0, 1)] * (26 * 2)
-    
-    for x0 in starts:
-        try:
-            res = minimize(objective, x0, method='Powell', bounds=bounds, 
-                           options={'maxiter': 500, 'ftol': 1e-12})
-            if -res.fun > best_sum:
-                best_sum = -res.fun
-                best_centers = res.x.reshape(26, 2)
-        except:
-            pass
-            
-    if best_centers is None:
-        best_centers = starts[0].reshape(26, 2)
-        
-    # Final compute radii
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Safety clamp
-    radii = np.clip(radii, 0, None)
-    best_centers = np.clip(best_centers, 0, 1)
-    
-    # Ensure no overlap due to precision?
-    # The LP guarantees it, but let's verify and shrink if needed.
-    # Actually, validate function has 1e-12 tolerance.
-    # It should pass.
-    
-    return best_centers, radii, float(np.sum(radii))
-```
-The logic seems sound. The LP inside the objective function is a strong way to handle the radii constraints, effectively solving the "inner" problem optimally for a fixed "outer" configuration of centers. Powell method handles the non-smoothness of the LP solution wrt centers reasonably well (or we hope so; the function is continuous).
-
-One detail: `linprog` might be slow if called thousands of times. 500 iterations * 5 starts = 2500 calls.
-Each LP is small. It should take milliseconds. Total time < 10 seconds.
-This is acceptable.
-
-Wait, `method='Powell'` in `minimize` does not support `bounds` in older scipy versions?
-Actually, it does in recent versions (1.4+).
-If bounds are not supported, it might wander.
-But `bounds` parameter is passed to `minimize`.
-If the method doesn't support it, it raises error or ignores?
-Docs say Powell supports bounds since 1.4.0.
-Assuming modern environment.
-
-If bounds are ignored, centers might go outside.
-But objective function handles centers outside?
-`compute_radii_and_sum` calculates `dist_boundary`.
-If center is at 1.1, `1-x` is -0.1. `dist_boundary` becomes negative.
-Bounds in LP: `(0, negative)` -> Infeasible.
-LP returns failure.
-Objective returns 0 (or fallback).
-Optimizer will be discouraged from going there.
-So even if bounds are ignored, the logic holds (penalty via infeasibility).
-But explicit bounds are better.
-
-I will include `bounds` argument.
-
-Final check on imports: `linprog` is in `scipy.optimize`.
-`np` is `numpy`.
-
-The solution looks solid.
-
-```python
-import numpy as np
-from scipy.optimize import minimize
-from scipy.optimize import linprog
-
-def run_packing():
-    n_circles = 26
-    
-    # Cache for linprob to avoid recompiling? Not necessary for this size.
-    
-    def compute_radii_and_sum(centers):
-        n = centers.shape[0]
-        x = centers[:, 0]
-        y = centers[:, 1]
-        
-        # Distance to boundaries: min(x, 1-x, y, 1-y)
-        # Vectorized
-        dist_boundary = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
-        
-        # Pairwise distances
-        # Using broadcasting
-        # centers shape (n, 2)
-        # diff shape (n, n, 2)
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
-        
-        # LP: Maximize sum(r) s.t. r_i + r_j <= dist_ij, 0 <= r_i <= dist_boundary_i
-        c_obj = -np.ones(n)
-        bounds = [(0.0, db) for db in dist_boundary]
-        
-        # Constraints: r_i + r_j <= dist_ij for all i < j
-        # A_ub @ r <= b_ub
-        # Triangular indices
-        rows, cols = np.triu_indices(n, k=1)
-        m = len(rows)
-        
-        # Preallocate A_ub sparse? Dense is fine for n=26 (325 constraints)
-        A_ub = np.zeros((m, n))
-        b_ub = dist_matrix[rows, cols]
-        
-        # Fill A_ub
-        # A_ub[k, i] = 1, A_ub[k, j] = 1
-        A_ub[np.arange(m), rows] = 1.0
-        A_ub[np.arange(m), cols] = 1.0
-        
-        # Solve
-        try:
-            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if res.success:
-                return res.x, np.sum(res.x)
-        except:
-            pass
-            
-        # Fallback
-        # If LP fails, return small radii
-        # This might happen if bounds are negative (centers outside)
-        r_safe = np.full(n, 0.0001)
-        return r_safe, 0.0
-
-    def objective(centers_flat):
-        centers = centers_flat.reshape(-1, 2)
-        _, s = compute_radii_and_sum(centers)
-        return -s
-
-    best_sum = 0.0
-    best_centers = None
-    
-    # Initial configurations
-    starts = []
-    rng = np.random.RandomState(123)
-    
-    # 1. Hexagonal-ish grid
-    # 5 rows, varying cols
-    # Rows at y = 0.1, 0.3, 0.5, 0.7, 0.9?
-    # Spacing y ~ 0.2
-    # Spacing x ~ 0.17
-    grid_centers = []
-    y_step = 0.2
-    x_step = 0.1732 # approx sqrt(3)/10 * 10? No. sqrt(3)/2 * 0.2 ~ 0.173
-    # Let's place 6 points in first row, 5 in next, 6, 5, 5? Total 27?
-    # 6+5+6+5+5 = 27. Remove 1.
-    # Just place 6x5 = 30 points and pick 26 best?
-    # Or just iterate.
-    
-    count = 0
-    r = 0
-    while count < n_circles:
-        c = 0
-        while count < n_circles and c < 6: # Max 6 cols
-            x = 0.08 + c * 0.16 + (r % 2) * 0.08
-            y = 0.08 + r * 0.18
-            if x <= 1 and y <= 1:
-                grid_centers.append([x, y])
-                count += 1
-            c += 1
-        r += 1
-        
-    if len(grid_centers) >= n_circles:
-        h_centers = np.array(grid_centers[:n_circles])
-    else:
-        h_centers = np.random.rand(n_circles, 2) * 0.8 + 0.1
-        
-    # Add noise
-    h_centers += rng.uniform(-0.02, 0.02, size=h_centers.shape)
-    starts.append(h_centers.flatten())
-    
-    # 2. Random starts
-    for _ in range(4):
-        r_centers = rng.uniform(0.05, 0.95, size=(n_circles, 2))
-        starts.append(r_centers.flatten())
-        
-    bounds = [(0.0, 1.0)] * (n_circles * 2)
-    
-    for x0 in starts:
-        try:
-            res = minimize(objective, x0, method='Powell', bounds=bounds, 
-                           options={'maxiter': 1000, 'ftol': 1e-10})
-            if -res.fun > best_sum:
-                best_sum = -res.fun
-                best_centers = res.x.reshape(n_circles, 2)
-        except:
-            pass
-
-    if best_centers is None:
-        best_centers = starts[0].reshape(n_circles, 2)
-        
-    # Final radii computation
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Ensure centers are strictly within bounds for safety (though LP handles it)
-    best_centers = np.clip(best_centers, 0.0, 1.0)
-    # Recompute radii after clip
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Ensure radii are non-negative
-    radii = np.maximum(radii, 0.0)
-    
-    return best_centers, radii, float(np.sum(radii))
-```
-The logic for generating grid centers was a bit messy in comments but code looks okay.
-Actually, the manual grid generation:
-`x = 0.08 + c * 0.16 ...`
-If `c=5`, `x` approx `0.08 + 0.80 = 0.88`.
-`y` step `0.18`. `r=4` -> `y` approx `0.08 + 0.72 = 0.80`.
-Fits well.
-The hexagonal shift `(r%2)*0.08` is half of `0.16`. Correct.
-
-One detail: `linprog` might return `status` 0 (success).
-I should check `res.success`.
-Added in code.
-
-The solution seems robust.
-
-One final check: The problem asks to return `centers`, `radii`, `sum_radii`.
-My function returns exactly that.
-
-Double check the `validate_packing` constraints.
-`x - r < -1e-12` -> `x - r >= -1e-12`?
-Wait, `x - r < -1e-12` is BAD.
-So `x - r >= -1e-12` is required?
-Actually `x - r >= 0` is required for valid.
-The validator allows `x - r` to be slightly negative (down to -1e-12).
-My code ensures `r <= x` (via LP bound `r <= x` since `dist_boundary` uses `x`).
-Actually `dist_boundary` uses `x`. So `r <= x`.
-Thus `x - r >= 0`.
-So it passes easily.
-
-Same for `x + r <= 1`. `r <= 1-x` -> `x+r <= 1`.
-Passes.
-
-Overlap: `dist < r1 + r2 - 1e-12` is BAD.
-So `dist >= r1 + r2 - 1e-12` is required.
-My LP ensures `r1 + r2 <= dist`.
-So `dist >= r1 + r2`.
-Passes.
-
-Looks good.
-
-One optimization: The `compute_radii_and_sum` is called many times.
-Inside `objective`, we call it.
-Inside `minimize`, it's called many times.
-It's fine.
-
-```python
-# Final Code Structure
-import numpy as np
-from scipy.optimize import minimize
-from scipy.optimize import linprog
-
-def run_packing():
-    n_circles = 26
-    
-    def compute_radii_and_sum(centers):
-        n = centers.shape[0]
-        x = centers[:, 0]
-        y = centers[:, 1]
-        
-        # Distance to boundaries
-        dist_boundary = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
-        
-        # Pairwise distances
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
-        
-        # LP: Maximize sum(r) s.t. r_i + r_j <= dist_ij, 0 <= r_i <= dist_boundary_i
-        c_obj = -np.ones(n)
-        bounds = [(0.0, db) for db in dist_boundary]
-        
-        rows, cols = np.triu_indices(n, k=1)
-        m = len(rows)
-        
-        A_ub = np.zeros((m, n))
-        b_ub = dist_matrix[rows, cols]
-        
-        A_ub[np.arange(m), rows] = 1.0
-        A_ub[np.arange(m), cols] = 1.0
-        
-        try:
-            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if res.success:
-                return res.x, np.sum(res.x)
-        except Exception:
-            pass
-            
-        r_safe = np.full(n, 0.0001)
-        return r_safe, 0.0
-
-    def objective(centers_flat):
-        centers = centers_flat.reshape(-1, 2)
-        _, s = compute_radii_and_sum(centers)
-        return -s
-
-    best_sum = 0.0
-    best_centers = None
-    
-    starts = []
-    rng = np.random.RandomState(123)
-    
-    # Hexagonal grid init
-    grid_centers = []
-    count = 0
-    r_idx = 0
-    while count < n_circles:
-        c_idx = 0
-        while count < n_circles and c_idx < 6:
-            x = 0.08 + c_idx * 0.16 + (r_idx % 2) * 0.08
-            y = 0.08 + r_idx * 0.18
-            if 0 <= x <= 1 and 0 <= y <= 1:
-                grid_centers.append([x, y])
-                count += 1
-            c_idx += 1
-        r_idx += 1
-    
-    if len(grid_centers) >= n_circles:
-        h_centers = np.array(grid_centers[:n_circles])
-    else:
-        h_centers = rng.uniform(0.1, 0.9, size=(n_circles, 2))
-        
-    h_centers += rng.uniform(-0.02, 0.02, size=h_centers.shape)
-    starts.append(h_centers.flatten())
-    
-    for _ in range(4):
-        r_centers = rng.uniform(0.05, 0.95, size=(n_circles, 2))
-        starts.append(r_centers.flatten())
-        
-    bounds = [(0.0, 1.0)] * (n_circles * 2)
-    
-    for x0 in starts:
-        try:
-            res = minimize(objective, x0, method='Powell', bounds=bounds, 
-                           options={'maxiter': 1000, 'ftol': 1e-10})
-            if -res.fun > best_sum:
-                best_sum = -res.fun
-                best_centers = res.x.reshape(n_circles, 2)
-        except Exception:
-            pass
-
-    if best_centers is None:
-        best_centers = starts[0].reshape(n_circles, 2)
-        
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    best_centers = np.clip(best_centers, 0.0, 1.0)
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    radii = np.maximum(radii, 0.0)
-    
-    return best_centers, radii, float(np.sum(radii))
-```
-This looks complete.
-
-Wait, `method='highs'` might not be available in very old scipy.
-If it fails, `linprog` defaults to `highs` in 1.6+, but before that `simplex`.
-I can wrap in try/except or just let it fail?
-Actually, if `highs` is not found, it throws.
-I'll add a fallback to `method='simplex'` or just remove method argument to use default.
-Default is `highs` in recent versions.
-I'll remove `method='highs'` to be safe and let scipy choose.
-
-Also `A_ub` construction: `np.triu_indices` is efficient.
-
-Final verification of logic:
-We maximize sum of radii.
-The LP finds the BEST radii for a fixed center configuration.
-The outer optimizer moves centers to improve this sum.
-This is a valid coordinate descent / block coordinate optimization approach (optimizing radii for fixed centers, then centers for fixed radii logic... well, centers affect radii).
-Actually, it's optimizing centers such that the optimal radii sum is maximized.
-This is a valid relaxation of the joint problem?
-No, it's solving $\max_c \max_r \{ \sum r_i \mid (c, r) \text{ feasible} \}$.
-Since the inner problem is feasible for any $c$ (with small $r$), and the inner max is well-defined, this is equivalent to $\max_{c, r} \sum r_i$ s.t. feasible.
-Because for any optimal $(c^*, r^*)$, $r^*$ must be optimal for $c^*$ (if not, we could increase $r$).
-So this decomposition is exact.
-We are just optimizing over $c$ the function $f(c) = \max_r \{ \sum r \mid \text{constraints} \}$.
-This function is concave?
-Distance constraints are concave? No.
-But we are maximizing.
-Anyway, it's a valid strategy.
-
-One risk: Local optima of $f(c)$.
-Multiple restarts help.
-
-The code is ready.
-
-
-<strategy>
-1.  **Problem Decomposition**: The problem is to maximize $\sum r_i$ subject to non-overlap and boundary constraints. This is a non-convex optimization problem. However, for a fixed set of centers $C$, the problem of finding optimal radii $R$ is a Linear Programming (LP) problem: maximize $\sum r_i$ subject to $r_i + r_j \le \|c_i - c_j\|$ and $r_i \le \text{dist}(c_i, \text{boundary})$.
-2.  **Outer Optimization**: Since the radii are determined by the centers, we can define an objective function $F(C) = \text{max\_sum\_radii}(C)$ which solves the LP for a given $C$. We then optimize $C$ to maximize $F(C)$.
-3.  **Solver Selection**: 
-    *   **Inner Loop (LP)**: Use `scipy.optimize.linprog` to solve for radii. This is fast and exact for fixed centers.
-    *   **Outer Loop (Non-linear)**: Use `scipy.optimize.minimize` with the 'Powell' method (derivative-free) to optimize the 52 center coordinates. Powell is robust for non-smooth landscapes.
-4.  **Initialization**: Good initialization is critical. We will use:
-    *   A hexagonal grid pattern (dense packing).
-    *   Multiple random restarts to escape local minima.
-5.  **Execution**: Run the optimization from several starting points and keep the best valid result.
-
-This approach decouples the complex non-linear constraints into a series of LPs, which are easier to handle, while using a robust global/local search for the centers.
+Key steps in the strategy:
+1. **Mathematical Formulation**: Variables are centers $(x_i, y_i)$ and radii $r_i$. Constraints are $r_i \le x_i \le 1-r_i$, $r_i \le y_i \le 1-r_i$, and $\sqrt{(x_i-x_j)^2 + (y_i-y_j)^2} \ge r_i + r_j$.
+2. **Initialization**: Start with a structured hexagonal lattice perturbed by small Gaussian noise. This breaks symmetry and provides a geometrically sound starting point close to high-density packings.
+3. **Optimization**: Use `scipy.optimize.minimize` with the SLSQP method, which handles non-linear inequality constraints robustly. We maximize the sum of radii by minimizing the negative sum.
+4. **Multi-Start & Perturbation**: Run the optimizer multiple times with slight random perturbations to escape local minima and explore the configuration space.
+5. **Validation & Clamping**: After optimization, apply a post-processing step to strictly enforce constraints within the required tolerance, shrinking radii marginally if numerical violations occur. A fallback grid packing ensures validity if optimization fails.
+6. **Top-Level Design**: All helper functions are defined at the module level without closures or lambdas, adhering to strict guidelines.
 </strategy>
 
 ```python
 import numpy as np
 from scipy.optimize import minimize
-from scipy.optimize import linprog
 
-def run_packing():
-    """
-    Packs 26 circles in a unit square to maximize the sum of radii.
-    Strategy: Optimize centers to maximize the sum of radii found by solving an LP
-    for the radii constraints given those centers.
-    """
-    n_circles = 26
-    
-    def compute_radii_and_sum(centers):
-        """
-        Given centers, solves LP to find max sum of radii.
-        Maximize sum(r_i) subject to:
-          1. r_i + r_j <= distance(c_i, c_j) for all i < j
-          2. 0 <= r_i <= distance(c_i, boundary)
-        """
-        n = centers.shape[0]
-        x = centers[:, 0]
-        y = centers[:, 1]
-        
-        # Distance to boundaries: min(x, 1-x, y, 1-y)
-        dist_boundary = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
-        
-        # Pairwise distances
-        # Vectorized difference: (n, 1, 2) - (1, n, 2) -> (n, n, 2)
-        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff**2, axis=2))
-        
-        # LP Setup
-        # Objective: maximize sum(r) -> minimize -sum(r)
-        c_obj = -np.ones(n)
-        
-        # Bounds for r_i: [0, dist_boundary_i]
-        # If dist_boundary is negative (center outside), bounds will be invalid, 
-        # but we handle centers within [0,1] mostly.
-        bounds = [(0.0, max(0.0, db)) for db in dist_boundary]
-        
-        # Inequality constraints: r_i + r_j <= dist_ij
-        # A_ub @ r <= b_ub
-        # We only need upper triangular part (i < j)
-        rows, cols = np.triu_indices(n, k=1)
-        m = len(rows)
-        
-        # Construct A_ub matrix
-        A_ub = np.zeros((m, n))
-        b_ub = dist_matrix[rows, cols]
-        
-        # Set coefficients 1 for pairs
-        A_ub[np.arange(m), rows] = 1.0
-        A_ub[np.arange(m), cols] = 1.0
-        
-        # Solve LP
-        try:
-            # 'highs' is the default in recent scipy, but we specify for clarity if available
-            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if res.success:
-                return res.x, np.sum(res.x)
-        except Exception:
-            pass
-        
-        # Fallback if LP fails (e.g. infeasible bounds)
-        # Return small valid radii
-        r_safe = np.full(n, 0.0001)
-        return r_safe, 0.0
+def _objective(vars, n):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2*n:])
 
-    def objective(centers_flat):
-        """Objective function to minimize (negative sum of radii)."""
-        centers = centers_flat.reshape(-1, 2)
-        _, s = compute_radii_and_sum(centers)
-        return -s
+def _constraints(vars, n):
+    """Constraint function: returns array of inequality constraints >= 0."""
+    c = vars[:2*n].reshape(n, 2)
+    r = vars[2*n:]
+    con = []
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    
+    # Non-overlap constraints: distance >= r_i + r_j
+    diffs = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    con.append(dists[mask] - (r[:, None] + r[None, :])[mask])
+    
+    return np.concatenate(con)
 
-    best_sum = 0.0
-    best_centers = None
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
     
-    # Generate initial configurations
-    starts = []
-    rng = np.random.RandomState(42)
-    
-    # 1. Hexagonal Grid Initialization
-    # Attempt to place circles in a dense hexagonal pattern
-    grid_centers = []
-    count = 0
-    r_idx = 0
-    # Heuristic steps
-    y_step = 0.18
-    x_step = 0.16
-    
-    while count < n_circles:
-        c_idx = 0
-        # Allow variable number of columns per row for hex packing
-        cols_in_row = 6 if r_idx % 2 == 0 else 5 
-        while count < n_circles and c_idx < cols_in_row:
-            x = 0.05 + c_idx * x_step + (r_idx % 2) * (x_step / 2)
-            y = 0.05 + r_idx * y_step
-            if 0 <= x <= 1 and 0 <= y <= 1:
-                grid_centers.append([x, y])
-                count += 1
-            c_idx += 1
-        r_idx += 1
-    
-    if len(grid_centers) >= n_circles:
-        h_centers = np.array(grid_centers[:n_circles])
-    else:
-        # Fallback to random if grid generation is weird
-        h_centers = rng.uniform(0.1, 0.9, size=(n_circles, 2))
+    # Initial configuration: Hexagonal lattice perturbed for symmetry breaking
+    centers = []
+    s = 0.25
+    for i in range(10):
+        y = i * s * np.sqrt(3) / 2
+        if y > 0.9: break
+        offset = (i % 2) * s / 2
+        for j in range(10):
+            x = offset + j * s
+            if x > 0.9: break
+            centers.append([x, y])
+        if len(centers) >= n: break
         
-    # Add random jitter to escape symmetry
-    h_centers += rng.uniform(-0.02, 0.02, size=h_centers.shape)
-    starts.append(h_centers.flatten())
+    centers = np.array(centers[:n])
+    centers += np.random.normal(0, 0.01, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    radii = np.ones(n) * 0.05
+    x0 = np.concatenate([centers.ravel(), radii])
     
-    # 2. Random Initializations
+    cons = {'type': 'ineq', 'fun': _constraints, 'args': (n,)}
+    
+    best_vars = None
+    best_val = -np.inf
+    
+    # Multi-start optimization to escape local minima
     for _ in range(5):
-        r_centers = rng.uniform(0.05, 0.95, size=(n_circles, 2))
-        starts.append(r_centers.flatten())
-        
-    # Bounds for centers: [0, 1]
-    bounds = [(0.0, 1.0)] * (n_circles * 2)
-    
-    # Optimization Loop
-    for x0 in starts:
         try:
-            # Powell method is derivative-free and good for this type of problem
-            res = minimize(objective, x0, method='Powell', bounds=bounds, 
-                           options={'maxiter': 2000, 'ftol': 1e-12})
-            
-            # Check if we improved
-            if -res.fun > best_sum:
-                best_sum = -res.fun
-                best_centers = res.x.reshape(n_circles, 2)
+            res = minimize(_objective, x0, args=(n,), method='SLSQP', 
+                           constraints=cons, options={'maxiter': 500, 'ftol': 1e-10})
+            if res.success:
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_vars = res.x
+            # Perturb for next restart
+            x0 = best_vars + np.random.normal(0, 0.002, len(x0)) if best_vars is not None else x0
         except Exception:
             pass
-
-    # If optimization failed completely, use the first start
-    if best_centers is None:
-        best_centers = starts[0].reshape(n_circles, 2)
+            
+    if best_vars is not None:
+        centers = best_vars[:2*n].reshape(n, 2)
+        radii = best_vars[2*n:]
+    else:
+        # Fallback grid packing if optimization fails
+        grid = np.array([(i/5, j/5) for i in range(6) for j in range(6)])[0:n]
+        centers = grid + np.random.normal(0, 0.02, grid.shape)
+        centers = np.clip(centers, 0.1, 0.9)
+        radii = np.ones(n) * 0.08
         
-    # Final computation of radii
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Safety: Clip centers to [0, 1] just in case
-    best_centers = np.clip(best_centers, 0.0, 1.0)
-    
-    # Recompute radii after clipping (centers might have shifted slightly)
-    radii, final_sum = compute_radii_and_sum(best_centers)
-    
-    # Ensure radii are non-negative
+    # Post-optimization validation and clamping to ensure strict validity
+    for _ in range(20):
+        min_margin = 1.0
+        min_margin = min(min_margin, np.min(centers[:, 0] - radii), np.min(1 - centers[:, 0] - radii))
+        min_margin = min(min_margin, np.min(centers[:, 1] - radii), np.min(1 - centers[:, 1] - radii))
+        
+        diffs = centers[:, None, :] - centers[None, :, :]
+        dists = np.sqrt(np.sum(diffs**2, axis=2))
+        ri_rj = radii[:, None] + radii[None, :]
+        margins = dists - ri_rj
+        np.fill_diagonal(margins, np.inf)
+        min_margin = min(min_margin, np.min(margins))
+        
+        if min_margin < -1e-9:
+            scale = 1.0 + min_margin * 0.95
+            radii *= max(scale, 0.99)
+        else:
+            break
+            
     radii = np.maximum(radii, 0.0)
-    
-    return best_centers, radii, float(np.sum(radii))
+    return centers, radii, float(np.sum(radii))
 ```

@@ -1,0 +1,122 @@
+# sol_000303 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 2823a898) state=1479cff3 sum of radii=2.467005 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(params, n, mu):
+    """Compute negative sum of radii plus penalty for constraint violations."""
+    x = params[0::3]
+    y = params[1::3]
+    r = params[2::3]
+    
+    # Objective: maximize sum of radii -> minimize negative sum
+    loss = -np.sum(r)
+    
+    # Boundary constraints: r <= min(x, 1-x) and r <= min(y, 1-y)
+    dist_walls_x = np.minimum(x, 1.0 - x)
+    dist_walls_y = np.minimum(y, 1.0 - y)
+    
+    v_x = r - dist_walls_x
+    v_x[v_x < 0.0] = 0.0
+    loss += mu * np.sum(v_x**2)
+    
+    v_y = r - dist_walls_y
+    v_y[v_y < 0.0] = 0.0
+    loss += mu * np.sum(v_y**2)
+    
+    # Pairwise constraints: r_i + r_j <= dist(c_i, c_j)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    np.fill_diagonal(dist, np.inf)  # Ignore self-distances
+    
+    r_sum = r[:, None] + r[None, :]
+    v_pair = r_sum - dist
+    v_pair[v_pair < 0.0] = 0.0
+    
+    # Sum over upper triangle to avoid double counting
+    idx = np.triu_indices(n, k=1)
+    loss += mu * np.sum(v_pair[idx]**2)
+    
+    return loss
+
+def get_initial_config(n_circles):
+    """Generate a perturbed hexagonal lattice initialization."""
+    np.random.seed(42)
+    pts = []
+    y = 0.12
+    row_idx = 0
+    while len(pts) < n_circles:
+        x = 0.12 + (0.075 if row_idx % 2 == 1 else 0.0)
+        while x <= 0.90 and len(pts) < n_circles:
+            pts.append([x, y])
+            x += 0.15
+        y += 0.13
+        row_idx += 1
+        
+    pts = np.array(pts[:n_circles])
+    pts += np.random.uniform(-0.02, 0.02, pts.shape)
+    pts = np.clip(pts, 0.05, 0.95)
+    
+    r_init = np.full(n_circles, 0.06)
+    return pts, r_init
+
+def run_packing():
+    n = 26
+    pts, r_init = get_initial_config(n)
+    
+    # Flatten parameters: [x1, y1, r1, x2, y2, r2, ...]
+    params = np.zeros(3 * n)
+    params[0::3] = pts[:, 0]
+    params[1::3] = pts[:, 1]
+    params[2::3] = r_init
+    
+    # Bounds: x,y in [0,1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    # Continuation: increase penalty weight gradually
+    mu_sequence = [1000, 5000, 20000, 100000]
+    
+    for mu in mu_sequence:
+        res = minimize(
+            objective, 
+            params, 
+            args=(n, mu), 
+            method='L-BFGS-B', 
+            bounds=bounds, 
+            options={'ftol': 1e-10, 'maxiter': 1500, 'disp': False}
+        )
+        params = res.x
+        
+    centers = np.column_stack((params[0::3], params[1::3]))
+    radii = params[2::3].copy()
+    
+    # Post-processing: enforce boundary constraints strictly
+    radii = np.minimum(radii, centers[:, 0])
+    radii = np.minimum(radii, 1.0 - centers[:, 0])
+    radii = np.minimum(radii, centers[:, 1])
+    radii = np.minimum(radii, 1.0 - centers[:, 1])
+    radii = np.maximum(radii, 0.0)
+    
+    # Fallback: slightly reduce radii if any overlaps persist (numerical safety)
+    for _ in range(5):
+        overlaps = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                if d < radii[i] + radii[j] - 1e-8:
+                    scale = d / (radii[i] + radii[j])
+                    radii[i] *= scale
+                    radii[j] *= scale
+                    overlaps = True
+        if not overlaps:
+            break
+            
+    sum_radii = float(np.sum(radii))
+    return centers, radii, sum_radii

@@ -1,0 +1,486 @@
+# sol_000318 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 4e7533ea) state=587b40b5 sum of radii=2.611939 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+
+def get_initial_hexagonal_positions(n):
+    """
+    Generates n positions in a hexagonal lattice pattern inside [0,1]x[0,1].
+    """
+    # We try to fit n circles. 
+    # Hexagonal packing density is high.
+    # We can estimate a radius r_est based on area. 
+    # Area per circle approx 1/n. pi*r^2 approx 1/n => r approx 1/sqrt(pi*n).
+    # But packing efficiency ~ 0.9.
+    # Let's just generate a grid and pick points.
+    
+    # A simple approach: generate points on a triangular lattice
+    # v1 = (1, 0), v2 = (0.5, sqrt(3)/2)
+    # Scale lattice to fit in unit square.
+    
+    # Let's try to fit a block of circles.
+    # Estimate rows and cols.
+    # For hex packing, area of fundamental cell is sqrt(3)/2 * (2r)^2 = 2*sqrt(3)*r^2?
+    # No, area per circle is sqrt(3)/2 * d^2 where d=2r? No.
+    # Area per circle in hex packing is sqrt(3) * r^2? 
+    # Unit cell contains 1 circle (effectively). Height sqrt(3)r, Width 2r?
+    # Area = 2r * sqrt(3)r = 2sqrt(3)r^2 approx 3.46 r^2.
+    # So n * 3.46 r^2 approx 1 => r approx 1/sqrt(3.46 * n).
+    # For n=26, r approx 1/sqrt(90) approx 0.105.
+    
+    # Let's construct a lattice with spacing slightly less than 0.2 to allow optimization room.
+    # Or just random shuffle of a dense grid.
+    
+    points = []
+    # Try a hexagonal arrangement
+    # Rows of circles.
+    # Row 0: y = r
+    # Row 1: y = r + sqrt(3)r, x shifted by r
+    # etc.
+    
+    # We don't know r. Let's assume r=0.1 for layout generation, then scale.
+    r_layout = 0.1
+    dx = 2 * r_layout
+    dy = math.sqrt(3) * r_layout
+    
+    # Generate grid points
+    candidates = []
+    y = r_layout
+    row_idx = 0
+    while y <= 1 - r_layout:
+        x = r_layout
+        # Check if row is shifted
+        shift = 0
+        if row_idx % 2 == 1:
+            shift = r_layout # shift by r means x starts at 2r? 
+            # Wait, standard hex:
+            # Row 0: r, 3r, 5r... (x = r + k*2r)
+            # Row 1: 2r, 4r, 6r... (x = 2r + k*2r) -> shift is r relative to r? 
+            # Actually distance between (r, y) and (2r, y+dy) is sqrt(r^2 + 3r^2) = 2r. Correct.
+            # So x start is 2r for odd rows.
+        
+        while x <= 1 - r_layout:
+            candidates.append((x, y))
+            x += dx
+        y += dy
+        row_idx += 1
+        
+    if len(candidates) >= n:
+        # Select n points. To be uniform, maybe just take first n or random.
+        # Taking first n from top-left might cluster them.
+        # Let's shuffle or pick based on some criterion.
+        # Actually, for optimization, a regular pattern is good.
+        # But we need to fit n.
+        # If we have too many, we can just pick the first n.
+        # But maybe the layout r_layout is too small?
+        # If we picked r_layout=0.1, we might have many points.
+        # We can just take the first n.
+        initial_centers = [candidates[i] for i in range(n)]
+    else:
+        # Fallback to random or grid
+        initial_centers = np.random.uniform(r_layout, 1-r_layout, (n, 2))
+        
+    return np.array(initial_centers)
+
+def validate_packing(centers, radii):
+    """
+    Validate that circles don't overlap and are inside the unit square
+    """
+    n = centers.shape[0]
+    # Check for NaN values
+    if np.isnan(centers).any():
+        return False
+    if np.isnan(radii).any():
+        return False
+    # Check if radii are nonnegative
+    for i in range(n):
+        if radii[i] < -1e-9: # Allow tiny negative due to float error? No, strict check in prompt is < 0.
+            # The prompt checks < 0.
+            return False 
+        elif np.isnan(radii[i]):
+            return False
+    # Check bounds
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            return False
+    # Check overlaps
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:
+                return False
+    return True
+
+def run_packing():
+    n = 26
+    
+    # Optimization variables: 
+    # We will optimize centers (2n) and radii (n). Total 3n = 78 variables.
+    # But to simplify constraints, let's optimize centers and radii directly.
+    
+    # Initial guess
+    # Use hexagonal packing initialization
+    centers_init = get_initial_hexagonal_positions(n)
+    
+    # Initial radii: small enough to be valid
+    # Check min distance to boundary and neighbors
+    radii_init = np.full(n, 0.05) # Start small
+    
+    # Adjust radii to be valid for initial centers
+    for i in range(n):
+        max_r = min(centers_init[i, 0], 1 - centers_init[i, 0], 
+                    centers_init[i, 1], 1 - centers_init[i, 1])
+        for j in range(n):
+            if i != j:
+                dist = np.linalg.norm(centers_init[i] - centers_init[j])
+                max_r = min(max_r, dist / 2) # Rough estimate, actual constraint is dist >= r_i + r_j
+        radii_init[i] = max(0.01, max_r * 0.9) # Scale down to be safe
+        
+    # Flatten variables: [x0, y0, r0, x1, y1, r1, ...]
+    # Or [x_all, y_all, r_all]
+    # Let's use vectorized approach in constraints if possible, but scipy needs scalar constraints usually or array.
+    
+    # Let's define the optimization problem
+    # Objective: minimize -sum(radii)
+    
+    def objective(vars_flat):
+        # vars_flat shape: 3n
+        # Order: x0, y0, x1, y1, ... r0, r1, ...
+        # Actually easier: x (n,2), r (n)
+        centers = vars_flat[:2*n].reshape(n, 2)
+        radii = vars_flat[2*n:]
+        return -np.sum(radii)
+
+    def constraint_box(vars_flat):
+        centers = vars_flat[:2*n].reshape(n, 2)
+        radii = vars_flat[2*n:]
+        # x - r >= 0 => x - r >= 0
+        # 1 - x - r >= 0
+        # y - r >= 0
+        # 1 - y - r >= 0
+        cons = []
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            cons.append(x - r)
+            cons.append(1.0 - x - r)
+            cons.append(y - r)
+            cons.append(1.0 - y - r)
+        return np.array(cons)
+
+    def constraint_dist(vars_flat):
+        centers = vars_flat[:2*n].reshape(n, 2)
+        radii = vars_flat[2*n:]
+        cons = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist_sq = np.sum((centers[i] - centers[j])**2)
+                r_sum = radii[i] + radii[j]
+                # dist >= r_sum => dist^2 >= r_sum^2
+                # But dist^2 - r_sum^2 >= 0 is valid constraint
+                # However, dist^2 - r_sum^2 >= 0 is non-convex?
+                # Yes, but scipy handles it.
+                # Actually, sqrt(dist_sq) - r_sum >= 0 is safer for gradient?
+                # But sqrt is smooth for dist>0.
+                # Let's use squared form to avoid sqrt, but be careful with signs.
+                # dist_sq - r_sum^2 >= 0
+                # Note: if dist_sq < r_sum^2, this is negative.
+                # Is dist^2 - r^2 convex? No.
+                # But it's a valid inequality constraint.
+                cons.append(dist_sq - r_sum**2)
+        return np.array(cons)
+
+    # Bounds
+    # x in [0, 1], y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+    for i in range(n):
+        bounds.append((0.0, 0.5)) # r
+        
+    # Initial point
+    x0 = np.zeros(3*n)
+    x0[:2*n] = centers_init.flatten()
+    x0[2*n:] = radii_init
+    
+    # Constraints
+    cons_box = {'type': 'ineq', 'fun': constraint_box}
+    cons_dist = {'type': 'ineq', 'fun': constraint_dist}
+    
+    # Try to optimize
+    # SLSQP is good for inequality constraints
+    # But with ~450 constraints, it might be slow.
+    # Let's try.
+    
+    # To improve performance, maybe reduce constraints?
+    # But we need validity.
+    
+    # Let's run optimization
+    try:
+        res = opt.minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=[cons_box, cons_dist],
+                           options={'maxiter': 2000, 'ftol': 1e-9})
+        
+        if res.success:
+            centers_opt = res.x[:2*n].reshape(n, 2)
+            radii_opt = res.x[2*n:]
+        else:
+            # Fallback to initial if optimization fails?
+            # Or just take the result
+            centers_opt = res.x[:2*n].reshape(n, 2)
+            radii_opt = res.x[2*n:]
+            
+    except Exception as e:
+        # If optimization crashes, return initial valid packing
+        centers_opt = centers_init
+        radii_opt = radii_init
+
+    # Post-processing: Clean up tiny violations or negative radii
+    # Clamp radii to be non-negative
+    radii_opt = np.maximum(radii_opt, 0.0)
+    
+    # Ensure centers are valid with respect to radii
+    # If a circle is slightly out of bounds due to numerical error, push it in
+    # But SLSQP should respect bounds.
+    
+    # Validate
+    # The provided validate_packing function is strict.
+    # We should ensure our output passes it.
+    
+    # One potential issue: SLSQP might satisfy constraints but floating point errors in validation might fail?
+    # The validation allows 1e-12 error.
+    
+    # Let's do a quick check and fix if needed.
+    # If radii are very small, maybe increase them?
+    # But optimizer maximizes sum.
+    
+    # If the result is invalid (shouldn't be), we might need to adjust.
+    # But let's trust the optimizer.
+    
+    # There is a risk that SLSQP gets stuck or fails to satisfy dist constraints strictly.
+    # Maybe run a second pass with tighter constraints or penalty?
+    
+    # Let's try a simple heuristic adjustment:
+    # If any overlap detected, reduce radii slightly?
+    # But we want max sum.
+    
+    # Let's check validity of result
+    # We can't call validate_packing inside run_packing? 
+    # The prompt says "We will run the below validation function".
+    # I can call it or replicate logic.
+    
+    # Let's implement a quick check
+    valid = True
+    for i in range(n):
+        x, y = centers_opt[i]
+        r = radii_opt[i]
+        if x < 0 or y < 0 or x > 1 or y > 1:
+            valid = False
+        if r < 0:
+            valid = False
+        if x - r < -1e-12 or x + r > 1 + 1e-12:
+            valid = False
+        if y - r < -1e-12 or y + r > 1 + 1e-12:
+            valid = False
+        
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(centers_opt[i] - centers_opt[j])
+            if d < radii_opt[i] + radii_opt[j] - 1e-12:
+                valid = False
+    
+    if not valid:
+        # Fallback: Scale down radii uniformly until valid
+        scale = 1.0
+        step = 0.95
+        for _ in range(100):
+            radii_opt *= step
+            # Re-check
+            is_valid = True
+            for i in range(n):
+                x, y = centers_opt[i]
+                r = radii_opt[i]
+                if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+                    is_valid = False
+                    break
+            if is_valid:
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.linalg.norm(centers_opt[i] - centers_opt[j])
+                        if d < radii_opt[i] + radii_opt[j] - 1e-12:
+                            is_valid = False
+                            break
+                    if not is_valid: break
+            if is_valid:
+                valid = True
+                break
+    
+    sum_radii = np.sum(radii_opt)
+    return centers_opt, radii_opt, sum_radii
+
+# To ensure the function is robust, let's add a multi-start strategy inside run_packing
+# But the structure requires a single function.
+# I can wrap the logic.
+
+def run_packing():
+    n = 26
+    
+    # Helper for optimization
+    def solve_from_init(centers_init, radii_init):
+        x0 = np.zeros(3*n)
+        x0[:2*n] = centers_init.flatten()
+        x0[2*n:] = radii_init
+        
+        def objective(vars_flat):
+            radii = vars_flat[2*n:]
+            return -np.sum(radii)
+
+        def constraint_box(vars_flat):
+            centers = vars_flat[:2*n].reshape(n, 2)
+            radii = vars_flat[2*n:]
+            cons = []
+            for i in range(n):
+                x, y = centers[i]
+                r = radii[i]
+                cons.append(x - r)
+                cons.append(1.0 - x - r)
+                cons.append(y - r)
+                cons.append(1.0 - y - r)
+            return np.array(cons)
+
+        def constraint_dist(vars_flat):
+            centers = vars_flat[:2*n].reshape(n, 2)
+            radii = vars_flat[2*n:]
+            cons = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    # Use a small epsilon to keep sqrt smooth if needed, but squared is fine
+                    # However, dist^2 - (r1+r2)^2 >= 0
+                    # If dist is very small, gradient might be 0?
+                    # No, gradient w.r.t x is 2(x_i - x_j).
+                    dx = centers[i, 0] - centers[j, 0]
+                    dy = centers[i, 1] - centers[j, 1]
+                    dist_sq = dx*dx + dy*dy
+                    r_sum = radii[i] + radii[j]
+                    cons.append(dist_sq - r_sum**2)
+            return np.array(cons)
+
+        bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+        
+        try:
+            res = opt.minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                               constraints=[{'type': 'ineq', 'fun': constraint_box},
+                                            {'type': 'ineq', 'fun': constraint_dist}],
+                               options={'maxiter': 1000, 'ftol': 1e-10, 'disp': False})
+            return res
+        except:
+            return None
+
+    # Strategy 1: Hexagonal Grid
+    # Generate points
+    r_est = 0.09
+    pts = []
+    y = r_est
+    row = 0
+    while y <= 1 - r_est:
+        x = r_est
+        if row % 2 == 1: x += r_est
+        while x <= 1 - r_est:
+            pts.append([x, y])
+            x += 2 * r_est
+        y += math.sqrt(3) * r_est
+        row += 1
+    
+    # If not enough points, fallback
+    if len(pts) < n:
+        # Fill with random?
+        while len(pts) < n:
+            pts.append([np.random.rand(), np.random.rand()])
+    
+    centers1 = np.array(pts[:n])
+    radii1 = np.full(n, 0.01)
+    
+    # Strategy 2: Random valid placement
+    centers2 = np.random.uniform(0.1, 0.9, (n, 2))
+    radii2 = np.full(n, 0.01)
+    
+    best_res = None
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    configs = [(centers1, radii1), (centers2, radii2)]
+    
+    for c_init, r_init in configs:
+        res = solve_from_init(c_init, r_init)
+        if res is not None:
+            centers_opt = res.x[:2*n].reshape(n, 2)
+            radii_opt = res.x[2*n:]
+            
+            # Check validity and fix
+            # If invalid, scale down
+            # Check overlap
+            valid = True
+            for i in range(n):
+                for j in range(i+1, n):
+                    d = np.linalg.norm(centers_opt[i] - centers_opt[j])
+                    if d < radii_opt[i] + radii_opt[j] - 1e-10:
+                        valid = False
+                        break
+                if not valid: break
+            
+            if not valid:
+                # Scale down
+                max_overlap = 0
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.linalg.norm(centers_opt[i] - centers_opt[j])
+                        overlap = (radii_opt[i] + radii_opt[j]) - d
+                        if overlap > max_overlap:
+                            max_overlap = overlap
+                # Reduce radii by factor to clear overlap
+                # If r -> alpha*r, sum radii -> alpha * sum. Overlap -> alpha * sum_r - d.
+                # We need alpha * sum_r <= d => alpha <= d / sum_r.
+                # So alpha = min(d / sum_r) over all pairs.
+                # Also check boundaries.
+                
+                alpha = 1.0
+                # Boundary check
+                for i in range(n):
+                    x, y = centers_opt[i]
+                    r = radii_opt[i]
+                    # x - r >= 0 => r <= x
+                    # x + r <= 1 => r <= 1-x
+                    # etc
+                    max_r_i = min(x, 1-x, y, 1-y)
+                    if r > max_r_i + 1e-9:
+                        alpha = min(alpha, max_r_i / r)
+                
+                # Distance check
+                for i in range(n):
+                    for j in range(i+1, n):
+                        d = np.linalg.norm(centers_opt[i] - centers_opt[j])
+                        r_sum = radii_opt[i] + radii_opt[j]
+                        if r_sum > d + 1e-9:
+                            alpha = min(alpha, d / r_sum)
+                
+                radii_opt *= alpha
+            
+            # Final clamp
+            radii_opt = np.maximum(radii_opt, 0.0)
+            
+            s = np.sum(radii_opt)
+            if s > best_sum:
+                best_sum = s
+                best_centers = centers_opt
+                best_radii = radii_opt
+
+    return best_centers, best_radii, best_sum

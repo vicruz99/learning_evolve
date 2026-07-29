@@ -1,134 +1,158 @@
 # sol_000210 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state cccf4974) state=6849ce22 sum of radii=1.185165 correctness=1.0
+# generation=0 parent=seed (state c1389c4d) state=ba4c417c sum of radii=2.166667 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import linprog
+from scipy.optimize import minimize
+import math
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+def run_packing():
+    """
+    Packs 26 circles in a unit square to maximize sum of radii.
+    """
     n = 26
-    num_iterations = 1000
     
-    # 1. Initialize centers in a dense 5x5 grid with one extra circle
-    grid_coords = []
-    step = 0.2
-    for i in range(5):
-        for j in range(5):
-            grid_coords.append((0.1 + i * step, 0.1 + j * step))
+    # 1. Initialization: Hexagonal Grid
+    # We define a layout to get close to a square aspect ratio.
+    # Layout: 6, 5, 6, 5, 4 circles per row.
+    # This sums to 26.
     
-    # Add 26th circle in the center of a gap or center of square
-    # Center of square is (0.5, 0.5), which is already in the grid (i=2, j=2)
-    # So we shift one slightly or place in a different configuration
-    # Let's use a 6x5 grid pattern compressed to fit better
-    centers = np.zeros((n, 2))
+    rows_config = [6, 5, 6, 5, 4]
+    rows = []
+    y = 0
     
-    # 5 rows of 5 circles + 1 extra in middle
-    # To make space, we scale the grid slightly to fit 26 in [0,1]
-    # Actually, let's just place them in a 6x5 grid logic
-    # 6 cols, 5 rows = 30 spots, we pick 26.
-    # Spacing 1/5 = 0.2. 
-    # x in {0.1, 0.3, 0.5, 0.7, 0.9, 1.1? No}
-    # Let's use linspace for 6 points: 0.1, 0.3, 0.5, 0.7, 0.9 -> 5 points.
-    # To fit 6, spacing 0.2, width 1.0? No, 1.0/6?
-    # Let's just use random valid positions to avoid grid bias
-    np.random.seed(42)
-    centers = np.random.rand(n, 2)
-    # Scale to center them roughly
-    centers = (centers - 0.5) * 0.8 + 0.5
+    # Lattice spacing parameters (relative)
+    # Horizontal spacing = 2, Vertical spacing = sqrt(3) for hexagonal packing
+    # Shift alternate rows by 1 unit
     
-    best_sum = 0.0
-    best_centers = centers.copy()
-    best_radii = np.zeros(n)
-    
-    for it in range(num_iterations):
-        # 2. Solve LP to find optimal radii for current centers
-        c_obj = np.ones(n) * -1  # Maximize sum(r) => Minimize -sum(r)
+    for i, count in enumerate(rows_config):
+        row_points = []
+        # Shift odd rows (index 1, 3) by 1 unit in x
+        shift = 1 if i % 2 == 1 else 0
         
-        A_ub = []
-        b_ub = []
+        # To center the row horizontally within the cluster, we adjust start x
+        # A row with 'count' circles spans (count-1)*2 units.
+        # We want to align centers. 
+        # Let's just place them and we will center the whole cluster later.
+        # However, for the shifted rows, to maintain hexagonal packing,
+        # the centers should be at x = shift, shift+2, ...
         
-        # Boundary constraints: r_i <= x_i, r_i <= 1-x_i, r_i <= y_i, r_i <= 1-y_i
-        for i in range(n):
-            x, y = centers[i]
-            # r_i <= x
-            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(x)
-            # r_i <= 1 - x
-            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(1.0 - x)
-            # r_i <= y
-            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(y)
-            # r_i <= 1 - y
-            row = np.zeros(n); row[i] = 1.0; A_ub.append(row); b_ub.append(1.0 - y)
-            
-        # Pairwise constraints: r_i + r_j <= dist(i, j)
-        dists = np.zeros((n, n))
+        # Let's generate raw coordinates
+        for j in range(count):
+            x = j * 2 + shift
+            row_points.append([x, y])
+        
+        rows.append(row_points)
+        y += math.sqrt(3) # Move to next row
+        
+    # Flatten the list of points
+    initial_centers = np.array([pt for row in rows for pt in row])
+    
+    # 2. Scaling and Centering to fit in [0,1]x[0,1] roughly
+    # Find bounding box of initial centers
+    min_x, min_y = initial_centers.min(axis=0)
+    max_x, max_y = initial_centers.max(axis=0)
+    
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    # We want to fit this shape into the square.
+    # The circles will have radius r. The centers must be in [r, 1-r].
+    # So the span of centers must be <= 1 - 2r.
+    # Also distance between centers >= 2r.
+    # In our lattice, min distance is 2.
+    # Let scale factor be s. New distance = 2s. So r = s.
+    # New span = width * s.
+    # Constraint: width * s <= 1 - 2s  =>  s(width + 2) <= 1 => s <= 1/(width+2)
+    # Similarly for height.
+    
+    # Calculate max scale based on width and height constraints
+    # Note: The "width" of the cluster of centers is width.
+    # The circles extend r outside.
+    # Total width occupied = width*s + 2*r = width*s + 2*s = s(width+2).
+    
+    scale_w = 1.0 / (width + 2.0)
+    scale_h = 1.0 / (height + 2.0)
+    scale = min(scale_w, scale_h)
+    
+    # Apply scale and center
+    # First scale relative to (0,0) or just shift
+    # Center the cluster in [0,1]
+    
+    # Shift to origin
+    centered_centers = initial_centers - [min_x, min_y]
+    # Scale
+    scaled_centers = centered_centers * scale
+    # Shift to center of square
+    current_span_x = width * scale
+    current_span_y = height * scale
+    offset_x = (1.0 - current_span_x) / 2.0
+    offset_y = (1.0 - current_span_y) / 2.0
+    
+    centers = scaled_centers + [offset_x, offset_y]
+    radii = np.full(n, scale) # Initial radius estimate
+    
+    # 3. Optimization
+    # We want to maximize the minimum distance between centers.
+    # Equivalent to maximizing r such that dist(i,j) >= 2r.
+    # We can optimize the positions to maximize min_dist, then set r = min_dist/2.
+    # However, to make it a single optimization, we can maximize a function that penalizes overlaps.
+    # Or simply maximize the minimum distance.
+    
+    # Let's use a barrier method or simple repulsion.
+    # Define a function that returns the negative of the minimum distance.
+    # We want to minimize this (maximize min dist).
+    
+    def objective(vars):
+        # vars is flattened array of 2*N coordinates
+        pts = vars.reshape(n, 2)
+        
+        min_d = float('inf')
+        # Check distances
         for i in range(n):
             for j in range(i + 1, n):
-                d = np.sqrt(np.sum((centers[i] - centers[j])**2))
-                dists[i, j] = d
-                dists[j, i] = d
-                row = np.zeros(n); row[i] = 1.0; row[j] = 1.0; A_ub.append(row); b_ub.append(d)
-                
-        A_ub = np.array(A_ub)
-        b_ub = np.array(b_ub)
-        bounds = [(0, None)] * n
+                d = np.sqrt(np.sum((pts[i] - pts[j])**2))
+                if d < min_d:
+                    min_d = d
         
-        # Use Highs solver for speed and stability
-        try:
-            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        except:
-            continue
-            
-        if res.success:
-            radii = res.x
-            current_sum = -res.fun
-            
-            if current_sum > best_sum:
-                best_sum = current_sum
-                best_centers = centers.copy()
-                best_radii = radii.copy()
-                
-            # 3. Compute Gradient from LP marginals (shadow prices)
-            # Marginals indicate how much the objective (min -sum r) changes per unit increase in RHS.
-            # For our max problem, sum_radii sensitivity = marginal.
-            grad_centers = np.zeros((n, 2))
-            marginal_idx = 0
-            
-            # Boundary constraints (4 per circle)
-            for i in range(n):
-                x, y = centers[i]
-                
-                # r_i <= x_i: marginal m. dx_i = 1. Gradient += m * (1, 0)
-                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 0] += m; marginal_idx += 1
-                # r_i <= 1 - x_i: marginal m. d(1-x_i) = -1. Gradient += m * (-1, 0)
-                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 0] -= m; marginal_idx += 1
-                # r_i <= y_i: marginal m. dy_i = 1. Gradient += m * (0, 1)
-                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 1] += m; marginal_idx += 1
-                # r_i <= 1 - y_i: marginal m. d(1-y_i) = -1. Gradient += m * (0, -1)
-                m = res.ineqlin.marginals[marginal_idx]; grad_centers[i, 1] -= m; marginal_idx += 1
-                
-            # Pairwise constraints (n*(n-1)/2 constraints)
-            # r_i + r_j <= dist(i, j). Gradient of dist wrt c_i is (c_i - c_j) / dist
-            # Note: We need to match the order in A_ub. A_ub was built with i < j.
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = dists[i, j]
-                    if d < 1e-12: continue 
-                    
-                    m = res.ineqlin.marginals[marginal_idx]
-                    dir_ij = (centers[i] - centers[j]) / d
-                    
-                    grad_centers[i] += m * dir_ij
-                    grad_centers[j] -= m * dir_ij
-                    marginal_idx += 1
-            
-            # 4. Update centers
-            # Learning rate decay
-            lr = 0.01 / (1 + it * 0.005)
-            centers = centers + lr * grad_centers
-            
-            # Clip to [0, 1]
-            centers = np.clip(centers, 0.0, 1.0)
-            
-    return best_centers, best_radii, float(best_sum)
+        return -min_d # Minimize negative min_dist -> Maximize min_dist
+
+    # Constraints: points must be within [0,1]
+    # Bounds for x, y are [0, 1]
+    bounds = [(0, 1)] * (2 * n)
+    
+    # Initial guess
+    x0 = centers.flatten()
+    
+    # Run optimization
+    # Using 'L-BFGS-B' with bounds
+    res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': 1000, 'ftol': 1e-9})
+    
+    optimized_centers = res.x.reshape(n, 2)
+    
+    # Calculate final radius
+    min_dist = float('inf')
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.sqrt(np.sum((optimized_centers[i] - optimized_centers[j])**2))
+            if d < min_dist:
+                min_dist = d
+    
+    # Radius is half the min distance, but also constrained by boundaries
+    # r <= x, r <= 1-x, r <= y, r <= 1-y for all points
+    # r <= min_dist / 2
+    
+    boundary_dist = float('inf')
+    for i in range(n):
+        x, y = optimized_centers[i]
+        boundary_dist = min(boundary_dist, x, 1-x, y, 1-y)
+    
+    r = min(min_dist / 2.0, boundary_dist)
+    
+    radii = np.full(n, r)
+    
+    return optimized_centers, radii, np.sum(radii)
+
+# Note: The validation function is provided separately, so we just define run_packing.

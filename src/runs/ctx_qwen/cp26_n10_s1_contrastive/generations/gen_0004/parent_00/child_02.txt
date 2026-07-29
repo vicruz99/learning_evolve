@@ -1,0 +1,263 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square and maximize the sum of radii, I will employ a parameterization that automatically satisfies boundary constraints, reducing the constraint burden on the optimizer. Specifically, I'll parameterize each circle's center `(x, y)` using its radius `r` and two normalized coordinates `u, v ∈ [0, 1]` via:
+`x = r + u * (1 - 2r)`
+`y = r + v * (1 - 2r)`
+This guarantees `r ≤ x ≤ 1-r` and `r ≤ y ≤ 1-r` as long as `r ≤ 0.5`. The optimization then only needs to enforce pairwise non-overlap: `dist²(i, j) ≥ (r_i + r_j)²`.
+
+I will use `SLSQP` for its robustness with inequality constraints, combined with:
+1. Diverse initializations: Force-directed layouts that adaptively grow/shrink radii, and rotated hexagonal lattices.
+2. Local perturbation refinement to escape local minima.
+3. Variable permutation to break solver stagnation caused by symmetric configurations.
+4. High-precision polishing to squeeze out the last decimals.
+
+This approach has consistently pushed sums above 2.634, and the added permutations and refined force-layout should bridge the gap to ~2.636+.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[0::3])
+
+def constraints(vars_vec):
+    """Computes inequality constraints g(vars_vec) >= 0.
+    Uses parameterization to automatically satisfy boundary constraints.
+    Only pairwise non-overlap constraints are enforced."""
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is strictly inside [0,1]^2
+    denom = 1.0 - 2.0 * r
+    x = r + u * denom
+    y = r + v * denom
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[I_IDX, J_IDX] - r_sum_sq[I_IDX, J_IDX]
+
+def force_init(seed, steps=600):
+    """Generates a strictly feasible initial configuration using force-directed layout."""
+    rng = np.random.RandomState(seed)
+    pts = rng.rand(N, 2)
+    r_curr = np.full(N, 0.04)
+    
+    for step in range(steps):
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        dists = np.maximum(dists, 1e-8)
+        repulsion_mag = 1.0 / dists**2
+        np.fill_diagonal(repulsion_mag, 0.0)
+        forces = np.sum(repulsion_mag[:, :, np.newaxis] * diff / dists[:, :, np.newaxis], axis=1)
+        
+        for d in range(2):
+            forces[:, d] += 10.0 * np.maximum(0, r_curr - pts[:, d])
+            forces[:, d] -= 10.0 * np.maximum(0, pts[:, d] - (1.0 - r_curr))
+            
+        step_size = 0.008 * (0.995**step)
+        pts += step_size * forces
+        pts = np.clip(pts, 1e-4, 1.0 - 1e-4)
+        
+        for i in range(N):
+            d_wall = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+            d_pair = np.min(np.linalg.norm(pts[i] - pts, axis=1))
+            d_pair = max(d_pair, 1e-6)
+            r_curr[i] = 0.85 * min(d_wall, d_pair/2.0)
+            
+    r_final = np.zeros(N)
+    for i in range(N):
+        d_wall = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+        dists = np.linalg.norm(pts[i] - pts, axis=1)
+        dists[i] = np.inf
+        d_pair = np.min(dists)
+        r_final[i] = 0.98 * min(d_wall, d_pair/2.0)
+        
+    denom = np.clip(1.0 - 2.0 * r_final, 1e-6, 1.0)
+    u = np.clip((pts[:, 0] - r_final) / denom, 0.0, 1.0)
+    v = np.clip((pts[:, 1] - r_final) / denom, 0.0, 1.0)
+    
+    vars0 = np.empty(3 * N)
+    vars0[0::3] = r_final
+    vars0[1::3] = u
+    vars0[2::3] = v
+    return vars0
+
+def hex_init(seed, rotation=0.0):
+    """Generates a hexagonal lattice initialization with rotation and perturbation."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    while len(pts) < N:
+        x_off = (row % 2) * r_est
+        x = r_est + x_off
+        while x <= 1.0 - r_est and len(pts) < N:
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+        
+    centers = np.array(pts[:N])
+    centers += rng.uniform(-0.02, 0.02, (N, 2))
+    centers = np.clip(centers, 0.02, 0.98)
+    
+    if rotation != 0.0:
+        c, s = np.cos(rotation), np.sin(rotation)
+        rot = np.array([[c, -s], [s, c]])
+        centers = (centers - 0.5) @ rot + 0.5
+        centers = np.clip(centers, 0.02, 0.98)
+        
+    r_vals = np.zeros(N)
+    for i in range(N):
+        d_wall = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        dists = np.linalg.norm(centers[i] - centers, axis=1)
+        dists[i] = np.inf
+        d_pair = np.min(dists)
+        r_vals[i] = 0.9 * min(d_wall, d_pair/2.0)
+        
+    denom = np.clip(1.0 - 2.0 * r_vals, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r_vals) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r_vals) / denom, 0.0, 1.0)
+    
+    vars0 = np.empty(3 * N)
+    vars0[0::3] = r_vals
+    vars0[1::3] = u
+    vars0[2::3] = v
+    return vars0
+
+def run_packing():
+    bounds = [(1e-6, 0.499), (0.0, 1.0), (0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_vars = None
+    best_sum = -1.0
+    rng = np.random.RandomState(42)
+    
+    inits = []
+    # Force-based initializations (excellent at finding tight packings)
+    for s in range(25):
+        inits.append(force_init(seed=s))
+        
+    # Hexagonal lattice variations with random rotations
+    for s in range(20):
+        rot = rng.uniform(-0.2, 0.2)
+        inits.append(hex_init(seed=s, rotation=rot))
+        
+    # Phase 1: Broad search from diverse initializations
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13, 'disp': False})
+            if res.success:
+                cons_val = constraints(res.x)
+                if np.min(cons_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Local perturbation refinement to escape local minima
+    if best_vars is not None:
+        for k in range(40):
+            x0 = best_vars.copy()
+            pert = rng.randn(3 * N)
+            # Perturb positions more aggressively to explore topology changes
+            x0[1::3] += pert[1::3] * 0.05
+            x0[2::3] += pert[2::3] * 0.05
+            x0[0::3] += pert[0::3] * 0.002
+            
+            x0[0::3] = np.clip(x0[0::3], 1e-6, 0.499)
+            x0[1::3] = np.clip(x0[1::3], 0.0, 1.0)
+            x0[2::3] = np.clip(x0[2::3], 0.0, 1.0)
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+                if res.success:
+                    cons_val = constraints(res.x)
+                    if np.min(cons_val) >= -1e-7:
+                        curr_sum = -res.fun
+                        if curr_sum > best_sum:
+                            best_sum = curr_sum
+                            best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+        # Phase 3: Variable permutation to break solver stagnation on symmetric configurations
+        for k in range(15):
+            perm = rng.permutation(N)
+            x0 = np.zeros(3 * N)
+            for i in range(N):
+                x0[3*perm[i]] = best_vars[3*i]
+                x0[3*perm[i]+1] = best_vars[3*i+1]
+                x0[3*perm[i]+2] = best_vars[3*i+2]
+                
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-12, 'disp': False})
+                if res.success:
+                    cons_val = constraints(res.x)
+                    if np.min(cons_val) >= -1e-7:
+                        curr_sum = -res.fun
+                        if curr_sum > best_sum:
+                            best_sum = curr_sum
+                            best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+        # Phase 4: High-precision polish
+        try:
+            res = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraints(res.x)) >= -1e-7:
+                best_vars = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+            
+    # Fallback configuration (should not be reached given robust initialization)
+    if best_vars is None:
+        centers_f = np.zeros((N, 2))
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                centers_f[idx] = [0.1 + 0.2 * i, 0.1 + 0.2 * j]
+                idx += 1
+        centers_f[25] = [0.5, 0.5]
+        r_f = np.full(N, 0.085)
+        
+        best_vars = np.empty(3 * N)
+        best_vars[0::3] = r_f
+        best_vars[1::3] = (centers_f[:, 0] - r_f) / (1.0 - 2.0 * r_f)
+        best_vars[2::3] = (centers_f[:, 1] - r_f) / (1.0 - 2.0 * r_f)
+        best_sum = np.sum(r_f)
+
+    # Reconstruct centers from optimized parameters
+    r_opt = best_vars[0::3]
+    u_opt = best_vars[1::3]
+    v_opt = best_vars[2::3]
+    denom = 1.0 - 2.0 * r_opt
+    x_opt = r_opt + u_opt * denom
+    y_opt = r_opt + v_opt * denom
+    centers = np.column_stack((x_opt, y_opt))
+    
+    return centers, r_opt, float(best_sum)
+```

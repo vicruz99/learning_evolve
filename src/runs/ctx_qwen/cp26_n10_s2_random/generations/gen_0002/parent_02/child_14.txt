@@ -1,0 +1,197 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.626129) and approach the target (2.636), I will implement a multi-phase optimization strategy that combines gradient-based and derivative-free methods:
+
+1. **Diverse Initialization**: Generate 40 different starting configurations by rotating and scaling a hexagonal lattice. This breaks symmetry and explores different packing geometries that pure grid initialization misses.
+2. **Gradient-Based Local Search (SLSQP)**: For each initial configuration, run `SLSQP` to jointly optimize centers and radii with explicit boundary and non-overlap constraints. This quickly converges to high-quality local optima.
+3. **Derivative-Free Polish (Powell)**: Take the best solution from SLSQP and refine it using `Powell` method on centers only, where radii are computed implicitly. This handles the non-smooth `min` function in radius computation better near the optimum.
+4. **Simulated Annealing Jiggle**: Run a temperature-scheduled random perturbation phase on centers to escape shallow local minima and squeeze out additional space.
+5. **Strict Repair & Validation**: Apply an iterative shrinking routine to guarantee all constraints are strictly satisfied within numerical tolerance before returning.
+
+This hybrid approach leverages the speed of SLSQP for large moves, the robustness of Powell for non-smooth objectives, and SA for fine-grained exploration, consistently pushing packing densities higher.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def get_sum_radii_from_centers(centers):
+    """Given fixed centers, compute the maximum valid radii and their sum."""
+    x, y = centers[:, 0], centers[:, 1]
+    # Distance to boundaries
+    rb = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dist = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dist, np.inf)
+    min_dist = np.min(dist, axis=1)
+    
+    # Radius constrained by half the minimum distance to avoid overlap
+    rp = 0.5 * min_dist
+    
+    # The actual radius is the limiting factor between boundary and neighbors
+    radii = np.minimum(rb, rp)
+    return radii, np.sum(radii)
+
+def obj_centers(x_flat):
+    """Objective for derivative-free optimization on centers only."""
+    centers = x_flat.reshape(N, 2)
+    _, s = get_sum_radii_from_centers(centers)
+    return -s
+
+def obj_slq(p):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(p[2::3])
+
+def slsqp_constraints(p):
+    """Computes all inequality constraint values (must be >= 0)."""
+    x = p[0::3]
+    y = p[1::3]
+    r = p[2::3]
+    
+    # Boundary constraints
+    c1 = x - r
+    c2 = 1.0 - x - r
+    c3 = y - r
+    c4 = 1.0 - y - r
+    
+    # Pairwise non-overlap constraints
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    dist = np.sqrt(dx**2 + dy**2)
+    mask = np.triu(np.ones((N, N)), k=1).astype(bool)
+    c5 = dist[mask] - dr[mask]
+    
+    return np.concatenate([c1, c2, c3, c4, c5])
+
+def get_hex_init(scale=1.0, angle=0.0):
+    """Generates an initial hexagonal lattice configuration, rotated and scaled."""
+    pts = []
+    r = 0.095
+    y = r
+    row = 0
+    while len(pts) < N:
+        x = r if row % 2 == 0 else 2 * r
+        while x <= 1.0 - r and len(pts) < N:
+            pts.append([x, y])
+            x += 2 * r
+        y += r * np.sqrt(3)
+        row += 1
+    pts = np.array(pts[:N])
+    
+    # Rotate and scale around center
+    c = np.mean(pts, axis=0)
+    pts = pts - c
+    ca, sa = np.cos(angle), np.sin(angle)
+    rot = np.array([[ca, -sa], [sa, ca]])
+    pts = (rot @ pts.T).T * scale
+    
+    # Normalize to fit inside [0,1] with margins
+    pts = pts - np.min(pts, axis=0)
+    span = np.max(pts, axis=0) - np.min(pts, axis=0)
+    pts = pts / span * 0.85 + 0.075
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing():
+    """Pack 26 circles in a unit square to maximize sum of radii."""
+    np.random.seed(42)
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    bounds = [(0.0, 1.0)] * (2 * N) + [(1e-7, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': slsqp_constraints}
+    
+    # Phase 1: Multi-start SLSQP optimization
+    for trial in range(40):
+        angle = np.random.uniform(0, np.pi / 6)
+        scale = np.random.uniform(0.85, 1.15)
+        c0 = get_hex_init(scale, angle)
+        c0 += np.random.normal(0, 0.003, c0.shape)
+        c0 = np.clip(c0, 0.05, 0.95)
+        
+        r0, _ = get_sum_radii_from_centers(c0)
+        p0 = np.zeros(3 * N)
+        p0[0::3] = c0[:, 0]
+        p0[1::3] = c0[:, 1]
+        p0[2::3] = r0
+        
+        try:
+            res = minimize(obj_slq, p0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 5000, 'ftol': 1e-13})
+            if -res.fun > best_sum:
+                best_sum = -res.fun
+                best_centers = res.x[:2 * N].reshape(N, 2).copy()
+                best_radii = res.x[2 * N:].copy()
+        except Exception:
+            continue
+            
+    # Fallback initialization if all optimizations fail
+    if best_centers is None:
+        c0 = get_hex_init()
+        r0, _ = get_sum_radii_from_centers(c0)
+        best_sum = np.sum(r0)
+        best_centers = c0
+        best_radii = r0
+        
+    # Phase 2: Derivative-free polish on centers (handles non-smooth radius computation)
+    curr_c = best_centers.copy()
+    curr_r = best_radii.copy()
+    curr_s = best_sum
+    
+    try:
+        res_pw = minimize(obj_centers, curr_c.flatten(), method='Powell',
+                          options={'maxiter': 3000, 'ftol': 1e-14, 'xtol': 1e-14})
+        opt_c = res_pw.x.reshape(N, 2)
+        opt_r, opt_s = get_sum_radii_from_centers(opt_c)
+        if opt_s > curr_s:
+            curr_c = opt_c
+            curr_r = opt_r
+            curr_s = opt_s
+    except Exception:
+        pass
+        
+    # Phase 3: Simulated Annealing / Jiggle to escape local minima
+    temp = 0.008
+    for i in range(2000):
+        idx = np.random.randint(N)
+        new_c = curr_c.copy()
+        new_c[idx] += np.random.normal(0, temp, 2)
+        new_c[idx] = np.clip(new_c[idx], 0.001, 0.999)
+        
+        _, new_s = get_sum_radii_from_centers(new_c)
+        delta = new_s - curr_s
+        if delta > 0 or np.random.rand() < np.exp(delta / max(temp, 1e-6)):
+            curr_c = new_c
+            curr_r, curr_s = get_sum_radii_from_centers(curr_c)
+        temp *= 0.9995
+        
+    # Phase 4: Strict repair to guarantee validation passes within tolerance
+    centers = curr_c
+    radii = curr_r
+    for _ in range(15):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(centers[i] - centers[j])
+                if d < radii[i] + radii[j] - 1e-11:
+                    shrink = (radii[i] + radii[j] - d) * 0.5 + 1e-12
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+            mx = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mx:
+                radii[i] = mx
+                changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    return centers, radii, final_sum
+```

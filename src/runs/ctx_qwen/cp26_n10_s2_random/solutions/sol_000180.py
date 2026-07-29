@@ -1,0 +1,249 @@
+# sol_000180 | problem=circle_packing_26 entrypoint=run_packing
+# generation=8 parent=sol_000155 (state 1d52432b) state=b19ba8d3 sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+A_LP = None
+PAIRS = None
+N_PAIRS = 0
+
+def init_global():
+    """Precompute the sparse structure of the LP constraint matrix."""
+    global A_LP, PAIRS, N_PAIRS
+    n_pairs = N * (N - 1) // 2
+    A = np.zeros((n_pairs + 4 * N, N))
+    pairs = []
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            pairs.append((i, j))
+            idx += 1
+    for i in range(N):
+        for _ in range(4):
+            A[idx, i] = 1.0
+            idx += 1
+    A_LP = A
+    PAIRS = pairs
+    N_PAIRS = n_pairs
+
+init_global()
+
+def solve_lp_and_grad(centers):
+    """
+    Solves LP for optimal radii given fixed centers and computes the gradient 
+    of the sum of radii with respect to center positions using LP duals.
+    """
+    n = centers.shape[0]
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-15)
+
+    b_ub = np.zeros(A_LP.shape[0])
+    idx = 0
+    for i, j in PAIRS:
+        b_ub[idx] = dists[i, j]
+        idx += 1
+    for i in range(n):
+        b_ub[idx] = centers[i, 0]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        b_ub[idx] = centers[i, 1]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+
+    res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b_ub,
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    
+    if not res.success:
+        return None, None, None
+
+    radii = res.x
+    duals = res.ineqlin.marginals
+
+    grad = np.zeros_like(centers)
+    idx = 0
+    for i, j in PAIRS:
+        lam = duals[idx]
+        if lam > 1e-8:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        idx += 1
+
+    b_start = N_PAIRS
+    for i in range(n):
+        grad[i, 0] += duals[b_start + 4*i] - duals[b_start + 4*i + 1]
+        grad[i, 1] += duals[b_start + 4*i + 2] - duals[b_start + 4*i + 3]
+
+    return radii, -res.fun, grad
+
+def force_directed_init(seed):
+    """Generates a well-spread configuration using repulsive forces."""
+    rng = np.random.default_rng(seed)
+    c = rng.uniform(0.1, 0.9, (N, 2))
+    for _ in range(600):
+        forces = np.zeros_like(c)
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(c[i] - c[j])
+                if d < 0.15 and d > 1e-6:
+                    f = (0.15 - d) / d * 10.0
+                    diff = c[i] - c[j]
+                    forces[i] += diff * f
+                    forces[j] -= diff * f
+            for dim in range(2):
+                if c[i, dim] < 0.05:
+                    forces[i, dim] += (0.05 - c[i, dim]) * 20.0
+                elif c[i, dim] > 0.95:
+                    forces[i, dim] -= (c[i, dim] - 0.95) * 20.0
+        c += forces * 0.002
+        c = np.clip(c, 0.02, 0.98)
+    return c
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    patterns = [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6], 
+                [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 4, 6, 6, 5]]
+    for pat in patterns:
+        for r0 in [0.09, 0.095, 0.10, 0.105]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+            starts.append(c)
+            
+    for i in range(12):
+        starts.append(force_directed_init(i))
+    for i in range(10):
+        starts.append(rng.uniform(0.15, 0.85, (N, 2)))
+    return starts
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    np.random.seed(42)
+    rng = np.random.default_rng(42)
+
+    best_c = None
+    best_s = -1.0
+    bounds_c = [(0.0, 1.0)] * (2 * N)
+
+    starts = generate_starts(rng)
+
+    # Phase 1: L-BFGS-B optimization on centers using exact LP gradient
+    def obj_centers(v):
+        _, val, _ = solve_lp_and_grad(v.reshape(N, 2))
+        return -val if val is not None else 0.0
+
+    def grad_centers(v):
+        _, _, grad = solve_lp_and_grad(v.reshape(N, 2))
+        return -grad.flatten() if grad is not None else np.zeros_like(v)
+
+    for c0 in starts:
+        v0 = c0.flatten()
+        try:
+            res = minimize(obj_centers, v0, jac=grad_centers,
+                           method='L-BFGS-B', bounds=bounds_c,
+                           options={'maxiter': 2000, 'ftol': 1e-14})
+            c_opt = res.x.reshape(N, 2)
+            _, s_opt, _ = solve_lp_and_grad(c_opt)
+            if s_opt > best_s:
+                best_s = s_opt
+                best_c = c_opt.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Simulated Annealing to escape local minima
+    curr_c = best_c.copy()
+    curr_s = best_s
+    T = 0.007
+    for step in range(5000):
+        T *= 0.9994
+        step_size = max(T * 1.5, 0.0005)
+        c_new = curr_c + rng.normal(0, step_size, curr_c.shape)
+        c_new = np.clip(c_new, 0.02, 0.98)
+        
+        r_new, s_new, _ = solve_lp_and_grad(c_new)
+        if r_new is None:
+            continue
+            
+        if s_new > curr_s or rng.random() < np.exp((s_new - curr_s) / max(T * 5.0, 1e-7)):
+            curr_c = c_new
+            curr_s = s_new
+            if curr_s > best_s:
+                best_s = curr_s
+                best_c = curr_c.copy()
+
+    # Phase 3: SLSQP joint polish on centers and radii
+    r_lp, _, _ = solve_lp_and_grad(best_c)
+    v0 = np.concatenate([best_c.flatten(), r_lp])
+    
+    def obj_j(v):
+        return -np.sum(v[2 * N:])
+        
+    def cons_j(v):
+        c = v[:2 * N].reshape(N, 2)
+        r = v[2 * N:]
+        con = [c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r]
+        idx_i, idx_j = np.triu_indices(N, 1)
+        dx = c[idx_i, 0] - c[idx_j, 0]
+        dy = c[idx_i, 1] - c[idx_j, 1]
+        # Use squared constraints for better numerical stability near tangencies
+        con.append(dx**2 + dy**2 - (r[idx_i] + r[idx_j])**2)
+        return np.concatenate(con)
+
+    bounds_j = bounds_c + [(0.0, 0.5)] * N
+    try:
+        res = minimize(obj_j, v0, method='SLSQP', bounds=bounds_j,
+                       constraints={'type': 'ineq', 'fun': cons_j},
+                       options={'maxiter': 8000, 'ftol': 1e-14})
+        if np.sum(res.x[2 * N:]) > best_s:
+            best_c = res.x[:2 * N].reshape(N, 2)
+            best_r = res.x[2 * N:]
+        else:
+            _, best_r, _ = solve_lp_and_grad(best_c)
+    except Exception:
+        _, best_r, _ = solve_lp_and_grad(best_c)
+
+    # Phase 4: Strict Numerical Repair to guarantee validation compliance
+    for _ in range(50):
+        changed = False
+        # Clamp to boundaries
+        for i in range(N):
+            mr = min(best_c[i, 0], 1.0 - best_c[i, 0], 
+                     best_c[i, 1], 1.0 - best_c[i, 1])
+            if best_r[i] > mr + 1e-12:
+                best_r[i] = mr
+                changed = True
+        # Resolve pairwise overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.linalg.norm(best_c[i] - best_c[j])
+                req = best_r[i] + best_r[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    best_r[i] -= shrink
+                    best_r[j] -= shrink
+                    changed = True
+        if not changed:
+            break
+            
+    best_r = np.maximum(best_r, 0.0)
+    return best_c, best_r, float(np.sum(best_r))

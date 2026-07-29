@@ -1,0 +1,137 @@
+
+
+<strategy>
+To improve the circle packing sum of radii, we need a robust strategy to escape the many local minima typical of this non-convex problem. The previous solutions used hexagonal or grid initializations, which are good but can get trapped in symmetric local optima.
+
+My approach uses a **force-directed layout initialization** combined with **multi-start local optimization**:
+1. **Force-Directed Initialization**: For each restart, we place 26 points randomly and apply a repulsive force (inverse square law) between all pairs, plus repulsion from the boundaries. This simulates an electrostatic system that naturally spreads points out evenly, adapting to the square shape and avoiding rigid grid symmetries.
+2. **Safe Feasible Radii**: After positioning centers, we compute a strictly feasible initial radius for each circle based on its distance to the nearest neighbor and boundaries, scaled down by 5% to ensure the inequality constraints are initially satisfied. This is crucial for SLSQP to start from a feasible point.
+3. **Multi-Start SLSQP**: We run the `SLSQP` optimizer from 30 diverse force-directed configurations. SLSQP efficiently handles the nonlinear boundary and pairwise separation constraints.
+4. **High-Precision Polish**: The best configuration found is refined with tighter tolerances and more iterations to squeeze out the final numerical precision.
+
+This method balances global exploration (via diverse physics-inspired starts) with local exploitation (via constrained gradient-based optimization), reliably pushing the sum of radii closer to the theoretical optimum.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N_CIRCLES = 26
+
+def objective(vars):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars):
+    """
+    Returns a 1D array of constraint values.
+    All constraints are formulated as g(vars) >= 0.
+    Includes boundary constraints and pairwise non-overlap constraints.
+    """
+    centers = vars.reshape(N_CIRCLES, 3)[:, :2]
+    radii = vars.reshape(N_CIRCLES, 3)[:, 2]
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    c_bound = np.concatenate([
+        centers[:, 0] - radii,
+        1.0 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1.0 - centers[:, 1] - radii
+    ])
+    
+    # Non-overlap constraints: dist_sq - (r_i + r_j)^2 >= 0
+    dx = centers[:, None, 0] - centers[None, :, 0]
+    dy = centers[:, None, 1] - centers[None, :, 1]
+    dist_sq = dx**2 + dy**2
+    rad_sum_sq = (radii[:, None] + radii[None, :])**2
+    
+    # Extract upper triangular indices for i < j
+    i, j = np.triu_indices(N_CIRCLES, 1)
+    c_overlap = dist_sq[i, j] - rad_sum_sq[i, j]
+    
+    return np.concatenate([c_bound, c_overlap])
+
+def get_initial_guesses(n_guesses=30):
+    """Generates diverse, well-spread initial configurations using force-directed layout."""
+    guesses = []
+    np.random.seed(42)
+    for _ in range(n_guesses):
+        centers = np.random.rand(N_CIRCLES, 2) * 0.8 + 0.1
+        
+        # Force-directed repulsion to spread points
+        for step in range(800):
+            diff = centers[:, None, :] - centers[None, :, :]
+            dist = np.sqrt(np.sum(diff**2, axis=2)) + 1e-9
+            repulsion = 0.1 / (dist**2)
+            mask = np.triu(np.ones((N_CIRCLES, N_CIRCLES), bool), 1)
+            repulsion = repulsion * mask
+            forces = np.sum(repulsion[:, :, None] * diff, axis=1)
+            
+            # Wall repulsion
+            margin = 0.05
+            for d in range(2):
+                forces[centers[:, d] < margin, d] += 20.0 * (margin - centers[centers[:, d] < margin, d])
+                forces[centers[:, d] > 1.0 - margin, d] -= 20.0 * (centers[centers[:, d] > 1.0 - margin, d] - (1.0 - margin))
+                
+            step_size = max(0.0005, 0.002 * (1.0 - step / 800.0))
+            centers += step_size * forces
+            centers = np.clip(centers, 0.01, 0.99)
+            
+        # Compute strictly feasible initial radii
+        dists = np.sqrt(np.sum((centers[:, None, :] - centers[None, :, :])**2, axis=2))
+        np.fill_diagonal(dists, np.inf)
+        min_dist = np.min(dists, axis=1)
+        b_dist = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]), 
+                            np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+        # Scale by 0.95 to ensure strict feasibility for the optimizer
+        radii = np.minimum(b_dist, min_dist / 2.0 * 0.95)
+        
+        vars0 = np.zeros(3 * N_CIRCLES)
+        vars0[0::3] = centers[:, 0]
+        vars0[1::3] = centers[:, 1]
+        vars0[2::3] = radii
+        guesses.append(vars0)
+    return guesses
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    bounds = []
+    for _ in range(N_CIRCLES):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_sum = -1.0
+    best_vars = None
+    
+    # Generate multiple diverse starting points
+    guesses = get_initial_guesses(30)
+    
+    # Local optimization from each start
+    for vars0 in guesses:
+        try:
+            res = minimize(objective, vars0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-12, 'iprint': -1})
+            curr_sum = -res.fun
+            if curr_sum > best_sum:
+                best_sum = curr_sum
+                best_vars = res.x
+        except Exception:
+            continue
+            
+    # High-precision refinement on the best configuration found
+    if best_vars is not None:
+        res_final = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                             constraints=cons, options={'maxiter': 8000, 'ftol': 1e-14, 'iprint': -1})
+        best_vars = res_final.x
+        
+    centers = best_vars.reshape(N_CIRCLES, 3)[:, :2]
+    radii = best_vars.reshape(N_CIRCLES, 3)[:, 2]
+    
+    # Ensure non-negative radii (safety against numerical drift)
+    radii = np.maximum(radii, 0.0)
+    
+    return centers, radii, float(np.sum(radii))
+```

@@ -1,0 +1,184 @@
+# sol_000059 | problem=circle_packing_26 entrypoint=run_packing
+# generation=2 parent=sol_000038 (state cf517c54) state=11e5860c sum of radii=1.623046 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+def objective(x):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(x[2 * N :])
+
+def constraints(x):
+    """Inequality constraints: boundary and pairwise non-overlap."""
+    cx = x[:N]
+    cy = x[N : 2 * N]
+    r = x[2 * N :]
+    
+    # Preallocate constraint array
+    n_con = 4 * N + N * (N - 1) // 2
+    c = np.empty(n_con)
+    
+    # Boundary constraints
+    c[:N] = cx - r
+    c[N : 2 * N] = 1.0 - cx - r
+    c[2 * N : 3 * N] = cy - r
+    c[3 * N : 4 * N] = 1.0 - cy - r
+    
+    # Pairwise non-overlap: dist(i,j) >= r_i + r_j
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    dist = np.hypot(dx, dy)
+    r_sum = r[:, None] + r[None, :]
+    
+    idx = np.triu_indices(N, k=1)
+    c[4 * N :] = dist[idx] - r_sum[idx]
+    return c
+
+def solve_radii_lp(centers):
+    """Given fixed centers, solve LP to find optimal radii maximizing sum(radii)."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    # Pairwise constraints: r_i + r_j <= dist(i, j)
+    n_pairs = n * (n - 1) // 2
+    A_ub = np.zeros((n_pairs, n))
+    b_ub = np.zeros(n_pairs)
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = d
+            k += 1
+            
+    # Boundary constraints as variable bounds
+    bounds_r = []
+    for i in range(n):
+        x, y = centers[i]
+        ub = min(x, 1.0 - x, y, 1.0 - y)
+        bounds_r.append((0.0, max(0.0, ub)))
+        
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds_r, method='highs')
+        if res.success:
+            return res.x, -res.fun
+    except Exception:
+        pass
+        
+    return np.zeros(n), 0.0
+
+def hex_init(n, seed):
+    """Generate a perturbed hexagonal lattice initialization."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    s = 0.175 + (seed % 10) * 0.004
+    y = 0.08 + s
+    row = 0
+    while len(pts) < n:
+        shift = s / 2.0 if row % 2 == 1 else 0.0
+        x = 0.08 + shift
+        while x <= 0.92 and len(pts) < n:
+            pts.append([x + rng.uniform(-0.012, 0.012), y + rng.uniform(-0.012, 0.012)])
+            x += s
+        y += s * np.sqrt(3) / 2.0
+        row += 1
+    centers = np.array(pts[:n])
+    r, _ = solve_radii_lp(centers)
+    return centers, r
+
+def optimize_from(centers0, bounds, cons):
+    """Run SLSQP optimization from given centers, followed by LP radius refinement."""
+    r0, _ = solve_radii_lp(centers0)
+    # Scale down slightly to ensure strict feasibility for SLSQP start
+    x0 = np.concatenate([centers0.ravel(), r0 * 0.85])
+    
+    try:
+        res = minimize(
+            objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+            options={'maxiter': 15000, 'ftol': 1e-14, 'disp': False}
+        )
+        c_opt = res.x[:2 * N].reshape(N, 2)
+        # Always solve LP for optimal radii at the optimized centers
+        r_opt, s_opt = solve_radii_lp(c_opt)
+        return c_opt, r_opt, s_opt
+    except Exception:
+        return None, None, 0.0
+
+def run_packing():
+    bounds = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Phase 1: Multiple diverse hexagonal starts
+    for seed in range(45):
+        c_init, _ = hex_init(N, seed)
+        c_opt, r_opt, s_opt = optimize_from(c_init, bounds, cons)
+        if c_opt is not None and s_opt > best_sum:
+            best_sum = s_opt
+            best_centers = c_opt.copy()
+            best_radii = r_opt.copy()
+            
+    # Phase 2: Local perturbation search to escape local minima
+    if best_centers is not None:
+        for trial in range(35):
+            rng = np.random.RandomState(trial * 13 + 7)
+            scale = 0.008 * (1.0 - trial / 40.0)
+            c_pert = best_centers + rng.normal(0, scale, best_centers.shape)
+            c_pert = np.clip(c_pert, 0.03, 0.97)
+            c_opt, r_opt, s_opt = optimize_from(c_pert, bounds, cons)
+            if c_opt is not None and s_opt > best_sum:
+                best_sum = s_opt
+                best_centers = c_opt.copy()
+                best_radii = r_opt.copy()
+                
+    # Fallback (should not be reached)
+    if best_centers is None:
+        best_centers = np.zeros((N, 2))
+        idx = 0
+        for r in range(5):
+            for c in range(5):
+                if idx < N:
+                    best_centers[idx] = [0.1 + c * 0.2, 0.1 + r * 0.2]
+                    idx += 1
+        while idx < N:
+            best_centers[idx] = [0.5, 0.5]
+            idx += 1
+        best_radii, best_sum = solve_radii_lp(best_centers)
+        
+    # Phase 3: Strict post-processing to guarantee validator compliance
+    centers = best_centers.copy()
+    radii = best_radii.copy()
+    
+    for _ in range(150):
+        changed = False
+        # Enforce boundary constraints
+        for i in range(N):
+            mx = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mx - 1e-11:
+                radii[i] = max(0.0, mx - 1e-11)
+                changed = True
+                
+        # Enforce non-overlap constraints
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                if d < radii[i] + radii[j] - 1e-11:
+                    excess = radii[i] + radii[j] - d
+                    radii[i] -= excess * 0.5
+                    radii[j] -= excess * 0.5
+                    changed = True
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    final_sum = float(np.sum(radii))
+    return centers, radii, final_sum

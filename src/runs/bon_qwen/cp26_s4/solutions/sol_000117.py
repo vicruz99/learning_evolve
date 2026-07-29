@@ -1,0 +1,195 @@
+# sol_000117 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state e52471dd) state=2c34610e sum of radii=1.305200 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    # --- Initialization ---
+    # Start with a hexagonal lattice pattern for better packing density
+    # We will place points and scale them later, but here we just pick a reasonable spacing
+    # to get an initial valid configuration with small radii.
+    
+    centers = np.zeros((n, 2))
+    idx = 0
+    
+    # Hexagonal packing generation parameters
+    # We want to fill the square. Let's estimate radius 0.05 initially.
+    # Spacing ~ 0.1
+    r_init = 0.05
+    
+    # Try to fit rows
+    # Height of row i: i * r * sqrt(3)
+    # x positions: r + j * 2r (for even rows), 2r + j * 2r (for odd rows)
+    
+    y_curr = r_init
+    row = 0
+    while idx < n:
+        x_curr = r_init if row % 2 == 0 else 2 * r_init
+        while x_curr + r_init <= 1.0 and idx < n:
+            centers[idx, 0] = x_curr
+            centers[idx, 1] = y_curr
+            idx += 1
+            x_curr += 2 * r_init
+        y_curr += r_init * np.sqrt(3)
+        row += 1
+    
+    radii = np.full(n, r_init)
+    
+    # --- Physics Simulation Parameters ---
+    dt = 0.005          # Time step
+    damping = 0.90      # Velocity damping
+    growth_rate = 0.0002 # Radius increase per step
+    stiffness = 50.0    # Repulsion strength
+    wall_stiffness = 100.0
+    max_steps = 4000
+    
+    velocities = np.zeros_like(centers)
+    
+    # --- Simulation Loop ---
+    for step in range(max_steps):
+        forces = np.zeros_like(centers)
+        
+        # 1. Inter-circle repulsive forces
+        # Vectorized computation for efficiency
+        # diff[i, j] = centers[i] - centers[j]
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :] # (n, n, 2)
+        
+        # Squared distances
+        dists_sq = np.sum(diff**2, axis=2)
+        
+        # Set diagonal to large value to avoid self-interaction issues
+        np.fill_diagonal(dists_sq, np.inf)
+        
+        dists = np.sqrt(dists_sq)
+        
+        # Sum of radii for each pair
+        r_sums = radii[:, np.newaxis] + radii[np.newaxis, :] # (n, n)
+        
+        # Overlap depth (positive if overlapping)
+        overlaps = r_sums - dists
+        
+        # We only care about positive overlaps (collisions)
+        # Force magnitude proportional to overlap
+        # F = overlap * stiffness
+        # Direction is along the vector connecting centers
+        # To avoid division by zero, we can use a soft potential or check dists
+        
+        # Safe distances for direction calculation
+        safe_dists = np.where(dists > 1e-9, dists, 1.0)
+        
+        # Unit vectors from j to i
+        unit_vecs = diff / safe_dists[:, :, np.newaxis]
+        
+        # Force contribution: overlap * stiffness * unit_vec
+        # Only apply if overlap > 0
+        # Using np.maximum(0, overlaps)
+        f_mag = np.maximum(0, overlaps) * stiffness
+        
+        # Accumulate forces
+        # Force on i from j is f_mag[i, j] * unit_vec[i, j]
+        # unit_vec[i, j] points from j to i (correct for repulsion on i)
+        forces_contrib = f_mag[:, :, np.newaxis] * unit_vecs
+        forces += np.sum(forces_contrib, axis=1)
+        
+        # 2. Wall repulsive forces
+        # Left wall: x - r >= 0. Violation if x < r. Push right (+x).
+        # Overlap amount: r - x
+        overlap_left = np.maximum(0, radii - centers[:, 0])
+        forces[:, 0] += overlap_left * wall_stiffness
+        
+        # Right wall: 1 - x - r >= 0. Violation if x > 1 - r. Push left (-x).
+        # Overlap amount: x + r - 1
+        overlap_right = np.maximum(0, centers[:, 0] + radii - 1.0)
+        forces[:, 0] -= overlap_right * wall_stiffness
+        
+        # Bottom wall: y - r >= 0. Violation if y < r. Push up (+y).
+        overlap_bottom = np.maximum(0, radii - centers[:, 1])
+        forces[:, 1] += overlap_bottom * wall_stiffness
+        
+        # Top wall: 1 - y - r >= 0. Violation if y > 1 - r. Push down (-y).
+        overlap_top = np.maximum(0, centers[:, 1] + radii - 1.0)
+        forces[:, 1] -= overlap_top * wall_stiffness
+        
+        # 3. Update velocities and positions
+        velocities += forces * dt
+        velocities *= damping
+        centers += velocities * dt
+        
+        # 4. Increase radii (Expansion)
+        # Only increase if the system is relatively settled or overlaps are small
+        # Check max overlap
+        max_overlap = np.max(np.maximum(0, overlaps))
+        
+        if max_overlap < 1e-4:
+            radii += growth_rate
+        else:
+            # If stuck with overlaps, slow down growth or shrink slightly to escape
+            # Here we just pause growth
+            pass
+            
+        # Adaptive growth rate: increase if clear, decrease if stuck
+        if max_overlap < 1e-6:
+            growth_rate = min(growth_rate * 1.005, 0.001)
+        elif max_overlap > 0.01:
+            growth_rate = max(growth_rate * 0.5, 1e-6)
+            
+        # Clamp centers to stay within reasonable bounds (helps stability)
+        # Though forces should handle it, clamping prevents explosion
+        centers = np.clip(centers, 0.0, 1.0)
+        radii = np.maximum(radii, 0.0)
+
+    # --- Final Optimization / Polish ---
+    # Use scipy to minimize overlap energy for the fixed final radii
+    # This ensures strict validity.
+    
+    def energy_func(pos):
+        c = pos.reshape(-1, 2)
+        e = 0.0
+        
+        # Pairwise overlap
+        diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=2))
+        np.fill_diagonal(dists, np.inf)
+        r_sums = radii[:, np.newaxis] + radii[np.newaxis, :]
+        overlaps = np.maximum(0, r_sums - dists)
+        e += np.sum(overlaps**2) * 1000.0
+        
+        # Wall overlaps
+        e += np.sum(np.maximum(0, radii - c[:, 0])**2) * 1000.0
+        e += np.sum(np.maximum(0, c[:, 0] + radii - 1.0)**2) * 1000.0
+        e += np.sum(np.maximum(0, radii - c[:, 1])**2) * 1000.0
+        e += np.sum(np.maximum(0, c[:, 1] + radii - 1.0)**2) * 1000.0
+        
+        return e
+
+    # Flatten centers for scipy
+    x0 = centers.flatten()
+    
+    # Bounds: centers must be in [0, 1]
+    # Ideally [r, 1-r], but r varies. [0, 1] is safe lower bound.
+    bounds = [(0.0, 1.0)] * (n * 2)
+    
+    try:
+        res = minimize(energy_func, x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': 100, 'ftol': 1e-12})
+        if res.success or res.fun < 1e-6:
+            centers = res.x.reshape(-1, 2)
+    except:
+        pass
+
+    # Final clamp to ensure absolute validity
+    centers = np.clip(centers, 0.0, 1.0)
+    # Ensure radii are consistent with centers (if center is at 0, r must be 0)
+    # But our energy function penalizes this.
+    # Just a sanity check clamp on radii based on centers
+    for i in range(n):
+        r_max = min(centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1])
+        if radii[i] > r_max + 1e-9:
+            radii[i] = r_max
+
+    return centers, radii, float(np.sum(radii))

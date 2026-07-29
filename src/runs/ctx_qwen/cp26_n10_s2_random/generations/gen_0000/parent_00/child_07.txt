@@ -1,0 +1,159 @@
+
+
+<strategy>
+1. **Initialization**: Generate multiple starting configurations using a hexagonal lattice pattern perturbed slightly, plus random repulsion-based layouts. This helps avoid poor local minima.
+2. **Penalty Optimization**: Use `scipy.optimize.minimize` with `L-BFGS-B` to maximize the sum of radii. Instead of hard constraints (which can be slow/unstable for 26 circles), employ a quadratic penalty method. The penalty term heavily penalizes overlaps and boundary violations. The penalty weight is annealed (increased multiplicatively) over iterations to drive the solution towards feasibility while pushing radii up.
+3. **Constraint Enforcement**: After optimization, strictly enforce boundary limits and resolve any remaining overlaps by proportionally reducing radii of intersecting circles. This guarantees a valid packing.
+4. **Greedy Expansion**: With centers fixed, perform a fixed-point iteration to expand each circle's radius to its maximum possible value given the current positions of all other circles. This efficiently utilizes any remaining slack and often squeezes out additional radius sum.
+5. **Multi-start & Selection**: Run the pipeline across several seeds/configurations and retain the best valid packing found. This robustness is key for non-convex geometry problems.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def compute_cost(vars, penalty, n):
+    """Compute objective: negative sum of radii + penalty for violations."""
+    xi = vars[:n]
+    yi = vars[n:2*n]
+    ri = vars[2*n:]
+    
+    cost = -np.sum(ri)
+    
+    # Inter-circle overlap penalty
+    dx = xi[:, None] - xi[None, :]
+    dy = yi[:, None] - yi[None, :]
+    d = np.hypot(dx, dy)
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    gaps = ri[i_idx] + ri[j_idx] - d[i_idx, j_idx]
+    overlaps = gaps[gaps > 0]
+    cost += penalty * np.sum(overlaps**2)
+    
+    # Boundary violation penalty
+    valid_r = np.minimum(xi, 1.0 - xi)
+    valid_r = np.minimum(valid_r, np.minimum(yi, 1.0 - yi))
+    viol = ri - valid_r
+    cost += penalty * np.sum(np.maximum(0, viol)**2)
+    
+    return cost
+
+def get_initial_config(n, seed=None):
+    """Generate initial circle centers and radii."""
+    if seed is not None:
+        np.random.seed(seed)
+        
+    # Hexagonal lattice packing
+    s = 0.23
+    pts = []
+    y = s / 2
+    while y < 1.0 - s/2 + 1e-5:
+        x = s / 2
+        while x < 1.0 - s/2 + 1e-5:
+            if len(pts) >= n:
+                break
+            pts.append([x, y])
+            x += s
+        y += s * np.sqrt(3) / 2
+        
+    # Fill remaining if needed
+    if len(pts) < n:
+        y_g = 0.15
+        while len(pts) < n:
+            x_g = 0.15
+            while len(pts) < n:
+                pts.append([x_g, y_g])
+                x_g += 0.25
+            y_g += 0.25
+            
+    coords = np.array(pts[:n])
+    x = coords[:, 0]
+    y = coords[:, 1]
+    r = np.full(n, 0.08)
+    return np.concatenate([x, y, r])
+
+def run_packing():
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple initial configurations
+    seeds = [42, 123, 456, None, None, 789]
+    
+    for seed in seeds:
+        vars0 = get_initial_config(n, seed=seed)
+        
+        penalty = 100.0
+        curr_vars = vars0.copy()
+        
+        # Annealing schedule
+        for step in range(15):
+            res = minimize(
+                compute_cost, curr_vars, args=(penalty, n),
+                method='L-BFGS-B',
+                bounds=[(0, 1)] * (2 * n) + [(0, 0.5)] * n,
+                options={'maxiter': 1000, 'ftol': 1e-15}
+            )
+            curr_vars = res.x
+            penalty *= 4.0
+            
+        xc = curr_vars[:n]
+        yc = curr_vars[n:2*n]
+        rc = curr_vars[2*n:]
+        
+        # Strict boundary enforcement
+        for i in range(n):
+            rc[i] = min(rc[i], xc[i], 1.0 - xc[i], yc[i], 1.0 - yc[i])
+            
+        # Resolve overlaps proportionally
+        for _ in range(20):
+            changed = False
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = np.hypot(xc[i] - xc[j], yc[i] - yc[j])
+                    if d < rc[i] + rc[j]:
+                        excess = rc[i] + rc[j] - d
+                        tr = rc[i] + rc[j]
+                        if tr > 0:
+                            rc[i] -= excess * (rc[i] / tr)
+                            rc[j] -= excess * (rc[j] / tr)
+                        else:
+                            rc[i] = rc[j] = d / 2
+                        changed = True
+            if not changed:
+                break
+                
+        rc = np.maximum(rc, 0.0)
+        current_sum = np.sum(rc)
+        
+        if current_sum > best_sum:
+            best_sum = current_sum
+            best_centers = np.column_stack([xc, yc])
+            best_radii = rc.copy()
+            
+    # Greedy radius expansion for optimal radii given fixed centers
+    if best_centers is not None:
+        for _ in range(100):
+            expanded = False
+            for i in range(n):
+                max_r = min(best_centers[i, 0], 1.0 - best_centers[i, 0], 
+                            best_centers[i, 1], 1.0 - best_centers[i, 1])
+                for j in range(n):
+                    if i == j:
+                        continue
+                    d = np.hypot(best_centers[i, 0] - best_centers[j, 0], 
+                                 best_centers[i, 1] - best_centers[j, 1])
+                    max_r = min(max_r, d - best_radii[j])
+                max_r = max(0.0, max_r)
+                if max_r > best_radii[i] + 1e-9:
+                    best_radii[i] = max_r
+                    expanded = True
+            if not expanded:
+                break
+        best_sum = np.sum(best_radii)
+    else:
+        best_centers = np.zeros((n, 2))
+        best_radii = np.zeros(n)
+        
+    return best_centers, best_radii, best_sum
+```

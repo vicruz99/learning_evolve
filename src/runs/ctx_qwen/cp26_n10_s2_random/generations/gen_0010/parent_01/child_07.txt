@@ -1,0 +1,312 @@
+
+
+<strategy>
+To push the sum of radii beyond 2.636, I will refine the optimization pipeline with the following key improvements:
+
+1. **Adaptive Gradient Ascent with Momentum-like Step Control**: Instead of fixed or backtracking line searches (which can be slow for 52D), I'll use an adaptive step size that grows when improvements are consistent and decays rapidly on stagnation. This navigates the non-smooth LP objective landscape more efficiently.
+2. **Corner-Biased & Symmetry-Breaking Initializations**: Optimal packings often anchor circles to corners or edges. I'll generate starts that explicitly bias circles toward corners and add controlled random swaps to break symmetric local minima that trap standard lattice starts.
+3. **Joint SLSQP Polish with Tight Constraints**: After finding a good center configuration via gradient ascent, I'll run a joint SLSQP optimization of centers and radii. This handles the non-convex coupling directly and often squeezes out an extra 0.1-0.3% improvement.
+4. **Coordinate-wise Local Search**: I'll add a fast coordinate descent phase that optimizes one circle's position at a time using `scipy.optimize.minimize` (Nelder-Mead). This effectively resolves tight local bottlenecks that full-gradient methods miss.
+5. **Strict Numerical Repair & LP Verification**: The final radii will be recomputed via LP to guarantee optimality for the fixed centers, followed by a deterministic shrink/clamp repair to satisfy the validator's `1e-12` tolerance without losing meaningful radius sum.
+
+This multi-phase approach combines the global exploration of diverse starts, the local precision of LP dual gradients, the robustness of derivative-free coordinate search, and the smooth coupling of SLSQP, targeting the known theoretical bounds for N=26.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+NUM_PAIRS = N * (N - 1) // 2
+IDX_I, IDX_J = np.triu_indices(N, k=1)
+
+def build_lp_matrices(n):
+    A = np.zeros((NUM_PAIRS + 4 * n, n))
+    pairs = []
+    k = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[k, i] = 1.0
+            A[k, j] = 1.0
+            pairs.append((i, j))
+            k += 1
+    for i in range(n):
+        base = NUM_PAIRS + 4 * i
+        A[base, i] = 1.0
+        A[base + 1, i] = 1.0
+        A[base + 2, i] = 1.0
+        A[base + 3, i] = 1.0
+    return A, pairs
+
+A_LP, LP_PAIRS = build_lp_matrices(N)
+
+def solve_lp_radii(centers):
+    n = centers.shape[0]
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-12)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b = np.zeros(A_LP.shape[0])
+    idx = 0
+    for i, j in LP_PAIRS:
+        b[idx] = dists[i, j]
+        idx += 1
+    for i in range(n):
+        b[idx] = centers[i, 0]; idx += 1
+        b[idx] = 1.0 - centers[i, 0]; idx += 1
+        b[idx] = centers[i, 1]; idx += 1
+        b[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b, 
+                  bounds=[(0.0, u) for u in ub], method='highs')
+    if res.success:
+        if hasattr(res, 'ineqlin') and hasattr(res.ineqlin, 'marginals'):
+            duals = res.ineqlin.marginals
+        else:
+            duals = np.zeros_like(b)
+        return res.x, np.sum(res.x), duals
+    return np.zeros(n), 0.0, np.zeros_like(b)
+
+def compute_grad(centers, duals):
+    n = centers.shape[0]
+    grad = np.zeros_like(centers)
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    idx = 0
+    for i, j in LP_PAIRS:
+        mu = duals[idx]
+        if mu > 1e-9:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += mu * vec
+                grad[j] -= mu * vec
+        idx += 1
+        
+    bound_start = NUM_PAIRS
+    for i in range(n):
+        grad[i, 0] += duals[bound_start + 4*i] - duals[bound_start + 4*i + 1]
+        grad[i, 1] += duals[bound_start + 4*i + 2] - duals[bound_start + 4*i + 3]
+    return grad
+
+def gradient_ascent(c0, max_iter=2500, step0=0.006, rng=None):
+    c = c0.copy()
+    best_c = c.copy()
+    best_s = -1.0
+    step = step0
+    no_improve = 0
+    
+    _, curr_s, _ = solve_lp_radii(c)
+    best_s = curr_s
+    
+    for k in range(max_iter):
+        radii, curr_s, duals = solve_lp_radii(c)
+        if curr_s > best_s:
+            best_s = curr_s
+            best_c = c.copy()
+            no_improve = 0
+            step = min(step * 1.12, 0.025)
+        else:
+            no_improve += 1
+            if no_improve > 40:
+                step *= 0.68
+            elif no_improve > 15:
+                step *= 0.85
+                
+        if step < 1e-11:
+            break
+            
+        grad = compute_grad(c, duals)
+        gn = np.linalg.norm(grad)
+        if gn < 1e-12:
+            break
+            
+        c = c + step * (grad / gn)
+        c = np.clip(c, 1e-5, 1.0 - 1e-5)
+        
+        if k % 200 == 0 and k > 0 and rng is not None:
+            c += rng.normal(0, step * 0.08, c.shape)
+            c = np.clip(c, 1e-5, 1.0 - 1e-5)
+            
+    return best_c, best_s
+
+def coordinate_optimize(c0, rng, rounds=3):
+    c = c0.copy()
+    curr_s = solve_lp_radii(c)[1]
+    
+    for _ in range(rounds):
+        for i in range(N):
+            best_c_i = c[i].copy()
+            best_s_i = curr_s
+            curr_pos = c[i].copy()
+            
+            # Local Nelder-Mead search for circle i
+            def obj_2d(x):
+                c[i] = np.clip(x, 1e-4, 1.0 - 1e-4)
+                return -solve_lp_radii(c)[1]
+                
+            try:
+                res = minimize(obj_2d, curr_pos, method='Nelder-Mead', 
+                               options={'maxiter': 500, 'xatol': 1e-7, 'fatol': 1e-9})
+                if -res.fun > best_s_i + 1e-9:
+                    best_s_i = -res.fun
+                    best_c_i = res.x
+            except Exception:
+                pass
+                
+            c[i] = best_c_i
+            curr_s = best_s_i
+    return c, curr_s
+
+def slsqp_obj(v):
+    return -np.sum(v[2*N:])
+
+def slsqp_cons(v):
+    c = v[:2*N].reshape(N, 2)
+    r = v[2*N:]
+    con = []
+    con.append(c[:, 0] - r)
+    con.append(1.0 - c[:, 0] - r)
+    con.append(c[:, 1] - r)
+    con.append(1.0 - c[:, 1] - r)
+    dx = c[IDX_I, 0] - c[IDX_J, 0]
+    dy = c[IDX_I, 1] - c[IDX_J, 1]
+    dr = r[IDX_I] + r[IDX_J]
+    con.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(con)
+
+SLSQP_BOUNDS = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+
+def slsqp_optimize(c_init, r_init, maxiter=7000):
+    v0 = np.concatenate([c_init.flatten(), r_init])
+    try:
+        res = minimize(slsqp_obj, v0, method='SLSQP', bounds=SLSQP_BOUNDS,
+                       constraints={'type': 'ineq', 'fun': slsqp_cons},
+                       options={'maxiter': maxiter, 'ftol': 1e-14})
+        if np.min(slsqp_cons(res.x)) >= -1e-7:
+            return res.x[:2*N].reshape(N, 2), res.x[2*N:], -res.fun
+    except Exception:
+        pass
+    return c_init, r_init, 0.0
+
+def repair(centers, radii):
+    radii = radii.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-11:
+                    shrink = (req - d) / 2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr - 1e-11:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def generate_inits(rng, n_inits=28):
+    inits = []
+    patterns = [
+        [5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 5, 5, 6],
+        [4, 6, 6, 6, 4], [6, 6, 5, 5, 4], [5, 5, 6, 5, 5],
+        [5, 4, 6, 6, 5], [6, 5, 5, 5, 5], [5, 5, 5, 6, 5]
+    ]
+    for pat in patterns:
+        for r0 in [0.090, 0.095, 0.100, 0.105]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            inits.append(np.array(c[:N]))
+            
+    # Corner & edge biased starts
+    for _ in range(6):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        corners = [[0.07, 0.07], [0.93, 0.07], [0.07, 0.93], [0.93, 0.93]]
+        for i, corner in enumerate(corners):
+            c[i] = np.array(corner) + rng.normal(0, 0.008, 2)
+        inits.append(c)
+        
+    return inits[:n_inits]
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+    
+    inits = generate_inits(rng, 30)
+    
+    # Phase 1: Multi-start SLSQP + Gradient Ascent
+    for c_init in inits:
+        ub = np.minimum(np.minimum(c_init[:, 0], 1.0 - c_init[:, 0]),
+                        np.minimum(c_init[:, 1], 1.0 - c_init[:, 1]))
+        dists = np.linalg.norm(c_init[:, None, :] - c_init[None, :, :], axis=2)
+        np.fill_diagonal(dists, np.inf)
+        rp = 0.5 * np.min(dists, axis=1)
+        r_init = np.minimum(ub, rp) * 0.82
+        
+        c_opt, r_opt, s_opt = slsqp_optimize(c_init, r_init, maxiter=5000)
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            best_r = r_opt.copy()
+            
+        c_ga, s_ga = gradient_ascent(c_opt, max_iter=2000, step0=0.007, rng=rng)
+        if s_ga > best_sum:
+            best_sum = s_ga
+            best_c = c_ga
+            r_lp, _, _ = solve_lp_radii(best_c)
+            best_r = r_lp
+
+    # Phase 2: Coordinate-wise refinement & aggressive perturbations
+    for _ in range(5):
+        c_cd, s_cd = coordinate_optimize(best_c, rng, rounds=2)
+        if s_cd > best_sum:
+            best_sum = s_cd
+            best_c = c_cd
+            r_lp, _, _ = solve_lp_radii(best_c)
+            best_r = r_lp
+            
+        c_pert = best_c + rng.normal(0, 0.014, best_c.shape)
+        c_pert = np.clip(c_pert, 0.04, 0.96)
+        c_ga2, s_ga2 = gradient_ascent(c_pert, max_iter=1500, step0=0.005, rng=rng)
+        if s_ga2 > best_sum:
+            best_sum = s_ga2
+            best_c = c_ga2
+            r_lp, _, _ = solve_lp_radii(best_c)
+            best_r = r_lp
+
+    # Phase 3: Final Joint Polish
+    c_final, r_final, s_final = slsqp_optimize(best_c, best_r, maxiter=8000)
+    if s_final > best_sum:
+        best_sum = s_final
+        best_c = c_final
+        best_r = r_final
+        
+    # Phase 4: LP Verification & Strict Repair
+    r_lp, s_lp, _ = solve_lp_radii(best_c)
+    if s_lp > best_sum:
+        best_sum = s_lp
+        best_r = r_lp
+        
+    radii = repair(best_c.copy(), best_r.copy())
+    return best_c, radii, float(np.sum(radii))
+```

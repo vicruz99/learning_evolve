@@ -1,0 +1,223 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we will employ a two-stage optimization strategy combining a robust initialization and iterative refinement.
+
+1.  **Initialization (Dense Lattice):** We will start with a staggered hexagonal grid. This arrangement provides a high circle density and serves as a strong baseline for non-overlapping circles. We will calculate optimal coordinates that center this lattice within the unit square, potentially scaling it to fit exactly.
+
+2.  **Iterative Expansion (LP & Local Search):** We will use a loop that alternates between two steps:
+    *   **Radius Maximization (Linear Programming):** For the current positions of the centers, we treat the radii as variables. We solve a Linear Programming (LP) problem to maximize the sum of radii subject to non-overlap (distance between centers $\ge r_i + r_j$) and boundary constraints ($r_i \le$ distance to edge). This allows us to find the optimal radii for any given center configuration.
+    *   **Center Refinement (Repulsive Dynamics):** We identify which constraints are "active" (binding). We then move the centers of the circles to relax these constraints—moving circles away from boundaries they are touching and pushing circles apart if they are touching each other. This step uses forces derived from the tightness of the constraints to create more space, allowing for larger radii in the subsequent LP step.
+
+3.  **Diversity and Perturbation:** To escape local optima, we will occasionally add small random perturbations to the center positions.
+
+This approach leverages the mathematical properties of the packing problem, ensuring that at each step, we are maximizing the objective function for the current geometry while systematically improving that geometry.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Pack 26 circles in a unit square to maximize the sum of radii.
+    
+    Strategy:
+    1. Initialize centers on a staggered hexagonal grid.
+    2. Iteratively optimize:
+       a. Solve an LP to maximize sum of radii for fixed centers.
+       b. Move centers to relax active constraints (repulsion from boundaries and other circles).
+    """
+    n = 26
+    
+    # --- 1. Initialization: Hexagonal Grid ---
+    # Estimate grid dimensions for n circles
+    cols = int(np.ceil(np.sqrt(n * 2 / np.sqrt(3)))) # Approximate columns for hex packing
+    rows = int(np.ceil(n / cols))
+    
+    # Refine rows/cols to fit n
+    # For hex, rows alternate in count or are shifted
+    # Let's just place them in a grid and let the optimizer fix overlaps
+    # Using a slightly denser grid
+    cols = 6
+    rows = 5
+    current_n = cols * rows # 30 circles, we will keep 26 or remove extras
+    
+    centers_init = []
+    for r in range(rows):
+        for c in range(cols):
+            x = (c + 0.5) * (1.0 / cols)
+            if r % 2 == 1:
+                x += (1.0 / cols) / 2 # Stagger
+            y = (r + 0.5) * (1.0 / rows)
+            # Ensure within bounds before adding
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                centers_init.append([x, y])
+    
+    # Take first n centers
+    centers = np.array(centers_init[:n])
+    
+    # Initialize radii small
+    radii = np.ones(n) * 0.01
+    
+    # --- 2. Iterative Optimization ---
+    num_iters = 300
+    
+    for it in range(num_iters):
+        # A. Solve LP to maximize sum of radii for fixed centers
+        # Variables: r_0, r_1, ..., r_{n-1}
+        # Maximize sum(r_i) <=> Minimize -sum(r_i)
+        c_obj = np.ones(n) * -1
+        
+        # Inequalities: A_ub * r <= b_ub
+        # Constraints:
+        # 1. r_i <= x_i (Left boundary)
+        # 2. r_i <= 1 - x_i (Right boundary)
+        # 3. r_i <= y_i (Bottom boundary)
+        # 4. r_i <= 1 - y_i (Top boundary)
+        # 5. r_i + r_j <= dist(i, j) for all pairs i < j
+        
+        A_ub = []
+        b_ub = []
+        
+        for i in range(n):
+            # Boundary constraints
+            # r_i <= x_i
+            row = np.zeros(n)
+            row[i] = 1
+            A_ub.append(row)
+            b_ub.append(centers[i, 0])
+            
+            # r_i <= 1 - x_i
+            row = np.zeros(n)
+            row[i] = 1
+            A_ub.append(row)
+            b_ub.append(1.0 - centers[i, 0])
+            
+            # r_i <= y_i
+            row = np.zeros(n)
+            row[i] = 1
+            A_ub.append(row)
+            b_ub.append(centers[i, 1])
+            
+            # r_i <= 1 - y_i
+            row = np.zeros(n)
+            row[i] = 1
+            A_ub.append(row)
+            b_ub.append(1.0 - centers[i, 1])
+            
+        # Pairwise constraints
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                row = np.zeros(n)
+                row[i] = 1
+                row[j] = 1
+                A_ub.append(row)
+                b_ub.append(dist)
+                
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        # Bounds for radii: r_i >= 0
+        bounds = [(0, None) for _ in range(n)]
+        
+        # Solve LP
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if res.success:
+            radii = -res.fun # Sum of radii is -res.fun? No, res.fun is min -sum.
+            radii = -res.x # radii values
+        else:
+            # If LP fails, keep previous radii or reset
+            # This shouldn't happen with valid bounds
+            pass
+            
+        # B. Center Refinement (Repulsive Forces)
+        # Identify tight constraints and move centers
+        # We look for constraints where r_i + r_j approx dist(i,j) or r_i approx boundary
+        
+        # Learning rate for movement
+        lr = 0.005 * (1.0 - it / num_iters) # Decay learning rate
+        if lr < 1e-6: lr = 1e-6
+        
+        forces = np.zeros_like(centers)
+        
+        # Check boundary tightness
+        for i in range(n):
+            # Left
+            gap = centers[i, 0] - radii[i]
+            if gap < 0.001: # Tight against left wall
+                forces[i, 0] += 1.0 * (0.001 - gap)
+            # Right
+            gap = (1.0 - centers[i, 0]) - radii[i]
+            if gap < 0.001:
+                forces[i, 0] -= 1.0 * (0.001 - gap)
+            # Bottom
+            gap = centers[i, 1] - radii[i]
+            if gap < 0.001:
+                forces[i, 1] += 1.0 * (0.001 - gap)
+            # Top
+            gap = (1.0 - centers[i, 1]) - radii[i]
+            if gap < 0.001:
+                forces[i, 1] -= 1.0 * (0.001 - gap)
+                
+        # Check pairwise tightness
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                sum_r = radii[i] + radii[j]
+                # If touching or overlapping
+                if dist < sum_r + 0.002:
+                    # Repulsive force along the vector connecting centers
+                    # Direction from j to i
+                    vec = centers[i] - centers[j]
+                    if dist > 1e-8:
+                        norm_vec = vec / dist
+                        # Force proportional to overlap or tightness
+                        # Push i away from j
+                        push_strength = max(0, sum_r - dist) + 0.001 # Always push a bit if close
+                        forces[i] += norm_vec * push_strength
+                        forces[j] -= norm_vec * push_strength
+        
+        # Apply forces
+        centers += forces * lr
+        
+        # Clip centers to stay inside [0,1] strictly (with margin)
+        margin = 0.001
+        centers = np.clip(centers, margin, 1.0 - margin)
+        
+        # Occasional random perturbation to escape local optima
+        if it % 50 == 0:
+            centers += np.random.normal(0, 0.01, centers.shape)
+            centers = np.clip(centers, margin, 1.0 - margin)
+
+    # Final validation and cleanup
+    # Ensure radii are consistent with final centers (re-solve LP once)
+    A_ub = []
+    b_ub = []
+    for i in range(n):
+        row = np.zeros(n); row[i] = 1; A_ub.append(row); b_ub.append(centers[i, 0])
+        row = np.zeros(n); row[i] = 1; A_ub.append(row); b_ub.append(1.0 - centers[i, 0])
+        row = np.zeros(n); row[i] = 1; A_ub.append(row); b_ub.append(centers[i, 1])
+        row = np.zeros(n); row[i] = 1; A_ub.append(row); b_ub.append(1.0 - centers[i, 1])
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+            row = np.zeros(n); row[i] = 1; row[j] = 1; A_ub.append(row); b_ub.append(dist)
+            
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    bounds = [(0, None) for _ in range(n)]
+    res = linprog(np.ones(n) * -1, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    
+    if res.success:
+        radii = -res.x
+    else:
+        # Fallback to small radii if optimization failed
+        radii = np.ones(n) * 0.001
+        
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+```

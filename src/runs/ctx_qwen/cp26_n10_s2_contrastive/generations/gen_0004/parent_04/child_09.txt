@@ -1,0 +1,242 @@
+
+
+<strategy>
+To improve the packing from ~2.629 to the target of 2.636+, I will shift the optimization focus from joint SLSQP to an alternating strategy that heavily relies on exact Linear Programming (LP) for radius computation given fixed centers. This avoids gradient vanishing when circles touch and handles the piecewise-linear objective landscape more robustly.
+
+Key improvements:
+1. **LP-based Center Optimization**: For fixed centers, maximizing $\sum r_i$ subject to $r_i + r_j \le d_{ij}$ and boundary constraints is a linear program. I will use `scipy.optimize.linprog` with the `highs` method to compute optimal radii exactly.
+2. **Adaptive Jiggle Search on Centers**: Instead of joint gradient descent, I will perform direct search on the center coordinates. Each step perturbs centers, solves the LP, and accepts if the sum of radii increases. An adaptive step size decays over iterations to allow coarse exploration followed by fine polishing.
+3. **Coordinate Sub-sampling Jitter**: To accelerate convergence, I'll randomly select subsets of circles to perturb, allowing local gaps to close efficiently without disturbing well-placed circles.
+4. **Diverse Structured Initializations**: Generate hexagonal, grid, specific row-count patterns (e.g., 5-6-5-6-4), and corner-biased layouts to cover promising regions of the configuration space.
+5. **SLSQP Polish as Fallback**: After the jiggle phase, run a quick SLSQP joint optimization on the best found configuration to exploit any remaining smooth-space improvements.
+6. **Strict Post-Processing**: Deterministically shrink radii to guarantee compliance with the validator's `1e-12` tolerance, removing any numerical overlap artifacts.
+
+This strategy typically outperforms pure SLSQP for packing problems because LP evaluates the true objective without relaxation error, and direct search navigates the non-smooth constraint boundaries effectively.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+NUM_PAIRS = len(I_IDX)
+
+# Precompute LP constraint matrix structure: r_i + r_j <= d_ij
+A_LP = np.zeros((NUM_PAIRS, N))
+A_LP[np.arange(NUM_PAIRS), I_IDX] = 1.0
+A_LP[np.arange(NUM_PAIRS), J_IDX] = 1.0
+
+def solve_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii subject to constraints."""
+    n = centers.shape[0]
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    b_ub = dists[I_IDX, J_IDX]
+    
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        mx = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(0.0, mx)))
+        
+    try:
+        res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success and np.all(res.x >= -1e-9):
+            return np.maximum(res.x, 0.0), -res.fun
+    except Exception:
+        pass
+    return np.zeros(n), 0.0
+
+def generate_initial_configs(rng):
+    """Generate diverse structured and random initial center configurations."""
+    configs = []
+    
+    # 1. Hexagonal patterns with varying spacing
+    for s in np.linspace(0.16, 0.22, 6):
+        c = np.zeros((N, 2))
+        idx = 0
+        y = s / 2
+        row = 0
+        while idx < N and y < 1.0 - s / 2:
+            x = s / 2 + (row % 2) * s / 2
+            while x < 1.0 - s / 2 and idx < N:
+                c[idx] = [x, y]
+                x += s
+                idx += 1
+            y += s * np.sqrt(3) / 2
+            row += 1
+        while idx < N:
+            c[idx] = rng.uniform(0.1, 0.9, 2)
+            idx += 1
+        c += rng.normal(0, 0.005, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        configs.append(c)
+        
+    # 2. Square grid patterns
+    for s in np.linspace(0.17, 0.23, 6):
+        c = np.zeros((N, 2))
+        idx = 0
+        y = s / 2
+        while y < 1.0 - s / 2 and idx < N:
+            x = s / 2
+            while x < 1.0 - s / 2 and idx < N:
+                c[idx] = [x, y]
+                x += s
+                idx += 1
+            y += s
+        while idx < N:
+            c[idx] = rng.uniform(0.1, 0.9, 2)
+            idx += 1
+        c += rng.normal(0, 0.005, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        configs.append(c)
+        
+    # 3. Custom row patterns optimized for 26 circles
+    for pat in [[5,6,5,6,4], [6,5,5,5,5], [5,5,6,5,5], [4,6,6,5,5], [6,6,5,5,4]]:
+        c = np.zeros((N, 2))
+        idx = 0
+        y = 0.1
+        dy = 0.8 / (len(pat) - 1) if len(pat) > 1 else 0.8
+        for r_idx, cnt in enumerate(pat):
+            shift = 0.0 if r_idx % 2 == 0 else 0.04
+            x = 0.08 + shift
+            step = (0.84 - 2*shift) / cnt if cnt > 0 else 1.0
+            for _ in range(cnt):
+                if idx < N:
+                    c[idx] = [x, y]
+                    x += step
+                idx += 1
+            y += dy
+        while idx < N:
+            c[idx] = rng.uniform(0.1, 0.9, 2)
+            idx += 1
+        c += rng.normal(0, 0.008, c.shape)
+        c = np.clip(c, 0.02, 0.98)
+        configs.append(c)
+        
+    # 4. Random feasible placements
+    for _ in range(12):
+        c = rng.uniform(0.12, 0.88, (N, 2))
+        configs.append(c)
+        
+    return configs
+
+def jiggle_and_refine(c_init, rng):
+    """Optimize centers using adaptive random jiggle with LP radius evaluation."""
+    c_best = c_init.copy()
+    r_best, s_best = solve_lp_radii(c_best)
+    
+    # Phase 1: Coarse global jiggle
+    step = 0.025
+    for i in range(1200):
+        step_cur = step * (1.0 - 0.45 * i / 1200)
+        pert = c_best + rng.normal(0, step_cur, (N, 2))
+        pert = np.clip(pert, 1e-4, 1.0 - 1e-4)
+        r_p, s_p = solve_lp_radii(pert)
+        if s_p > s_best:
+            c_best, r_best, s_best = pert, r_p, s_p
+            step *= 1.06
+        else:
+            step *= 0.97
+        step = np.clip(step, 1e-5, 0.035)
+        
+    # Phase 2: Fine coordinate sub-sampling jitter
+    for _ in range(900):
+        k = rng.integers(1, N // 4 + 2)
+        idx = rng.choice(N, size=k, replace=False)
+        c_pert = c_best.copy()
+        c_pert[idx] += rng.normal(0, 0.003, (k, 2))
+        c_pert = np.clip(c_pert, 1e-4, 1.0 - 1e-4)
+        r_p, s_p = solve_lp_radii(c_pert)
+        if s_p > s_best:
+            c_best, r_best, s_best = c_pert, r_p, s_p
+            
+    return c_best, r_best, s_best
+
+def obj_slsqp(x):
+    """Objective for SLSQP: minimize negative sum of radii."""
+    return -np.sum(x[2 * N:])
+
+def con_slsqp(x):
+    """Constraints for SLSQP: boundary clearance and pairwise non-overlap (>= 0)."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    c = np.empty(4 * N + NUM_PAIRS)
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[I_IDX] - cx[J_IDX]
+    dy = cy[I_IDX] - cy[J_IDX]
+    c[4*N:] = np.hypot(dx, dy) - r[I_IDX] - r[J_IDX]
+    return c
+
+def run_packing():
+    rng = np.random.default_rng(42)
+    configs = generate_initial_configs(rng)
+    
+    best_c = None
+    best_r = None
+    best_s = 0.0
+    
+    # Evaluate all initial configurations with jiggle refinement
+    for c0 in configs:
+        c_res, r_res, s_res = jiggle_and_refine(c0, rng)
+        if s_res > best_s:
+            best_c, best_r, best_s = c_res, r_res, s_res
+            
+    # SLSQP polish on joint space to catch any smooth-space improvements
+    if best_c is not None:
+        x0 = np.zeros(3 * N)
+        x0[0::3] = best_c[:, 0]
+        x0[1::3] = best_c[:, 1]
+        x0[2::3] = np.maximum(best_r * 0.995, 1e-5)
+        
+        bounds_opt = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+        cons_dict = {'type': 'ineq', 'fun': con_slsqp}
+        
+        try:
+            res = minimize(obj_slsqp, x0, method='SLSQP', bounds=bounds_opt, constraints=cons_dict,
+                           options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+            if res.success:
+                co = np.column_stack((res.x[0::3], res.x[1::3]))
+                ro, so = solve_lp_radii(co)
+                if so > best_s:
+                    best_c, best_r, best_s = co, ro, so
+        except Exception:
+            pass
+            
+    # Strict post-processing to guarantee validator compliance
+    c_final = best_c.copy()
+    r_final = best_r.copy()
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        mx = min(c_final[i, 0], 1.0 - c_final[i, 0], 
+                 c_final[i, 1], 1.0 - c_final[i, 1])
+        r_final[i] = min(r_final[i], mx - 1e-10)
+        r_final[i] = max(r_final[i], 0.0)
+        
+    # Iteratively resolve any remaining numerical overlaps
+    for _ in range(150):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = c_final[i, 0] - c_final[j, 0]
+                dy = c_final[i, 1] - c_final[j, 1]
+                d = np.hypot(dx, dy)
+                if d < r_final[i] + r_final[j] - 1e-12:
+                    exc = r_final[i] + r_final[j] - d
+                    r_final[i] -= exc * 0.5
+                    r_final[j] -= exc * 0.5
+                    changed = True
+        if not changed:
+            break
+            
+    r_final = np.maximum(r_final, 0.0)
+    return c_final, r_final, float(np.sum(r_final))
+```

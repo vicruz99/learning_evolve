@@ -1,162 +1,101 @@
 # sol_000201 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 4a6b07ba) state=4ecdc9f4 sum of radii=0.000000 correctness=1.0
+# generation=0 parent=seed (state 263f0241) state=64eedbc2 sum of radii=2.589318 correctness=1.0
 # stdout(first 200): 
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
+from scipy.optimize import minimize
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Returns (centers, radii, sum_radii) for 26 circles in a unit square.
-    Uses a force-directed optimization to maximize the minimum separation, 
-    thereby maximizing the equal radii.
-    """
+def compute_objective(vars):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    radii = vars[2::3]
+    return -np.sum(radii)
+
+def compute_constraints(vars):
+    """Compute all inequality constraints g(vars) >= 0."""
     n = 26
-    best_centers = None
-    best_r = 0.0
-    best_sum = 0.0
-
-    def calculate_min_separation(centers):
-        """Calculates the minimum distance between centers or boundaries."""
-        # Pairwise distances
-        dists = np.inf
-        for i in range(n):
-            for j in range(i + 1, n):
-                dx = centers[i, 0] - centers[j, 0]
-                dy = centers[i, 1] - centers[j, 1]
-                d = np.hypot(dx, dy)
-                if d < dists:
-                    dists = d
-        
-        # Boundary distances
-        # x distance to 0 and 1
-        dx = np.minimum(centers[:, 0], 1.0 - centers[:, 0])
-        dy = np.minimum(centers[:, 1], 1.0 - centers[:, 1])
-        min_boundary = np.minimum(dx.min(), dy.min())
-        
-        return np.minimum(dists, min_boundary)
-
-    def optimize_packing(init_centers, steps=2000):
-        """Runs force-directed optimization."""
-        centers = init_centers.copy()
-        # Learning rate parameters
-        lr = 0.05
-        cooling = 0.995
-        
-        for _ in range(steps):
-            forces = np.zeros_like(centers)
-            
-            # Calculate repulsion forces
-            for i in range(n):
-                # Boundary repulsion
-                for d in [centers[i, 0], 1 - centers[i, 0], centers[i, 1], 1 - centers[i, 1]]:
-                    if d < 0.3: # Only consider close boundaries
-                        f = 1.0 / (d**2 + 1e-5)
-                        # Direction
-                        if d == centers[i, 0]: forces[i, 0] += f
-                        elif d == 1 - centers[i, 0]: forces[i, 0] -= f
-                        elif d == centers[i, 1]: forces[i, 1] += f
-                        else: forces[i, 1] -= f
-
-                # Circle repulsion
-                for j in range(i + 1, n):
-                    dx = centers[i, 0] - centers[j, 0]
-                    dy = centers[i, 1] - centers[j, 1]
-                    dist_sq = dx*dx + dy*dy
-                    dist = np.sqrt(dist_sq)
-                    
-                    if dist < 0.5: # Optimization cutoff
-                        # Stronger repulsion when close
-                        f_mag = 1.0 / (dist_sq + 1e-5)
-                        forces[i, 0] += (dx / dist) * f_mag
-                        forces[i, 1] += (dy / dist) * f_mag
-                        forces[j, 0] -= (dx / dist) * f_mag
-                        forces[j, 1] -= (dy / dist) * f_mag
-            
-            centers += forces * lr
-            centers = np.clip(centers, 0.001, 0.999) # Keep inside strictly
-            lr *= cooling
-
-        return centers
-
-    # --- Generation Strategies ---
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
     
-    # Strategy 1: Hexagonal Grid
-    # Rows of alternating counts. e.g., 5, 6, 5, 6, 4 (Total 26)
-    h_centers = []
-    rows = [5, 6, 5, 6, 4]
-    row_y = 0.0
-    spacing_y = 0.18
-    spacing_x = 0.17
-    shift = 0.085
+    # Boundary constraints: circle must be inside [0,1]x[0,1]
+    # x >= r, 1-x >= r, y >= r, 1-y >= r
+    c1 = x - r
+    c2 = 1.0 - x - r
+    c3 = y - r
+    c4 = 1.0 - y - r
+    c5 = r  # radii non-negativity
+    
+    # Non-overlap constraints: dist^2 >= (r_i + r_j)^2
+    # Vectorized computation for all pairs
+    X = x[:, np.newaxis] - x[np.newaxis, :]
+    Y = y[:, np.newaxis] - y[np.newaxis, :]
+    R_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    
+    dist_sq = X**2 + Y**2
+    overlap_vals = dist_sq - R_sum**2
+    
+    # Extract upper triangle (i < j) to avoid duplicates and self-checks
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    c6 = overlap_vals[mask]
+    
+    return np.concatenate([c1, c2, c3, c4, c5, c6])
+
+def get_initial_guess():
+    """Generate a feasible initial configuration using a hexagonal lattice."""
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.10
     
     idx = 0
+    rows = [6, 5, 6, 5, 4]
+    spacing = 0.16
+    y_base = 0.12
+    
     for i, count in enumerate(rows):
-        x_start = 0.5 - (count * spacing_x) / 2
-        if i % 2 == 1:
-            x_start += shift
-        for _ in range(count):
-            h_centers.append([x_start, row_y])
-            x_start += spacing_x
-        row_y += spacing_y
+        y = y_base + i * spacing * np.sqrt(3) / 2.0
+        x_start = 0.12 + (0.0 if i % 2 == 0 else spacing / 2.0)
+        for j in range(count):
+            if idx < n:
+                centers[idx, 0] = x_start + j * spacing
+                centers[idx, 1] = y
+                idx += 1
+                
+    # Flatten to [x1, y1, r1, x2, y2, r2, ..., x26, y26, r26]
+    vars0 = np.empty(3 * n)
+    vars0[0::3] = centers[:, 0]
+    vars0[1::3] = centers[:, 1]
+    vars0[2::3] = radii
+    return vars0
+
+def run_packing():
+    n = 26
+    vars0 = get_initial_guess()
     
-    if len(h_centers) == n:
-        h_centers = np.array(h_centers)
-        # Center and scale to fit roughly in [0.1, 0.9]
-        h_centers = (h_centers - h_centers.min(axis=0)) / (h_centers.max(axis=0) - h_centers.min(axis=0)) * 0.8 + 0.1
-        
-        opt_centers = optimize_packing(h_centers)
-        r = calculate_min_separation(opt_centers) / 2
-        if r > best_r:
-            best_r = r
-            best_centers = opt_centers
-            best_sum = n * r
-
-    # Strategy 2: Perturbed 5x5 Grid + 1
-    # Start with 25 in 5x5, place 26th in center, then optimize
-    p_centers = []
-    for i in range(5):
-        for j in range(5):
-            p_centers.append([0.1 + j*0.2, 0.1 + i*0.2])
-    p_centers.append([0.5, 0.5]) # The 26th circle
-    p_centers = np.array(p_centers)
+    # Define bounds: x,y in [0,1], r in [0,0.5]
+    bnds = []
+    for i in range(3 * n):
+        if i % 3 == 2:
+            bnds.append((0.0, 0.5))
+        else:
+            bnds.append((0.0, 1.0))
+            
+    cons = {'type': 'ineq', 'fun': compute_constraints}
     
-    # Add small noise to break symmetry
-    p_centers += np.random.uniform(-0.01, 0.01, p_centers.shape)
-    p_centers = np.clip(p_centers, 0.01, 0.99)
+    # Run SLSQP optimizer
+    res = minimize(compute_objective, vars0, method='SLSQP', 
+                   bounds=bnds, constraints=cons, 
+                   options={'maxiter': 3000, 'ftol': 1e-12})
+                   
+    # Extract results
+    centers = np.zeros((n, 2))
+    centers[:, 0] = res.x[0::3]
+    centers[:, 1] = res.x[1::3]
+    radii = res.x[2::3]
     
-    opt_centers = optimize_packing(p_centers, steps=3000)
-    r = calculate_min_separation(opt_centers) / 2
-    if r > best_r:
-        best_r = r
-        best_centers = opt_centers
-        best_sum = n * r
-
-    # Strategy 3: Random initialization (multiple restarts)
-    for _ in range(5):
-        r_centers = np.random.uniform(0.1, 0.9, (n, 2))
-        opt_centers = optimize_packing(r_centers, steps=1000)
-        r = calculate_min_separation(opt_centers) / 2
-        if r > best_r:
-            best_r = r
-            best_centers = opt_centers
-            best_sum = n * r
-
-    # Finalize
-    if best_centers is None:
-        # Fallback to simple grid
-        best_centers = np.array([[0.1 + j*0.2, 0.1 + i*0.2] for i in range(5) for j in range(5)] + [[0.5, 0.5]])
-        best_r = 0.05 # Safe radius
-        best_sum = n * best_r
-
-    # Refine radius based on actual calculated separation
-    final_r = calculate_min_separation(best_centers) / 2
-    final_radii = np.full(n, final_r)
-    final_sum = np.sum(final_radii)
-
-    return best_centers, final_radii, final_sum
-
-# Note: To ensure reproducibility and robustness in the returned solution,
-# we rely on the optimization finding a local optimum near the theoretical max.
-# The target 2.636 requires r ~ 0.1014. Hexagonal packing should approach this.
+    # Ensure non-negative radii (handle potential numerical noise)
+    radii = np.maximum(radii, 0.0)
+    
+    total_sum = np.sum(radii)
+    return centers, radii, total_sum

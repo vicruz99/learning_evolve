@@ -1,250 +1,193 @@
 # sol_000188 | problem=circle_packing_26 entrypoint=run_packing
-# generation=0 parent=seed (state 9afef83a) state=a62d3615 sum of radii=1.771592 correctness=1.0
-# stdout(first 200): 
+# generation=0 parent=seed (state 4dd6d242) state=3cc9a5a2 sum of radii=2.613222 correctness=1.0
+# stdout(first 200): Optimization terminated successfully    (Exit mode 0)             Current function value: -2.6132223728808954             Iterations: 11             Function evaluations: 790             Gradient eval
 # NOTE: model code as-parsed; at eval time the harness also injects a preamble
 #       (validator source + construction globals) via envs/<problem>.py.
 
 import numpy as np
-from scipy.optimize import linprog
-import warnings
+from scipy.optimize import minimize
 
-# Suppress warnings from linprog for cleaner output
-warnings.filterwarnings('ignore')
-
-def compute_forces(centers, marginals, n_pairs_map):
+def validate_packing(centers, radii):
     """
-    Computes forces on centers based on LP dual variables (marginals).
-    Forces are derived from the sensitivity of the objective (sum of radii) 
-    to changes in the RHS of the constraints (which depend on centers).
+    Validate that circles don't overlap and are inside the unit square
+
+    Args:
+        centers: np.array of shape (n, 2) with (x, y) coordinates
+        radii: np.array of shape (n) with radius of each circle
+
+    Returns:
+        True if valid, False otherwise
     """
     n = centers.shape[0]
-    forces_x = np.zeros(n)
-    forces_y = np.zeros(n)
-    
-    # 1. Boundary constraints forces
-    # Marginals indices:
-    # 0..n-1: r_i <= x_i
-    # n..2n-1: r_i <= 1 - x_i
-    # 2n..3n-1: r_i <= y_i
-    # 3n..4n-1: r_i <= 1 - y_i
-    
-    # r_i <= x_i (RHS is x_i, deriv wrt x_i is 1)
-    for i in range(n):
-        lam = marginals[i]
-        forces_x[i] += lam
-        
-    # r_i <= 1 - x_i (RHS is 1-x_i, deriv wrt x_i is -1)
-    for i in range(n):
-        lam = marginals[n + i]
-        forces_x[i] -= lam
-        
-    # r_i <= y_i (RHS is y_i, deriv wrt y_i is 1)
-    for i in range(n):
-        lam = marginals[2*n + i]
-        forces_y[i] += lam
-        
-    # r_i <= 1 - y_i (RHS is 1-y_i, deriv wrt y_i is -1)
-    for i in range(n):
-        lam = marginals[3*n + i]
-        forces_y[i] -= lam
 
-    # 2. Pairwise constraints forces
-    # r_i + r_j <= dist_ij
-    # RHS is dist_ij. 
-    # dist_ij = sqrt((xi-xj)^2 + (yi-yj)^2)
-    # grad(dist_ij) wrt xi = (xi - xj) / dist_ij
-    # grad(dist_ij) wrt xj = (xj - xi) / dist_ij
-    
-    # Marginals for pairs start at index 4*n
-    # We iterate through the pairs we stored
-    
-    base_idx = 4 * n
-    for idx, (i, j) in enumerate(n_pairs_map):
-        lam = marginals[base_idx + idx]
-        if lam > 1e-9: # Only consider active constraints
-            dx = centers[i, 0] - centers[j, 0]
-            dy = centers[i, 1] - centers[j, 1]
-            dist = np.sqrt(dx*dx + dy*dy)
-            
-            if dist > 1e-9:
-                # Force proportional to lambda * gradient of distance
-                # We want to maximize sum radii, so we move in direction of increasing dist
-                # Force on i is + lam * grad_i
-                # Force on j is + lam * grad_j
-                
-                fx = lam * dx / dist
-                fy = lam * dy / dist
-                
-                forces_x[i] += fx
-                forces_y[i] += fy
-                
-                forces_x[j] -= fx
-                forces_y[j] -= fy
-                
-    return forces_x, forces_y
+    # Check for NaN values
+    if np.isnan(centers).any():
+        print("NaN values detected in circle centers")
+        return False
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    n = 26
-    
-    # 1. Initialize centers
-    # Start with a grid and add perturbation to break symmetry
-    # 5x5 grid is 25 points. We need 26.
-    # Let's use a 6x5 grid logic or just random dense packing
-    # A good heuristic is to pack them as densely as possible initially
-    
-    # Create a grid of 26 points
-    # Maybe 6 rows: 4, 5, 4, 5, 4, 4 ?
-    # Or just random
-    np.random.seed(42)
-    
-    # Initialize with a perturbed grid
-    # 5 columns, 6 rows roughly
-    cols = 5
-    rows = 6
-    # Spacing
-    dx = 1.0 / (cols + 1)
-    dy = 1.0 / (rows + 1)
-    
-    centers = []
-    for r in range(rows):
-        for c in range(cols):
-            centers.append([
-                (c + 1) * dx + np.random.uniform(-0.05, 0.05),
-                (r + 1) * dy + np.random.uniform(-0.05, 0.05)
-            ])
-    centers = np.array(centers)
-    
-    # If we have more than 26, slice (we generated 30)
-    # Actually 5*6 = 30.
-    centers = centers[:n]
-    
-    # Ensure centers are within reasonable bounds [0.1, 0.9]
-    centers = np.clip(centers, 0.1, 0.9)
+    if np.isnan(radii).any():
+        print("NaN values detected in circle radii")
+        return False
 
-    # Precompute pair indices
-    pairs = []
+    # Check if radii are nonnegative and not nan
+    for i in range(n):
+        if radii[i] < 0:
+            print(f"Circle {i} has negative radius {radii[i]}")
+            return False
+        elif np.isnan(radii[i]):
+            print(f"Circle {i} has nan radius")
+            return False
+
+    # Check if circles are inside the unit square
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-12 or x + r > 1 + 1e-12 or y - r < -1e-12 or y + r > 1 + 1e-12:
+            print(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+            return False
+
+    # Check for overlaps
     for i in range(n):
         for j in range(i + 1, n):
-            pairs.append((i, j))
-    
-    num_pairs = len(pairs)
-    num_constraints = 4 * n + num_pairs
-    
-    # Precompute A_ub structure for pairs (constant)
-    # A_ub is sparse-ish but for n=26 dense is fine
-    # Actually A_ub changes only in b_ub (RHS) for pairs, 
-    # but the rows for pairs are constant (1 at i, 1 at j).
-    
-    # Build constant part of A_ub for pairs
-    # Shape (num_pairs, n)
-    A_pairs = np.zeros((num_pairs, n))
-    for idx, (i, j) in enumerate(pairs):
-        A_pairs[idx, i] = 1.0
-        A_pairs[idx, j] = 1.0
-        
-    # Build A_ub for boundaries (identity matrices)
-    # We can construct the full A_ub matrix
-    # Rows 0..n-1: I (r_i <= x_i)
-    # Rows n..2n-1: I (r_i <= 1-x_i)
-    # Rows 2n..3n-1: I (r_i <= y_i)
-    # Rows 3n..4n-1: I (r_i <= 1-y_i)
-    # Rows 4n..end: A_pairs
-    
-    A_ub = np.vstack([
-        np.eye(n),
-        np.eye(n),
-        np.eye(n),
-        np.eye(n),
-        A_pairs
-    ])
-    
-    c = -np.ones(n) # Maximize sum -> minimize negative sum
-    bounds = [(0, None) for _ in range(n)]
-    
-    # Optimization parameters
-    max_iter = 500
-    step_size = 0.01
-    alpha = 0.9 # Momentum / damping
-    
-    best_sum_radii = -1.0
-    best_centers = centers.copy()
-    best_radii = np.zeros(n)
-    
-    # Previous velocity for momentum
-    vx = np.zeros(n)
-    vy = np.zeros(n)
-    
-    for iteration in range(max_iter):
-        # 1. Solve LP for radii given current centers
-        b_ub = np.zeros(num_constraints)
-        
-        # Fill boundary RHS
-        for i in range(n):
-            x, y = centers[i]
-            b_ub[i] = x
-            b_ub[n + i] = 1.0 - x
-            b_ub[2*n + i] = y
-            b_ub[3*n + i] = 1.0 - y
-            
-        # Fill pair RHS
-        for idx, (i, j) in enumerate(pairs):
-            dx = centers[i, 0] - centers[j, 0]
-            dy = centers[i, 1] - centers[j, 1]
-            b_ub[4*n + idx] = np.sqrt(dx*dx + dy*dy)
-            
-        # Solve
-        try:
-            res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if not res.success:
-                # If LP fails, try to recover or break
-                # Sometimes happens if constraints are infeasible (shouldn't be for valid centers)
-                # But if centers are too close? No, radii can be 0.
-                # Maybe numerical issue.
-                continue
-                
-            radii = res.x
-            current_sum = np.sum(radii)
-            
-            if current_sum > best_sum_radii:
-                best_sum_radii = current_sum
-                best_centers = centers.copy()
-                best_radii = radii.copy()
-                
-            # 2. Compute forces for next iteration
-            # We need marginals. Highs provides them in res.marginals
-            # Note: marginals order matches constraints order
-            
-            if hasattr(res, 'marginals'):
-                m = res.marginals
-                # Inequalities marginals
-                # Note: scipy linprog marginals for inequalities correspond to A_ub x <= b_ub
-                ineq_marginals = m.ineqlin
-                
-                # Check if marginals are available (sometimes None or 0 if not requested/supported)
-                if ineq_marginals is not None:
-                    fx, fy = compute_forces(centers, ineq_marginals, pairs)
-                    
-                    # Update velocities with momentum
-                    vx = alpha * vx + (1 - alpha) * fx
-                    vy = alpha * vy + (1 - alpha) * fy
-                    
-                    # Update centers
-                    # Adaptive step size?
-                    # Decrease step size over time to converge
-                    current_step = step_size * (1.0 / (1.0 + iteration * 0.01))
-                    
-                    centers[:, 0] += current_step * vx
-                    centers[:, 1] += current_step * vy
-                    
-                    # Clamp centers to stay inside [r_min, 1-r_min]
-                    # Since min radius can be 0, strictly [0, 1] is safe, 
-                    # but to allow non-zero radii, keep away from boundary slightly?
-                    # Actually, if center hits 0, radius becomes 0.
-                    # It's valid. But let's keep it in [0.001, 0.999] to avoid numerical issues with 0 dist
-                    centers = np.clip(centers, 0.001, 0.999)
-                    
-        except Exception as e:
-            # Fallback if optimization fails
-            continue
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-12:  # Allow for tiny numerical errors
+                print(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+                return False
 
-    return best_centers, best_radii, best_sum_radii
+    return True
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Optimize the packing of 26 circles in a unit square to maximize the sum of radii.
+    
+    Returns:
+        tuple: (centers, radii, sum_radii)
+    """
+    n = 26
+    # Variables: [x0, y0, r0, x1, y1, r1, ..., x25, y25, r25]
+    # Total variables = 26 * 3 = 78
+    
+    # Initialize with a hexagonal grid
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Parameters for hexagonal packing
+    cols = 6
+    rows = 5
+    spacing_x = 0.2
+    spacing_y = 0.15
+    radius_init = 0.04
+    
+    # Generate initial positions
+    count = 0
+    for r in range(rows):
+        for c in range(cols):
+            if count >= n:
+                break
+            # Hexagonal shift
+            x = (c + 0.5) * spacing_x
+            y = (r + 0.5) * spacing_y + (c % 2) * (spacing_y / 2)
+            
+            # Adjust to fit in unit square [0, 1]
+            x = 0.1 + x * 0.8
+            y = 0.1 + y * 0.8
+            
+            if count < n:
+                centers[count] = [x, y]
+                radii[count] = radius_init
+                count += 1
+        if count >= n:
+            break
+            
+    # Flatten for optimizer
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = radii[i]
+        
+    # Bounds for variables
+    bounds = []
+    for i in range(n):
+        # x, y in [0, 1], r >= 0
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r (upper bound 0.5 is safe)
+        
+    # Objective function: maximize sum of radii => minimize negative sum
+    def objective(vars):
+        r = vars[2::3]
+        return -np.sum(r)
+        
+    # Constraints
+    constraints = []
+    
+    # Boundary constraints: r <= x <= 1-r  =>  x >= r, 1-x >= r
+    # r <= y <= 1-y  =>  y >= r, 1-y >= r
+    for i in range(n):
+        idx = 3 * i
+        xi = lambda v, i=i: v[idx]
+        yi = lambda v, i=i: v[idx+1]
+        ri = lambda v, i=i: v[idx+2]
+        
+        # x >= r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i] - v[3*i+2]})
+        # 1 - x >= r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[3*i] - v[3*i+2]})
+        # y >= r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: v[3*i+1] - v[3*i+2]})
+        # 1 - y >= r
+        constraints.append({'type': 'ineq', 'fun': lambda v, i=i: 1 - v[3*i+1] - v[3*i+2]})
+        
+    # Non-overlap constraints: ||ci - cj|| >= ri + rj
+    # ||ci - cj||^2 >= (ri + rj)^2
+    # (xi - xj)^2 + (yi - yj)^2 - (ri + rj)^2 >= 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            idx_i = 3 * i
+            idx_j = 3 * j
+            
+            def make_constraint(i, j):
+                def constraint_func(v):
+                    xi, yi, ri = v[3*i], v[3*i+1], v[3*i+2]
+                    xj, yj, rj = v[3*j], v[3*j+1], v[3*j+2]
+                    dist_sq = (xi - xj)**2 + (yi - yj)**2
+                    rad_sum_sq = (ri + rj)**2
+                    return dist_sq - rad_sum_sq
+                return constraint_func
+            
+            constraints.append({'type': 'ineq', 'fun': make_constraint(i, j)})
+            
+    # Run optimization
+    # SLSQP is a good choice for non-linear constraints
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                   options={'maxiter': 1000, 'ftol': 1e-9, 'disp': True})
+    
+    if res.success:
+        final_centers = np.zeros((n, 2))
+        final_radii = np.zeros(n)
+        for i in range(n):
+            final_centers[i, 0] = res.x[3*i]
+            final_centers[i, 1] = res.x[3*i+1]
+            final_radii[i] = res.x[3*i+2]
+            
+        # Ensure radii are not negative due to numerical errors
+        final_radii = np.maximum(final_radii, 0.0)
+        
+        # Validate
+        if validate_packing(final_centers, final_radii):
+            sum_radii = np.sum(final_radii)
+            return final_centers, final_radii, sum_radii
+        else:
+            print("Optimization succeeded but validation failed. Falling back to initial.")
+            return centers, radii, np.sum(radii)
+    else:
+        print("Optimization failed.")
+        return centers, radii, np.sum(radii)
+
+# Execute the packing
+if __name__ == "__main__":
+    centers, radii, sum_r = run_packing()
+    print(f"Sum of radii: {sum_r}")
+    print(f"Number of circles: {len(radii)}")
+    print(f"Min radius: {np.min(radii)}, Max radius: {np.max(radii)}")

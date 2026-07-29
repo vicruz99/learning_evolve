@@ -1,0 +1,226 @@
+# sol_000178 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 0ae2e142) state=96be072f sum of radii=2.588383 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+import time
+
+def get_initial_guess():
+    """
+    Generates a good initial guess using a hexagonal lattice packing.
+    """
+    n = 26
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    # Generate a hexagonal lattice
+    # Basis vectors for hexagonal packing
+    scale = 0.2  # Approximate spacing
+    v1 = np.array([scale, 0.0])
+    v2 = np.array([scale * 0.5, scale * np.sqrt(3) / 2])
+    
+    points = []
+    # Search a range large enough to cover the unit square
+    range_limit = 10
+    for i in range(-range_limit, range_limit):
+        for j in range(-range_limit, range_limit):
+            pt = i * v1 + j * v2 + np.array([0.5, 0.5])
+            # Check if point is somewhat inside (with margin)
+            if 0.05 <= pt[0] <= 0.95 and 0.05 <= pt[1] <= 0.95:
+                points.append(pt)
+    
+    # We might have too many or too few points depending on scale.
+    # If too few, we can just fill with a grid or random valid points.
+    # If too many, we can select a subset.
+    
+    # Let's try to ensure we have at least 26 points.
+    # If the hex grid didn't produce enough (unlikely with range 10), fallback.
+    if len(points) < n:
+        # Fallback to a regular grid
+        # 6x6 grid
+        grid_x = np.linspace(0.1, 0.9, 6)
+        grid_y = np.linspace(0.1, 0.9, 6)
+        temp_points = []
+        for y in grid_y:
+            for x in grid_x:
+                temp_points.append(np.array([x, y]))
+        points = temp_points
+
+    # Select 26 points. 
+    # To maximize spread, we could use a greedy approach or just take first 26.
+    # First 26 of a dense grid might be clustered. 
+    # Let's pick points that are far apart? Or just random subset?
+    # A random subset of a uniform grid is uniform.
+    if len(points) > n:
+        indices = np.random.choice(len(points), n, replace=False)
+        selected_points = [points[i] for i in indices]
+    else:
+        selected_points = points[:n]
+        
+    centers = np.array(selected_points)
+    
+    # Initial radii: small enough to be valid.
+    # Min distance in our grid is approx 0.1 or 0.2.
+    # r = 0.05 should be safe.
+    # Check validity roughly
+    min_dist = 1.0
+    for i in range(n):
+        for j in range(i+1, n):
+            d = np.linalg.norm(centers[i] - centers[j])
+            if d < min_dist:
+                min_dist = d
+    
+    r_init = min(0.05, min_dist / 4.0) # Ensure valid
+    radii = np.full(n, r_init)
+    
+    return centers, radii
+
+def run_packing():
+    """
+    Solves the circle packing problem for 26 circles in a unit square.
+    Maximizes sum of radii.
+    """
+    n = 26
+    
+    # 1. Generate Initial Guess
+    centers_init, radii_init = get_initial_guess()
+    
+    # Flatten to 1D vector for optimizer: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers_init[i, 0]
+        x0[3*i+1] = centers_init[i, 1]
+        x0[3*i+2] = radii_init[i]
+        
+    # 2. Define Objective
+    def objective(vars):
+        # vars is [x1, y1, r1, ...]
+        # We want to maximize sum of radii => minimize negative sum
+        r = vars[2::3]
+        return -np.sum(r)
+
+    # 3. Define Constraints
+    # Inequality constraints: c(x) >= 0
+    
+    def constraints(vars):
+        # Unpack
+        xs = vars[0::3]
+        ys = vars[1::3]
+        rs = vars[2::3]
+        
+        cons = []
+        
+        # Boundary constraints:
+        # x - r >= 0  => x - r
+        # 1 - x - r >= 0 => 1 - x - r
+        # y - r >= 0
+        # 1 - y - r >= 0
+        
+        # Vectorized
+        cons.extend(xs - rs)
+        cons.extend(1.0 - xs - rs)
+        cons.extend(ys - rs)
+        cons.extend(1.0 - ys - rs)
+        
+        # Pairwise distance constraints:
+        # dist^2 >= (r_i + r_j)^2
+        # (x_i - x_j)^2 + (y_i - y_j)^2 - (r_i + r_j)^2 >= 0
+        
+        # We can compute this efficiently or just loop (N=26 is small)
+        # Loop is safer to avoid memory overhead of dense matrix if N was large, 
+        # but here N=26 is tiny.
+        
+        # Create arrays for easier indexing
+        # But simple loop is fine
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = xs[i] - xs[j]
+                dy = ys[i] - ys[j]
+                dr = rs[i] + rs[j]
+                # dist_sq - dr^2
+                val = dx*dx + dy*dy - dr*dr
+                cons.append(val)
+                
+        return np.array(cons)
+
+    # Define constraint dict for SLSQP
+    cons_dict = {
+        'type': 'ineq',
+        'fun': constraints
+    }
+    
+    # Bounds: x, y in [0, 1], r >= 0
+    bounds = []
+    for i in range(n):
+        bounds.append((0.0, 1.0)) # x
+        bounds.append((0.0, 1.0)) # y
+        bounds.append((0.0, 0.5)) # r (radius cannot exceed 0.5 in unit square)
+        
+    # 4. Run Optimizer
+    # We might run it a couple of times or use a method that handles non-convexity well.
+    # SLSQP is a good start.
+    
+    # To improve robustness, we can try a few runs or use different initializations.
+    # But for a single function return, let's do one solid run.
+    # We can increase maxiter if needed.
+    
+    try:
+        res = minimize(
+            objective, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=cons_dict,
+            options={'maxiter': 500, 'ftol': 1e-9}
+        )
+        
+        if res.success or res.nit < 500: # Accept if successful or just finished
+            final_vars = res.x
+        else:
+            # If it didn't converge, take the best point found
+            final_vars = res.x
+    except Exception as e:
+        # Fallback to initial guess if optimization fails completely
+        final_vars = x0
+        
+    # 5. Extract results
+    final_centers = np.zeros((n, 2))
+    final_radii = np.zeros(n)
+    
+    for i in range(n):
+        final_centers[i, 0] = final_vars[3*i]
+        final_centers[i, 1] = final_vars[3*i+1]
+        final_radii[i] = final_vars[3*i+2]
+        
+    sum_radii = np.sum(final_radii)
+    
+    return final_centers, final_radii, sum_radii
+
+# Helper to run and print (for testing/debugging if needed, though not required by prompt)
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")
+    # Simple validation check
+    import numpy as np
+    # (Validate logic embedded in prompt, but we can check locally)
+    valid = True
+    for i in range(26):
+        x, y = centers[i]
+        r = radii[i]
+        if x < 0 or x > 1 or y < 0 or y > 1 or r < 0:
+            valid = False
+            break
+        if x - r < -1e-9 or x + r > 1 + 1e-9 or y - r < -1e-9 or y + r > 1 + 1e-9:
+            valid = False
+            break
+    for i in range(26):
+        for j in range(i+1, 26):
+            dist = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+            if dist < radii[i] + radii[j] - 1e-9:
+                valid = False
+                break
+        if not valid: break
+    print(f"Valid: {valid}")

@@ -1,0 +1,177 @@
+
+
+<strategy>
+To improve the circle packing sum of radii beyond 2.63, we need a more robust optimization strategy that avoids local minima and handles constraints smoothly. Key improvements:
+1. **Vectorized Squared Distance Constraints**: Using `(x_i-x_j)^2 + (y_i-y_j)^2 >= (r_i+r_j)^2` avoids square roots in the constraint function, leading to smoother gradients and faster convergence in SLSQP.
+2. **Diverse Hexagonal Initializations**: Optimal packings for dense circles closely resemble hexagonal lattices. We generate many variations by altering the starting radius and adding controlled noise, covering a wide basin of attraction.
+3. **Feasibility Projection**: Before each optimization run, we project centers to respect boundary constraints given their current radii, ensuring SLSQP starts in a strictly feasible region.
+4. **Multi-Scale Refinement**: After finding a promising solution, we perturb it at decreasing scales (1e-3 down to 1e-6) and re-optimize. This helps escape shallow local minima and fine-tune the packing to machine precision.
+5. **Strict Validation & Minimal Repair**: A final check ensures the output passes the validator's `1e-12` tolerance. If numerical drift causes micro-overlaps, a tiny radius shrinkage guarantees validity with negligible impact on the score.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def unpack(vars):
+    """Converts flat optimization vector to centers and radii arrays."""
+    c = vars.reshape(N, 3)
+    return c[:, :2], c[:, 2]
+
+def objective(vars):
+    """Objective to minimize: negative sum of radii."""
+    return -np.sum(vars[2::3])
+
+def constraints(vars):
+    """Returns array of constraint values g(x) >= 0."""
+    c = vars.reshape(N, 3)
+    x, y, r = c[:, 0], c[:, 1], c[:, 2]
+    
+    # Preallocate constraint array
+    num_overlap = N * (N - 1) // 2
+    res = np.empty(N * 4 + num_overlap)
+    
+    # Boundary constraints: x-r >= 0, 1-x-r >= 0, y-r >= 0, 1-y-r >= 0
+    res[:N] = x - r
+    res[N:2*N] = 1.0 - x - r
+    res[2*N:3*N] = y - r
+    res[3*N:4*N] = 1.0 - y - r
+    
+    # Overlap constraints: squared distance - (r_i + r_j)^2 >= 0
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dr = r[:, None] + r[None, :]
+    
+    tri = np.tril_indices(N, -1)
+    res[4*N:] = dx[tri]**2 + dy[tri]**2 - dr[tri]**2
+    
+    return res
+
+def get_bounds():
+    """Variable bounds: x,y in [0,1], r in [0, 0.5]."""
+    b = []
+    for _ in range(N):
+        b.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+    return b
+
+def hex_init(seed, r_start=0.09):
+    """Generates a perturbed hexagonal lattice initialization."""
+    np.random.seed(seed)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, r_start)
+    idx = 0
+    y = r_start
+    row = 0
+    
+    while idx < N and y + r_start <= 1.0:
+        x = r_start + (row % 2) * r_start
+        while idx < N and x + r_start <= 1.0:
+            centers[idx] = [x, y]
+            idx += 1
+            x += 2 * r_start
+        y += np.sqrt(3) * r_start
+        row += 1
+        
+    # Fill remaining if grid didn't cover all 26
+    while idx < N:
+        centers[idx] = np.random.uniform(r_start, 1.0 - r_start, 2)
+        idx += 1
+        
+    # Add slight noise to break exact symmetry
+    centers += np.random.normal(0, 0.002, centers.shape)
+    centers = np.clip(centers, r_start, 1.0 - r_start)
+    return centers, radii
+
+def run_packing():
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_sum = -1.0
+    best_x = None
+    
+    # Phase 1: Multiple diverse starts
+    seeds = list(range(30))
+    r_starts = np.linspace(0.08, 0.105, 15)
+    
+    for s in seeds:
+        for rs in r_starts:
+            c_init, r_init = hex_init(s, rs)
+            x0 = np.zeros(3 * N)
+            x0[0::3] = c_init[:, 0]
+            x0[1::3] = c_init[:, 1]
+            x0[2::3] = r_init
+            
+            # Project to strictly feasible bounds before optimization
+            for i in range(N):
+                x0[3*i] = np.clip(x0[3*i], x0[3*i+2], 1.0 - x0[3*i+2])
+                x0[3*i+1] = np.clip(x0[3*i+1], x0[3*i+2], 1.0 - x0[3*i+2])
+                
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 15000, 'ftol': 1e-13, 'disp': False})
+                s_val = -res.fun
+                if s_val > best_sum:
+                    c_opt, r_opt = unpack(res.x)
+                    # Quick feasibility verification
+                    valid = True
+                    for i in range(N):
+                        if r_opt[i] < 0 or c_opt[i,0] < r_opt[i] - 1e-9 or c_opt[i,0] + r_opt[i] > 1 + 1e-9 or \
+                           c_opt[i,1] < r_opt[i] - 1e-9 or c_opt[i,1] + r_opt[i] > 1 + 1e-9:
+                            valid = False; break
+                    if valid:
+                        for i in range(N):
+                            for j in range(i+1, N):
+                                d = np.hypot(c_opt[i,0]-c_opt[j,0], c_opt[i,1]-c_opt[j,1])
+                                if d < r_opt[i] + r_opt[j] - 1e-9:
+                                    valid = False; break
+                            if not valid: break
+                    if valid:
+                        best_sum = s_val
+                        best_x = res.x.copy()
+            except Exception:
+                pass
+                
+    # Phase 2: Local refinement on best solution
+    if best_x is not None:
+        for scale in [1e-3, 1e-4, 1e-5, 1e-6]:
+            x0 = best_x + np.random.normal(0, scale, 3*N)
+            # Ensure perturbed state respects bounds
+            for i in range(N):
+                r = max(1e-6, x0[3*i+2])
+                x0[3*i+2] = r
+                x0[3*i] = np.clip(x0[3*i], r, 1.0-r)
+                x0[3*i+1] = np.clip(x0[3*i+1], r, 1.0-r)
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+                if -res.fun > best_sum:
+                    best_x = res.x.copy()
+                    best_sum = -res.fun
+            except Exception:
+                pass
+                
+    c_res, r_res = unpack(best_x)
+    
+    # Phase 3: Strict validity repair (handles numerical drift)
+    for _ in range(50):
+        valid = True
+        for i in range(N):
+            if r_res[i] < 0 or c_res[i,0] < r_res[i] - 1e-12 or c_res[i,0] + r_res[i] > 1 + 1e-12 or \
+               c_res[i,1] < r_res[i] - 1e-12 or c_res[i,1] + r_res[i] > 1 + 1e-12:
+                valid = False; break
+        if valid:
+            for i in range(N):
+                for j in range(i+1, N):
+                    d = np.hypot(c_res[i,0]-c_res[j,0], c_res[i,1]-c_res[j,1])
+                    if d < r_res[i] + r_res[j] - 1e-12:
+                        valid = False; break
+                if not valid: break
+        if valid:
+            break
+        r_res *= 0.999  # Minimal shrinkage to recover strict validity
+        
+    return c_res, r_res, float(np.sum(r_res))
+```

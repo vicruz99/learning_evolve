@@ -1,0 +1,189 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we employ a two-phase hybrid optimization strategy that overcomes the local minima traps common in direct non-linear constrained optimization:
+
+1. **LP-Based Center Optimization**: For fixed centers, finding the optimal radii that maximize $\sum r_i$ subject to non-overlap and boundary constraints is a linear programming problem. We formulate this LP and use it as the objective function for optimizing center positions. Since the LP solves exactly and efficiently (using the `highs` solver), we can wrap it in a derivative-free optimizer (`Powell`) to navigate the non-smooth landscape of center configurations. This phase rapidly converges to a high-quality packing layout.
+
+2. **Joint SLSQP Refinement**: The LP phase yields excellent center positions and corresponding radii, but treating them separately can leave small optimization gaps. We take the best configuration from Phase 1 and refine it jointly using `SLSQP` on all variables (centers + radii) simultaneously. Constraints are formulated using squared distances (`d² - (r_i + r_j)² ≥ 0`) for numerical stability and smoothness, alongside linear boundary constraints.
+
+3. **Multi-Start & Perturbation**: We initialize from hexagonal, grid, and random patterns. After each optimization run, we perturb the best solution and retry to escape shallow local optima.
+
+4. **Post-Processing & Validation**: A final pass clips radii to boundary limits and iteratively reduces overlapping radii to guarantee strict compliance with the validation function, ensuring zero overlaps and full containment within `[0,1]²`.
+
+This approach leverages the exactness of LP for radius determination, the robustness of derivative-free methods for center placement, and the precision of gradient-based refinement, consistently pushing past previous best results.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+def solve_lp(centers):
+    """Solve LP to find radii maximizing sum(r) for fixed centers."""
+    n = centers.shape[0]
+    dists = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+            dists[i, j] = d
+            dists[j, i] = d
+            
+    m = n * (n - 1) // 2
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    idx = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[idx, i] = 1.0
+            A_ub[idx, j] = 1.0
+            b_ub[idx] = dists[i, j]
+            idx += 1
+            
+    bounds = []
+    for i in range(n):
+        x, y = centers[i]
+        r_max = min(x, 1.0 - x, y, 1.0 - y)
+        bounds.append((0.0, max(0.0, r_max)))
+        
+    try:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+    except ValueError:
+        res = linprog(-np.ones(n), A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='interior-point')
+        
+    if res.success:
+        return res.x, -res.fun
+    return np.zeros(n), 0.0
+
+def obj_centers(centers_flat):
+    """Objective for center optimization: negative max sum of radii."""
+    c = np.clip(centers_flat.reshape(-1, 2), 1e-7, 1.0 - 1e-7)
+    _, s = solve_lp(c)
+    return -s
+
+def full_obj(x):
+    """Objective for joint optimization: negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def full_constraints(x):
+    """Constraints for joint optimization."""
+    n = 26
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    cons = []
+    cons.append(cx - r)
+    cons.append(1.0 - cx - r)
+    cons.append(cy - r)
+    cons.append(1.0 - cy - r)
+    
+    dx = cx[:, None] - cx[None, :]
+    dy = cy[:, None] - cy[None, :]
+    d2 = dx**2 + dy**2
+    rs = r[:, None] + r[None, :]
+    
+    idx = np.tril_indices(n, k=-1)
+    cons.append(d2[idx] - rs[idx]**2)
+    
+    return np.concatenate(cons)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    best_s = 0.0
+    best_c = None
+    best_r = None
+    
+    # Phase 1: Optimize centers using LP for radii
+    inits = []
+    # Hexagonal pattern
+    hc = []
+    y = 0.08
+    row = 0
+    while len(hc) < n and y < 0.92:
+        x = 0.08
+        shift = 0.06 if row % 2 else 0.0
+        while x < 0.92 and len(hc) < n:
+            hc.append([x + shift, y])
+            x += 0.12
+        y += 0.105
+        row += 1
+    inits.append(np.array(hc[:n]).flatten())
+    
+    # Grid pattern
+    gc = []
+    for i in range(5):
+        for j in range(5):
+            gc.append([0.1 + 0.18 * i, 0.1 + 0.18 * j])
+    gc.append([0.5, 0.5])
+    inits.append(np.array(gc[:n]).flatten())
+    
+    # Random pattern
+    np.random.seed(101)
+    inits.append(np.random.uniform(0.15, 0.85, (n, 2)).flatten())
+    
+    for x0 in inits:
+        res = minimize(obj_centers, x0, method='Powell', 
+                       options={'maxiter': 1000, 'xtol': 1e-6, 'ftol': 1e-8})
+        curr_s = -res.fun
+        if curr_s > best_s:
+            best_s = curr_s
+            best_c = res.x.reshape(n, 2)
+            best_r, _ = solve_lp(best_c)
+            
+        # Perturb best to escape local optima
+        for _ in range(2):
+            pert = best_c.copy() + np.random.randn(n, 2) * 0.015
+            pert = np.clip(pert, 0.02, 0.98)
+            res2 = minimize(obj_centers, pert.flatten(), method='Powell',
+                            options={'maxiter': 600, 'xtol': 1e-6, 'ftol': 1e-8})
+            if -res2.fun > best_s:
+                best_s = -res2.fun
+                best_c = res2.x.reshape(n, 2)
+                best_r, _ = solve_lp(best_c)
+                
+    # Phase 2: Joint refinement with SLSQP
+    x0_full = np.zeros(3 * n)
+    for i in range(n):
+        x0_full[3 * i] = best_c[i, 0]
+        x0_full[3 * i + 1] = best_c[i, 1]
+        x0_full[3 * i + 2] = best_r[i]
+        
+    bounds_full = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * n
+    cons = {'type': 'ineq', 'fun': full_constraints}
+    
+    res_full = minimize(full_obj, x0_full, method='SLSQP', bounds=bounds_full,
+                        constraints=cons, options={'maxiter': 2000, 'ftol': 1e-12})
+    
+    if -res_full.fun > best_s:
+        best_s = -res_full.fun
+        best_c = np.column_stack((res_full.x[0::3], res_full.x[1::3]))
+        best_r = res_full.x[2::3]
+        
+    # Post-processing to guarantee strict validity
+    best_r = np.maximum(best_r, 0.0)
+    
+    # Fix any residual overlaps
+    for _ in range(5):
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.hypot(best_c[i, 0] - best_c[j, 0], best_c[i, 1] - best_c[j, 1])
+                if d < best_r[i] + best_r[j] - 1e-9:
+                    overlap = (best_r[i] + best_r[j] - d) / 2.0 + 1e-10
+                    best_r[i] -= overlap
+                    best_r[j] -= overlap
+                    changed = True
+        if not changed:
+            break
+            
+    # Fix boundary violations
+    for i in range(n):
+        x, y = best_c[i]
+        r = best_r[i]
+        mr = min(x, 1.0 - x, y, 1.0 - y)
+        if r > mr:
+            best_r[i] = max(0.0, mr)
+            
+    best_r = np.maximum(best_r, 0.0)
+    return best_c, best_r, float(np.sum(best_r))
+```

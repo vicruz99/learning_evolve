@@ -1,0 +1,234 @@
+
+
+<strategy>
+I need to pack 26 circles in a unit square to maximize the sum of radii. The target is 2.636.
+
+**Key observations:**
+1. For 26 equal circles with hexagonal packing, the theoretical maximum is around 2.7-2.9 (well above target), so 2.636 should be achievable.
+2. The problem is non-convex, so initialization matters critically.
+3. I'll use a multi-stage approach:
+   - Stage 1: Generate a good initial hexagonal packing
+   - Stage 2: Use scipy SLSQP with squared-distance constraints (smoother gradients)
+   - Stage 3: Multiple random restarts to escape local optima
+   - Stage 4: Final refinement with higher precision
+
+**Technical details:**
+- Use squared distance formulation for non-overlap: (x_i-x_j)² + (y_i-y_j)² ≥ (r_i + r_j)² (avoids sqrt singularity)
+- Start with hexagonal grid pattern (5-5-5-5-5-1 rows)
+- Run 30+ random restarts with small perturbations
+- Use bounds to keep circles within feasible region
+- The squared constraint gradient is smooth everywhere: 2(c_i - c_j) for positions, -2(r_i + r_j) for radii
+
+**Expected performance:**
+With 26 circles of radius ~0.1 each, sum ≈ 2.6. A well-optimized hexagonal packing should exceed the 2.636 target significantly.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Try multiple initial configurations with different seeds
+    for seed in range(40):
+        centers, radii = generate_initial_hexagonal(n, seed)
+        
+        c_opt, r_opt = optimize_slqp(centers.copy(), radii.copy(), n)
+        
+        if c_opt is not None:
+            s = np.sum(r_opt)
+            # Verify validity
+            if is_valid_packing(c_opt, r_opt, n):
+                if s > best_sum:
+                    best_sum = s
+                    best_centers = c_opt.copy()
+                    best_radii = r_opt.copy()
+    
+    # If we found a solution, try additional refinement
+    if best_centers is not None:
+        # Fine-tune with another round
+        for seed in range(15):
+            c_pert = best_centers + np.random.uniform(-0.005, 0.005, best_centers.shape)
+            c_pert = np.clip(c_pert, 0.05, 0.95)
+            r_pert = best_radii + np.random.uniform(-0.005, 0.005, best_radii.shape)
+            r_pert = np.maximum(r_pert, 0.01)
+            
+            c_opt, r_opt = optimize_slqp(c_pert, r_pert, n)
+            
+            if c_opt is not None:
+                s = np.sum(r_opt)
+                if is_valid_packing(c_opt, r_opt, n):
+                    if s > best_sum:
+                        best_sum = s
+                        best_centers = c_opt.copy()
+                        best_radii = r_opt.copy()
+    
+    return best_centers, best_radii, float(best_sum)
+
+
+def generate_initial_hexagonal(n, seed):
+    rng = np.random.RandomState(seed)
+    
+    centers = np.zeros((n, 2))
+    radii = np.ones(n) * 0.05
+    
+    # Hexagonal pattern: rows with alternating offset
+    # Target: pack ~26 circles with spacing that allows room for growth
+    spacing = 0.175
+    margin_x = 0.07
+    margin_y = 0.07
+    
+    idx = 0
+    row = 0
+    while idx < n:
+        y = margin_y + row * spacing * np.sqrt(3) / 2
+        offset = (row % 2) * spacing / 2
+        
+        col = 0
+        while idx < n:
+            x = margin_x + col * spacing + offset
+            if x + 0.1 > 1.0:
+                break
+            centers[idx] = [x, y]
+            idx += 1
+            col += 1
+        
+        row += 1
+        if row > 20:
+            break
+    
+    # Ensure we have exactly n circles
+    if idx < n:
+        for i in range(idx, n):
+            centers[i] = [0.5, 0.5]
+    
+    # Add small random perturbation to break symmetry
+    centers += rng.uniform(-0.008, 0.008, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    radii = np.ones(n) * 0.04
+    
+    return centers, radii
+
+
+def optimize_slqp(centers, radii, n):
+    x0 = np.concatenate([centers.flatten(), radii])
+    
+    # Precompute constraint index ranges for efficiency
+    num_vars = 3 * n
+    
+    def objective(x):
+        return -np.sum(x[2*n:3*n])
+    
+    # Build constraints list
+    constraints = []
+    
+    # Boundary constraints for each circle: 4 per circle
+    for i in range(n):
+        xi_idx = 2 * i
+        yi_idx = 2 * i + 1
+        ri_idx = 2 * n + i
+        
+        # x_i >= r_i  =>  x_i - r_i >= 0
+        def make_constr(xi, ri):
+            def constr(x):
+                return x[xi] - x[ri]
+            return constr
+        
+        constraints.append({'type': 'ineq', 'fun': make_constr(xi_idx, ri_idx)})
+        
+        # 1 - x_i >= r_i  =>  1 - r_i - x_i >= 0
+        def make_constr2(xi, ri):
+            def constr(x):
+                return 1.0 - x[ri] - x[xi]
+            return constr
+        
+        constraints.append({'type': 'ineq', 'fun': make_constr2(xi_idx, ri_idx)})
+        
+        # y_i >= r_i
+        constraints.append({'type': 'ineq', 'fun': make_constr(yi_idx, ri_idx)})
+        
+        # 1 - y_i >= r_i
+        constraints.append({'type': 'ineq', 'fun': make_constr2(yi_idx, ri_idx)})
+        
+        # r_i >= 0.002
+        def make_pos(ri):
+            def constr(x):
+                return x[ri] - 0.002
+            return constr
+        
+        constraints.append({'type': 'ineq', 'fun': make_pos(ri_idx)})
+    
+    # Non-overlap constraints using squared distance (smooth!)
+    for i in range(n):
+        for j in range(i + 1, n):
+            xi_idx = 2 * i
+            yi_idx = 2 * i + 1
+            ri_idx = 2 * n + i
+            xj_idx = 2 * j
+            yj_idx = 2 * j + 1
+            rj_idx = 2 * n + j
+            
+            def make_overlap(xi, yi, ri, xj, yj, rj):
+                def constr(x):
+                    dx = x[xi] - x[xj]
+                    dy = x[yi] - x[yj]
+                    dist_sq = dx * dx + dy * dy
+                    sum_r = x[ri] + x[rj]
+                    return dist_sq - sum_r * sum_r
+                return constr
+            
+            constraints.append({'type': 'ineq', 'fun': make_overlap(
+                xi_idx, yi_idx, ri_idx, xj_idx, yj_idx, rj_idx)})
+    
+    # Bounds: centers in [0.02, 0.98], radii in [0.002, 0.45]
+    bounds = [(0.02, 0.98) for _ in range(2*n)] + [(0.002, 0.45) for _ in range(n)]
+    
+    # Optimize with SLSQP
+    result = minimize(
+        objective, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+        options={'maxiter': 8000, 'ftol': 1e-13, 'disp': False}
+    )
+    
+    if result.success or (-result.fun) > 1.0:
+        x_opt = result.x
+        centers_opt = np.array([[x_opt[2*i], x_opt[2*i+1]] for i in range(n)])
+        radii_opt = np.array([x_opt[2*n + i] for i in range(n)])
+        
+        # Quick validity check
+        if is_valid_packing(centers_opt, radii_opt, n):
+            return centers_opt, radii_opt
+    
+    # Even if not successful, try to extract a valid solution
+    x_opt = result.x
+    centers_opt = np.array([[x_opt[2*i], x_opt[2*i+1]] for i in range(n)])
+    radii_opt = np.array([x_opt[2*n + i] for i in range(n)])
+    
+    if is_valid_packing(centers_opt, radii_opt, n):
+        return centers_opt, radii_opt
+    
+    return None, None
+
+
+def is_valid_packing(centers, radii, n):
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        if x - r < -1e-10 or x + r > 1 + 1e-10 or y - r < -1e-10 or y + r > 1 + 1e-10:
+            return False
+        if r < 0:
+            return False
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - 1e-10:
+                return False
+    
+    return True
+```

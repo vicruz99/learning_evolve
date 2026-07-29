@@ -1,0 +1,191 @@
+
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+_PAIRS_I, _PAIRS_J = np.triu_indices(N, k=1)
+
+def compute_constraints(vars):
+    """
+    Computes inequality constraints for SLSQP.
+    Returns array where each element must be >= 0 for a valid configuration.
+    """
+    c = vars[:2*N].reshape(N, 2)
+    r = vars[2*N:]
+    
+    # Boundary constraints: x >= r, x + r <= 1, y >= r, y + r <= 1
+    c_cons = np.concatenate([c[:,0]-r, 1.0-c[:,0]-r, c[:,1]-r, 1.0-c[:,1]-r])
+    
+    # Overlap constraints: dist(i, j) >= r_i + r_j
+    dx = c[_PAIRS_I, 0] - c[_PAIRS_J, 0]
+    dy = c[_PAIRS_I, 1] - c[_PAIRS_J, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    o_cons = dists - (r[_PAIRS_I] + r[_PAIRS_J])
+    
+    return np.concatenate([c_cons, o_cons])
+
+def objective_func(vars):
+    """Objective: maximize sum of radii => minimize negative sum."""
+    return -np.sum(vars[2*N:])
+
+def get_bounds():
+    """Variable bounds: centers in [0,1], radii in [1e-6, 0.5]."""
+    return [(0.0, 1.0)] * (2*N) + [(1e-6, 0.5)] * N
+
+def get_hex_centers(r, pat, noise, rng):
+    """Generates centers based on a hexagonal row pattern."""
+    centers = []
+    y = r
+    dy = np.sqrt(3.0) * r
+    dx = 2.0 * r
+    
+    for i, cnt in enumerate(pat):
+        offset = (dx / 2.0) if (i % 2 == 1) else 0.0
+        x = r + offset
+        for _ in range(cnt):
+            centers.append([x, y])
+            x += dx
+        y += dy
+        
+    centers = np.array(centers[:N])
+    if noise > 0:
+        centers += rng.normal(0, noise, centers.shape)
+    return np.clip(centers, 0.02, 0.98)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses multi-start SLSQP with continuation growth and perturbation refinement.
+    """
+    rng = np.random.default_rng(42)
+    bounds = get_bounds()
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    best_val = -np.inf
+    best_vars = None
+    
+    starts = []
+    
+    # 1. Hexagonal lattice variations with diverse row patterns
+    patterns = [[5, 6, 5, 6, 4], [6, 5, 6, 5, 4], [5, 5, 6, 5, 5], 
+                [4, 6, 6, 6, 4], [5, 6, 4, 6, 5], [5, 5, 5, 5, 6]]
+    for pat in patterns:
+        for r in [0.090, 0.095, 0.100, 0.105, 0.110]:
+            for noise in [0.0, 0.005, 0.010, 0.015]:
+                c = get_hex_centers(r, pat, noise, rng)
+                starts.append(np.concatenate([c.flatten(), np.full(N, r * 0.94)]))
+                
+    # 2. Square grid + center fill variations
+    for r in [0.09, 0.095, 0.10]:
+        gx = np.linspace(r, 1-r, 5)
+        gy = np.linspace(r, 1-r, 5)
+        gc = np.array(np.meshgrid(gx, gy)).T.reshape(-1, 2)
+        gc = np.vstack([gc, [0.5, 0.5]])
+        for _ in range(8):
+            pc = gc + rng.normal(0, 0.008, gc.shape)
+            pc = np.clip(pc, 0.05, 0.95)
+            starts.append(np.concatenate([pc.flatten(), np.full(N, r * 0.90)]))
+            
+    # 3. Dense random starts
+    for _ in range(15):
+        c = rng.uniform(0.1, 0.9, (N, 2))
+        starts.append(np.concatenate([c.flatten(), np.full(N, 0.06)]))
+        
+    # ---------------------------------------------------------
+    # Phase 1: Multi-start Local Optimization
+    # ---------------------------------------------------------
+    for x0 in starts:
+        try:
+            res = minimize(objective_func, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 10000, 'ftol': 1e-13})
+            if np.all(compute_constraints(res.x) >= -1e-9):
+                v = -res.fun
+                if v > best_val:
+                    best_val = v
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+
+    if best_vars is None:
+        best_vars = starts[0]
+        
+    # ---------------------------------------------------------
+    # Phase 2: Continuation / Growth Refinement
+    # Forces the solver to push past local maxima by scaling radii
+    # up and re-optimizing positions with decaying noise.
+    # ---------------------------------------------------------
+    curr = best_vars.copy()
+    for step in range(70):
+        # Adaptive scale factor: starts strong, decays to fine-tune
+        scale = 1.0 + 0.0018 * np.exp(-step/25.0)
+        curr[2*N:] *= scale
+        
+        # Decaying positional noise to escape basins
+        noise = 0.0007 * np.exp(-step/15.0)
+        curr[:2*N] += rng.normal(0, noise, 2*N)
+        curr[:2*N] = np.clip(curr[:2*N], 0.01, 0.99)
+        
+        try:
+            res = minimize(objective_func, curr, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 6000, 'ftol': 1e-13})
+            if np.all(compute_constraints(res.x) >= -1e-9):
+                v = -res.fun
+                if v > best_val:
+                    best_val = v
+                    best_vars = res.x.copy()
+                    curr = best_vars.copy() # Track best for next step
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # Phase 3: Local perturbations to escape remaining local minima
+    # ---------------------------------------------------------
+    for _ in range(50):
+        pert = best_vars.copy()
+        pert[:2*N] += rng.normal(0, 0.0006, 2*N)
+        pert[:2*N] = np.clip(pert[:2*N], 0.01, 0.99)
+        try:
+            res = minimize(objective_func, pert, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 5000, 'ftol': 1e-13})
+            if np.all(compute_constraints(res.x) >= -1e-9):
+                v = -res.fun
+                if v > best_val:
+                    best_val = v
+                    best_vars = res.x.copy()
+        except Exception:
+            pass
+            
+    # ---------------------------------------------------------
+    # Phase 4: Deterministic Repair for Strict Validation
+    # ---------------------------------------------------------
+    centers = best_vars[:2*N].reshape(N, 2)
+    radii = best_vars[2*N:].copy()
+    
+    for _ in range(30):
+        changed = False
+        # Resolve overlaps by proportional shrinking
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i,0] - centers[j,0], centers[i,1] - centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    ov = radii[i] + radii[j] - d
+                    # Slight asymmetry prevents infinite loops on tie constraints
+                    radii[i] -= ov * 0.51
+                    radii[j] -= ov * 0.49
+                    changed = True
+                    
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(centers[i,0], 1.0 - centers[i,0], centers[i,1], 1.0 - centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx - 1e-12
+                changed = True
+                
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return centers, radii, float(np.sum(radii))
+```

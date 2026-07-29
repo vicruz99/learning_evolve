@@ -1,0 +1,125 @@
+# sol_000172 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 397104b2) state=7d45a12c sum of radii=0.520000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Optimizes the packing of 26 circles in a unit square to maximize the sum of radii.
+    """
+    n = 26
+    # Random seed for reproducibility of the noise
+    np.random.seed(42)
+
+    # 1. Initialization: Hexagonal-like grid
+    # We generate a dense grid and select points to approximate a hexagonal packing.
+    # Using a 6x5 grid (30 points) and selecting 26.
+    x_grid = np.linspace(0.1, 0.9, 6)
+    y_grid = np.linspace(0.1, 0.9, 5)
+    
+    xx, yy = np.meshgrid(x_grid, y_grid)
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    
+    # Add noise to break symmetry and allow the optimizer to find better local spots
+    noise = np.random.uniform(-0.01, 0.01, size=points.shape)
+    points = points + noise
+    
+    # Clip points to ensure they are safely inside the square for the initial state
+    points = np.clip(points, 0.01, 0.99)
+    
+    # Select first 26 points
+    centers_init = points[:n].copy()
+    
+    # Initialize radii to a small valid value
+    radii_init = np.ones(n) * 0.02
+
+    # Flatten variables for optimizer: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3 * i] = centers_init[i, 0]
+        x0[3 * i + 1] = centers_init[i, 1]
+        x0[3 * i + 2] = radii_init[i]
+
+    # Bounds: x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0)]) # x, y
+        bounds.append((0.0, 0.5))               # r
+
+    # Helper functions for optimization
+    def objective(x_vec):
+        # Maximize sum of radii -> Minimize negative sum
+        radii = x_vec[2 * n:]
+        return -np.sum(radii)
+
+    def constraints_func(x_vec):
+        centers = x_vec[:2 * n].reshape(n, 2)
+        radii = x_vec[2 * n:]
+
+        # 1. Boundary Constraints
+        # Circle must be inside [0,1]x[0,1]
+        # x >= r, 1-x >= r  =>  x-r >= 0, 1-x-r >= 0
+        # y >= r, 1-y >= r  =>  y-r >= 0, 1-y-r >= 0
+        b1 = centers[:, 0] - radii
+        b2 = 1.0 - centers[:, 0] - radii
+        b3 = centers[:, 1] - radii
+        b4 = 1.0 - centers[:, 1] - radii
+        bounds_con = np.concatenate([b1, b2, b3, b4])
+
+        # 2. Non-overlap Constraints
+        # dist(i, j)^2 >= (ri + rj)^2
+        # Using broadcasting for vectorization
+        # centers shape (n, 2)
+        
+        # Compute squared Euclidean distances matrix
+        # diff shape (n, n, 2)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff**2, axis=2)
+        
+        # Compute squared sum of radii
+        rad_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+        rad_sum_sq = rad_sum**2
+        
+        # Constraint: dist_sq - rad_sum_sq >= 0
+        # We only need upper triangle (i < j) to avoid redundancy
+        idx = np.triu_indices(n, k=1)
+        overlap_con = dist_sq[idx] - rad_sum_sq[idx]
+
+        return np.concatenate([bounds_con, overlap_con])
+
+    # Define constraints object
+    cons = {'type': 'ineq', 'fun': constraints_func}
+
+    # Run Optimization
+    # SLSQP is a good choice for constrained non-linear optimization
+    try:
+        res = minimize(
+            objective, 
+            x0, 
+            method='SLSQP', 
+            bounds=bounds, 
+            constraints=[cons], 
+            options={
+                'maxiter': 2000, 
+                'ftol': 1e-10, 
+                'disp': False
+            }
+        )
+        
+        if res.success:
+            best_centers = res.x[:2 * n].reshape(n, 2)
+            best_radii = res.x[2 * n:]
+            # Ensure radii are strictly non-negative (clip tiny negatives due to numerical error)
+            best_radii = np.maximum(best_radii, 0.0)
+            return best_centers, best_radii, np.sum(best_radii)
+        else:
+            # If optimization fails, return the initial configuration (valid but suboptimal)
+            return centers_init, radii_init, np.sum(radii_init)
+            
+    except Exception:
+        # Fallback in case of any error
+        return centers_init, radii_init, np.sum(radii_init)

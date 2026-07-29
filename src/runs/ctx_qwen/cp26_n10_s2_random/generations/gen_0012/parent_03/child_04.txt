@@ -1,0 +1,265 @@
+
+
+<strategy>
+To improve the sum of radii beyond 2.6307, I will focus on:
+1. **Robust Gradient-Based Optimization**: Use the exact subgradient derived from LP duals, which is highly effective for this piecewise-linear objective. L-BFGS-B is preferred for its bound handling and memory efficiency.
+2. **Smart Perturbation Strategies**: Instead of uniform noise, I will use subset perturbations (randomly moving 2-6 circles) and occasional pairwise swaps. This breaks symmetric traps and local minima more effectively than full-vector noise.
+3. **Diverse Initial Configurations**: Combine hexagonal lattices, force-directed spreads, and corner-biased starts to cover different structural basins.
+4. **Joint SLSQP Polish**: After finding a strong center configuration, perform a constrained joint optimization of centers and radii to squeeze out the last bits of slack.
+5. **Strict Numerical Repair**: Ensure all outputs pass the validator's `1e-12` tolerance by iteratively shrinking overlapping or boundary-violating circles.
+6. **Precomputation & Stability**: Precompute LP constraint matrices and triangular indices to speed up repeated calls. Add small epsilons to avoid division by zero in gradients.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, minimize
+
+N = 26
+NUM_PAIRS = N * (N - 1) // 2
+TRIU_I, TRIU_J = np.triu_indices(N, 1)
+
+def build_lp_matrices():
+    A = np.zeros((NUM_PAIRS + 4 * N, N))
+    pairs = []
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            pairs.append((i, j))
+            idx += 1
+    for i in range(N):
+        base = NUM_PAIRS + 4 * i
+        A[base, i] = 1.0
+        A[base + 1, i] = 1.0
+        A[base + 2, i] = 1.0
+        A[base + 3, i] = 1.0
+    return A, pairs
+
+A_LP, PAIR_IDX = build_lp_matrices()
+
+def solve_lp_and_grad(centers):
+    """Solves LP for optimal radii and computes exact subgradient via duals."""
+    c = centers.copy()
+    n = c.shape[0]
+    ub = np.minimum(np.minimum(c[:, 0], 1.0 - c[:, 0]),
+                    np.minimum(c[:, 1], 1.0 - c[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+
+    diff = c[:, None, :] - c[None, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-16)
+
+    b = np.zeros(A_LP.shape[0])
+    k = 0
+    for i, j in PAIR_IDX:
+        b[k] = dists[i, j]
+        k += 1
+    for i in range(n):
+        b[k] = c[i, 0]; k += 1
+        b[k] = 1.0 - c[i, 0]; k += 1
+        b[k] = c[i, 1]; k += 1
+        b[k] = 1.0 - c[i, 1]; k += 1
+
+    try:
+        res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b,
+                      bounds=[(0.0, u) for u in ub], method='highs')
+        if not res.success:
+            return np.full(n, 1e-5), 0.0, np.zeros_like(c)
+    except Exception:
+        return np.full(n, 1e-5), 0.0, np.zeros_like(c)
+
+    radii = res.x
+    s_sum = np.sum(radii)
+
+    duals = np.zeros(len(b))
+    try:
+        duals = res.marginals.ineqlin
+    except AttributeError:
+        try:
+            duals = res.ineqlin.marginals
+        except AttributeError:
+            pass
+
+    grad = np.zeros_like(c)
+    k = 0
+    for i, j in PAIR_IDX:
+        lam = duals[k]
+        if lam > 1e-8:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (c[i] - c[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        k += 1
+
+    b_start = NUM_PAIRS
+    for i in range(n):
+        grad[i, 0] += duals[b_start + 4 * i] - duals[b_start + 4 * i + 1]
+        grad[i, 1] += duals[b_start + 4 * i + 2] - duals[b_start + 4 * i + 3]
+
+    return radii, s_sum, grad
+
+def lbfgs_wrapper(x_flat):
+    """Objective and gradient wrapper for L-BFGS-B minimization."""
+    c = x_flat.reshape(N, 2)
+    _, val, grad = solve_lp_and_grad(c)
+    return -val, -grad.flatten()
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    pats = [[5,6,5,6,4], [6,5,6,5,4], [5,5,5,5,6], [4,6,6,6,4], [6,6,5,5,4]]
+    for pat in pats:
+        for r0 in [0.09, 0.095, 0.10, 0.105]:
+            c = []
+            y = r0
+            for ri, cnt in enumerate(pat):
+                sh = r0 if ri % 2 == 1 else 0.0
+                x = r0 + sh
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x + rng.normal(0, 0.002), y + rng.normal(0, 0.002)])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3.0)
+            while len(c) < N:
+                c.append(rng.uniform(0.2, 0.8, 2))
+            starts.append(np.clip(np.array(c[:N]), 0.05, 0.95))
+
+    for _ in range(12):
+        c = rng.uniform(0.15, 0.85, (N, 2))
+        for _ in range(600):
+            f = np.zeros_like(c)
+            d_mat = c[:, None, :] - c[None, :, :]
+            dists = np.linalg.norm(d_mat, axis=2)
+            np.fill_diagonal(dists, np.inf)
+            mask = dists < 0.2
+            f += np.sum(d_mat * (1.0 / (dists + 1e-4)**2)[:, :, None] * mask[:, :, None], axis=1)
+            c += f * 0.005
+            c = np.clip(c, 0.1, 0.9)
+        starts.append(c)
+        
+    return starts
+
+def obj_joint(v):
+    return -np.sum(v[2 * N:])
+
+def cons_joint(v):
+    c = v[:2 * N].reshape(N, 2)
+    r = v[2 * N:]
+    con = [c[:, 0] - r, 1.0 - c[:, 0] - r, c[:, 1] - r, 1.0 - c[:, 1] - r]
+    dx = c[TRIU_I, 0] - c[TRIU_J, 0]
+    dy = c[TRIU_I, 1] - c[TRIU_J, 1]
+    dr = r[TRIU_I] + r[TRIU_J]
+    con.append(dx**2 + dy**2 - dr**2)
+    return np.concatenate(con)
+
+def repair(centers, radii):
+    """Deterministic repair to guarantee strict validation compliance."""
+    radii = radii.copy()
+    for _ in range(100):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(centers[i, 0] - centers[j, 0], centers[i, 1] - centers[j, 1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d) * 0.5 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i, 0], 1.0 - centers[i, 0], centers[i, 1], 1.0 - centers[i, 1])
+            if radii[i] > mr + 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    rng = np.random.default_rng(42)
+    bounds = [(0.02, 0.98)] * (2 * N)
+    bounds_sl = [(0.0, 1.0)] * (2 * N) + [(0.0, 0.5)] * N
+
+    best_c = None
+    best_r = None
+    best_sum = -1.0
+
+    starts = generate_starts(rng)
+
+    # Phase 1: Multi-start L-BFGS-B
+    for c0 in starts:
+        try:
+            res = minimize(lbfgs_wrapper, c0.flatten(), method='L-BFGS-B', jac=True,
+                           bounds=bounds, options={'maxiter': 2000, 'ftol': 1e-14})
+            s = -res.fun
+            if s > best_sum:
+                best_sum = s
+                best_c = res.x.reshape(N, 2).copy()
+        except Exception:
+            pass
+
+    if best_c is None:
+        best_c = starts[0]
+    best_r, _, best_sum = solve_lp_and_grad(best_c)
+
+    # Phase 2: Subset Perturbation & Swap Refinement
+    T = 0.006
+    for step in range(60):
+        subset_size = rng.integers(2, 7)
+        idx = rng.choice(N, subset_size, replace=False)
+        c_pert = best_c.copy()
+        noise_scale = T * (1.0 + 0.5 * np.exp(-step / 25.0))
+        c_pert[idx] += rng.normal(0, noise_scale, (subset_size, 2))
+        
+        # Occasional swap to break symmetry traps
+        if rng.random() < 0.3:
+            i, j = rng.choice(N, 2, replace=False)
+            c_pert[[i, j]] = c_pert[[j, i]]
+            
+        c_pert = np.clip(c_pert, 0.02, 0.98)
+
+        try:
+            res = minimize(lbfgs_wrapper, c_pert.flatten(), method='L-BFGS-B', jac=True,
+                           bounds=bounds, options={'maxiter': 1200, 'ftol': 1e-14})
+            c_pert = res.x.reshape(N, 2)
+            r_pert, s_pert, _ = solve_lp_and_grad(c_pert)
+
+            delta = s_pert - best_sum
+            if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-6)):
+                best_sum = s_pert
+                best_c = c_pert.copy()
+                best_r = r_pert.copy()
+                if delta > 0:
+                    T = min(T * 1.02, 0.025)
+                else:
+                    T *= 0.96
+        except Exception:
+            continue
+
+    # Phase 3: Joint SLSQP Polish
+    v0 = np.concatenate([best_c.flatten(), best_r])
+    for _ in range(3):
+        try:
+            res = minimize(obj_joint, v0, method='SLSQP', bounds=bounds_sl,
+                          constraints={'type': 'ineq', 'fun': cons_joint},
+                          options={'maxiter': 6000, 'ftol': 1e-14})
+            if np.min(cons_joint(res.x)) >= -1e-8:
+                s = np.sum(res.x[2 * N:])
+                if s > best_sum:
+                    best_sum = s
+                    best_c = res.x[:2 * N].reshape(N, 2).copy()
+                    best_r = res.x[2 * N:].copy()
+                    v0 = res.x.copy()
+        except Exception:
+            pass
+
+    # Final LP solve to ensure radii match centers exactly
+    lp_r, lp_s, _ = solve_lp_and_grad(best_c)
+    if lp_s > best_sum:
+        best_r = lp_r
+        best_sum = lp_s
+
+    radii = repair(best_c.copy(), best_r.copy())
+    return best_c, radii, float(np.sum(radii))
+```

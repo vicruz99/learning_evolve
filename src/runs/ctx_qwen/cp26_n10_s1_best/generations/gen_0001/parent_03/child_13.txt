@@ -1,0 +1,178 @@
+
+
+<strategy>
+To improve the packing of 26 circles and maximize the sum of radii, we will:
+1. Use squared distance constraints `(dx^2 + dy^2) - (r_i + r_j)^2 >= 0` instead of Euclidean distance. This removes the square root singularity and makes the constraint landscape much smoother for gradient-based optimizers like SLSQP.
+2. Initialize with a hexagonal lattice pattern perturbed by small noise. Hexagonal packing is the densest arrangement for equal circles and provides an excellent starting basin for the optimizer.
+3. Run multiple optimization restarts from different initial radii and random seeds to escape local minima.
+4. Implement a refinement phase that takes the best solution found, applies small random perturbations to centers and radii, and re-optimizes to push past local plateaus.
+5. Strictly validate each candidate solution before accepting it, ensuring no boundary or overlap violations beyond a tight numerical tolerance.
+6. Adhere strictly to the rule of top-level helper functions and no closures/lambdas.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def unpack(vars):
+    """Extracts x, y, r arrays from the flat optimization vector."""
+    return vars[0::3], vars[1::3], vars[2::3]
+
+def objective(vars):
+    """Objective function: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars):
+    """Computes all inequality constraints g(x) >= 0."""
+    x, y, r = unpack(vars)
+    c = []
+    # Boundary constraints
+    c.extend(x - r)
+    c.extend(1.0 - x - r)
+    c.extend(y - r)
+    c.extend(1.0 - y - r)
+    # Overlap constraints (squared distance for numerical stability)
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            c.append(dx*dx + dy*dy - (r[i] + r[j])**2)
+    return np.array(c)
+
+def get_hex_grid_init(r_init, seed):
+    """Generates a hexagonal initial layout with slight perturbation."""
+    np.random.seed(seed)
+    centers = []
+    dy = np.sqrt(3) * r_init
+    for row in range(20):
+        y = r_init + row * dy
+        if y > 1.0 - r_init:
+            break
+        offset = r_init if row % 2 == 1 else 0.0
+        col = 0
+        while True:
+            x = r_init + offset + col * 2 * r_init
+            if x > 1.0 - r_init:
+                break
+            centers.append([x, y])
+            col += 1
+            if len(centers) >= N:
+                break
+        if len(centers) >= N:
+            break
+            
+    # Fallback padding if grid doesn't yield enough points
+    while len(centers) < N:
+        centers.append([np.random.uniform(r_init, 1.0 - r_init), 
+                        np.random.uniform(r_init, 1.0 - r_init)])
+        
+    centers = np.array(centers[:N])
+    # Break exact symmetry to help optimizer find asymmetric/global optima
+    centers += np.random.normal(0, 1e-4, centers.shape)
+    radii = np.full(N, r_init)
+    return centers, radii
+
+def run_packing():
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Bounds: x,y in [0,1], r in [1e-6, 0.5]
+    bounds = [(0.0, 1.0), (0.0, 1.0), (1e-6, 0.5)] * N
+    
+    # Multiple starting configurations
+    seeds = list(range(15))
+    r_inits = [0.085, 0.090, 0.095, 0.100]
+    
+    for seed in seeds:
+        for r_init in r_inits:
+            c_init, r_init_arr = get_hex_grid_init(r_init, seed)
+            x0 = np.zeros(3 * N)
+            x0[0::3] = c_init[:, 0]
+            x0[1::3] = c_init[:, 1]
+            x0[2::3] = r_init_arr
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints={'type': 'ineq', 'fun': constraint_func},
+                               options={'maxiter': 15000, 'ftol': 1e-15, 'disp': False})
+                
+                if not np.isnan(res.fun):
+                    current_sum = -res.fun
+                    if current_sum > best_sum:
+                        x_opt = res.x[0::3]
+                        y_opt = res.x[1::3]
+                        r_opt = res.x[2::3]
+                        
+                        valid = True
+                        # Strict boundary check
+                        if np.any(x_opt < r_opt - 1e-10) or np.any(x_opt + r_opt > 1.0 + 1e-10) or \
+                           np.any(y_opt < r_opt - 1e-10) or np.any(y_opt + r_opt > 1.0 + 1e-10):
+                            valid = False
+                        # Strict overlap check
+                        if valid:
+                            for i in range(N):
+                                for j in range(i+1, N):
+                                    dist = np.hypot(x_opt[i] - x_opt[j], y_opt[i] - y_opt[j])
+                                    if dist < r_opt[i] + r_opt[j] - 1e-10:
+                                        valid = False
+                                        break
+                                if not valid: break
+                            
+                        if valid:
+                            best_sum = current_sum
+                            best_centers = np.column_stack((x_opt, y_opt))
+                            best_radii = r_opt.copy()
+            except Exception:
+                pass
+
+    # Refinement phase: perturb best solution and re-optimize to escape local minima
+    if best_centers is not None:
+        for _ in range(10):
+            c_pert = best_centers + np.random.normal(0, 1e-5, best_centers.shape)
+            c_pert = np.clip(c_pert, best_radii, 1.0 - best_radii)
+            r_pert = best_radii + np.random.normal(0, 1e-5, N)
+            r_pert = np.clip(r_pert, 1e-6, 0.5)
+            
+            x0 = np.zeros(3 * N)
+            x0[0::3] = c_pert[:, 0]
+            x0[1::3] = c_pert[:, 1]
+            x0[2::3] = r_pert
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints={'type': 'ineq', 'fun': constraint_func},
+                               options={'maxiter': 5000, 'ftol': 1e-15, 'disp': False})
+                if -res.fun > best_sum:
+                    x_opt = res.x[0::3]
+                    y_opt = res.x[1::3]
+                    r_opt = res.x[2::3]
+                    valid = True
+                    if np.any(x_opt < r_opt - 1e-10) or np.any(x_opt + r_opt > 1.0 + 1e-10) or \
+                       np.any(y_opt < r_opt - 1e-10) or np.any(y_opt + r_opt > 1.0 + 1e-10):
+                        valid = False
+                    if valid:
+                        for i in range(N):
+                            for j in range(i+1, N):
+                                dist = np.hypot(x_opt[i] - x_opt[j], y_opt[i] - y_opt[j])
+                                if dist < r_opt[i] + r_opt[j] - 1e-10:
+                                    valid = False
+                                    break
+                            if not valid: break
+                    if valid:
+                        best_sum = -res.fun
+                        best_centers = np.column_stack((x_opt, y_opt))
+                        best_radii = r_opt.copy()
+            except Exception:
+                pass
+
+    # Fallback (should not be reached with valid hex init)
+    if best_centers is None:
+        best_centers = np.random.uniform(0.2, 0.8, (N, 2))
+        best_radii = np.full(N, 0.02)
+        best_sum = np.sum(best_radii)
+        
+    return best_centers, best_radii, float(best_sum)
+```

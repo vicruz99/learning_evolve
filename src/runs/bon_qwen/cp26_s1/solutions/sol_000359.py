@@ -1,0 +1,273 @@
+# sol_000359 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b8d6b6a1) state=3b7f56ea sum of radii=2.300420 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+import math
+import random
+
+# Set random seed for reproducibility if needed, but random search helps
+np.random.seed(42)
+
+def solve_radii_lp(centers):
+    """
+    Given fixed centers, find radii r_i that maximize sum(r_i)
+    subject to:
+      r_i + r_j <= dist(c_i, c_j) for all i < j
+      r_i <= min(x_i, 1-x_i, y_i, 1-y_i) for all i
+      r_i >= 0
+    This is a Linear Programming problem.
+    """
+    n = centers.shape[0]
+    
+    # Objective: maximize sum(r_i) -> minimize -sum(r_i)
+    c_obj = -np.ones(n)
+    
+    # Inequality constraints A_ub * r <= b_ub
+    # 1. Non-negativity: -r_i <= 0
+    A_ub = []
+    b_ub = []
+    
+    # r_i >= 0  => -r_i <= 0
+    A_ub.append(-np.eye(n))
+    b_ub.append(np.zeros(n))
+    
+    # 2. Boundary constraints:
+    # r_i <= x_i
+    # r_i <= 1 - x_i
+    # r_i <= y_i
+    # r_i <= 1 - y_i
+    # This can be written as I * r <= bounds
+    # where bounds is a vector of size n with min distance to walls
+    bounds_vec = np.array([
+        min(c[0], 1-c[0], c[1], 1-c[1]) for c in centers
+    ])
+    
+    # Constraint: r_i <= bounds_vec[i]  =>  r_i <= b_i
+    # Matrix form: I * r <= bounds_vec
+    A_ub.append(np.eye(n))
+    b_ub.append(bounds_vec)
+    
+    # 3. Pairwise non-overlap: r_i + r_j <= dist_ij
+    # Vector for pair (i, j) has 1 at i, 1 at j, 0 elsewhere.
+    # We need to construct a matrix where each row corresponds to a pair.
+    
+    pair_rows = []
+    pair_bounds = []
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.linalg.norm(centers[i] - centers[j])
+            
+            row = np.zeros(n)
+            row[i] = 1.0
+            row[j] = 1.0
+            pair_rows.append(row)
+            pair_bounds.append(dist)
+            
+    if pair_rows:
+        A_ub.append(np.array(pair_rows))
+        b_ub.append(np.array(pair_bounds))
+        
+    A_ub = np.vstack(A_ub)
+    b_ub = np.concatenate(b_ub)
+    
+    # Bounds for variables r_i (already handled by A_ub, but linprog requires bounds argument or handling)
+    # linprog bounds default to (0, inf). We have -r <= 0 handled, but let's be explicit.
+    # Actually, -eye constraint handles lower bound 0. 
+    # Upper bound is handled by I*r <= bounds_vec.
+    # So variables are free in linprog but constrained by A_ub.
+    # However, linprog 'bounds' argument is easier.
+    # r_i >= 0 is default lower bound. Upper bound is inf.
+    # But we have explicit upper bounds in A_ub.
+    
+    try:
+        res = opt.linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=[(0, None)] * n, method='highs')
+        if res.success:
+            # Residual might be small negative due to float error, ensure non-negative
+            radii = np.maximum(res.x, 0)
+            return radii, -res.fun
+        else:
+            # Fallback: small equal circles
+            # Estimate max possible radius
+            min_dist = np.inf
+            for i in range(n):
+                for j in range(i+1, n):
+                    d = np.linalg.norm(centers[i] - centers[j])
+                    if d < min_dist: min_dist = d
+                d_to_wall = min(centers[i][0], 1-centers[i][0], centers[i][1], 1-centers[i][1])
+                if d_to_wall < min_dist: min_dist = d_to_wall
+            
+            # Just return tiny radii to be safe
+            return np.zeros(n), 0.0
+    except Exception:
+        return np.zeros(n), 0.0
+
+def objective_function(centers_flat):
+    """
+    Objective function for the optimizer.
+    Returns negative sum of radii (since we minimize).
+    """
+    n = 26
+    centers = centers_flat.reshape((n, 2))
+    
+    # Ensure centers are within [0, 1]
+    # Although optimizer should handle this, clipping helps stability
+    centers = np.clip(centers, 0.0, 1.0)
+    
+    radii, sum_r = solve_radii_lp(centers)
+    return -sum_r
+
+def run_packing():
+    n = 26
+    
+    # 1. Initialization: Hexagonal-like packing
+    # We want to fit 26 circles. A 5x5 grid fits 25.
+    # Let's try a perturbed hexagonal lattice or just a dense random start?
+    # A structured start is usually better.
+    # 5 rows. 26/5 = 5.2.
+    # Maybe rows of 5, 5, 6, 5, 5? No, width constraint.
+    # Rows of 5, 5, 5, 5, 5 is 25.
+    # Let's try to place 26 points in a way that mimics optimal packing density.
+    # A hexagonal grid rotated or shifted.
+    
+    centers = []
+    
+    # Try a 5x5 grid first, plus one in the center?
+    # But center is occupied.
+    # Let's try a hexagonal grid generation.
+    # Rows with y offset.
+    
+    # Approximate number of circles per row for hexagonal packing in unit square
+    # With r approx 0.1, diameter 0.2.
+    # 5 circles fit in width 1.0 (0.1 to 0.9 spacing 0.2).
+    
+    # Let's create 6 rows of 5 circles? No, height issue.
+    # Let's create a set of random points first to initialize, 
+    # but structured to avoid immediate overlaps.
+    
+    # Better initialization: 
+    # Place 25 in 5x5 grid.
+    # Place 1st circle at (0.5, 0.5) but shift grid to make space?
+    # Or just randomize 26 points within [0,1]x[0,1] and let optimizer sort it out.
+    # Random initialization is robust for global optimization if we run enough iterations.
+    
+    # Let's use a grid initialization for stability.
+    # 5 columns, roughly 5-6 rows.
+    # To fit 26, maybe 6 rows?
+    # 6 rows * 5 cols = 30. We have 26.
+    # Remove 4 points from a 6x5 grid?
+    
+    # Generate 6x5 grid
+    grid_points = []
+    for r in range(6):
+        for c in range(5):
+            # Stagger rows for hexagonal
+            x = 0.1 + c * 0.18 # slightly compressed to fit
+            y = 0.1 + r * 0.15 # compressed vertically
+            if r % 2 == 1:
+                x += 0.09 # shift
+            
+            # Check bounds
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                grid_points.append([x, y])
+    
+    # Take first 26
+    initial_centers = np.array(grid_points[:26])
+    
+    # Add some randomness
+    initial_centers += np.random.uniform(-0.02, 0.02, size=initial_centers.shape)
+    initial_centers = np.clip(initial_centers, 0, 1)
+    
+    # 2. Optimization
+    # We use a simple iterative improvement (Hill Climbing with Simulated Annealing idea)
+    # Since scipy minimize might get stuck, we do manual search.
+    
+    best_centers = initial_centers.copy()
+    best_sum = 0
+    radii_best = np.zeros(n)
+    
+    # Solve for best initial
+    radii_best, best_sum = solve_radii_lp(best_centers)
+    
+    # Iterative optimization
+    # We will try random perturbations and keep if better.
+    # Use decreasing step size.
+    
+    current_centers = best_centers.copy()
+    current_sum = best_sum
+    current_radii = radii_best
+    
+    temperature = 0.05
+    min_temp = 1e-6
+    cooling = 0.995
+    
+    iterations = 2000 # Number of attempts
+    
+    for it in range(iterations):
+        # Perturb centers
+        step = temperature * 0.1 # Scale step
+        noise = np.random.uniform(-step, step, size=current_centers.shape)
+        new_centers = current_centers + noise
+        new_centers = np.clip(new_centers, 0, 1)
+        
+        # Evaluate
+        new_radii, new_sum = solve_radii_lp(new_centers)
+        
+        # Acceptance criterion
+        # Always accept if better
+        if new_sum > current_sum:
+            current_centers = new_centers
+            current_radii = new_radii
+            current_sum = new_sum
+            if new_sum > best_sum:
+                best_centers = new_centers.copy()
+                best_radii = new_radii.copy()
+                best_sum = new_sum
+                temperature *= 1.1 # Heat up slightly to explore? No, standard is cool down.
+        else:
+            # Simulated Annealing acceptance
+            prob = math.exp((new_sum - current_sum) / (temperature + 1e-9))
+            if random.random() < prob:
+                current_centers = new_centers
+                current_radii = new_radii
+                current_sum = new_sum
+        
+        temperature *= cooling
+        if temperature < min_temp:
+            temperature = min_temp
+            
+    # Final refinement: Local optimization using scipy minimize (Nelder-Mead)
+    # Flatten centers
+    x0 = best_centers.flatten()
+    
+    # Use minimize to polish
+    # Bounds for coordinates [0, 1]
+    bounds = [(0, 1)] * (2 * n)
+    
+    try:
+        res = opt.minimize(objective_function, x0, method='Nelder-Mead', 
+                           options={'maxiter': 500, 'xatol': 1e-4, 'fatol': 1e-4})
+        if res.success or (-res.fun > best_sum):
+            best_centers = res.x.reshape((n, 2))
+            best_radii, best_sum = solve_radii_lp(best_centers)
+    except Exception:
+        pass
+        
+    # Ensure radii are consistent with final centers
+    final_radii, final_sum = solve_radii_lp(best_centers)
+    
+    # Validate
+    # Just a quick check logic inside function
+    # But we rely on LP solution which guarantees constraints
+    
+    return best_centers, final_radii, final_sum
+
+if __name__ == "__main__":
+    centers, radii, total_sum = run_packing()
+    print(f"Total Sum of Radii: {total_sum}")
+    # print(f"Centers:\n{centers}")
+    # print(f"Radii:\n{radii}")

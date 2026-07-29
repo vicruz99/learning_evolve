@@ -1,0 +1,203 @@
+
+
+<strategy>
+To improve the circle packing beyond 2.627, we adopt a two-phase optimization strategy that decouples center placement from radius calculation during the global search phase, then jointly refines both:
+
+1. **Center-Optimization via LP-Evaluated Objective**: The sum of radii for fixed centers is a concave, piecewise-linear function that can be computed exactly and efficiently using a Linear Program (LP). We precompute the constant constraint matrix structure for the LP to minimize overhead. We then use `Nelder-Mead` (robust for non-smooth objectives) to optimize only the 52 center coordinates from multiple diverse initial configurations (hexagonal lattice, perturbed grid, random). This allows the solver to freely explore the configuration space without getting trapped by radius coupling.
+
+2. **Joint SLSQP Refinement**: Once optimal centers are found, we extract the corresponding radii via the LP and initialize a joint `SLSQP` optimization on all 78 variables (centers + radii). This tightens constraints, ensures differentiability-based convergence, and pushes the solution to the precise boundary of feasibility.
+
+3. **Deterministic Repair & Validation**: A final iterative shrinkage pass resolves any numerical overlaps or boundary violations down to machine epsilon, guaranteeing the validator will accept the result.
+
+This approach leverages the exactness of LP for radius determination during the costly search phase, while relying on gradient-based joint optimization for the final polish, consistently breaking through local maxima that trap single-phase methods.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+
+# Precompute pair indices for all i < j
+_PAIR_I = []
+_PAIR_J = []
+for i in range(N):
+    for j in range(i + 1, N):
+        _PAIR_I.append(i)
+        _PAIR_J.append(j)
+_PAIR_I = np.array(_PAIR_I)
+_PAIR_J = np.array(_PAIR_J)
+_NUM_PAIRS = len(_PAIR_I)
+
+# Precompute constant LP constraint matrix A_ub
+# Rows 0 to _NUM_PAIRS-1: r_i + r_j <= dist(i,j)
+# Rows _NUM_PAIRS to end: r_i <= boundary_dist(i)
+_A_ub = np.zeros((_NUM_PAIRS + N, N))
+for k in range(_NUM_PAIRS):
+    _A_ub[k, _PAIR_I[k]] = 1.0
+    _A_ub[k, _PAIR_J[k]] = 1.0
+for i in range(N):
+    _A_ub[_NUM_PAIRS + i, i] = 1.0
+
+_BOUNDS_LP = [(0.0, None)] * N
+
+def solve_radii_lp(centers):
+    """Solves LP to find maximum sum of radii for fixed centers."""
+    x, y = centers[:, 0], centers[:, 1]
+    b_bound = np.minimum(np.minimum(x, 1.0 - x), np.minimum(y, 1.0 - y))
+    
+    # Pairwise Euclidean distances
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    # Construct b_ub dynamically
+    b_ub = np.empty(_NUM_PAIRS + N)
+    b_ub[:_NUM_PAIRS] = dists[_PAIR_I, _PAIR_J]
+    b_ub[_NUM_PAIRS:] = b_bound
+    
+    # Maximize sum(r) => minimize -sum(r)
+    res = linprog(-np.ones(N), A_ub=_A_ub, b_ub=b_ub, bounds=_BOUNDS_LP, method='highs')
+    if res.success:
+        return res.x, -res.fun
+    # Fallback heuristic if LP fails
+    r_safe = np.minimum(b_bound, 0.5 * np.min(dists, axis=1))
+    return np.maximum(r_safe, 0.0), np.sum(r_safe)
+
+def objective_centers(vars_flat):
+    """Objective for center-only optimization: minimize negative sum of radii."""
+    centers = np.clip(vars_flat.reshape(N, 2), 1e-5, 1.0 - 1e-5)
+    _, s = solve_radii_lp(centers)
+    return -s
+
+def compute_constraints_joint(vars):
+    """Inequality constraints for joint SLSQP optimization."""
+    c = vars[:2*N].reshape(N, 2)
+    r = vars[2*N:]
+    
+    # Boundary constraints
+    cons = np.concatenate([
+        c[:, 0] - r,
+        1.0 - c[:, 0] - r,
+        c[:, 1] - r,
+        1.0 - c[:, 1] - r
+    ])
+    
+    # Overlap constraints
+    dx = c[:, 0, np.newaxis] - c[:, 0]
+    dy = c[:, 1, np.newaxis] - c[:, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    pair_dists = dists[_PAIR_I, _PAIR_J]
+    pair_r_sum = r[_PAIR_I] + r[_PAIR_J]
+    cons = np.concatenate([cons, pair_dists - pair_r_sum])
+    return cons
+
+def objective_joint(vars):
+    """Objective for joint optimization: minimize negative sum of radii."""
+    return -np.sum(vars[2*N:])
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Packs 26 circles in a unit square to maximize the sum of radii.
+    Uses a two-phase strategy: LP-evaluated center search + joint SLSQP polish.
+    """
+    np.random.seed(42)
+    
+    # ---------------------------------------------------------
+    # Phase 1: Generate Diverse Initial Configurations
+    # ---------------------------------------------------------
+    starts = []
+    
+    # 1. Hexagonal lattice (rows summing to 26)
+    r_h = 0.105
+    rows = [5, 6, 5, 6, 4]
+    c_h = []
+    y = r_h
+    for i, cnt in enumerate(rows):
+        off = r_h if i % 2 == 1 else 0.0
+        x = r_h + off
+        for _ in range(cnt):
+            c_h.append([x, y])
+            x += 2.0 * r_h
+        y += np.sqrt(3.0) * r_h
+    starts.append(np.array(c_h[:N]))
+    
+    # 2. Perturbed 5x5 Grid + Center Fill
+    gx = np.linspace(0.12, 0.88, 5)
+    gy = np.linspace(0.12, 0.88, 5)
+    cx, cy = np.meshgrid(gx, gy)
+    grid = np.column_stack([cx.flatten(), cy.flatten()])
+    grid = np.vstack([grid, [0.5, 0.5]])
+    starts.append(grid + np.random.normal(0, 0.015, grid.shape))
+    
+    # 3. Dense Random Starts
+    for _ in range(4):
+        starts.append(np.random.rand(N, 2) * 0.8 + 0.1)
+        
+    # ---------------------------------------------------------
+    # Phase 2: Optimize Centers using Nelder-Mead
+    # ---------------------------------------------------------
+    best_val = np.inf
+    best_centers = None
+    
+    for s in starts:
+        try:
+            res = minimize(objective_centers, s.flatten(), method='Nelder-Mead',
+                           options={'maxiter': 2500, 'fatol': 1e-12, 'xatol': 1e-10})
+            if res.fun < best_val:
+                best_val = res.fun
+                best_centers = res.x.reshape(N, 2)
+        except Exception:
+            continue
+            
+    if best_centers is None:
+        best_centers = starts[0]
+        
+    # ---------------------------------------------------------
+    # Phase 3: Joint Refinement with SLSQP
+    # ---------------------------------------------------------
+    radii, _ = solve_radii_lp(best_centers)
+    vars_init = np.concatenate([best_centers.flatten(), radii])
+    
+    bounds_joint = [(0.0, 1.0)] * (2*N) + [(1e-8, 0.5)] * N
+    cons_joint = {'type': 'ineq', 'fun': compute_constraints_joint}
+    
+    try:
+        res = minimize(objective_joint, vars_init, method='SLSQP', bounds=bounds_joint,
+                       constraints=cons_joint, options={'maxiter': 6000, 'ftol': 1e-14})
+        if np.all(compute_constraints_joint(res.x) >= -1e-9):
+            best_centers = res.x[:2*N].reshape(N, 2)
+            radii = res.x[2*N:].copy()
+    except Exception:
+        pass
+        
+    # ---------------------------------------------------------
+    # Phase 4: Deterministic Repair for Strict Validation
+    # ---------------------------------------------------------
+    for _ in range(25):
+        changed = False
+        # Resolve overlaps
+        for i in range(N):
+            for j in range(i + 1, N):
+                d = np.hypot(best_centers[i,0] - best_centers[j,0], 
+                             best_centers[i,1] - best_centers[j,1])
+                if d < radii[i] + radii[j] - 1e-12:
+                    ov = radii[i] + radii[j] - d
+                    radii[i] -= ov / 2.0
+                    radii[j] -= ov / 2.0
+                    changed = True
+                    
+        # Clamp to boundaries
+        for i in range(N):
+            mx = min(best_centers[i,0], 1.0 - best_centers[i,0], 
+                     best_centers[i,1], 1.0 - best_centers[i,1])
+            if radii[i] > mx + 1e-12:
+                radii[i] = mx
+                changed = True
+                
+        if not changed:
+            break
+            
+    radii = np.maximum(radii, 0.0)
+    return best_centers, radii, float(np.sum(radii))
+```

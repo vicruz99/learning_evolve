@@ -1,0 +1,303 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need to navigate a highly non-convex optimization landscape with many local optima. The previous best score (~2.631) indicates we are close to the theoretical optimum but stuck in a suboptimal contact topology. 
+
+Key improvements in this solution:
+1. **Dual-Guided Local Search**: The LP solver provides dual variables (Lagrange multipliers) for each constraint. For active pairwise constraints ($r_i + r_j = d_{ij}$), the dual value indicates how much the objective would improve if the distance increased. We use these duals to compute repulsive forces and nudge circles apart along the exact directions that unlock radius growth, significantly accelerating convergence compared to blind random walks.
+2. **Topology Shocking**: Pure local optimization gets trapped in rigid configurations where circles form a locked contact graph. Periodically repositioning 3-4 circles to random locations breaks the current topology, allowing the optimizer to explore fundamentally different packing arrangements.
+3. **Hybrid Parameterization**: We use the $(r, u, v)$ parameterization for SLSQP to automatically satisfy boundary constraints ($x \in [r, 1-r]$), but fallback to direct LP evaluation during Simulated Annealing (SA) for exact objective values. This combines the smooth landscape of parameterized gradients with the exact feasibility checks of LP.
+4. **Multi-Phase Pipeline**: 
+   - Phase 0: Generate diverse initializations (hexagonal lattices with varied rotations/scales, force-directed spreads).
+   - Phase 1: Local SLSQP optimization from each start to find strong baselines.
+   - Phase 2: LP-driven SA with dual-guided moves, adaptive step/temperature cooling, and periodic topology shocks.
+   - Phase 3: Perturbation restarts + SLSQP to escape remaining local minima.
+   - Phase 4: High-precision polishing to squeeze out numerical slack.
+5. **Strict Compliance**: All helpers are top-level, no closures, no lambdas, robust error handling, and exact constraint validation.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def solve_lp(centers):
+    """Given fixed centers, solves LP to find radii that maximize sum(r_i)."""
+    n = centers.shape[0]
+    num_c = 4 * n + n * (n - 1) // 2
+    A_ub = np.zeros((num_c, n))
+    b_ub = np.zeros(num_c)
+    k = 0
+    
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        bounds_list = [x, 1.0 - x, y, 1.0 - y]
+        for b in bounds_list:
+            A_ub[k, i] = 1.0
+            b_ub[k] = b
+            k += 1
+            
+    # Pairwise constraints
+    dx = centers[:, 0, np.newaxis] - centers[np.newaxis, :, 0]
+    dy = centers[:, 1, np.newaxis] - centers[np.newaxis, :, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            A_ub[k, i] = 1.0
+            A_ub[k, j] = 1.0
+            b_ub[k] = dists[i, j]
+            k += 1
+            
+    c_obj = -np.ones(n)
+    bounds = [(0.0, None)] * n
+    
+    try:
+        res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            duals = None
+            if hasattr(res, 'ineqlin') and res.ineqlin is not None:
+                try:
+                    duals = np.asarray(res.ineqlin.marginals).flatten()
+                except Exception:
+                    duals = None
+            return res.x, -res.fun, duals
+    except Exception:
+        pass
+    return np.full(n, 1e-5), 1e-4, None
+
+def get_params(centers, radii):
+    """Convert physical centers/radii to (r, u, v) optimization parameters."""
+    r = radii.copy()
+    denom = np.clip(1.0 - 2.0 * r, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r) / denom, 0.0, 1.0)
+    return np.concatenate([r, u, v])
+
+def obj_func(p):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(p[:N])
+
+def cons_func(p):
+    """Inequality constraints: pairwise non-overlap. Boundaries handled by parameterization."""
+    r = p[:N]
+    u = p[N:2*N]
+    v = p[2*N:3*N]
+    
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    d2 = dx**2 + dy**2
+    
+    rs = r[:, np.newaxis] + r[np.newaxis, :]
+    return d2[I_IDX, J_IDX] - rs[I_IDX, J_IDX]**2
+
+def apply_dual_forces(centers, duals, step):
+    """Computes ascent forces on centers based on LP dual variables."""
+    n = centers.shape[0]
+    forces = np.zeros((n, 2))
+    idx = 4 * n  # Skip boundary constraint duals
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            lam = duals[idx]
+            idx += 1
+            if lam > 1e-7:  # Active constraint
+                diff = centers[i] - centers[j]
+                dist = np.linalg.norm(diff)
+                if dist > 1e-8:
+                    # Force points in direction that increases distance
+                    f = lam * step * diff / dist
+                    forces[i] += f
+                    forces[j] -= f
+    return forces
+
+def generate_hex(rng, row_counts, rot, scale):
+    """Generate a hexagonal lattice initialization."""
+    pts = []
+    r_est = 0.095
+    y = r_est
+    row = 0
+    for cnt in row_counts:
+        shift = (row % 2) * r_est
+        x = r_est + shift
+        for _ in range(cnt):
+            if len(pts) < N:
+                pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+    pts = np.array(pts[:N])
+    pts = (pts - 0.5) * scale + 0.5
+    if rot != 0.0:
+        c, s = np.cos(rot), np.sin(rot)
+        pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+    pts += rng.uniform(-0.015, 0.015, pts.shape)
+    return np.clip(pts, 0.02, 0.98)
+
+def run_packing():
+    np.seterr(all='ignore')
+    rng = np.random.default_rng(42)
+    
+    bounds_slqp = [(1e-6, 0.49)] * N + [(0.0, 1.0)] * N + [(0.0, 1.0)] * N
+    cons_dict = {'type': 'ineq', 'fun': cons_func}
+    
+    best_p = None
+    best_sum = -np.inf
+    best_c = None
+    best_r = None
+    
+    # Phase 0: Diverse Initializations
+    inits = []
+    pats = [[6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [7,5,5,5,4], 
+            [5,5,5,5,6], [6,6,5,5,4], [5,5,6,5,5], [6,4,6,5,5]]
+    for pat in pats:
+        for _ in range(6):
+            rot = rng.uniform(-0.3, 0.3)
+            sc = rng.uniform(0.88, 1.12)
+            inits.append(generate_hex(rng, pat, rot, sc))
+            
+    for _ in range(10):
+        pts = rng.uniform(0.15, 0.85, (N, 2))
+        # Simple force spread to avoid overlaps initially
+        for _ in range(150):
+            diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+            d = np.sqrt(np.sum(diff**2, axis=2))
+            d = np.maximum(d, 1e-4)
+            f = np.sum((1.0 / d**2)[:, :, np.newaxis] * diff / d[:, :, np.newaxis], axis=1)
+            for dim in range(2):
+                f[:, dim] += 20.0 * np.maximum(0, 0.1 - pts[:, dim])
+                f[:, dim] -= 20.0 * np.maximum(0, pts[:, dim] - 0.9)
+            pts += 0.002 * f
+            pts = np.clip(pts, 0.05, 0.95)
+        inits.append(pts)
+        
+    # Phase 1: SLSQP from inits to find strong baselines
+    for c in inits:
+        r, _, _ = solve_lp(c)
+        r = np.clip(r * 0.99, 1e-6, 0.49)
+        p0 = get_params(c, r)
+        try:
+            res = minimize(obj_func, p0, method='SLSQP', bounds=bounds_slqp, constraints=cons_dict,
+                           options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+            if res.success and np.min(cons_func(res.x)) >= -1e-7:
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_p = res.x.copy()
+        except Exception:
+            continue
+            
+    if best_p is None:
+        c_f = inits[0]
+        r_f, _, _ = solve_lp(c_f)
+        best_p = get_params(c_f, r_f * 0.99)
+        best_sum = -obj_func(best_p)
+        
+    # Extract best for SA
+    r_b = best_p[:N]
+    u_b = best_p[N:2*N]
+    v_b = best_p[2*N:3*N]
+    c_best = np.column_stack((r_b + u_b * (1 - 2 * r_b), r_b + v_b * (1 - 2 * v_b)))
+    
+    # Phase 2: LP-Driven SA with Dual Guidance & Topology Shocks
+    curr_c = c_best.copy()
+    curr_r, curr_s, _ = solve_lp(curr_c)
+    step = 0.04
+    temp = 0.03
+    
+    for it in range(8000):
+        if it % 2 == 0:
+            # Use duals from current state to guide moves
+            nr, ns, duals = solve_lp(curr_c)
+            if ns != curr_s:
+                curr_r, curr_s = nr, ns
+                
+            if duals is not None and rng.random() < 0.6:
+                forces = apply_dual_forces(curr_c, duals, step * 0.4)
+                nc = np.clip(curr_c + forces, 0.02, 0.98)
+            else:
+                nc = curr_c.copy()
+                idx = rng.integers(N)
+                nc[idx] = np.clip(nc[idx] + rng.standard_normal(2) * step, 0.02, 0.98)
+        else:
+            # Random move
+            nc = curr_c.copy()
+            if rng.random() < 0.3:
+                idx = rng.integers(N)
+                nc[idx] = rng.uniform(0.1, 0.9, 2)
+            else:
+                idx = rng.integers(N)
+                nc[idx] = np.clip(nc[idx] + rng.standard_normal(2) * step, 0.02, 0.98)
+                
+            nr, ns, _ = solve_lp(nc)
+            
+        delta = ns - curr_s
+        if delta > 0 or (temp > 1e-6 and rng.random() < np.exp(delta / temp)):
+            curr_c = nc
+            curr_r, curr_s = nr, ns
+            if ns > best_sum:
+                best_sum = ns
+                best_c = nc.copy()
+                best_r = nr.copy()
+            step = max(0.001, step * 0.9994)
+            temp = max(1e-5, temp * 0.9993)
+            
+        # Periodic topology shock to escape rigid local minima
+        if (it + 1) % 1500 == 0:
+            for _ in range(4):
+                idx = rng.integers(N)
+                curr_c[idx] = rng.uniform(0.1, 0.9, 2)
+            curr_r, curr_s, _ = solve_lp(curr_c)
+            
+    if best_c is not None:
+        best_p = get_params(best_c, np.clip(best_r * 0.995, 1e-6, 0.49))
+        
+    # Phase 3: Perturbation & SLSQP to escape remaining local minima
+    for k in range(30):
+        xp = best_p.copy()
+        xp[:N] += rng.normal(0, 0.003, N)
+        xp[N:3*N] += rng.normal(0, 0.02, 2*N)
+        xp[:N] = np.clip(xp[:N], 1e-6, 0.49)
+        xp[N:3*N] = np.clip(xp[N:3*N], 0.0, 1.0)
+        
+        try:
+            res = minimize(obj_func, xp, method='SLSQP', bounds=bounds_slqp, constraints=cons_dict,
+                           options={'maxiter': 4000, 'ftol': 1e-12, 'disp': False})
+            if res.success and np.min(cons_func(res.x)) >= -1e-7:
+                s = -res.fun
+                if s > best_sum:
+                    best_sum = s
+                    best_p = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 4: High-precision final polish
+    try:
+        res_f = minimize(obj_func, best_p, method='SLSQP', bounds=bounds_slqp, constraints=cons_dict,
+                         options={'maxiter': 10000, 'ftol': 1e-14, 'disp': False})
+        if res_f.success and np.min(cons_func(res_f.x)) >= -1e-8:
+            best_p = res_f.x
+            best_sum = -res_f.fun
+    except Exception:
+        pass
+        
+    # Reconstruct physical centers and radii
+    r_opt = best_p[:N]
+    u_opt = best_p[N:2*N]
+    v_opt = best_p[2*N:3*N]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    radii = np.maximum(r_opt, 0.0)
+    
+    # Final LP ensures radii are strictly optimal for the exact final centers
+    radii_final, sum_final, _ = solve_lp(centers)
+    
+    return centers, radii_final, float(sum_final)
+```

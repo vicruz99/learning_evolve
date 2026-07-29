@@ -1,0 +1,314 @@
+# sol_000373 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state b75b923f) state=b32932f2 sum of radii=2.465762 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import linprog
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    n = 26
+    np.random.seed(42)  # For reproducibility
+
+    # --- Helper Functions ---
+
+    def generate_hex_grid(n_circles):
+        """Generates an initial hexagonal grid of centers."""
+        # Try to fit circles in a hexagonal pattern
+        # We want roughly sqrt(n) rows. For 26, maybe 6 or 7 rows.
+        # Let's try to fit them in a rectangular-ish block.
+        
+        # Heuristic: Try to determine rows and cols
+        # A 5x5 grid is 25. We need 26.
+        # Maybe 6 rows: 5, 5, 5, 5, 4, 2? 
+        # Or 5, 5, 5, 5, 5, 1?
+        # Let's try to create a dense cluster.
+        
+        # Standard hex packing:
+        # Row 0: 5 circles
+        # Row 1: 5 circles (shifted) -> Actually fits 4 if shifted by radius?
+        # Let's just generate a grid and trim/expand.
+        
+        rows = 6
+        cols = 5
+        
+        centers = []
+        r_guess = 0.09 # Initial radius guess to fit
+        
+        # Calculate grid spacing
+        # Horizontal spacing: 2 * r_guess
+        # Vertical spacing: sqrt(3) * r_guess
+        
+        # To fit in [0,1], we need to scale.
+        # Let's just place them in a normalized grid and scale later?
+        # Or place directly.
+        
+        # Let's try a specific layout for 26
+        # 5, 5, 5, 5, 4, 2
+        row_counts = [5, 5, 5, 5, 4, 2]
+        
+        y = r_guess
+        row_idx = 0
+        
+        for count in row_counts:
+            # Determine x offset for this row to center it
+            # Width of row = count * 2 * r_guess
+            # But actually centers are spaced by 2r.
+            # Total width occupied by 'count' circles is 2r * count?
+            # No, from first center to last center is 2r*(count-1).
+            # Plus r on each side for boundary.
+            # Total width = 2r + 2r*(count-1) = 2r*count.
+            
+            width = 2 * r_guess * count
+            x_start = (1.0 - width) / 2 + r_guess
+            
+            for i in range(count):
+                x = x_start + i * 2 * r_guess
+                centers.append([x, y])
+            
+            # If next row is offset, shift x?
+            # In hex packing, odd rows are shifted by r.
+            # But to fit count, we might need to adjust.
+            # Let's keep simple rectangular grid first, then perturb.
+            # Actually, simple grid is safer to start.
+            
+            y += 1.8 * r_guess # Slightly larger than 2r to allow overlap initially? 
+                               # No, let's keep them valid. 2r vertical spacing.
+                               # Hex spacing is sqrt(3)*r ~ 1.732r.
+            # Reset y for next row logic?
+            # Let's just use y += 2*r_guess for now to avoid complexity.
+            # We will optimize anyway.
+            pass 
+            
+        # The logic above was flawed for loop. Let's redo properly.
+        
+        centers = []
+        y = r_guess
+        
+        # Try 6 rows
+        # Row counts: 5, 5, 5, 5, 4, 2 (Sum 26)
+        counts = [5, 5, 5, 5, 4, 2]
+        
+        for i, count in enumerate(counts):
+            # Hexagonal offset
+            # Even rows (0, 2, ...): start at x_start
+            # Odd rows (1, 3, ...): start at x_start + r_guess (shifted right)
+            # But if shifted, width might exceed 1.
+            # Let's just center them.
+            
+            # Width required for 'count' circles is approx 2*r*count
+            # But actually distance between first and last center is 2r*(count-1)
+            # Extent is [x - r, x + r].
+            # Let's just place them centered.
+            
+            # Effective width of 'count' circles: 2*r*count is safe upper bound.
+            # Let's use spacing 2r.
+            spacing = 2 * r_guess
+            
+            if i % 2 == 1:
+                # Shifted row
+                # Start a bit to the right
+                # But we need to fit 'count' circles.
+                # If we shift, we might lose space on one side.
+                # Let's just center the row of 'count' circles.
+                pass
+
+            # Just place them in a straight line centered
+            row_width = spacing * (count - 1) if count > 1 else 0
+            x_start = (1.0 - row_width) / 2
+            # Centers range from x_start to x_start + row_width
+            # But need to add r to fit in box? 
+            # No, x_start is the center of the first circle?
+            # If count=1, x_start=0.5.
+            # If count=5, spacing=0.18 (for r=0.09). row_width = 4*0.18 = 0.72.
+            # x_start = 0.14. Centers: 0.14, 0.32, 0.50, 0.68, 0.86.
+            # Bounds: 0.14-0.09=0.05, 0.86+0.09=0.95. Fits.
+            
+            for j in range(count):
+                x = x_start + j * spacing
+                # Offset for hexagonal packing
+                # If i is odd, shift by half spacing?
+                if i % 2 == 1:
+                    x += spacing / 2.0 # Shift by r
+                
+                # Re-center the shifted row?
+                # If we shift, the row might go out of bounds.
+                # Let's just not shift for now to ensure validity, 
+                # optimizer will fix it.
+                # Actually, shifting is good for density.
+                # Let's clamp x to [r, 1-r] roughly.
+                if x < r_guess: x = r_guess
+                if x > 1.0 - r_guess: x = 1.0 - r_guess
+                
+                centers.append([x, y])
+            
+            y += 1.8 * r_guess # Vertical spacing
+            
+        centers = np.array(centers[:n])
+        return centers
+
+    def solve_radii(centers):
+        """
+        Given centers, solve LP to find max radii.
+        Maximize sum(r_i)
+        Subject to:
+          r_i + r_j <= dist(i, j)
+          r_i <= x_i
+          r_i <= 1 - x_i
+          r_i <= y_i
+          r_i <= 1 - y_i
+          r_i >= 0
+        """
+        n = centers.shape[0]
+        
+        # Objective: minimize -sum(r)
+        c = np.ones(n) * -1
+        
+        # Constraints A_ub * r <= b_ub
+        A_ub = []
+        b_ub = []
+        
+        # Pairwise distance constraints
+        # r_i + r_j <= dist_ij
+        # Row with 1 at i, 1 at j
+        dist_matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
+                dist_matrix[i, j] = dist
+                dist_matrix[j, i] = dist
+                
+                # Add constraint
+                row = np.zeros(n)
+                row[i] = 1.0
+                row[j] = 1.0
+                A_ub.append(row)
+                b_ub.append(dist)
+        
+        # Boundary constraints
+        # r_i <= x_i
+        # r_i <= 1 - x_i
+        # r_i <= y_i
+        # r_i <= 1 - y_i
+        for i in range(n):
+            # x constraints
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(centers[i, 0])
+            
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(1.0 - centers[i, 0])
+            
+            # y constraints
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(centers[i, 1])
+            
+            row = np.zeros(n)
+            row[i] = 1.0
+            A_ub.append(row)
+            b_ub.append(1.0 - centers[i, 1])
+            
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        
+        # Bounds for r_i: [0, None]
+        bounds = [(0, None) for _ in range(n)]
+        
+        # Solve
+        try:
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                return -res.fun, res.x
+            else:
+                # Fallback or error
+                return 0, np.zeros(n)
+        except Exception:
+            return 0, np.zeros(n)
+
+    # --- Main Optimization Loop ---
+
+    # 1. Initial Configuration
+    centers = generate_hex_grid(n)
+    current_sum, current_radii = solve_radii(centers)
+    
+    # 2. Optimization (Simulated Annealing)
+    temp = 0.05 # Initial temperature (step size)
+    best_sum = current_sum
+    best_centers = centers.copy()
+    best_radii = current_radii.copy()
+    
+    iterations = 5000 # Number of iterations
+    step_size = 0.02
+    
+    for k in range(iterations):
+        # Pick a random circle
+        idx = np.random.randint(0, n)
+        
+        # Perturb center
+        delta_x = np.random.normal(0, step_size)
+        delta_y = np.random.normal(0, step_size)
+        
+        new_centers = centers.copy()
+        new_centers[idx, 0] += delta_x
+        new_centers[idx, 1] += delta_y
+        
+        # Ensure inside square (loosely)
+        # Radii will handle boundaries, but let's keep centers reasonable
+        new_centers[idx, 0] = np.clip(new_centers[idx, 0], 0, 1)
+        new_centers[idx, 1] = np.clip(new_centers[idx, 1], 0, 1)
+        
+        # Solve for radii
+        new_sum, new_radii = solve_radii(new_centers)
+        
+        # Accept/Reject
+        # We want to maximize sum.
+        # If new_sum > current_sum, accept.
+        # If not, maybe accept with probability? 
+        # But since LP is exact for radii, random acceptance might be risky if we jump to bad centers.
+        # However, we might need to jump out of local optima.
+        
+        if new_sum > current_sum:
+            current_sum = new_sum
+            current_radii = new_radii
+            centers = new_centers
+            
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = current_radii.copy()
+                
+        else:
+            # Simulated annealing probability
+            # prob = exp((new_sum - current_sum) / temp)
+            # if random < prob: accept
+            # But difference is small, temp is small.
+            pass
+            
+        # Decrease step size
+        if k % 500 == 0:
+            step_size *= 0.9
+            
+        # Periodically try random restart of a circle if stuck?
+        # Not needed if step size decreases.
+
+    # Final validation and cleanup
+    # Ensure no NaNs
+    best_radii = np.nan_to_num(best_radii, nan=0.0)
+    best_centers = np.nan_to_num(best_centers, nan=0.5)
+    
+    # Re-solve radii one last time to be sure
+    final_sum, final_radii = solve_radii(best_centers)
+    
+    # Clip radii to be safe
+    final_radii = np.maximum(final_radii, 0)
+    
+    return best_centers, final_radii, float(np.sum(final_radii))
+
+# Run the function to test locally if allowed, but here we just define it.
+# The prompt asks to return the program.

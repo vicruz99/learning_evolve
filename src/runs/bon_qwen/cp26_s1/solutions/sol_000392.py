@@ -1,0 +1,197 @@
+# sol_000392 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 19a68663) state=1e95824f sum of radii=0.000000 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import cvxpy as cp
+from scipy.optimize import minimize
+
+def get_max_radii_sum(centers):
+    """
+    Given fixed centers, solves the LP to find the maximum sum of radii
+    such that circles do not overlap and stay within the unit square.
+    """
+    n = centers.shape[0]
+    r = cp.Variable(n, nonneg=True)
+    
+    constraints = []
+    
+    # Boundary constraints
+    for i in range(n):
+        x, y = centers[i]
+        constraints.append(r[i] <= x)
+        constraints.append(r[i] <= 1 - x)
+        constraints.append(r[i] <= y)
+        constraints.append(r[i] <= 1 - y)
+        
+    # Overlap constraints: dist(i, j) >= r[i] + r[j]
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            constraints.append(r[i] + r[j] <= dist)
+            
+    objective = cp.Maximize(cp.sum(r))
+    prob = cp.Problem(objective, constraints)
+    
+    try:
+        prob.solve(solver=cp.ECOS, verbose=False)
+        if prob.status in ["optimal", "optimal_inaccurate"]:
+            return r.value, np.sum(r.value)
+        else:
+            return None, -np.inf
+    except Exception:
+        return None, -np.inf
+
+def objective_function(coords, n):
+    """
+    Wrapper for the optimizer.
+    coords is a 1D array of length 2*n representing (x1, y1, x2, y2, ...)
+    """
+    centers = coords.reshape((n, 2))
+    
+    # Basic boundary check to penalize invalid centers heavily
+    # This helps the optimizer stay within feasible region
+    valid = True
+    penalty = 0.0
+    for x, y in centers:
+        if x < 0 or x > 1 or y < 0 or y > 1:
+            valid = False
+            penalty += 1000.0
+    
+    if not valid:
+        return -penalty # Large penalty
+    
+    # Solve for max radii
+    radii, total_radius = get_max_radii_sum(centers)
+    
+    if radii is None:
+        return -1000.0 # Infeasible LP
+        
+    # Check for numerical stability/validity of radii
+    if np.any(np.isnan(radii)) or np.any(np.isinf(radii)):
+        return -1000.0
+        
+    return -total_radius # Minimize negative sum
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Finds the optimal packing of 26 circles in a unit square.
+    """
+    n = 26
+    best_sum = 0.0
+    best_centers = None
+    best_radii = None
+    
+    # Strategy 1: Hexagonal Grid Initialization
+    # Try to fit a hexagonal lattice
+    hex_rows = 6
+    hex_cols = 5 # Approx
+    step_x = 2.0 / (hex_cols - 1) if hex_cols > 1 else 1.0
+    step_y = np.sqrt(3) * step_x / 2
+    
+    centers_hex = []
+    for row in range(hex_rows):
+        for col in range(hex_cols):
+            # Shift every other row
+            x = col * step_x
+            y = row * step_y
+            if row % 2 == 1:
+                x += step_x / 2
+            # Scale and shift to fit in [0,1] roughly, but let optimizer adjust
+            # We just generate a pattern
+            centers_hex.append([x, y])
+    
+    # Trim or pad to exactly 26
+    if len(centers_hex) > n:
+        centers_hex = centers_hex[:n]
+    elif len(centers_hex) < n:
+        # Fill remaining with random points
+        while len(centers_hex) < n:
+            centers_hex.append([np.random.rand(), np.random.rand()])
+            
+    init_centers = np.array(centers_hex)
+    # Normalize to fit in unit square roughly
+    min_c = np.min(init_centers, axis=0)
+    max_c = np.max(init_centers, axis=0)
+    spread = max_c - min_c
+    if np.any(spread > 0):
+        init_centers = (init_centers - min_c) / spread
+        # Add small margin
+        init_centers = init_centers * 0.9 + 0.05
+
+    # Add some randomness to the grid to escape local minima
+    init_centers += np.random.randn(n, 2) * 0.05
+    init_centers = np.clip(init_centers, 0.01, 0.99)
+
+    # Run optimization from this start
+    x0 = init_centers.flatten()
+    try:
+        res = minimize(objective_function, x0, args=(n,), method='SLSQP', 
+                       options={'maxiter': 1000, 'ftol': 1e-9})
+        
+        if res.fun < 0: # If we found a valid solution (negative of sum)
+            current_sum = -res.fun
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = res.x.reshape((n, 2))
+                radii, _ = get_max_radii_sum(best_centers)
+                best_radii = radii
+    except Exception as e:
+        print(f"Optimization failed with error: {e}")
+
+    # Strategy 2: Random Restarts (a few attempts)
+    for _ in range(5):
+        random_centers = np.random.rand(n, 2)
+        # Jitter a grid structure
+        grid_x = np.linspace(0.1, 0.9, 5)
+        grid_y = np.linspace(0.1, 0.9, 5)
+        # 25 grid points + 1 random
+        pts = []
+        for y in grid_y:
+            for x in grid_x:
+                pts.append([x, y])
+        pts.append([np.random.rand(), np.random.rand()])
+        
+        # Randomly select 26 points or just use the generated structure
+        # Let's just use random points with some structure
+        rand_centers = np.random.rand(n, 2)
+        # Sort by y to make it somewhat structured? No need.
+        
+        x0 = rand_centers.flatten()
+        try:
+            res = minimize(objective_function, x0, args=(n,), method='SLSQP', 
+                           options={'maxiter': 500, 'ftol': 1e-9})
+            if res.fun < 0:
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = res.x.reshape((n, 2))
+                    radii, _ = get_max_radii_sum(best_centers)
+                    best_radii = radii
+        except:
+            pass
+
+    # Fallback to hex grid if nothing worked well (unlikely)
+    if best_centers is None:
+        best_centers = init_centers
+        radii, _ = get_max_radii_sum(best_centers)
+        best_radii = radii
+        best_sum = np.sum(best_radii)
+
+    # Final validation and clamping
+    # Ensure strict boundaries
+    if best_centers is not None:
+        best_centers = np.clip(best_centers, 0, 1)
+        # Re-solve radii to be safe after clipping
+        best_radii, best_sum = get_max_radii_sum(best_centers)
+        if best_radii is None:
+             # If LP fails, return zeros
+             return np.zeros((n, 2)), np.zeros(n), 0.0
+
+    return best_centers, best_radii, best_sum
+
+if __name__ == "__main__":
+    centers, radii, s = run_packing()
+    print(f"Sum of radii: {s}")

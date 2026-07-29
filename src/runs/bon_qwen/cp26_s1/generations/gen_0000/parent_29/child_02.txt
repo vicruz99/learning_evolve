@@ -1,100 +1,213 @@
 
 
 <strategy>
-To maximize the sum of radii for 26 circles in a unit square, we treat the problem as an unconstrained optimization over the centers, with radii implicitly determined by the minimum distance to boundaries and neighboring circles. This formulation naturally enforces non-overlap and boundary constraints while maximizing the objective.
+The goal is to pack 26 circles into a unit square to maximize the sum of radii. This is a non-convex optimization problem with quadratic constraints (circle-circle and circle-boundary non-overlap).
 
-Key steps in the strategy:
-1. **Implicit Radius Definition**: For any given set of centers, the maximum valid radius for circle $i$ is $r_i = \min(\text{dist}(c_i, \partial), \min_{j \neq i} \|c_i - c_j\|/2)$. This guarantees feasibility.
-2. **Global Search**: Use `scipy.optimize.differential_evolution` to explore the 52-dimensional parameter space (26 centers × 2 coordinates). DE is robust for non-smooth, multi-modal landscapes typical in packing problems.
-3. **Local Refinement**: DE finds a high-quality basin. We then apply multiple restarts of `Nelder-Mead` local optimization with small random perturbations to escape shallow local optima and finely tune center positions. Nelder-Mead handles the piecewise-linear nature of the `min` function better than gradient-based methods.
-4. **Numerical Safety**: After optimization, radii are slightly shrunk (factor $1 - 10^{-10}$) to strictly satisfy the validator's tolerance without affecting the objective value meaningfully.
-5. **Efficiency**: Vectorized NumPy operations compute pairwise distances efficiently. The total evaluation budget is kept reasonable (~2000-3000 objective calls) to ensure quick execution while converging to a sum of radii well above the 2.636 target.
+Strategy:
+1.  **Mathematical Formulation**: Define the decision variables as the center coordinates $(x_i, y_i)$ and radii $r_i$ for each of the 26 circles. The objective is to maximize $\sum r_i$, which is equivalent to minimizing $-\sum r_i$.
+2.  **Constraints**:
+    *   **Boundaries**: $0 \le x_i - r_i$ and $x_i + r_i \le 1$ (similarly for $y$). This ensures circles stay inside $[0,1] \times [0,1]$.
+    *   **Non-overlap**: For every pair $i < j$, the distance between centers must be at least the sum of radii: $(x_i - x_j)^2 + (y_i - y_j)^2 \ge (r_i + r_j)^2$.
+3.  **Optimization Algorithm**: Use `scipy.optimize.minimize` with the `SLSQP` method, which handles bounds and nonlinear inequality constraints effectively.
+4.  **Initialization**: A dense initial configuration is crucial to reach a good local optimum. I will initialize centers in a 5x5 grid pattern (25 points) with one additional point placed in a gap (26 points). Initial radii will be set small (0.05) to satisfy constraints initially, allowing the optimizer to expand them.
+5.  **Robustness**: To avoid getting stuck in poor local minima, I will perform a few random restarts or perturbations if time permits, but a single well-initialized run with a dense grid should suffice for $N=26$. I will also ensure the solution is valid by clamping radii to non-negative values and verifying constraints before returning.
 
-This combination of global exploration and deterministic local polishing reliably achieves near-optimal circle packings for this scale.
+Implementation details:
+*   Variables are flattened into a 1D array of size $3 \times 26$ (x, y, r for each circle).
+*   Constraints are defined as functions returning arrays $\ge 0$.
+*   Vectorized distance calculations will be used for efficiency.
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import differential_evolution, minimize
+from scipy.optimize import minimize
 
-def compute_negative_sum_radii(params):
+def run_packing():
     """
-    Computes the negative sum of radii for a given configuration of circle centers.
-    Radii are determined by the minimum distance to the boundary and half the minimum 
-    distance to any other circle center.
+    Packs 26 circles in a unit square to maximize sum of radii.
+    Uses SLSQP optimization with a dense initial grid configuration.
     """
-    centers = params.reshape(26, 2)
+    n = 26
     
-    # Distance to the four boundaries of the unit square
-    d_bound = np.minimum(
-        np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
-        np.minimum(centers[:, 1], 1.0 - centers[:, 1])
-    )
-    
-    # Pairwise distances between all circles
-    diff = centers[:, None, :] - centers[None, :, :]
-    dists = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    min_dists = np.min(dists, axis=1)
-    
-    # Radius of each circle is constrained by boundaries and neighbor distances
-    r = np.minimum(d_bound, min_dists / 2.0)
-    
-    # Return negative sum because optimizers minimize by default
-    return -np.sum(r)
+    # Define bounds for variables: x in [0, 1], y in [0, 1], r in [0, 0.5]
+    # Variables layout: [x0, y0, r0, x1, y1, r1, ...]
+    bounds = []
+    for _ in range(n):
+        bounds.append((0.0, 1.0))  # x
+        bounds.append((0.0, 1.0))  # y
+        bounds.append((0.0, 0.5))  # r (max possible radius is 0.5)
 
-def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Optimizes the placement of 26 circles in a unit square to maximize the sum of radii.
-    Uses Differential Evolution for global search followed by Nelder-Mead for local refinement.
-    """
-    np.random.seed(42)
-    bounds = [(0.0, 1.0)] * 52
+    # Objective function: minimize negative sum of radii
+    def objective(v):
+        # Radii are at indices 2, 5, 8, ...
+        return -np.sum(v[2::3])
+
+    # Constraint functions
+    # 1. Circle inside square (x bounds)
+    def constr_x_lower(v):
+        return v[0::3] - v[2::3]  # x - r >= 0
     
-    # Global optimization using Differential Evolution
-    res = differential_evolution(
-        compute_negative_sum_radii, 
-        bounds, 
-        popsize=20, 
-        maxiter=1500, 
-        tol=1e-7, 
-        mutation=0.9, 
-        recombination=0.7, 
-        seed=42,
-        polish=False
-    )
+    def constr_x_upper(v):
+        return 1.0 - (v[0::3] + v[2::3])  # 1 - (x + r) >= 0
+
+    # 2. Circle inside square (y bounds)
+    def constr_y_lower(v):
+        return v[1::3] - v[2::3]  # y - r >= 0
     
-    best_centers = res.x.reshape(26, 2)
-    best_sum = -res.fun
+    def constr_y_upper(v):
+        return 1.0 - (v[1::3] + v[2::3])  # 1 - (y + r) >= 0
+
+    # 3. Non-overlap between circles
+    # dist^2 >= (r1 + r2)^2  =>  dist^2 - (r1 + r2)^2 >= 0
+    def constr_non_overlap(v):
+        xs = v[0::3]
+        ys = v[1::3]
+        rs = v[2::3]
+        
+        # Compute squared distances for all pairs using broadcasting
+        # Shape (n, n)
+        dx = xs[:, None] - xs
+        dy = ys[:, None] - ys
+        dist2 = dx**2 + dy**2
+        
+        # Compute squared sum of radii
+        # Shape (n, n)
+        r_sum = rs[:, None] + rs[None, :]
+        r_sum2 = r_sum**2
+        
+        # Difference
+        diff = dist2 - r_sum2
+        
+        # Return only the upper triangle (i < j) to avoid duplicates and self-comparison
+        mask = np.triu_indices(n, k=1)
+        return diff[mask]
+
+    constraints = [
+        {'type': 'ineq', 'fun': constr_x_lower},
+        {'type': 'ineq', 'fun': constr_x_upper},
+        {'type': 'ineq', 'fun': constr_y_lower},
+        {'type': 'ineq', 'fun': constr_y_upper},
+        {'type': 'ineq', 'fun': constr_non_overlap}
+    ]
+
+    # Helper to flatten variables
+    def to_flat(centers, radii):
+        v = np.zeros(3 * n)
+        v[0::3] = centers[:, 0]
+        v[1::3] = centers[:, 1]
+        v[2::3] = radii
+        return v
+
+    # Helper to unpack variables
+    def from_flat(v):
+        centers = np.column_stack((v[0::3], v[1::3]))
+        radii = v[2::3]
+        return centers, radii
+
+    # Best solution tracking
+    best_result = None
+    best_val = -np.inf
+
+    # Try multiple starting configurations to avoid local minima
+    # 1. Grid initialization (5x5 + 1)
+    # 2. Random initialization
     
-    # Local refinement using multiple restarts of Nelder-Mead
-    for _ in range(15):
-        x0 = best_centers + np.random.normal(0, 0.005, (26, 2))
-        x0 = np.clip(x0, 1e-6, 1.0 - 1e-6)
-        res_local = minimize(
-            compute_negative_sum_radii, 
-            x0.flatten(), 
-            method='Nelder-Mead', 
-            options={'maxiter': 3000, 'xatol': 1e-8, 'fatol': 1e-10}
-        )
-        if -res_local.fun > best_sum:
-            best_sum = -res_local.fun
-            best_centers = res_local.x.reshape(26, 2)
+    starts = []
+    
+    # Start 1: Dense Grid
+    # 5x5 grid points
+    grid_pts = []
+    for i in range(5):
+        for j in range(5):
+            grid_pts.append([0.1 + 0.2 * i, 0.1 + 0.2 * j])
+    # Add one point in a gap, e.g., center of a cell (0.2, 0.2) is distance 0.141 from corners
+    # But (0.2, 0.2) might be too close to (0.1, 0.1) if r is large. 
+    # Let's place it at (0.2, 0.2) but we rely on optimizer to move it.
+    # Actually, better to place it at center of empty space.
+    # (0.5, 0.5) is occupied.
+    # Let's just pick a random point or (0.2, 0.2) with small radius.
+    grid_pts.append([0.2, 0.2]) 
+    
+    # Take first 26
+    starts.append(np.array(grid_pts[:26]))
+
+    # Start 2: Random dense packing
+    np.random.seed(123)
+    rand_centers = np.random.uniform(0.1, 0.9, (n, 2))
+    starts.append(rand_centers)
+
+    # Start 3: Another random seed
+    np.random.seed(456)
+    rand_centers2 = np.random.uniform(0.1, 0.9, (n, 2))
+    starts.append(rand_centers2)
+
+    for centers_init in starts:
+        # Initialize radii to a small valid value
+        radii_init = np.ones(n) * 0.04
+        
+        x0 = to_flat(centers_init, radii_init)
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, 
+                           constraints=constraints, options={'maxiter': 1000, 'ftol': 1e-10, 'disp': False})
             
-    # Compute final radii based on optimized centers
-    d_bound = np.minimum(
-        np.minimum(best_centers[:, 0], 1.0 - best_centers[:, 0]),
-        np.minimum(best_centers[:, 1], 1.0 - best_centers[:, 1])
-    )
-    diff = best_centers[:, None, :] - best_centers[None, :, :]
-    dists = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists, np.inf)
-    min_dists = np.min(dists, axis=1)
-    radii = np.minimum(d_bound, min_dists / 2.0)
+            if res.success or res.nit > 0:
+                val = -res.fun # Sum of radii
+                if val > best_val:
+                    best_val = val
+                    best_result = res
+        except Exception:
+            continue
+
+    if best_result is None:
+        # Fallback if optimization failed
+        # Return a trivial valid packing
+        centers = np.zeros((n, 2))
+        radii = np.zeros(n)
+        # Place tiny circles
+        for i in range(n):
+            centers[i] = [0.5, 0.5]
+            radii[i] = 0.0
+        return centers, radii, 0.0
+
+    centers, radii = from_flat(best_result.x)
     
-    # Slightly shrink radii to ensure strict non-overlap and boundary compliance 
-    # within numerical tolerance of the validator
-    radii *= 0.9999999999
+    # Post-processing: clamp small negative radii due to numerical noise
+    radii = np.maximum(radii, 0.0)
     
-    return best_centers, radii, float(np.sum(radii))
+    # Ensure strict boundary satisfaction by shrinking slightly if needed?
+    # The constraints should handle it, but just in case.
+    # Check if any circle is outside
+    for i in range(n):
+        x, y = centers[i]
+        r = radii[i]
+        # Shrink radius if it violates boundary
+        min_dist_boundary = min(x, 1-x, y, 1-y)
+        if r > min_dist_boundary:
+            r = min_dist_boundary
+            radii[i] = r
+            
+    # Check overlaps and fix by shrinking
+    # This is a safety net.
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            for j in range(i+1, n):
+                dist = np.sqrt((centers[i,0]-centers[j,0])**2 + (centers[i,1]-centers[j,1])**2)
+                req_dist = radii[i] + radii[j]
+                if dist < req_dist - 1e-9:
+                    # Overlap detected, reduce radii
+                    overlap = req_dist - dist
+                    # Reduce both radii equally or just one?
+                    # Let's reduce the sum of radii to match distance
+                    factor = dist / req_dist if req_dist > 0 else 0
+                    radii[i] *= factor
+                    radii[j] *= factor
+                    changed = True
+
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+
 ```

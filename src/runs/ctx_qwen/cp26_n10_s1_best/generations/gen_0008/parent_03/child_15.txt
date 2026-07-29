@@ -1,0 +1,149 @@
+
+
+<strategy>
+The previous solutions converged to ~2.634292 using SLSQP on a joint (centers, radii) space. This formulation is highly non-convex and prone to local minima where circle contacts lock into suboptimal configurations. 
+
+To break free and target >2.636, I will decouple the problem:
+1. **Optimize Centers Globally**: Use `scipy.optimize.differential_evolution` on the 52 center coordinates. The objective for any center configuration is the maximum possible sum of radii, which is computed exactly via a Linear Program (LP). This transforms the problem into a global optimization over centers with a well-defined, piecewise-linear objective.
+2. **Fast LP Solver**: Precompute the constraint matrix `A_ub` structure. For each candidate center set, only update the distance vector `b_ub` and call `linprog` with the `highs` method, which is extremely fast (~0.1-0.2ms for N=26).
+3. **High-Quality Initial Guesses**: Seed DE with rotated hexagonal lattices and force-directed layouts to guide the population into promising regions of the configuration space.
+4. **Local Refinement**: After DE finds a globally competitive center arrangement, apply a stochastic coordinate descent to fine-tune individual circle positions, accepting moves that increase the LP-optimal sum of radii.
+5. **Strict Feasibility**: Final LP radii are shrunk by a negligible factor (0.99999) and centers are clipped to guarantee strict compliance with the `1e-12` tolerance in the validator.
+
+This approach avoids the gradient ambiguities of joint optimization and leverages global search + exact LP evaluation to push past the 2.634 bottleneck.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import linprog, differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+N = 26
+A_LP = None
+TRIU_IDX = np.triu_indices(N, 1)
+
+def init_lp_matrix():
+    global A_LP
+    n = N
+    A = np.zeros((n + n * (n - 1) // 2, n))
+    idx = 0
+    for i in range(n):
+        A[idx, i] = 1.0
+        idx += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            A[idx, i] = 1.0
+            A[idx, j] = 1.0
+            idx += 1
+    A_LP = A
+
+def solve_lp_radii(centers):
+    """Optimally compute radii for fixed centers using Linear Programming."""
+    n = N
+    b_ub = np.zeros(A_LP.shape[0])
+    
+    # Boundary constraints
+    xs = centers[:, 0]
+    ys = centers[:, 1]
+    b_ub[:n] = np.maximum(np.minimum(np.minimum(xs, 1.0 - xs), np.minimum(ys, 1.0 - ys)), 0.0)
+    
+    # Overlap constraints
+    dx = xs[:, None] - xs[None, :]
+    dy = ys[:, None] - ys[None, :]
+    dists = np.hypot(dx, dy)
+    b_ub[n:] = dists[TRIU_IDX]
+    
+    try:
+        res = linprog(-np.ones(n), A_ub=A_LP, b_ub=b_ub, bounds=[(0.0, None)] * n, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return np.full(n, 0.001)
+
+def objective_de(x):
+    """Objective for Differential Evolution: negative max sum of radii."""
+    centers = x.reshape(N, 2)
+    radii = solve_lp_radii(centers)
+    return -np.sum(radii)
+
+def generate_initial_guesses():
+    """Generate structured initial configurations for DE."""
+    guesses = []
+    for r0 in [0.085, 0.095, 0.105]:
+        for ang in np.linspace(-0.6, 0.6, 9):
+            pts = []
+            y = r0
+            row = 0
+            while len(pts) < N:
+                x = r0 if row % 2 == 0 else 2.0 * r0
+                while x <= 1.0 - r0 and len(pts) < N:
+                    pts.append([x, y])
+                    x += 2.0 * r0
+                y += np.sqrt(3.0) * r0
+                row += 1
+            pts = np.array(pts)
+            if ang != 0.0:
+                c, s = np.cos(ang), np.sin(ang)
+                pts = (pts - 0.5) @ np.array([[c, -s], [s, c]]) + 0.5
+            pts = np.clip(pts, 0.01, 0.99)
+            guesses.append(pts.flatten())
+    return np.array(guesses)
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    """Pack 26 circles in a unit square to maximize the sum of radii."""
+    global A_LP
+    np.random.seed(42)
+    init_lp_matrix()
+    
+    bounds = [(0.0, 1.0)] * (2 * N)
+    guesses = generate_initial_guesses()
+    
+    # Phase 1: Global search over centers using Differential Evolution
+    res = differential_evolution(
+        objective_de, 
+        bounds, 
+        seed=42, 
+        maxiter=1000, 
+        popsize=30,
+        mutation=(0.5, 1.0), 
+        recombination=0.9, 
+        polish=False,
+        initial_guesses=guesses
+    )
+    
+    best_centers = res.x.reshape(N, 2)
+    
+    # Phase 2: Local refinement via stochastic coordinate descent
+    current_radii = solve_lp_radii(best_centers)
+    best_sum = np.sum(current_radii)
+    
+    for _ in range(3000):
+        k = np.random.randint(N)
+        old_pos = best_centers[k].copy()
+        improved = False
+        for _ in range(15):
+            pert = np.random.uniform(-0.002, 0.002, 2)
+            best_centers[k] = np.clip(old_pos + pert, 0.005, 0.995)
+            r_temp = solve_lp_radii(best_centers)
+            s_temp = np.sum(r_temp)
+            if s_temp > best_sum + 1e-9:
+                best_sum = s_temp
+                improved = True
+                # Bias further in successful direction
+                best_centers[k] = best_centers[k] + pert * 0.4
+                best_centers[k] = np.clip(best_centers[k], 0.005, 0.995)
+        if not improved:
+            best_centers[k] = old_pos
+            
+    # Phase 3: Final exact radii computation and strict feasibility adjustment
+    final_radii = solve_lp_radii(best_centers)
+    
+    # Minimal shrinkage to guarantee strict compliance with validator tolerance
+    final_radii *= 0.99999
+    best_centers[:, 0] = np.clip(best_centers[:, 0], final_radii, 1.0 - final_radii)
+    best_centers[:, 1] = np.clip(best_centers[:, 1], final_radii, 1.0 - final_radii)
+    
+    return best_centers, final_radii, float(np.sum(final_radii))
+```

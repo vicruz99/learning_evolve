@@ -1,0 +1,203 @@
+# sol_000166 | problem=circle_packing_26 entrypoint=run_packing
+# generation=8 parent=sol_000160 (state 08773110) state=8032bb50 sum of radii=2.299968 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+n_pairs = N * (N - 1) // 2
+
+# Precompute constant constraint matrix structure for LP
+A_ub_global = np.zeros((n_pairs + 4 * N, N))
+pair_indices_global = []
+idx = 0
+for i in range(N):
+    for j in range(i + 1, N):
+        A_ub_global[idx, i] = 1.0
+        A_ub_global[idx, j] = 1.0
+        pair_indices_global.append((i, j))
+        idx += 1
+for i in range(N):
+    for _ in range(4):
+        A_ub_global[idx, i] = 1.0
+        idx += 1
+
+def solve_lp_and_grad(centers):
+    """Solves LP for maximal radii given fixed centers and computes exact gradient."""
+    ub = np.minimum(np.minimum(centers[:, 0], 1.0 - centers[:, 0]),
+                    np.minimum(centers[:, 1], 1.0 - centers[:, 1]))
+    ub = np.maximum(ub, 1e-9)
+    
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.sqrt(np.sum(diffs**2, axis=2))
+    
+    b_ub = np.zeros(A_ub_global.shape[0])
+    idx = 0
+    for i, j in pair_indices_global:
+        b_ub[idx] = dists[i, j]
+        idx += 1
+    for i in range(N):
+        b_ub[idx] = centers[i, 0]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 0]; idx += 1
+        b_ub[idx] = centers[i, 1]; idx += 1
+        b_ub[idx] = 1.0 - centers[i, 1]; idx += 1
+        
+    res = linprog(-np.ones(N), A_ub=A_ub_global, b_ub=b_ub, 
+                  bounds=[(0, u) for u in ub], method='highs')
+    if not res.success:
+        return 0.0, np.zeros(N), np.zeros_like(centers)
+        
+    radii = res.x
+    duals = res.ineqlin.marginals
+    
+    grad = np.zeros_like(centers)
+    idx = 0
+    for i, j in pair_indices_global:
+        lam = duals[idx]
+        if lam > 1e-8:
+            d = dists[i, j]
+            if d > 1e-9:
+                vec = (centers[i] - centers[j]) / d
+                grad[i] += lam * vec
+                grad[j] -= lam * vec
+        idx += 1
+        
+    for i in range(N):
+        grad[i, 0] += duals[idx] - duals[idx+1]
+        grad[i, 1] += duals[idx+2] - duals[idx+3]
+        idx += 4
+        
+    return np.sum(radii), radii, grad
+
+def obj_grad(x):
+    """Objective and gradient for scipy optimizer: minimizes negative sum of radii."""
+    c = x.reshape(N, 2)
+    val, _, grad = solve_lp_and_grad(c)
+    return -val, -grad.flatten()
+
+def generate_starts(rng):
+    """Generates diverse initial configurations."""
+    starts = []
+    patterns = [
+        [5,6,5,6,4], [6,5,6,5,4], [5,5,5,5,6], [6,6,5,5,4], 
+        [4,6,6,6,4], [5,5,6,5,5], [5,5,5,6,5], [6,5,5,5,5],
+        [4,5,6,5,6], [5,6,4,5,6], [5,5,4,6,6]
+    ]
+    for pat in patterns:
+        for r0 in [0.085, 0.09, 0.095, 0.10]:
+            c = []
+            y = r0
+            for r_idx, cnt in enumerate(pat):
+                shift = r0 if r_idx % 2 == 1 else 0.0
+                x = r0 + shift
+                for _ in range(cnt):
+                    if len(c) < N:
+                        c.append([x, y])
+                    x += 2.0 * r0
+                y += r0 * np.sqrt(3)
+            c = np.array(c[:N])
+            c += rng.normal(0, 0.002, c.shape)
+            c = np.clip(c, 0.05, 0.95)
+            starts.append(c)
+            
+    for _ in range(8):
+        starts.append(rng.uniform(0.1, 0.9, (N, 2)))
+        
+    for seed in range(5):
+        rng_fd = np.random.default_rng(seed)
+        c = rng_fd.uniform(0.2, 0.8, (N, 2))
+        for _ in range(400):
+            forces = np.zeros_like(c)
+            for i in range(N):
+                for j in range(i+1, N):
+                    d = np.linalg.norm(c[i]-c[j])
+                    if d < 0.25 and d > 1e-4:
+                        f = (0.25 - d) / d
+                        diff = c[i] - c[j]
+                        forces[i] += diff * f
+                        forces[j] -= diff * f
+            c += forces * 0.005
+            c = np.clip(c, 0.05, 0.95)
+        starts.append(c)
+    return starts
+
+def repair_packing(centers, radii):
+    """Deterministic repair to guarantee strict validation compliance."""
+    radii = radii.copy()
+    for _ in range(50):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(centers[i,0]-centers[j,0], centers[i,1]-centers[j,1])
+                req = radii[i] + radii[j]
+                if d < req - 1e-12:
+                    shrink = (req - d)/2.0 + 1e-9
+                    radii[i] -= shrink
+                    radii[j] -= shrink
+                    changed = True
+        for i in range(N):
+            mr = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+            if radii[i] > mr - 1e-12:
+                radii[i] = mr
+                changed = True
+        if not changed:
+            break
+    return np.maximum(radii, 0.0)
+
+def run_packing() -> tuple:
+    rng = np.random.default_rng(42)
+    best_sum = -1.0
+    best_c = None
+    best_r = None
+    
+    starts = generate_starts(rng)
+    bounds = [(0.02, 0.98)] * (2 * N)
+    
+    # Phase 1: Multi-start L-BFGS-B optimization
+    for c0 in starts:
+        for _ in range(3):
+            c_init = c0 + rng.normal(0, 0.003, c0.shape)
+            c_init = np.clip(c_init, 0.05, 0.95)
+            try:
+                res = minimize(obj_grad, c_init.flatten(), method='L-BFGS-B',
+                               bounds=bounds, jac=True,
+                               options={'maxiter': 2000, 'ftol': 1e-14, 'gtol': 1e-10, 'disp': False})
+                if -res.fun > best_sum:
+                    best_sum = -res.fun
+                    best_c = res.x.reshape(N, 2).copy()
+                    _, best_r, _ = solve_lp_and_grad(best_c)
+            except Exception:
+                pass
+                
+    # Phase 2: Iterative jitter & refinement to escape local minima
+    if best_c is not None:
+        c_curr = best_c.copy()
+        s_curr = best_sum
+        r_curr = best_r.copy()
+        
+        for step in range(12):
+            noise = 0.004 * (0.75 ** step)
+            c_jitter = c_curr + rng.normal(0, noise, c_curr.shape)
+            c_jitter = np.clip(c_jitter, 0.05, 0.95)
+            try:
+                res = minimize(obj_grad, c_jitter.flatten(), method='L-BFGS-B',
+                               bounds=bounds, jac=True,
+                               options={'maxiter': 1500, 'ftol': 1e-14, 'gtol': 1e-10, 'disp': False})
+                if -res.fun > s_curr:
+                    s_curr = -res.fun
+                    c_curr = res.x.reshape(N, 2).copy()
+                    _, r_curr, _ = solve_lp_and_grad(c_curr)
+            except Exception:
+                pass
+        best_c = c_curr
+        best_r = r_curr
+        best_sum = s_curr
+        
+    # Phase 3: Strict numerical repair
+    centers = best_c.copy()
+    radii = repair_packing(centers, best_r.copy())
+    
+    return centers, radii, float(np.sum(radii))

@@ -1,0 +1,196 @@
+# sol_000062 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 05a03f22) state=b1e6ac50 sum of radii=2.588818 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+from scipy.optimize import minimize
+
+def run_packing():
+    """
+    Pack 26 circles in a unit square to maximize the sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    
+    # 1. Initialization: Hexagonal Grid
+    # We want to place 26 points in a hexagonal pattern.
+    # We can construct rows. 
+    # Pattern of row lengths: 6, 5, 6, 5, 4 sums to 26.
+    # Or 5, 6, 5, 6, 4?
+    # Let's try to fit a compact shape.
+    # Rows with 6, 5, 6, 5, 4 points.
+    
+    centers_init = []
+    
+    # Define the lattice parameters
+    # Vertical spacing dy = sqrt(3)/2 * spacing_x
+    # Horizontal spacing dx
+    # We will scale later.
+    
+    # Row configurations (number of points, offset in x)
+    # Even rows (0, 2, 4) aligned with x=0 start?
+    # Odd rows shifted by 0.5
+    
+    rows = [6, 5, 6, 5, 4]
+    dy_unscaled = np.sqrt(3) / 2
+    
+    current_y = 0
+    for i, count in enumerate(rows):
+        # Offset for odd rows (index 1, 3)
+        offset = 0.5 if i % 2 == 1 else 0.0
+        
+        for j in range(count):
+            x_unscaled = j + offset
+            y_unscaled = current_y
+            centers_init.append([x_unscaled, y_unscaled])
+        
+        current_y += dy_unscaled
+    
+    centers_init = np.array(centers_init)
+    
+    # Scale to fit in [0, 1] x [0, 1] with some margin
+    # Find bounding box
+    min_x, min_y = np.min(centers_init, axis=0)
+    max_x, max_y = np.max(centers_init, axis=0)
+    width = max_x - min_x
+    height = max_y - min_y
+    
+    # Scale factor to fit within 0.8 x 0.8 initially to allow growth
+    # We want the configuration to be centered.
+    scale = 0.8 / max(width, height)
+    
+    centers_init = (centers_init - [min_x, min_y]) * scale
+    # Center in [0,1]
+    centers_init += 0.5 - (scale * np.array([width, height])) / 2
+    
+    # Initial radii
+    # Estimate based on min distance
+    # Just pick a small safe radius
+    r_init = 0.05 * np.ones(n)
+    
+    # Flatten initial state for optimizer
+    # Structure: [x0, y0, r0, x1, y1, r1, ...]
+    x0 = np.zeros(n * 3)
+    for i in range(n):
+        x0[3*i] = centers_init[i, 0]
+        x0[3*i+1] = centers_init[i, 1]
+        x0[3*i+2] = r_init[i]
+        
+    # 2. Define Objective and Constraints
+    def objective(vars):
+        # vars is array of shape (n*3,)
+        # radii are at indices 2, 5, 8, ... i.e., 3*i + 2
+        radii = vars[2::3]
+        return -np.sum(radii) # Minimize negative sum
+    
+    def constraint_dist(vars, i, j):
+        # Constraint: dist_ij >= r_i + r_j
+        # (xi-xj)^2 + (yi-yj)^2 >= (ri + rj)^2
+        # dist^2 - (ri+rj)^2 >= 0
+        
+        xi = vars[3*i]
+        yi = vars[3*i+1]
+        ri = vars[3*i+2]
+        
+        xj = vars[3*j]
+        yj = vars[3*j+1]
+        rj = vars[3*j+2]
+        
+        dx = xi - xj
+        dy = yi - yj
+        dist_sq = dx*dx + dy*dy
+        
+        r_sum = ri + rj
+        return dist_sq - r_sum*r_sum
+
+    def constraint_boundary(vars, k, type_):
+        # type_ 0: left (x >= r), 1: right (1-x >= r), 2: bottom (y >= r), 3: top (1-y >= r)
+        xk = vars[3*k]
+        yk = vars[3*k+1]
+        rk = vars[3*k+2]
+        
+        if type_ == 0:
+            return xk - rk
+        elif type_ == 1:
+            return 1.0 - xk - rk
+        elif type_ == 2:
+            return yk - rk
+        elif type_ == 3:
+            return 1.0 - yk - rk
+
+    # Build constraints list
+    constraints = []
+    
+    # Distance constraints
+    # There are n*(n-1)/2 pairs. For n=26, ~325 constraints.
+    # This might be slow to evaluate inside the loop if not careful, but for n=26 it's acceptable.
+    # To speed up, we could only enforce constraints for nearby circles, 
+    # but initially we don't know. We enforce all.
+    for i in range(n):
+        for j in range(i + 1, n):
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda v, i=i, j=j: constraint_dist(v, i, j)
+            })
+            
+    # Boundary constraints
+    for k in range(n):
+        for t in range(4):
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda v, k=k, t=t: constraint_boundary(v, k, t)
+            })
+            
+    # Bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for i in range(n):
+        bounds.append((0, 1)) # x
+        bounds.append((0, 1)) # y
+        bounds.append((0, 0.5)) # r
+
+    # 3. Run Optimization
+    # Using SLSQP
+    # We might need to run multiple times or with different methods if it gets stuck,
+    # but SLSQP is usually robust for this size.
+    # Adding a callback to monitor progress? Not needed for final output.
+    
+    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints, 
+                      options={'ftol': 1e-9, 'maxiter': 1000, 'disp': False})
+    
+    # Extract results
+    optimal_vars = result.x
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    
+    for i in range(n):
+        centers[i, 0] = optimal_vars[3*i]
+        centers[i, 1] = optimal_vars[3*i+1]
+        radii[i] = optimal_vars[3*i+2]
+        
+    # Validate before returning (just in case)
+    # Although optimizer should satisfy constraints, numerical tolerance might be an issue.
+    # The validation function uses 1e-12 tolerance.
+    
+    sum_radii = np.sum(radii)
+    
+    return centers, radii, sum_radii
+
+if __name__ == "__main__":
+    centers, radii, sum_r = run_packing()
+    print(f"Sum of radii: {sum_r}")
+    print(f"Radii stats: min={np.min(radii):.4f}, max={np.max(radii):.4f}, mean={np.mean(radii):.4f}")
+    
+    # Run validation
+    # Note: The prompt says validation function is provided but we are writing run_packing.
+    # We can assume the environment has numpy.
+    # Let's double check if we need to import numpy inside run_packing? 
+    # The prompt implies we can use scientific libraries.
+    
+    # Let's try to print a few circles to visualize mentally
+    # Sort by radius
+    # indices = np.argsort(radii)[::-1]
+    # for idx in indices[:5]:
+    #     print(f"Circle {idx}: center=({centers[idx,0]:.4f}, {centers[idx,1]:.4f}), r={radii[idx]:.4f}")

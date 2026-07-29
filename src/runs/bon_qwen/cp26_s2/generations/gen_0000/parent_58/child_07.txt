@@ -1,0 +1,251 @@
+
+
+<strategy>
+To solve the problem of packing 26 circles in a unit square to maximize the sum of radii, I will employ a numerical optimization strategy. The problem is non-convex, so finding the global maximum is difficult, but a high-quality local optimum should be sufficient to exceed the target sum of 2.636.
+
+My strategy involves the following steps:
+1.  **Initialization**: I will start with a structured arrangement that is dense but valid. A 5x5 grid (25 circles) is a natural starting point. To accommodate 26 circles, I will place 25 circles in a slightly perturbed grid and add the 26th circle in a gap. I'll initialize radii to a small value (e.g., 0.05) to ensure the initial configuration is valid (no overlaps).
+2.  **Optimization Method**: I will use `scipy.optimize.minimize` with the L-BFGS-B algorithm. This algorithm handles bound constraints efficiently.
+3.  **Objective Function**: I will maximize the sum of radii. To enforce the non-overlap and boundary constraints, I will use a penalty method. The objective function will be the negative sum of radii plus a large penalty for any constraint violations. The penalties will be quadratic to ensure smoothness (differentiability) required by the gradient-based optimizer.
+    *   **Boundary Penalty**: For each circle, penalties are added if $x < r$, $x > 1-r$, $y < r$, or $y > 1-r$.
+    *   **Overlap Penalty**: For every pair of circles, if the distance between centers is less than the sum of radii, a penalty is added based on the squared overlap depth.
+4.  **Refinement**: To help the optimizer escape poor local minima and scale the radii up effectively, I will run the optimization in a loop. In each iteration, I will increase the "pressure" (penalty weight) or simply rely on the optimizer to expand radii. However, a simpler and robust approach is to just run a sufficiently long optimization with a high penalty weight, or a multi-stage approach where we gradually increase the target radius. Given the constraints of the prompt, a single robust optimization run with a well-tuned penalty function and good initialization is likely sufficient. I will use a "barrier" style penalty where we strongly penalize violations.
+5.  **Validation**: Finally, the code will construct the `centers` and `radii` arrays and return them. I will include a check to ensure the result is valid, though the penalty method should guarantee this if converged.
+
+I will define helper functions for the penalty calculation to keep the code clean and adhere to the "no closures" rule by passing necessary data or using top-level functions (though inside `run_packing` is fine, I'll keep it structured). Actually, the prompt asks for helper functions to be top-level. I will structure the code accordingly.
+</strategy>
+
+```python
+import numpy as np
+import math
+from scipy.optimize import minimize
+
+def compute_penalty_and_objective(params, n):
+    """
+    Computes the objective (negative sum of radii) and penalty for constraint violations.
+    
+    Args:
+        params: 1D array of shape (3*n), [x1, y1, r1, x2, y2, r2, ...]
+        n: number of circles
+        
+    Returns:
+        loss: float, negative sum of radii + penalty
+    """
+    # Reshape params
+    centers = params.reshape(-1, 3) # (n, 3) where col 0=x, 1=y, 2=r
+    x = centers[:, 0]
+    y = centers[:, 1]
+    r = centers[:, 2]
+    
+    # Objective: maximize sum(r) => minimize -sum(r)
+    obj = -np.sum(r)
+    
+    # Penalty coefficient - needs to be large enough
+    penalty_weight = 1000.0
+    
+    penalty = 0.0
+    
+    # 1. Boundary Constraints
+    # Circles must be inside [0,1]x[0,1]
+    # Constraints: x - r >= 0, x + r <= 1, y - r >= 0, y + r <= 1
+    # Violations: r - x, x + r - 1, r - y, y + r - 1
+    
+    # Vectorized calculation
+    v_x_left = np.maximum(0, r - x)
+    v_x_right = np.maximum(0, x + r - 1.0)
+    v_y_bottom = np.maximum(0, r - y)
+    v_y_top = np.maximum(0, y + r - 1.0)
+    
+    boundary_penalty = (v_x_left**2 + v_x_right**2 + v_y_bottom**2 + v_y_top**2)
+    penalty += np.sum(boundary_penalty) * penalty_weight
+    
+    # 2. Overlap Constraints
+    # Distance between centers >= sum of radii
+    # dist^2 >= (r_i + r_j)^2
+    # Violation: (r_i + r_j)^2 - dist^2 (if positive)
+    # To keep it smooth, we can penalize (r_i + r_j - dist)^2 if dist < r_i + r_j
+    
+    # Efficient pairwise distance calculation
+    # x.shape (n,), compute (x_i - x_j)^2
+    # Using broadcasting
+    dx = x[:, None] - x[None, :] # (n, n)
+    dy = y[:, None] - y[None, :] # (n, n)
+    dist_sq = dx**2 + dy**2
+    
+    # Sum of radii
+    r_sum = r[:, None] + r[None, :] # (n, n)
+    
+    # We only care about i < j, but summing all and dividing by 2 is easier
+    # Violation depth: r_sum - sqrt(dist_sq)
+    # However, sqrt is expensive and non-smooth at 0.
+    # Better: check if dist_sq < r_sum^2.
+    # Penalty term: max(0, r_sum - sqrt(dist_sq))^2
+    # Or simply max(0, r_sum^2 - dist_sq)^2? 
+    # Let's use the geometric overlap depth for better physical meaning.
+    
+    # Clip dist_sq to avoid negative sqrt (numerical issues)
+    dist = np.sqrt(np.maximum(dist_sq, 0))
+    
+    # Overlap depth
+    overlap = r_sum - dist
+    
+    # Only penalize if overlap > 0
+    # np.maximum(0, overlap) gives 0 if dist >= r_sum
+    valid_overlap = np.maximum(0, overlap)
+    
+    # Square the overlap depth
+    overlap_penalty = valid_overlap**2
+    
+    # Sum over all pairs (i != j). Since matrix is symmetric, sum is 2 * sum_{i<j}
+    # We can sum the whole matrix and divide by 2, ignoring diagonal (which is 0 overlap depth? 
+    # wait, diagonal: dist=0, r_sum=2r. overlap=2r. That's bad.
+    # Diagonal elements represent self-overlap? No, dist=0, r+r=2r. 
+    # But we should exclude i=j.
+    
+    # Set diagonal to 0 before summing
+    np.fill_diagonal(overlap, 0)
+    
+    penalty += np.sum(overlap**2) * penalty_weight
+    
+    loss = obj + penalty
+    return loss
+
+def run_packing() -> tuple:
+    n = 26
+    
+    # Strategy: Start with a grid-like configuration and optimize.
+    # 5x5 grid gives 25 circles. We need 26.
+    # We'll place 25 in a grid and 1 in a gap.
+    
+    # Grid coordinates for 5x5
+    # To fit in [0,1], with some margin, let's say centers at 0.1, 0.3, 0.5, 0.7, 0.9
+    # But we will let the optimizer move them.
+    grid_pts = np.linspace(0.1, 0.9, 5)
+    
+    centers_init = []
+    # 5x5 grid
+    for gx in grid_pts:
+        for gy in grid_pts:
+            centers_init.append([gx, gy])
+    
+    # We have 25 points. Add 26th.
+    # A good spot for the 26th circle in a 5x5 grid packing (radius ~0.1) 
+    # is in the center of a 2x2 block, e.g., (0.2, 0.2), (0.4, 0.4) etc.
+    # However, with r=0.1, (0.2, 0.2) is too close to (0.1, 0.1) dist=0.141 < 0.2.
+    # So we start with a small radius to make it valid, then grow.
+    centers_init.append([0.2, 0.2]) # 26th circle
+    
+    centers_init = np.array(centers_init)
+    
+    # Initial radii: small enough to avoid overlap
+    # Max possible radius for 26 circles is approx 0.1.
+    # Let's start at 0.05.
+    radii_init = np.full(n, 0.05)
+    
+    # Flatten parameters: [x1, y1, r1, x2, y2, r2, ...]
+    x0 = []
+    for i in range(n):
+        x0.extend([centers_init[i, 0], centers_init[i, 1], radii_init[i]])
+    x0 = np.array(x0)
+    
+    # Bounds
+    # x, y in [0, 1], r in [0, 0.5]
+    bounds = []
+    for _ in range(n):
+        bounds.extend([
+            (0.0, 1.0), # x
+            (0.0, 1.0), # y
+            (0.0, 0.5)  # r
+        ])
+        
+    # Optimization
+    # We use L-BFGS-B because it handles bounds and is efficient.
+    # We need to pass 'n' to the objective function. 
+    # Since we cannot use closures effectively with top-level constraints, 
+    # we define a wrapper or pass n. 
+    # But the prompt says "Make all helper functions top level".
+    # So I will define the objective function to take params and use global n or passed n?
+    # Actually, run_packing is the entry point. I can define helpers inside or outside.
+    # If outside, they shouldn't capture scope.
+    # I'll pass n as an argument.
+    
+    # To improve chances of finding a better solution, we can run multiple restarts
+    # or simply run one long optimization.
+    # Given the complexity, a single run with a good start is risky.
+    # Let's try a few random perturbations of the grid and pick the best.
+    
+    best_loss = np.inf
+    best_params = x0
+    
+    # Number of restarts
+    n_restarts = 5
+    
+    for k in range(n_restarts):
+        # Perturb initial centers slightly to avoid symmetry traps
+        if k > 0:
+            perturbation = np.random.randn(2 * n) * 0.02
+            # Apply to x and y parts of x0
+            current_x0 = x0.copy()
+            for i in range(n):
+                current_x0[3*i] += perturbation[2*i]
+                current_x0[3*i+1] += perturbation[2*i+1]
+                # Keep radii small initially
+                current_x0[3*i+2] = 0.02 
+        else:
+            current_x0 = x0
+            
+        # Clip bounds for safety
+        for i in range(n):
+            current_x0[3*i] = np.clip(current_x0[3*i], 0.0, 1.0)
+            current_x0[3*i+1] = np.clip(current_x0[3*i+1], 0.0, 1.0)
+            current_x0[3*i+2] = np.clip(current_x0[3*i+2], 0.0, 0.5)
+
+        # Run optimization
+        # We minimize the loss function
+        # options={'maxiter': 1000, 'disp': True}
+        
+        # Define local objective that captures n? 
+        # No, pass n.
+        res = minimize(compute_penalty_and_objective, 
+                       current_x0, 
+                       args=(n,),
+                       method='L-BFGS-B', 
+                       bounds=bounds,
+                       options={'maxiter': 2000, 'ftol': 1e-9, 'gtol': 1e-6})
+        
+        if res.fun < best_loss:
+            best_loss = res.fun
+            best_params = res.x
+            
+        # Check if penalty is effectively 0 (valid packing)
+        # We can evaluate penalty separately or check fun.
+        # fun = -sum_r + penalty.
+        # If penalty is 0, fun = -sum_r.
+        # A valid solution with sum_r > 0 will have negative fun.
+        
+    # Extract best solution
+    centers_res = np.zeros((n, 2))
+    radii_res = np.zeros(n)
+    
+    for i in range(n):
+        centers_res[i, 0] = best_params[3*i]
+        centers_res[i, 1] = best_params[3*i+1]
+        radii_res[i] = best_params[3*i+2]
+        
+    # Calculate sum of radii
+    sum_radii = np.sum(radii_res)
+    
+    # Double check validity with a strict validator logic inside?
+    # The prompt provides a validator, but we should ensure our output is clean.
+    # The penalty method should ensure validity, but let's do a quick sanitization.
+    # If any radius is negative (unlikely due to bounds), set to 0.
+    radii_res = np.maximum(radii_res, 0.0)
+    
+    # Clip centers to [0,1] just in case
+    centers_res = np.clip(centers_res, 0.0, 1.0)
+    
+    return centers_res, radii_res, sum_radii
+
+# Helper function needs to be top level as requested
+# compute_penalty_and_objective is already defined above.
+```

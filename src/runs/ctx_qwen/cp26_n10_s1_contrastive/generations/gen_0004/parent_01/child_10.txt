@@ -1,0 +1,241 @@
+
+
+<strategy>
+To improve upon the current sum of radii (2.634292) and approach the target of 2.636, we need to enhance the exploration of the configuration space and refine the local optimization process. Circle packing problems are highly non-convex with many local minima. Key improvements will focus on:
+
+1. **Diverse Structured Initializations**: Hexagonal lattices are known to yield near-optimal packings. We will generate a wide variety of hexagonal patterns with different row counts, scales, and rotations to cover different topological arrangements that might fit 26 circles tightly in a square.
+2. **Topology-Swapping Perturbations**: Standard coordinate perturbations often get trapped in the same local basin. We will introduce circle index swapping during the refinement phase. This changes the solver's internal gradient flow direction and can jump to better basins of attraction.
+3. **Adaptive Perturbation Magnitude**: We will gradually increase the perturbation step size during the local search phase to encourage broader exploration after each successful refinement, preventing premature stagnation.
+4. **High-Precision Polish**: After finding the best configuration, we will run a final optimization pass with extremely tight tolerances (`ftol=1e-14`) and high iteration limits to squeeze out the last bits of numerical accuracy.
+5. **Robust Parameterization**: We continue using the $(r, u, v)$ parameterization $x = r + u(1-2r)$, $y = r + v(1-2r)$, which inherently satisfies boundary constraints and simplifies the optimization landscape to only pairwise non-overlap constraints.
+
+The strategy combines global coverage via diverse hexagonal/random starts, topological diversity via swaps, and precise local refinement to maximize the sum of radii.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+I_IDX, J_IDX = np.triu_indices(N, k=1)
+
+def objective(vars_vec):
+    """Objective function: minimize negative sum of radii."""
+    return -np.sum(vars_vec[0::3])
+
+def constraint_func(vars_vec):
+    """
+    Computes inequality constraints g(vars_vec) >= 0.
+    Uses parameterization to automatically satisfy boundary constraints.
+    Only pairwise non-overlap constraints are enforced.
+    """
+    r = vars_vec[0::3]
+    u = vars_vec[1::3]
+    v = vars_vec[2::3]
+    
+    # Parameterization maps u, v in [0,1] to x, y such that circle is strictly inside [0,1]^2
+    x = r + u * (1.0 - 2.0 * r)
+    y = r + v * (1.0 - 2.0 * r)
+    
+    # Pairwise squared distances
+    dx = x[:, np.newaxis] - x[np.newaxis, :]
+    dy = y[:, np.newaxis] - y[np.newaxis, :]
+    dist_sq = dx**2 + dy**2
+    
+    # Squared sum of radii
+    r_sum = r[:, np.newaxis] + r[np.newaxis, :]
+    r_sum_sq = r_sum**2
+    
+    # Constraint: dist^2 >= (r_i + r_j)^2
+    return dist_sq[I_IDX, J_IDX] - r_sum_sq[I_IDX, J_IDX]
+
+def make_hex_init(row_counts, scale, rotation, jitter_std, seed):
+    """Generates a hexagonal lattice initialization with specified parameters."""
+    rng = np.random.RandomState(seed)
+    pts = []
+    r_est = 0.1
+    y = r_est
+    row = 0
+    for cnt in row_counts:
+        shift = (row % 2) * r_est
+        x = r_est + shift
+        for _ in range(cnt):
+            pts.append([x, y])
+            x += 2.0 * r_est
+        y += np.sqrt(3.0) * r_est
+        row += 1
+        
+    centers = np.array(pts[:N])
+    # Center and scale
+    centers -= 0.5
+    centers *= scale
+    centers += 0.5
+    
+    if rotation != 0.0:
+        c, s = np.cos(rotation), np.sin(rotation)
+        rot_mat = np.array([[c, -s], [s, c]])
+        centers = centers @ rot_mat.T
+        centers -= centers.mean(axis=0)
+        centers += 0.5
+        
+    centers += rng.normal(0, jitter_std, (N, 2))
+    centers = np.clip(centers, 0.01, 0.99)
+    
+    # Compute safe initial radii
+    r_vals = np.zeros(N)
+    for i in range(N):
+        d_wall = min(centers[i,0], 1.0-centers[i,0], centers[i,1], 1.0-centers[i,1])
+        dists = np.linalg.norm(centers[i] - centers, axis=1)
+        dists[i] = np.inf
+        d_pair = np.min(dists)
+        r_vals[i] = 0.95 * min(d_wall, d_pair/2.0)
+        
+    denom = np.clip(1.0 - 2.0 * r_vals, 1e-6, 1.0)
+    u = np.clip((centers[:, 0] - r_vals) / denom, 0.0, 1.0)
+    v = np.clip((centers[:, 1] - r_vals) / denom, 0.0, 1.0)
+    
+    vars0 = np.empty(3 * N)
+    vars0[0::3] = r_vals
+    vars0[1::3] = u
+    vars0[2::3] = v
+    return vars0
+
+def run_packing():
+    """
+    Solves the circle packing problem for N=26 in a unit square.
+    Returns (centers, radii, sum_radii).
+    """
+    bounds = [(1e-6, 0.5), (0.0, 1.0), (0.0, 1.0)] * N
+    cons = {'type': 'ineq', 'fun': constraint_func}
+    
+    best_vars = None
+    best_sum = -1.0
+    rng = np.random.RandomState(42)
+    
+    inits = []
+    
+    # Diverse hexagonal patterns covering various boundary alignments
+    patterns = [
+        [6,5,6,5,4], [5,6,5,6,4], [4,6,5,6,5], [5,5,5,5,6],
+        [6,4,6,5,5], [5,6,4,6,5], [4,5,6,5,6], [6,6,5,5,4],
+        [5,5,6,5,5], [6,5,5,5,5], [7,5,5,5,4], [4,5,5,5,7],
+        [5,7,5,5,4], [4,5,5,7,5], [6,5,6,4,5], [5,6,5,4,6],
+        [6,6,6,4,4], [4,6,6,6,4], [5,5,4,6,6], [6,4,6,6,4]
+    ]
+    
+    for pat in patterns:
+        for s in range(6):
+            rot = rng.uniform(-0.3, 0.3)
+            scale = rng.uniform(0.8, 1.25)
+            jitter = rng.uniform(0.005, 0.025)
+            inits.append(make_hex_init(pat, scale, rot, jitter, seed=s*100 + 1))
+            
+    # Random clustered inits to capture non-hexagonal optimal topologies
+    for s in range(25):
+        rng_s = np.random.RandomState(s)
+        pts = rng_s.rand(N, 2)
+        pts = np.clip(pts, 0.05, 0.95)
+        r_vals = np.zeros(N)
+        for i in range(N):
+            d_wall = min(pts[i,0], 1.0-pts[i,0], pts[i,1], 1.0-pts[i,1])
+            dists = np.linalg.norm(pts[i] - pts, axis=1)
+            dists[i] = np.inf
+            d_pair = np.min(dists)
+            r_vals[i] = 0.85 * min(d_wall, d_pair/2.0)
+        denom = np.clip(1.0 - 2.0 * r_vals, 1e-6, 1.0)
+        u = np.clip((pts[:, 0] - r_vals) / denom, 0.0, 1.0)
+        v = np.clip((pts[:, 1] - r_vals) / denom, 0.0, 1.0)
+        vars0 = np.empty(3 * N)
+        vars0[0::3] = r_vals
+        vars0[1::3] = u
+        vars0[2::3] = v
+        inits.append(vars0)
+
+    # Phase 1: Broad search from diverse initializations
+    for x0 in inits:
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 4000, 'ftol': 1e-13, 'disp': False})
+            if res.success:
+                cons_val = constraint_func(res.x)
+                if np.min(cons_val) >= -1e-7:
+                    curr_sum = -res.fun
+                    if curr_sum > best_sum:
+                        best_sum = curr_sum
+                        best_vars = res.x.copy()
+        except Exception:
+            continue
+            
+    # Phase 2: Iterative perturbation & topology-swapping refinement
+    if best_vars is not None:
+        for k in range(80):
+            x0 = best_vars.copy()
+            pert = rng.randn(3 * N)
+            
+            # Gradually increase perturbation magnitude to escape local minima
+            sigma_pos = 0.015 + 0.04 * (k / 80.0)
+            sigma_r = 0.0015
+            
+            x0[1::3] += pert[1::3] * sigma_pos
+            x0[2::3] += pert[2::3] * sigma_pos
+            x0[0::3] += pert[0::3] * sigma_r
+            
+            x0[0::3] = np.clip(x0[0::3], 1e-6, 0.5)
+            x0[1::3] = np.clip(x0[1::3], 0.0, 1.0)
+            x0[2::3] = np.clip(x0[2::3], 0.0, 1.0)
+            
+            # Periodically swap two circles to change solver gradient flow topology
+            if k % 4 == 0:
+                i_swap, j_swap = rng.choice(N, 2, replace=False)
+                x0[3*i_swap:3*i_swap+3], x0[3*j_swap:3*j_swap+3] = x0[3*j_swap:3*j_swap+3].copy(), x0[3*i_swap:3*i_swap+3].copy()
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                               constraints=cons, options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                if res.success:
+                    cons_val = constraint_func(res.x)
+                    if np.min(cons_val) >= -1e-7:
+                        curr_sum = -res.fun
+                        if curr_sum > best_sum:
+                            best_sum = curr_sum
+                            best_vars = res.x.copy()
+            except Exception:
+                continue
+                
+    # Phase 3: High-precision polish
+    if best_vars is not None:
+        try:
+            res = minimize(objective, best_vars, method='SLSQP', bounds=bounds,
+                           constraints=cons, options={'maxiter': 12000, 'ftol': 1e-14, 'disp': False})
+            if np.min(constraint_func(res.x)) >= -1e-8:
+                best_vars = res.x
+                best_sum = -res.fun
+        except Exception:
+            pass
+            
+    # Fallback configuration (should not be reached given robust initialization)
+    if best_vars is None:
+        centers_f = np.zeros((N, 2))
+        idx = 0
+        for i in range(5):
+            for j in range(5):
+                centers_f[idx] = [0.1 + 0.2 * i, 0.1 + 0.2 * j]
+                idx += 1
+        centers_f[25] = [0.5, 0.5]
+        r_f = np.full(N, 0.09)
+        best_vars = np.empty(3 * N)
+        best_vars[0::3] = r_f
+        best_vars[1::3] = (centers_f[:, 0] - r_f) / (1.0 - 2.0 * r_f)
+        best_vars[2::3] = (centers_f[:, 1] - r_f) / (1.0 - 2.0 * r_f)
+        best_sum = np.sum(r_f)
+
+    # Reconstruct centers from optimized parameters
+    r_opt = best_vars[0::3]
+    u_opt = best_vars[1::3]
+    v_opt = best_vars[2::3]
+    x_opt = r_opt + u_opt * (1.0 - 2.0 * r_opt)
+    y_opt = r_opt + v_opt * (1.0 - 2.0 * r_opt)
+    centers = np.column_stack((x_opt, y_opt))
+    
+    return centers, r_opt, float(best_sum)
+```

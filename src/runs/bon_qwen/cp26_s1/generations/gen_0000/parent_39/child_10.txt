@@ -1,203 +1,229 @@
 
 
 <strategy>
-For maximizing the sum of radii of 26 circles in a unit square, I'll use a multi-stage optimization approach:
+I'll use a force-based optimization approach combined with hexagonal initialization. The key insights are:
 
-1. **Initialization**: Start with a hexagonal grid pattern, which is the densest circle packing in the plane. For 26 circles, I'll arrange them in alternating offset rows with initial radius ~0.095.
+1. **Hexagonal packing** is the densest arrangement for circles. I'll initialize with a staggered hexagonal grid.
 
-2. **Iterative Jiggle-and-Grow**: This physics-based approach incrementally grows circles while resolving overlaps through repulsive forces. This naturally pushes circles to boundaries and corners where they can grow larger.
+2. **Force-based optimization**: Start with small circles and gradually grow them. When circles overlap or hit boundaries, repulsive forces push them apart. This naturally leads to an optimal packing where:
+   - Corner circles grow larger (less constrained)
+   - Edge circles are medium-sized
+   - Interior circles are smaller (more constrained by neighbors)
 
-3. **Numerical Optimization**: Fine-tune the packing using L-BFGS-B with penalty functions for constraint violations (boundary and overlap). The penalty-based approach with L-BFGS-B is efficient for this 78-variable problem.
+3. **Multiple restarts** with different random seeds and perturbations to escape local minima.
 
-4. **Multi-restart**: Run multiple optimizations from different initializations to escape local minima.
+4. **Adaptive parameters**: Learning rate and growth rate decrease over time for fine-tuning near the optimum.
 
-Key insights:
-- Variable radii allow larger circles in corners (fewer neighbors) and smaller ones in dense middle regions
-- The target sum of 2.636 corresponds to average radius ~0.101, which is achievable with tight packing
-- Hexagonal packing pattern provides good initial structure for 26 circles (5 columns × 5-6 rows)
+5. **Cleanup**: After optimization, slightly shrink radii to ensure strict validity.
 
-I'll combine the iterative growth with gradient-based optimization for robust convergence.
+The force method works because:
+- The "growth pressure" acts like a uniform pressure trying to expand all circles
+- Repulsion from overlaps acts like hard-sphere interactions
+- Boundary repulsion keeps circles inside the square
+- The system converges to a configuration where circles are maximally packed
 </strategy>
 
 ```python
 import numpy as np
-from scipy.optimize import minimize
+import math
 
 
-def compute_penalty(centers, radii, w_boundary=5000, w_overlap=5000):
-    """Compute penalty for constraint violations."""
+def create_hexagonal_init(n, spacing=None, offset_x=0, offset_y=0):
+    """Create initial hexagonal arrangement of circles."""
+    centers = np.zeros((n, 2))
+    count = 0
+    row = 0
+    if spacing is None:
+        spacing = math.sqrt((1.0 - 2 * 0.1) ** 2 / (math.sqrt(3) * n))
+    
+    y = 0.1 + offset_y
+    while count < n:
+        x = 0.1 + (row % 2) * spacing / 2 + offset_x
+        while x <= 0.9 and count < n:
+            centers[count, 0] = x
+            centers[count, 1] = y
+            count += 1
+            x += spacing
+        y += spacing * math.sqrt(3) / 2
+        row += 1
+    
+    while count < n:
+        centers[count, 0] = 0.5 + np.random.randn() * 0.05
+        centers[count, 1] = 0.5 + np.random.randn() * 0.05
+        count += 1
+    
+    return centers
+
+
+def compute_forces(centers, radii):
+    """Compute repulsion forces between circles and with boundaries."""
     n = len(radii)
-    penalty = 0.0
-
-    for i in range(n):
-        x, y = centers[i]
-        r = radii[i]
-        # Boundary violations
-        penalty += w_boundary * (max(0, r - x)**2 + max(0, r - (1 - x))**2 +
-                                  max(0, r - y)**2 + max(0, r - (1 - y))**2)
-
+    forces = np.zeros((n, 2))
+    
     for i in range(n):
         for j in range(i + 1, n):
-            dist = np.sqrt(np.sum((centers[i] - centers[j])**2))
-            overlap = radii[i] + radii[j] - dist
-            if overlap > 0:
-                penalty += w_overlap * overlap**2
-
-    return penalty
-
-
-def objective(params, n):
-    """Objective: minimize negative sum of radii plus penalties."""
-    centers = params[:2 * n].reshape(n, 2)
-    radii = params[2 * n:]
-    obj = -np.sum(radii)
-    obj += compute_penalty(centers, radii)
-    return obj
-
-
-def initialize_hexagonal(n):
-    """Initialize circles in a hexagonal pattern."""
-    r = 0.095
-    centers = []
-    radii_list = []
-
-    dx = 2 * r
-    dy = r * np.sqrt(3)
-
-    row = 0
-    while len(centers) < n:
-        y = r + row * dy
-        if y + r > 1:
-            break
-
-        if row % 2 == 0:
-            x_start = r
-        else:
-            x_start = r + r  # offset by one radius
-
-        x = x_start
-        while x + r <= 1 and len(centers) < n:
-            centers.append([x, y])
-            radii_list.append(r)
-            x += dx
-        row += 1
-
-    centers = np.array(centers[:n])
-    radii = np.array(radii_list[:n])
-
-    return centers, radii
+            dx = centers[j, 0] - centers[i, 0]
+            dy = centers[j, 1] - centers[i, 1]
+            dist = math.sqrt(dx * dx + dy * dy)
+            min_dist = radii[i] + radii[j]
+            
+            if dist < min_dist and dist > 1e-12:
+                overlap = min_dist - dist
+                force_mag = 200.0 * overlap
+                fx = force_mag * dx / dist
+                fy = force_mag * dy / dist
+                forces[i, 0] -= fx
+                forces[i, 1] -= fy
+                forces[j, 0] += fx
+                forces[j, 1] += fy
+        
+        for dim in range(2):
+            if centers[i, dim] - radii[i] < 0:
+                forces[i, dim] += 500.0 * (radii[i] - centers[i, dim])
+            if centers[i, dim] + radii[i] > 1.0:
+                forces[i, dim] -= 500.0 * (centers[i, dim] + radii[i] - 1.0)
+    
+    return forces
 
 
-def jiggle_and_grow(centers, radii, max_iters=500, growth_rate=0.0005, force_scale=0.5):
-    """Iteratively grow circles and push them apart to resolve overlaps."""
+def clamp_to_boundary(centers, radii):
+    """Clamp centers to valid region."""
     n = len(radii)
-    centers = centers.copy()
-    radii = radii.copy()
+    for i in range(n):
+        for dim in range(2):
+            centers[i, dim] = max(radii[i], min(1.0 - radii[i], centers[i, dim]))
+    return centers
 
-    for iteration in range(max_iters):
-        # Grow circles
-        current_growth = growth_rate * (1 + iteration * 0.0001)
-        for i in range(n):
-            radii[i] += current_growth
 
-        # Resolve overlaps with forces
-        for _ in range(50):
-            forces = np.zeros_like(centers)
+def check_validity(centers, radii, tol=1e-9):
+    """Check if packing is valid."""
+    n = len(radii)
+    for i in range(n):
+        if radii[i] < -tol:
+            return False
+        for dim in range(2):
+            if centers[i, dim] - radii[i] < -tol:
+                return False
+            if centers[i, dim] + radii[i] > 1.0 + tol:
+                return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dist = math.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+            if dist < radii[i] + radii[j] - tol:
+                return False
+    return True
 
-            for i in range(n):
-                for j in range(i + 1, n):
-                    diff = centers[i] - centers[j]
-                    dist = np.sqrt(np.sum(diff**2))
-                    min_dist = radii[i] + radii[j]
-                    if dist < min_dist and dist > 1e-10:
-                        overlap = min_dist - dist
-                        force = force_scale * overlap * diff / dist
-                        forces[i] += force
-                        forces[j] -= force
 
-            # Boundary forces
-            for i in range(n):
-                for axis in range(2):
-                    if centers[i][axis] - radii[i] < 0:
-                        forces[i][axis] += force_scale * (radii[i] - centers[i][axis])
-                    if centers[i][axis] + radii[i] > 1:
-                        forces[i][axis] -= force_scale * (centers[i][axis] + radii[i] - 1)
+def cleanup_overlaps(centers, radii, max_iterations=200):
+    """Slightly shrink radii to eliminate small overlaps."""
+    for _ in range(max_iterations):
+        max_overlap = 0.0
+        for i in range(len(radii)):
+            for j in range(i + 1, len(radii)):
+                dist = math.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                min_dist = radii[i] + radii[j]
+                if dist < min_dist:
+                    max_overlap = max(max_overlap, min_dist - dist)
+        if max_overlap < 1e-12:
+            break
+        radii *= 0.9995
+    return radii
 
-            centers += forces
-            centers = np.clip(centers, 0.001, 0.999)
 
-        # Reduce growth rate periodically
-        if iteration % 50 == 0 and iteration > 0:
-            current_growth *= 0.95
-
+def optimize_trial(centers_init, radii_init, steps=30000, seed=0):
+    """Run force-based optimization for one trial."""
+    np.random.seed(seed)
+    centers = centers_init.copy()
+    radii = radii_init.copy()
+    
+    lr = 0.002
+    base_growth = 0.00012
+    
+    for step in range(steps):
+        # Adaptive growth rate - high at start, tapering off
+        if step < 8000:
+            growth = base_growth
+        elif step < 16000:
+            growth = base_growth * 0.5
+        elif step < 24000:
+            growth = base_growth * 0.2
+        else:
+            growth = base_growth * 0.05
+        
+        radii += growth
+        
+        # Compute repulsion forces
+        forces = compute_forces(centers, radii)
+        
+        # Apply forces with damping
+        centers += forces * lr * 0.005
+        
+        # Clamp to valid region
+        clamp_to_boundary(centers, radii)
+        
+        # Random perturbation to escape local minima
+        if step % 3000 == 0 and step > 0:
+            perturbation = np.random.normal(0, 0.008, centers.shape)
+            centers += perturbation
+            clamp_to_boundary(centers, radii)
+    
     return centers, radii
-
-
-def optimize_with_lbfgs(centers, radii, n, num_trials=8):
-    """Optimize using L-BFGS-B with multiple restarts."""
-    best_sum = 0
-    best_centers = centers.copy()
-    best_radii = radii.copy()
-
-    for trial in range(num_trials):
-        # Perturb initial configuration
-        perturbed_centers = centers.copy()
-        perturbed_radii = radii.copy()
-
-        if trial > 0:
-            perturbed_centers += np.random.uniform(-0.01, 0.01, perturbed_centers.shape)
-            perturbed_centers = np.clip(perturbed_centers, 0.02, 0.98)
-            perturbed_radii += np.random.uniform(-0.005, 0.005, len(perturbed_radii))
-            perturbed_radii = np.maximum(perturbed_radii, 0.001)
-
-        params = np.concatenate([perturbed_centers.flatten(), perturbed_radii])
-
-        bounds = [(0.01, 0.99) for _ in range(2 * n)]
-        bounds += [(0.001, 0.5) for _ in range(n)]
-
-        result = minimize(
-            objective,
-            params,
-            args=(n,),
-            bounds=bounds,
-            method='L-BFGS-B',
-            options={'maxiter': 3000, 'ftol': 1e-15, 'gtol': 1e-12}
-        )
-
-        opt_centers = result.x[:2 * n].reshape(n, 2)
-        opt_radii = np.maximum(result.x[2 * n:], 0.001)
-
-        # Validate and track best
-        if validate_packing(opt_centers, opt_radii):
-            current_sum = np.sum(opt_radii)
-            if current_sum > best_sum:
-                best_sum = current_sum
-                best_centers = opt_centers.copy()
-                best_radii = opt_radii.copy()
-
-    return best_centers, best_radii
 
 
 def run_packing():
-    """Pack 26 circles in a unit square to maximize sum of radii."""
+    """Pack 26 circles in unit square to maximize sum of radii."""
     n = 26
-    np.random.seed(42)
-
-    # Stage 1: Initialize with hexagonal pattern
-    centers, radii = initialize_hexagonal(n)
-
-    # Stage 2: Jiggle and grow to find a good configuration
-    centers, radii = jiggle_and_grow(centers, radii, max_iters=800, growth_rate=0.0008, force_scale=0.3)
-
-    # Stage 3: Numerical optimization with multiple restarts
-    centers, radii = optimize_with_lbfgs(centers, radii, n, num_trials=10)
-
-    # Stage 4: Final validation and return
-    if not validate_packing(centers, radii):
-        # Fallback: re-optimize from scratch
-        centers, radii = initialize_hexagonal(n)
-        centers, radii = jiggle_and_grow(centers, radii, max_iters=400, growth_rate=0.0005, force_scale=0.2)
-        centers, radii = optimize_with_lbfgs(centers, radii, n, num_trials=5)
-
-    return centers, radii, np.sum(radii)
+    
+    best_centers = None
+    best_radii = None
+    best_sum = 0.0
+    
+    # Try multiple initial configurations and seeds
+    for trial_idx in range(25):
+        # Different initialization strategies
+        if trial_idx < 8:
+            # Hexagonal with different spacing
+            spacing = 0.15 + trial_idx * 0.02
+            centers_init = create_hexagonal_init(n, spacing=spacing)
+        elif trial_idx < 16:
+            # Grid-based initialization
+            centers_init = np.zeros((n, 2))
+            for i in range(n):
+                row = i // 6
+                col = i % 6
+                centers_init[i, 0] = 0.08 + col * 0.15 + (row % 2) * 0.075
+                centers_init[i, 1] = 0.08 + row * 0.18
+        else:
+            # Random initialization
+            centers_init = np.random.uniform(0.1, 0.9, (n, 2))
+        
+        radii_init = np.full(n, 0.04)
+        
+        # Run optimization
+        seed = trial_idx * 100 + 42
+        centers, radii = optimize_trial(centers_init, radii_init, steps=35000, seed=seed)
+        
+        # Cleanup small overlaps
+        radii = cleanup_overlaps(centers, radii)
+        
+        # Check validity and track best
+        if check_validity(centers, radii):
+            current_sum = np.sum(radii)
+            if current_sum > best_sum:
+                best_sum = current_sum
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+    
+    # Fallback if no valid solution found (shouldn't happen)
+    if best_centers is None:
+        best_centers = np.zeros((n, 2))
+        best_radii = np.full(n, 0.04)
+        for i in range(n):
+            row = i // 6
+            col = i % 6
+            best_centers[i, 0] = 0.05 + col * 0.15
+            best_centers[i, 1] = 0.05 + row * 0.18
+        best_sum = np.sum(best_radii)
+    
+    return best_centers, best_radii, best_sum
 ```

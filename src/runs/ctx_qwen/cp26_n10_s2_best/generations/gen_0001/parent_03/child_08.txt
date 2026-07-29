@@ -1,0 +1,176 @@
+
+
+<strategy>
+To maximize the sum of radii for 26 circles in a unit square, we need a robust optimization strategy that escapes local minima. The problem is non-convex with many constraints. My approach involves:
+1. **Diverse Initializations**: Generate multiple starting configurations including hexagonal lattices (which are naturally dense), random perturbations, and structured grids. This increases the chance of landing in the basin of attraction for the global optimum.
+2. **Warm-Start Radii**: Instead of starting with uniform small radii, estimate initial radii based on the minimum distance to neighbors and boundaries for each circle. This gives the optimizer a much better head start, as it reflects the local geometric constraints.
+3. **Vectorized Constraints**: Precompute pair indices and use vectorized NumPy operations within the constraint function for efficiency and numerical stability.
+4. **Multi-Restart SLSQP**: Run the Sequential Least Squares Programming optimizer multiple times with different initial conditions. SLSQP is well-suited for this type of bound-constrained non-linear problem.
+5. **Strict Post-Processing**: After optimization, iteratively clamp radii to guarantee they strictly satisfy the boundary and non-overlap constraints within the validator's tolerance, preventing rejection due to floating-point drift.
+6. **Squared Distance Option**: I'll stick to Euclidean distance constraints as they performed well in past iterations, but ensure tight tolerances and sufficient iterations.
+
+This strategy balances exploration (multiple starts) with exploitation (warm-started radii and direct constrained optimization), reliably pushing the sum of radii above 2.62.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def get_pair_indices(n):
+    """Precompute indices for all unique circle pairs (i < j)."""
+    i_idx = []
+    j_idx = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            i_idx.append(i)
+            j_idx.append(j)
+    return np.array(i_idx), np.array(j_idx)
+
+def objective_function(vars, n):
+    """Objective: Minimize negative sum of radii."""
+    return -np.sum(vars[2*n:])
+
+def constraint_function(vars, n, pair_i, pair_j):
+    """Compute inequality constraints: boundaries and non-overlap."""
+    centers = vars[:2*n].reshape(n, 2)
+    radii = vars[2*n:]
+    
+    # Boundary constraints: r <= x <= 1-r, r <= y <= 1-r
+    cons = np.concatenate([
+        centers[:, 0] - radii,
+        1 - centers[:, 0] - radii,
+        centers[:, 1] - radii,
+        1 - centers[:, 1] - radii
+    ])
+    
+    # Overlap constraints: dist >= r_i + r_j
+    c_i = centers[pair_i]
+    c_j = centers[pair_j]
+    r_i = radii[pair_i]
+    r_j = radii[pair_j]
+    
+    dists = np.sqrt(np.sum((c_i - c_j)**2, axis=1))
+    cons = np.concatenate([cons, dists - (r_i + r_j)])
+    return cons
+
+def estimate_initial_radii(centers):
+    """Estimate feasible initial radii based on nearest neighbors and boundaries."""
+    n = centers.shape[0]
+    # Distance to boundaries
+    d_bound = np.minimum(
+        np.minimum(centers[:, 0], 1 - centers[:, 0]),
+        np.minimum(centers[:, 1], 1 - centers[:, 1])
+    )
+    
+    # Distance to nearest other center
+    dists = np.linalg.norm(centers[:, np.newaxis] - centers[np.newaxis, :], axis=2)
+    np.fill_diagonal(dists, np.inf)
+    d_nn = np.min(dists, axis=1)
+    
+    # Conservative initial radius: 40% of the limiting distance
+    return np.minimum(d_bound, d_nn) * 0.4
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    n = 26
+    pair_i, pair_j = get_pair_indices(n)
+    bounds = [(0.0, 1.0)] * (2*n) + [(0.0, 0.5)] * n
+    
+    best_centers = None
+    best_radii = None
+    best_sum = -1.0
+    
+    # Generate diverse initial configurations
+    configs = []
+    
+    # 1. Hexagonal lattice patterns with varying spacings
+    for spacing in np.linspace(0.13, 0.19, 6):
+        pts = []
+        y = spacing
+        row = 0
+        while len(pts) < n:
+            x = spacing if row % 2 == 0 else 2 * spacing
+            while x <= 1 - spacing and len(pts) < n:
+                pts.append([x, y])
+                x += 2 * spacing
+            y += spacing * np.sqrt(3)
+            row += 1
+        configs.append(np.array(pts[:n]))
+        
+    # 2. Uniform random distributions
+    np.random.seed(42)
+    for _ in range(8):
+        configs.append(np.random.uniform(0.08, 0.92, (n, 2)))
+        
+    # 3. Perturbed structured grids (5x5 plus one)
+    grid_coords = []
+    for i in range(5):
+        for j in range(5):
+            grid_coords.append([0.1 + i*0.2, 0.1 + j*0.2])
+    for _ in range(4):
+        p = np.array(grid_coords[:n]) + np.random.uniform(-0.025, 0.025, (n, 2))
+        configs.append(np.clip(p, 0.05, 0.95))
+
+    # Optimization loop
+    for idx, init_centers in enumerate(configs):
+        # Warm-start radii
+        r_init = estimate_initial_radii(init_centers)
+        v0 = np.concatenate([init_centers.flatten(), r_init])
+        
+        # Add small controlled jitter to break exact symmetries
+        v0 += np.random.uniform(-0.005, 0.005, v0.shape)
+        v0 = np.clip(v0, 0.02, 0.98)
+        
+        try:
+            res = minimize(
+                objective_function, 
+                v0, 
+                args=(n,), 
+                method='SLSQP',
+                bounds=bounds,
+                constraints={'type': 'ineq', 'fun': constraint_function, 'args': (n, pair_i, pair_j)},
+                options={'maxiter': 10000, 'ftol': 1e-12, 'disp': False}
+            )
+            
+            if res.success or -res.fun > best_sum:
+                current_sum = -res.fun
+                if current_sum > best_sum:
+                    best_sum = current_sum
+                    best_centers = res.x[:2*n].reshape(n, 2).copy()
+                    best_radii = res.x[2*n:].copy()
+        except Exception:
+            continue
+
+    if best_centers is None:
+        # Fallback to a trivial valid packing if all optimizations fail
+        best_centers = np.tile([0.5, 0.5], (n, 1))
+        best_radii = np.zeros(n)
+        best_sum = 0.0
+
+    # Strict validity enforcement to handle floating point drift
+    radii = np.maximum(best_radii, 0.0)
+    for _ in range(5):
+        changed = False
+        for k in range(n):
+            # Limit by boundaries
+            max_r = min(best_centers[k, 0], 1 - best_centers[k, 0],
+                        best_centers[k, 1], 1 - best_centers[k, 1])
+            
+            # Limit by neighbors
+            for m in range(n):
+                if k != m:
+                    d = np.sqrt((best_centers[k, 0] - best_centers[m, 0])**2 + 
+                                (best_centers[k, 1] - best_centers[m, 1])**2)
+                    max_r = min(max_r, d - radii[m])
+                    
+            if max_r < radii[k] - 1e-10:
+                radii[k] = max(0.0, max_r)
+                changed = True
+        if not changed:
+            break
+            
+    return best_centers, radii, float(np.sum(radii))
+```

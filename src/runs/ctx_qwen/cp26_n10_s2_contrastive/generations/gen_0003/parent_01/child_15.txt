@@ -1,0 +1,418 @@
+
+
+Looking at the current best solution (2.626740), I need to find a better configuration. Let me analyze the key improvements needed:
+
+**Strategy:**
+1. **More diverse initial configurations** - Explore different lattice spacings, margins, and patterns more systematically
+2. **Alternating SLSQP-LP optimization** - More rounds of alternating between SLSQP (joint optimization) and LP (optimal radii for fixed centers)
+3. **Adaptive basin hopping** - Multiple scales of perturbation with decaying noise
+4. **Corner/edge exploitation** - Explicitly try configurations that push circles to boundaries where they can be larger
+5. **Ultra-fine refinement** - Very small perturbations around the best solution with tight tolerances
+
+The key insight is that better packings exploit corners and edges more effectively, with larger boundary circles and smaller interior circles. I'll also add more structured initializations and longer optimization runs.
+
+```python
+import numpy as np
+from scipy.optimize import minimize, linprog
+
+N = 26
+PAIRS_I, PAIRS_J = np.triu_indices(N, k=1)
+NUM_PAIRS = len(PAIRS_I)
+BOUNDS = [(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)] * N
+
+def objective(x):
+    """Minimize negative sum of radii."""
+    return -np.sum(x[2::3])
+
+def constraints_fn(x):
+    """Inequality constraints using squared distances for smoothness."""
+    cx = x[0::3]
+    cy = x[1::3]
+    r = x[2::3]
+    
+    c = np.empty(4 * N + NUM_PAIRS)
+    c[:N] = cx - r
+    c[N:2*N] = 1.0 - cx - r
+    c[2*N:3*N] = cy - r
+    c[3*N:4*N] = 1.0 - cy - r
+    
+    dx = cx[PAIRS_I] - cx[PAIRS_J]
+    dy = cy[PAIRS_I] - cy[PAIRS_J]
+    r_sum = r[PAIRS_I] + r[PAIRS_J]
+    c[4*N:] = dx**2 + dy**2 - r_sum**2
+    return c
+
+CONS = {'type': 'ineq', 'fun': constraints_fn}
+
+def get_lp_radii(centers):
+    """Given fixed centers, solve LP to maximize sum of radii."""
+    n = centers.shape[0]
+    c_obj = -np.ones(n)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.hypot(diff[:, :, 0], diff[:, :, 1])
+    
+    A_ub = np.zeros((NUM_PAIRS, n))
+    A_ub[np.arange(NUM_PAIRS), PAIRS_I] = 1.0
+    A_ub[np.arange(NUM_PAIRS), PAIRS_J] = 1.0
+    b_ub = dists[PAIRS_I, PAIRS_J]
+    
+    bounds = []
+    for i in range(n):
+        mx, my = centers[i]
+        ub = min(mx, 1.0 - mx, my, 1.0 - my)
+        bounds.append((0.0, max(0.0, ub)))
+    
+    for method in ['highs', 'interior-point']:
+        try:
+            res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method=method)
+            if res.success and np.all(res.x >= -1e-9):
+                return np.maximum(res.x, 0.0)
+        except Exception:
+            continue
+    return np.full(n, 0.01)
+
+def make_hex_config(sx, margin, rng=None):
+    """Create hexagonal lattice configuration."""
+    centers = np.zeros((N, 2))
+    idx = 0
+    y = margin
+    row = 0
+    sy = sx * np.sqrt(3) / 2
+    while y < 1.0 - margin and idx < N:
+        x = margin + (row % 2) * sx / 2
+        while x < 1.0 - margin and idx < N:
+            centers[idx] = [x, y]
+            idx += 1
+            x += sx
+        y += sy
+        row += 1
+    if rng is not None:
+        while idx < N:
+            centers[idx] = rng.uniform(margin, 1.0 - margin, 2)
+            idx += 1
+    return centers
+
+def make_staggered_config(sx, sy, margin, rng=None):
+    """Create staggered grid configuration."""
+    centers = np.zeros((N, 2))
+    idx = 0
+    y = margin
+    row = 0
+    while y < 1.0 - margin and idx < N:
+        x_off = margin + (row % 2) * sx / 2
+        x = x_off
+        while x < 1.0 - margin and idx < N:
+            centers[idx] = [x, y]
+            idx += 1
+            x += sx
+        y += sy
+        row += 1
+    if rng is not None:
+        while idx < N:
+            centers[idx] = rng.uniform(margin, 1.0 - margin, 2)
+            idx += 1
+    return centers
+
+def make_corner_edge_config(margin, rng=None):
+    """Explicitly exploit corners and edges."""
+    centers = np.zeros((N, 2))
+    idx = 0
+    
+    # 4 corners
+    cm = margin + 0.02
+    centers[idx] = [cm, cm]; idx += 1
+    centers[idx] = [1 - cm, cm]; idx += 1
+    centers[idx] = [cm, 1 - cm]; idx += 1
+    centers[idx] = [1 - cm, 1 - cm]; idx += 1
+    
+    # Bottom edge (between corners)
+    for i in range(1, 5):
+        x = 0.2 + i * 0.15
+        if idx < N:
+            centers[idx] = [x, margin + 0.015]
+            idx += 1
+    
+    # Top edge
+    for i in range(1, 5):
+        x = 0.2 + i * 0.15
+        if idx < N:
+            centers[idx] = [x, 1 - margin - 0.015]
+            idx += 1
+    
+    # Left edge
+    for i in range(1, 4):
+        y = 0.25 + i * 0.2
+        if idx < N:
+            centers[idx] = [margin + 0.015, y]
+            idx += 1
+    
+    # Right edge
+    for i in range(1, 4):
+        y = 0.25 + i * 0.2
+        if idx < N:
+            centers[idx] = [1 - margin - 0.015, y]
+            idx += 1
+    
+    # Interior hexagonal
+    int_margin = 0.25
+    sy_int = 0.13
+    row = 0
+    y = int_margin + sy_int
+    while y < 1.0 - int_margin and idx < N:
+        x = int_margin + (row % 2) * 0.08
+        while x < 1.0 - int_margin and idx < N:
+            centers[idx] = [x, y]
+            idx += 1
+            x += 0.16
+        y += sy_int * np.sqrt(3) / 2
+        row += 1
+    
+    if rng is not None:
+        while idx < N:
+            centers[idx] = rng.uniform(0.2, 0.8, 2)
+            idx += 1
+    
+    return centers
+
+def run_opt(x0, maxiter=5000):
+    """Run SLSQP optimization."""
+    try:
+        res = minimize(objective, x0, method='SLSQP', bounds=BOUNDS,
+                      constraints=CONS, options={'maxiter': maxiter, 'ftol': 1e-14, 'disp': False})
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+    return x0
+
+def run_packing() -> tuple[np.ndarray, np.ndarray, float]:
+    best_sum = 0.0
+    best_c = None
+    best_r = None
+    
+    inits = []
+    
+    # 1. Hexagonal patterns with various spacings and margins
+    for sx in np.linspace(0.13, 0.22, 16):
+        for margin in [0.01, 0.025, 0.04, 0.06, 0.08, 0.1]:
+            seed = int(sx * 10000) + int(margin * 10000)
+            rng = np.random.RandomState(seed)
+            cfg = make_hex_config(sx, margin, rng)
+            cfg += rng.normal(0, 0.003, cfg.shape)
+            cfg = np.clip(cfg, 0.005, 0.995)
+            inits.append(cfg)
+    
+    # 2. Staggered patterns
+    for sx in np.linspace(0.14, 0.21, 8):
+        for sy in np.linspace(0.14, 0.20, 6):
+            for margin in [0.03, 0.06]:
+                seed = int(sx * 1000) + int(sy * 1000) + int(margin * 1000)
+                rng = np.random.RandomState(seed)
+                cfg = make_staggered_config(sx, sy, margin, rng)
+                cfg += rng.normal(0, 0.003, cfg.shape)
+                cfg = np.clip(cfg, 0.01, 0.99)
+                inits.append(cfg)
+    
+    # 3. Corner/edge exploitation
+    for margin in [0.03, 0.05, 0.07, 0.09]:
+        for seed in range(8):
+            rng = np.random.RandomState(seed * 31 + margin * 100)
+            cfg = make_corner_edge_config(margin, rng)
+            cfg += rng.normal(0, 0.008, cfg.shape)
+            cfg = np.clip(cfg, 0.01, 0.99)
+            inits.append(cfg)
+    
+    # 4. Random configurations
+    for seed in range(50):
+        rng = np.random.RandomState(seed * 17 + 7)
+        inits.append(rng.uniform(0.05, 0.95, (N, 2)))
+    
+    # Phase 1: Optimize from each configuration
+    for c0 in inits:
+        r0 = get_lp_radii(c0) * 0.96
+        x0 = np.zeros(3 * N)
+        x0[0::3] = c0[:, 0]
+        x0[1::3] = c0[:, 1]
+        x0[2::3] = r0
+        
+        # First SLSQP pass
+        x_opt = run_opt(x0, maxiter=6000)
+        c_opt = np.column_stack((x_opt[0::3], x_opt[1::3]))
+        
+        # LP refinement
+        r_opt = get_lp_radii(c_opt)
+        s_opt = np.sum(r_opt)
+        
+        if s_opt > best_sum:
+            best_sum = s_opt
+            best_c = c_opt.copy()
+            best_r = r_opt.copy()
+            
+            # Alternate SLSQP-LP for local refinement
+            for _ in range(3):
+                x_alt = np.zeros(3 * N)
+                x_alt[0::3] = c_opt[:, 0]
+                x_alt[1::3] = c_opt[:, 1]
+                x_alt[2::3] = r_opt * 0.98
+                
+                x_alt = run_opt(x_alt, maxiter=4000)
+                c_alt = np.column_stack((x_alt[0::3], x_alt[1::3]))
+                r_alt = get_lp_radii(c_alt)
+                s_alt = np.sum(r_alt)
+                
+                if s_alt > best_sum:
+                    best_sum = s_alt
+                    best_c = c_alt.copy()
+                    best_r = r_alt.copy()
+                    c_opt = c_alt
+                    r_opt = r_alt
+                else:
+                    break
+    
+    # Phase 2: Adaptive basin hopping
+    if best_c is not None:
+        for step in range(200):
+            # Adaptive perturbation scale
+            scale = 0.02 * max(0.05, 1.0 - step / 250.0)
+            scale = max(scale, 0.0005)
+            
+            c_pert = best_c + np.random.normal(0, scale, best_c.shape)
+            c_pert = np.clip(c_pert, 0.005, 0.995)
+            
+            r_pert = get_lp_radii(c_pert) * 0.97
+            x_pert = np.zeros(3 * N)
+            x_pert[0::3] = c_pert[:, 0]
+            x_pert[1::3] = c_pert[:, 1]
+            x_pert[2::3] = r_pert
+            
+            x_opt = run_opt(x_pert, maxiter=5000)
+            c_opt = np.column_stack((x_opt[0::3], x_opt[1::3]))
+            r_opt = get_lp_radii(c_opt)
+            s_opt = np.sum(r_opt)
+            
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    
+    # Phase 3: Ultra-fine refinement with multiple passes
+    if best_c is not None:
+        for _ in range(100):
+            c_pert = best_c + np.random.normal(0, 0.0008, best_c.shape)
+            c_pert = np.clip(c_pert, 0.005, 0.995)
+            
+            r_pert = get_lp_radii(c_pert)
+            x_pert = np.zeros(3 * N)
+            x_pert[0::3] = c_pert[:, 0]
+            x_pert[1::3] = c_pert[:, 1]
+            x_pert[2::3] = np.maximum(r_pert * 0.999, 0.0001)
+            
+            x_opt = run_opt(x_pert, maxiter=12000)
+            c_opt = np.column_stack((x_opt[0::3], x_opt[1::3]))
+            r_opt = get_lp_radii(c_opt)
+            s_opt = np.sum(r_opt)
+            
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    
+    # Phase 4: Targeted boundary pushing
+    if best_c is not None:
+        for trial in range(60):
+            # Push some circles towards boundaries
+            c_pert = best_c.copy()
+            n_push = np.random.randint(1, 6)
+            for _ in range(n_push):
+                i = np.random.randint(0, N)
+                direction = np.random.choice(['left', 'right', 'bottom', 'top'])
+                factor = np.random.uniform(0.005, 0.03)
+                if direction == 'left':
+                    c_pert[i, 0] = max(c_pert[i, 0] - factor, 0.005)
+                elif direction == 'right':
+                    c_pert[i, 0] = min(c_pert[i, 0] + factor, 0.995)
+                elif direction == 'bottom':
+                    c_pert[i, 1] = max(c_pert[i, 1] - factor, 0.005)
+                else:
+                    c_pert[i, 1] = min(c_pert[i, 1] + factor, 0.995)
+            
+            c_pert += np.random.normal(0, 0.002, best_c.shape)
+            c_pert = np.clip(c_pert, 0.005, 0.995)
+            
+            r_pert = get_lp_radii(c_pert) * 0.98
+            x_pert = np.zeros(3 * N)
+            x_pert[0::3] = c_pert[:, 0]
+            x_pert[1::3] = c_pert[:, 1]
+            x_pert[2::3] = r_pert
+            
+            x_opt = run_opt(x_pert, maxiter=6000)
+            c_opt = np.column_stack((x_opt[0::3], x_opt[1::3]))
+            r_opt = get_lp_radii(c_opt)
+            s_opt = np.sum(r_opt)
+            
+            if s_opt > best_sum:
+                best_sum = s_opt
+                best_c = c_opt.copy()
+                best_r = r_opt.copy()
+    
+    # Fallback
+    if best_c is None:
+        best_c = inits[0]
+        best_r = get_lp_radii(best_c)
+        best_sum = np.sum(best_r)
+    
+    # Final post-processing for strict validity
+    c_f = best_c.copy()
+    r_f = best_r.copy()
+    
+    # Enforce boundary constraints strictly
+    for i in range(N):
+        mx, my = c_f[i]
+        max_r = min(mx, 1.0 - mx, my, 1.0 - my, 0.5)
+        r_f[i] = min(r_f[i], max_r - 1e-10)
+        r_f[i] = max(r_f[i], 0.0)
+    
+    # Iteratively resolve any remaining overlaps
+    for _ in range(200):
+        changed = False
+        for k in range(NUM_PAIRS):
+            i, j = PAIRS_I[k], PAIRS_J[k]
+            d = np.hypot(c_f[i, 0] - c_f[j, 0], c_f[i, 1] - c_f[j, 1])
+            if d < r_f[i] + r_f[j] - 1e-12:
+                exc = r_f[i] + r_f[j] - d
+                r_f[i] -= exc * 0.5
+                r_f[j] -= exc * 0.5
+                r_f[i] = max(r_f[i], 0.0)
+                r_f[j] = max(r_f[j], 0.0)
+                changed = True
+        if not changed:
+            break
+    
+    # Re-run LP after adjustments to potentially increase radii
+    r_f_lp = get_lp_radii(c_f)
+    r_f_lp = np.minimum(r_f_lp, r_f)
+    
+    # Final overlap check and fix
+    for _ in range(100):
+        changed = False
+        for k in range(NUM_PAIRS):
+            i, j = PAIRS_I[k], PAIRS_J[k]
+            d = np.hypot(c_f[i, 0] - c_f[j, 0], c_f[i, 1] - c_f[j, 1])
+            if d < r_f_lp[i] + r_f_lp[j] - 1e-12:
+                exc = r_f_lp[i] + r_f_lp[j] - d
+                r_f_lp[i] -= exc * 0.5
+                r_f_lp[j] -= exc * 0.5
+                r_f_lp[i] = max(r_f_lp[i], 0.0)
+                r_f_lp[j] = max(r_f_lp[j], 0.0)
+                changed = True
+        if not changed:
+            break
+    
+    # Use the better of r_f and r_f_lp
+    if np.sum(r_f_lp) > np.sum(r_f):
+        r_f = r_f_lp
+    
+    final_sum = np.sum(r_f)
+    return c_f, r_f, float(final_sum)
+```

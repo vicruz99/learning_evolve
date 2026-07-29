@@ -1,0 +1,211 @@
+# sol_000061 | problem=circle_packing_26 entrypoint=run_packing
+# generation=0 parent=seed (state 05a03f22) state=cf72bb30 sum of radii=2.410386 correctness=1.0
+# stdout(first 200): 
+# NOTE: model code as-parsed; at eval time the harness also injects a preamble
+#       (validator source + construction globals) via envs/<problem>.py.
+
+import numpy as np
+import scipy.optimize as opt
+
+def get_max_radii(centers):
+    """
+    Given a set of centers, solve the LP to find radii that maximize sum of radii.
+    
+    Args:
+        centers: np.array of shape (n, 2)
+        
+    Returns:
+        radii: np.array of shape (n)
+        sum_radii: float
+    """
+    n = centers.shape[0]
+    
+    # Objective: Maximize sum(r_i) <=> Minimize -sum(r_i)
+    c_obj = np.ones(n) * -1.0
+    
+    # Constraints: A_ub @ r <= b_ub
+    # 1. Boundary constraints: r_i <= min(x_i, 1-x_i, y_i, 1-y_i)
+    #    This can be handled via bounds in linprog, but let's stick to standard form or bounds.
+    #    linprog bounds argument is easier for r_i >= 0 and r_i <= limit.
+    
+    # Compute boundary limits for each circle
+    x = centers[:, 0]
+    y = centers[:, 1]
+    limits = np.minimum(np.minimum(x, 1 - x), np.minimum(y, 1 - y))
+    limits = np.maximum(limits, 0.0) # Ensure non-negative
+    
+    # 2. Pairwise constraints: r_i + r_j <= dist(i, j)
+    #    We need to construct the matrix for these constraints.
+    #    Number of pairs: n*(n-1)/2
+    
+    pair_indices = []
+    dists = []
+    
+    # Precompute distances and indices
+    # Vectorized distance computation
+    c_diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists_full = np.sqrt(np.sum(c_diff**2, axis=2))
+    
+    # Get upper triangular indices
+    rows, cols = np.triu_indices(n, k=1)
+    
+    # Number of constraints
+    m = len(rows)
+    
+    A_ub = np.zeros((m, n))
+    b_ub = np.zeros(m)
+    
+    for k in range(m):
+        i = rows[k]
+        j = cols[k]
+        A_ub[k, i] = 1.0
+        A_ub[k, j] = 1.0
+        b_ub[k] = dists_full[i, j]
+        
+    # Bounds for variables r_i: 0 <= r_i <= limit_i
+    bounds = [(0, lim) for lim in limits]
+    
+    # Solve LP
+    try:
+        res = opt.linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            radii = res.x
+            # Due to numerical noise, ensure radii don't violate bounds slightly
+            # Also ensure non-negativity
+            radii = np.maximum(radii, 0.0)
+            # Clamp to limits strictly
+            radii = np.minimum(radii, limits)
+            return radii, -res.fun
+        else:
+            # Fallback if LP fails (shouldn't happen often with valid centers)
+            return np.zeros(n), 0.0
+    except Exception:
+        return np.zeros(n), 0.0
+
+def run_packing():
+    """
+    Runs the optimization to pack 26 circles in a unit square.
+    """
+    np.random.seed(42)
+    n = 26
+    
+    # 1. Initialization: Hexagonal Grid
+    # We want to fit 26 circles. A 5x5 grid is 25. 
+    # Hexagonal packing is denser. 
+    # Let's generate points in a hex grid and select 26 best ones or just generate 26.
+    
+    # Estimate spacing. Area 1, 26 circles. 
+    # Hex packing density ~ 0.9069. 
+    # Area per circle ~ 1/26. pi r^2 ~ 1/26 / 0.9069 => r ~ 0.105.
+    # Diameter ~ 0.21. 
+    # Spacing ~ 0.21.
+    
+    spacing = 0.22
+    points = []
+    
+    # Generate a grid of hex points
+    # y = row * spacing * sqrt(3)/2
+    # x = col * spacing + (row % 2) * spacing / 2
+    
+    max_y = 1.2
+    row = 0
+    while row * spacing * np.sqrt(3)/2 < max_y:
+        y = row * spacing * np.sqrt(3)/2
+        # x starts at spacing/2 for odd rows to center, or 0?
+        # Let's start x from 0.
+        col = 0
+        while True:
+            offset = (spacing / 2) if (row % 2 == 1) else 0
+            x = col * spacing + offset
+            
+            # Keep points inside [0, 1] roughly
+            if x < -0.1 or x > 1.1:
+                break
+            
+            points.append([x, y])
+            col += 1
+        
+        row += 1
+        if len(points) > 35: # Generate extra
+            break
+            
+    points = np.array(points)
+    
+    # Filter points inside [0, 1] and select 26
+    # Or just take first 26 that are inside
+    valid_points = []
+    for p in points:
+        if 0.0 <= p[0] <= 1.0 and 0.0 <= p[1] <= 1.0:
+            valid_points.append(p)
+            
+    # If we have enough, take first 26
+    if len(valid_points) >= 26:
+        init_centers = np.array(valid_points[:26])
+    else:
+        # Fallback to random if grid failed to provide 26
+        init_centers = np.random.rand(26, 2)
+
+    # 2. Simulated Annealing Optimization
+    current_centers = init_centers.copy()
+    current_radii, current_score = get_max_radii(current_centers)
+    
+    # SA Parameters
+    T = 0.05 # Initial temperature
+    T_min = 1e-6
+    cooling_rate = 0.995
+    steps = 5000
+    
+    best_score = current_score
+    best_centers = current_centers.copy()
+    best_radii = current_radii.copy()
+    
+    step_count = 0
+    while T > T_min and step_count < steps:
+        # Propose a move: pick a random circle and perturb it
+        idx = np.random.randint(0, n)
+        
+        # Gaussian perturbation scaled by temperature
+        # Scale factor needs to be tuned. 
+        # Radii are ~0.1, so perturbation of 0.05*T might be too small/large?
+        # Let's use a fixed step size that decays, or constant.
+        # Constant step size is often better for LP objective landscape.
+        step_size = 0.02 
+        delta = np.random.normal(0, step_size, 2)
+        
+        new_centers = current_centers.copy()
+        new_centers[idx] = new_centers[idx] + delta
+        
+        # Clip to [0, 1]
+        new_centers = np.clip(new_centers, 0.0, 1.0)
+        
+        # Evaluate
+        new_radii, new_score = get_max_radii(new_centers)
+        
+        delta_E = current_score - new_score # We want to maximize score, so decrease in score is positive delta_E
+        
+        # Acceptance probability
+        if delta_E < 0 or np.random.rand() < np.exp(-delta_E / T):
+            current_centers = new_centers
+            current_radii = new_radii
+            current_score = new_score
+            
+            if current_score > best_score:
+                best_score = current_score
+                best_centers = current_centers.copy()
+                best_radii = current_radii.copy()
+        
+        T *= cooling_rate
+        step_count += 1
+        
+    # Final verification and return
+    # Re-solve LP on best centers to ensure consistency
+    final_radii, final_sum = get_max_radii(best_centers)
+    
+    # Double check constraints manually to be safe
+    # (The LP solver guarantees them, but floating point issues might occur)
+    # We'll just return the result from the LP which is consistent.
+    
+    return best_centers, final_radii, final_sum
+
+# The validation function is provided in the prompt, we just need to return the tuple.
+# We can run the function to test locally if needed, but here we just define it.

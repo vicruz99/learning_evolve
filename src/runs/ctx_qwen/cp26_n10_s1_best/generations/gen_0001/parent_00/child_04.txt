@@ -1,0 +1,166 @@
+
+
+<strategy>
+The previous solution used direct SLSQP optimization from grid/hex/random starts, which often gets trapped in suboptimal local minima due to the highly non-convex constraint landscape of circle packing. To break through the ~2.631 barrier, I employ a two-phase strategy:
+
+1. **Force-Directed Pre-Optimization**: Before calling SLSQP, I run a lightweight physics simulation for each seed. Circles start small and repel each other when overlapping. When no overlaps exist, radii are slowly increased. This phase quickly discovers dense, valid configurations that SLSQP alone struggles to find from scratch.
+2. **Multi-Start SLSQP Refinement**: Each force-packed configuration is passed to SLSQP with exact inequality constraints (`dist - r_i - r_j >= 0`, boundary conditions). SLSQP precisely maximizes the sum of radii within the valid region.
+3. **Final Polishing Pass**: The best result from all seeds undergoes one more high-precision SLSQP run with tighter tolerances to extract the maximum possible sum.
+
+This hybrid approach efficiently navigates the configuration space, avoids poor local minima, and respects all constraints without using closures or lambda functions.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def obj_func(params):
+    """Objective: minimize negative sum of radii."""
+    return -np.sum(params[2::3])
+
+def compute_constraints(params):
+    """Compute all inequality constraints: g(params) >= 0."""
+    n = len(params) // 3
+    xs = params[0::3]
+    ys = params[1::3]
+    rs = params[2::3]
+    
+    cons = []
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    for i in range(n):
+        cons.append(xs[i] - rs[i])
+        cons.append(1.0 - xs[i] - rs[i])
+        cons.append(ys[i] - rs[i])
+        cons.append(1.0 - ys[i] - rs[i])
+        
+    # Non-overlap constraints: dist(i,j) >= r_i + r_j
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            cons.append(np.sqrt(dx*dx + dy*dy) - rs[i] - rs[j])
+            
+    return np.array(cons)
+
+def force_pack(n, seed):
+    """Generate a dense valid packing using repulsive forces."""
+    np.random.seed(seed)
+    centers = np.random.uniform(0.2, 0.8, (n, 2))
+    radii = np.ones(n) * 0.035
+    dt = 0.06
+    
+    for step in range(1200):
+        forces = np.zeros((n, 2))
+        overlaps = 0
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = centers[j, 0] - centers[i, 0]
+                dy = centers[j, 1] - centers[i, 1]
+                d = np.sqrt(dx*dx + dy*dy)
+                
+                if d < radii[i] + radii[j] and d > 1e-7:
+                    overlap = radii[i] + radii[j] - d
+                    f = overlap * 12.0
+                    forces[i, 0] -= f * dx / d
+                    forces[i, 1] -= f * dy / d
+                    forces[j, 0] += f * dx / d
+                    forces[j, 1] += f * dy / d
+                    overlaps += 1
+        
+        # Boundary repulsion
+        for i in range(n):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i]
+            if x < r: forces[i, 0] += (r - x) * 15.0
+            if x > 1 - r: forces[i, 0] -= (x - (1 - r)) * 15.0
+            if y < r: forces[i, 1] += (r - y) * 15.0
+            if y > 1 - r: forces[i, 1] -= (y - (1 - r)) * 15.0
+            
+        centers += forces * dt
+        centers[:, 0] = np.clip(centers[:, 0], 0.001, 0.999)
+        centers[:, 1] = np.clip(centers[:, 1], 0.001, 0.999)
+        
+        # Expand radii when valid
+        if overlaps == 0 and np.max(radii) < 0.25:
+            radii *= 1.001
+        elif step > 400:
+            dt *= 0.995
+            
+    return centers, radii
+
+def run_packing():
+    """Pack 26 circles in unit square to maximize sum of radii."""
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    # Bounds for x, y, r
+    bounds = []
+    for _ in range(n):
+        bounds.extend([(0.0, 1.0), (0.0, 1.0), (0.0, 0.5)])
+        
+    cons = {'type': 'ineq', 'fun': compute_constraints}
+    
+    # Multi-start with different random seeds
+    for seed in range(18):
+        centers, radii = force_pack(n, seed)
+        
+        # Flatten to optimization parameters
+        params = np.zeros(3 * n)
+        for i in range(n):
+            params[3*i] = centers[i, 0]
+            params[3*i+1] = centers[i, 1]
+            params[3*i+2] = radii[i]
+            
+        try:
+            res = minimize(obj_func, params, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 3000, 'ftol': 1e-12})
+            cur_sum = -res.fun
+            if not np.isnan(cur_sum) and cur_sum > best_sum:
+                best_sum = cur_sum
+                best_centers = np.zeros((n, 2))
+                best_radii = np.zeros(n)
+                for i in range(n):
+                    best_centers[i, 0] = res.x[3*i]
+                    best_centers[i, 1] = res.x[3*i+1]
+                    best_radii[i] = res.x[3*i+2]
+        except Exception:
+            continue
+            
+    # Fallback valid configuration
+    if best_centers is None:
+        best_centers = np.zeros((n, 2))
+        best_radii = np.ones(n) * 0.09
+        idx = 0
+        for r_idx in range(6):
+            for c_idx in range(5):
+                if idx < n:
+                    best_centers[idx, 0] = 0.08 + c_idx * 0.18
+                    best_centers[idx, 1] = 0.08 + r_idx * 0.16
+                    idx += 1
+        best_sum = np.sum(best_radii)
+        
+    # Final high-precision refinement pass
+    params = np.zeros(3 * n)
+    for i in range(n):
+        params[3*i] = best_centers[i, 0]
+        params[3*i+1] = best_centers[i, 1]
+        params[3*i+2] = best_radii[i]
+        
+    try:
+        res = minimize(obj_func, params, method='SLSQP', bounds=bounds, constraints=cons,
+                       options={'maxiter': 6000, 'ftol': 1e-14})
+        if not np.isnan(res.fun):
+            best_centers = np.zeros((n, 2))
+            best_radii = np.zeros(n)
+            for i in range(n):
+                best_centers[i, 0] = res.x[3*i]
+                best_centers[i, 1] = res.x[3*i+1]
+                best_radii[i] = res.x[3*i+2]
+            best_sum = np.sum(best_radii)
+    except Exception:
+        pass
+        
+    return best_centers, best_radii, float(best_sum)
+```

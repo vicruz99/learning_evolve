@@ -1,0 +1,219 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square, I will employ a robust optimization strategy combining multiple high-quality initial configurations with efficient constraint handling and local refinement.
+
+1. **Vectorized Constraints**: Instead of looping through pairs in Python, I'll use NumPy broadcasting to compute all pairwise distances and boundary constraints simultaneously. This drastically speeds up each iteration of the optimizer.
+2. **Diverse Initializations**: I'll generate starting points from:
+   - Rejection sampling (ensures strictly valid, dense starting packings)
+   - Hexagonal lattices rotated at various angles (0°, 5°, 10°, 15°, etc.) to explore different alignments with the square boundaries
+   - Slight random perturbations of the best found so far to escape local minima
+3. **SLSQP Optimization**: Sequential Quadratic Programming handles nonlinear constraints well. I'll maximize `maxiter` to 10,000 and set a tight `ftol` to ensure thorough convergence.
+4. **Post-Validation & Shrinking**: Due to numerical tolerances in nonlinear solvers, the final result might have infinitesimal violations. A uniform slight scaling of radii ensures strict compliance with the validation function while preserving nearly all the optimized sum.
+5. **No Closures/Lambdas**: All helper functions are defined at the top level, and constraint passing uses `args` instead of closures, strictly following the rules.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+def objective(vars):
+    """Objective: maximize sum of radii -> minimize negative sum."""
+    return -np.sum(vars[2::3])
+
+def constraint_func(vars, n):
+    """Vectorized inequality constraints: g(vars) >= 0"""
+    x = vars[0::3]
+    y = vars[1::3]
+    r = vars[2::3]
+    
+    c = []
+    # Boundary constraints: x >= r, 1-x >= r, y >= r, 1-y >= r
+    c.extend(x - r)
+    c.extend(1 - x - r)
+    c.extend(y - r)
+    c.extend(1 - y - r)
+    
+    # Non-overlap constraints using squared distances: dist^2 >= (ri + rj)^2
+    X = x[:, None] - x[None, :]
+    Y = y[:, None] - y[None, :]
+    R = r[:, None] + r[None, :]
+    
+    dist_sq = X**2 + Y**2
+    min_dist_sq = R**2
+    
+    # Only need upper triangle to avoid double counting
+    iu, ju = np.triu_indices(n, k=1)
+    c.extend(dist_sq[iu, ju] - min_dist_sq[iu, ju])
+        
+    return np.array(c)
+
+def generate_rejection_init(n, target_r):
+    """Place circles via rejection sampling to ensure valid start."""
+    centers = []
+    radii = []
+    for _ in range(n):
+        placed = False
+        for _ in range(3000):
+            cx = np.random.uniform(target_r, 1 - target_r)
+            cy = np.random.uniform(target_r, 1 - target_r)
+            valid = True
+            for k in range(len(centers)):
+                dx = cx - centers[k][0]
+                dy = cy - centers[k][1]
+                if dx*dx + dy*dy < (target_r + radii[k])**2:
+                    valid = False
+                    break
+            if valid:
+                centers.append([cx, cy])
+                radii.append(target_r)
+                placed = True
+                break
+        if not placed:
+            centers.append([np.random.uniform(0.2, 0.8), np.random.uniform(0.2, 0.8)])
+            radii.append(0.02)
+    return np.array(centers), np.array(radii)
+
+def generate_hex_init(n, angle):
+    """Generate a compact hexagonal lattice, optionally rotated."""
+    pts = []
+    dx = 0.18
+    dy = dx * np.sqrt(3) / 2
+    for row in range(-15, 20):
+        for col in range(-15, 20):
+            x = col * dx + (row % 2) * (dx / 2)
+            y = row * dy
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                pts.append([x, y])
+    pts = np.array(pts)
+    
+    if len(pts) >= n:
+        if angle != 0:
+            rad = np.radians(angle)
+            cos_a, sin_a = np.cos(rad), np.sin(rad)
+            pts = pts - [0.5, 0.5]
+            rotated = pts @ np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            pts = rotated + [0.5, 0.5]
+        
+        # Select points closest to center for compactness
+        dists = np.linalg.norm(pts - [0.5, 0.5], axis=1)
+        idx = np.argsort(dists)[:n]
+        pts = pts[idx]
+        
+        # Ensure initial feasibility by scaling down if overlaps exist
+        radii = np.full(n, 0.08)
+        valid = False
+        while not valid and radii[0] > 0.04:
+            valid = True
+            for i in range(n):
+                for j in range(i+1, n):
+                    dx = pts[i,0] - pts[j,0]
+                    dy = pts[i,1] - pts[j,1]
+                    if dx*dx + dy*dy < (radii[0]*2)**2:
+                        valid = False
+                        break
+                if not valid: break
+            if not valid:
+                radii *= 0.95
+        return pts, radii
+    else:
+        return np.random.uniform(0.1, 0.9, (n, 2)), np.full(n, 0.05)
+
+def get_initializations(n):
+    """Create diverse high-quality starting configurations."""
+    inits = []
+    np.random.seed(101)
+    inits.append(generate_rejection_init(n, 0.08))
+    
+    # Rotated hexagonal grids help align differently with square boundaries
+    for angle in [0, 5, 10, 15, 20, 30, 45]:
+        np.random.seed(angle)
+        inits.append(generate_hex_init(n, angle))
+        
+    np.random.seed(42)
+    inits.append(generate_rejection_init(n, 0.075))
+        
+    return inits
+
+def run_optimization(n, centers_init, radii_init):
+    """Run SLSQP optimization from a given starting point."""
+    x0 = np.zeros(3 * n)
+    x0[0::3] = centers_init[:, 0]
+    x0[1::3] = centers_init[:, 1]
+    x0[2::3] = radii_init
+    
+    bounds = [(0, 1), (0, 1), (0, 0.5)] * n
+    constraints = {'type': 'ineq', 'fun': constraint_func, 'args': (n,)}
+    
+    res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints,
+                   options={'maxiter': 10000, 'ftol': 1e-12, 'disp': False})
+    
+    if np.isnan(res.fun):
+        return None, None, 0.0
+        
+    centers = np.zeros((n, 2))
+    radii = np.zeros(n)
+    centers[:, 0] = res.x[0::3]
+    centers[:, 1] = res.x[1::3]
+    radii = res.x[2::3]
+    
+    return centers, radii, -res.fun
+
+def validate_and_fix(centers, radii, n):
+    """Ensure strict feasibility by slight uniform scaling if numerical errors exist."""
+    scale = 1.0
+    for _ in range(100):
+        valid = True
+        for i in range(n):
+            x, y, r = centers[i, 0], centers[i, 1], radii[i] * scale
+            if x - r < -1e-10 or x + r > 1 + 1e-10 or y - r < -1e-10 or y + r > 1 + 1e-10:
+                valid = False
+                break
+            for j in range(i + 1, n):
+                dx = x - centers[j, 0]
+                dy = y - centers[j, 1]
+                rj = radii[j] * scale
+                if dx*dx + dy*dy < (r + rj)**2 - 1e-12:
+                    valid = False
+                    break
+            if not valid: break
+        if valid:
+            return centers, radii * scale, np.sum(radii * scale)
+        scale *= 0.995
+    return centers, radii * scale, np.sum(radii * scale)
+
+def run_packing():
+    n = 26
+    best_sum = -1.0
+    best_centers = None
+    best_radii = None
+    
+    inits = get_initializations(n)
+    
+    # Evaluate multiple starting configurations
+    for c_init, r_init in inits:
+        c_opt, r_opt, s_opt = run_optimization(n, c_init, r_init)
+        if c_opt is not None and s_opt > best_sum:
+            best_sum = s_opt
+            best_centers = c_opt
+            best_radii = r_opt
+            
+    # Local refinement: perturb best result and re-optimize to escape local minima
+    if best_centers is not None:
+        for _ in range(5):
+            c_pert = best_centers + np.random.normal(0, 1e-4, best_centers.shape)
+            r_pert = best_radii + np.random.normal(0, 1e-4, n)
+            r_pert = np.clip(r_pert, 0.01, 0.5)
+            c_opt, r_opt, s_opt = run_optimization(n, c_pert, r_pert)
+            if c_opt is not None and s_opt > best_sum:
+                best_sum = s_opt
+                best_centers = c_opt
+                best_radii = r_opt
+                
+    if best_centers is None:
+        best_centers = np.random.uniform(0.2, 0.8, (n, 2))
+        best_radii = np.full(n, 0.05)
+        best_sum = np.sum(best_radii)
+        
+    return validate_and_fix(best_centers, best_radii, n)
+```

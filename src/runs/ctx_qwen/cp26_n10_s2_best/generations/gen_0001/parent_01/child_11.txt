@@ -1,0 +1,155 @@
+
+
+<strategy>
+To improve the packing of 26 circles in a unit square, we need to escape local minima that plague standard gradient-based optimizers when applied to non-convex geometric constraints. The strategy involves:
+
+1. **Vectorized Constraint Formulation**: Computing boundary and pairwise non-overlap constraints using numpy broadcasting significantly speeds up each optimization iteration, allowing more iterations or restarts within a reasonable time.
+2. **Multi-Start Optimization**: Running `SLSQP` from 20 diverse initial configurations (hexagonal, grid, and random layouts) increases the probability of finding the global basin of attraction.
+3. **Iterative Refinement**: After finding the best configuration from the initial runs, we perform a local search phase by adding small Gaussian noise to the best solution and re-optimizing. This helps fine-tune positions and radii to squeeze out additional sum-of-radii.
+4. **Strict Validity Enforcement**: A post-processing step calculates the minimum constraint slack. If numerical drift causes any violation beyond a tight tolerance, radii are uniformly scaled down minimally to guarantee the validator passes, without unnecessarily sacrificing the objective.
+5. **Robust Initialization**: Starting with a feasible small radius (0.05) ensures the optimizer begins in the feasible region, preventing early failures. Layouts are carefully spaced to cover the square uniformly.
+
+This approach balances exploration (multiple restarts) and exploitation (refinement phase), reliably beating previous local optima.
+</strategy>
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+N = 26
+
+def objective(v):
+    """Minimize negative sum of radii to maximize total radius."""
+    return -np.sum(v[2*N:])
+
+def constraints(v):
+    """
+    Vectorized inequality constraints:
+    - Boundaries: center +/- radius within [0, 1]
+    - Non-overlap: distance >= sum of radii
+    Returns array where all elements must be >= 0.
+    """
+    centers = v[:2*N].reshape(N, 2)
+    radii = v[2*N:]
+    
+    c = []
+    # Boundary constraints
+    c.append(centers[:, 0] - radii)
+    c.append(1.0 - centers[:, 0] - radii)
+    c.append(centers[:, 1] - radii)
+    c.append(1.0 - centers[:, 1] - radii)
+    
+    # Pairwise non-overlap constraints
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    r_sum = radii[:, np.newaxis] + radii[np.newaxis, :]
+    
+    # Extract upper triangle (i < j)
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    c.append((dists - r_sum)[mask])
+    
+    return np.concatenate(c)
+
+def get_initial_guess(seed, layout_type='hex'):
+    """Generates a feasible initial configuration based on layout type."""
+    np.random.seed(seed)
+    centers = np.zeros((N, 2))
+    radii = np.full(N, 0.05)  # Small feasible radius
+    
+    if layout_type == 'hex':
+        idx = 0
+        y = 0.08
+        row = 0
+        while idx < N:
+            x_start = 0.08 if row % 2 == 0 else 0.16
+            x = x_start
+            while x <= 0.92 and idx < N:
+                centers[idx] = [x, y]
+                idx += 1
+                x += 0.16
+            y += 0.14
+            row += 1
+    elif layout_type == 'grid':
+        idx = 0
+        for r in range(5):
+            for c in range(6):
+                if idx < N:
+                    centers[idx] = [0.1 + c*0.15, 0.1 + r*0.18]
+                    idx += 1
+    elif layout_type == 'random':
+        centers = np.random.uniform(0.1, 0.9, (N, 2))
+        
+    # Break symmetry and ensure strict interior placement
+    centers += np.random.uniform(-0.02, 0.02, centers.shape)
+    centers = np.clip(centers, 0.05, 0.95)
+    
+    return np.concatenate([centers.flatten(), radii])
+
+def run_packing():
+    """
+    Optimizes packing of 26 circles in a unit square to maximize sum of radii.
+    Returns (centers, radii, sum_radii).
+    """
+    bounds = [(0.0, 1.0)] * (2*N) + [(0.0, 0.5)] * N
+    cons = {'type': 'ineq', 'fun': constraints}
+    
+    best_val = -np.inf
+    best_v = None
+    
+    # Phase 1: Multi-start exploration
+    for seed in range(20):
+        layout = 'hex' if seed % 3 == 0 else ('grid' if seed % 3 == 1 else 'random')
+        x0 = get_initial_guess(seed * 1000, layout)
+        
+        try:
+            res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 2000, 'ftol': 1e-12, 'disp': False})
+            val = -res.fun
+            if val > best_val:
+                best_val = val
+                best_v = res.x.copy()
+        except Exception:
+            pass
+            
+    # Phase 2: Local refinement around the best found configuration
+    if best_v is not None:
+        np.random.seed(42)
+        for _ in range(10):
+            x0 = best_v + np.random.normal(0, 0.005, size=best_v.shape)
+            # Ensure perturbed vars stay within bounds
+            x0[:2*N] = np.clip(x0[:2*N], 0.01, 0.99)
+            x0[2*N:] = np.clip(x0[2*N:], 0.01, 0.49)
+            
+            try:
+                res = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                               options={'maxiter': 3000, 'ftol': 1e-13, 'disp': False})
+                val = -res.fun
+                if val > best_val:
+                    best_val = val
+                    best_v = res.x.copy()
+            except Exception:
+                pass
+                
+    centers = best_v[:2*N].reshape(N, 2)
+    radii = best_v[2*N:]
+    
+    # Phase 3: Strict validity enforcement against numerical drift
+    min_slack = 1.0
+    for i in range(N):
+        min_slack = min(min_slack, 
+                        centers[i,0] - radii[i], 
+                        1.0 - centers[i,0] - radii[i],
+                        centers[i,1] - radii[i], 
+                        1.0 - centers[i,1] - radii[i])
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.sqrt((centers[i,0] - centers[j,0])**2 + (centers[i,1] - centers[j,1])**2)
+            min_slack = min(min_slack, d - radii[i] - radii[j])
+            
+    # If any constraint is violated by more than tolerance, scale radii down minimally
+    if min_slack < -1e-10:
+        scale = 1.0 + min_slack / np.max(radii)
+        radii *= max(0.9, scale)
+        
+    return centers, radii, float(np.sum(radii))
+```
