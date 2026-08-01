@@ -30,6 +30,21 @@ to learn and nothing to keep in sync; unknown keys are rejected before anything 
       max_parallel: 2
       stagger: 120                  # seconds between launches
       server_max_num_seqs: 256      # optional; only used to warn about oversubscription
+      ray:                          # optional; every key overrides something auto-detected
+        reserve_cpus: 3             # cores kept off Ray for the supervisor + drivers
+                                    #   (default 1 + max_parallel)
+        object_store_gb: 2          # carved out of /dev/shm; this workload ships kilobytes
+        memory_fraction: 0.85       # of the cgroup's memory limit, minus the object store
+        temp_dir_base: /tmp         # set to node-local scratch if /tmp is a network mount
+        port: auto                  # auto = let the kernel pick, so co-tenants cannot collide
+
+Ray
+---
+The launcher starts and sizes the head itself (``--ray-head=auto``, the default) and stops it when
+the queue drains. You do NOT need to ``ray start`` or export ``OMP_NUM_THREADS`` by hand — the
+thread-limit variables are derived from ``num-cpus-per-task`` and set on the head process, which is
+the only place that affects eval workers. Runs receive ``RAY_ADDRESS`` explicitly, so a shared
+``/tmp`` cannot make them attach to another machine's cluster. See ``sandbox/ray_head.py``.
 
     common:
       problem: circle_packing_26
@@ -67,6 +82,7 @@ from typing import Any
 import yaml
 
 from run_icl import build_parser
+from sandbox import ray_head
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = "sweep.json"
@@ -171,37 +187,95 @@ def _to_argv(flags: dict[str, Any], by_flag: dict, bool_pair: dict) -> list[str]
 # --------------------------------------------------------------------------------------------------
 # preflight checks
 # --------------------------------------------------------------------------------------------------
-def _ray_head_ready() -> bool:
-    try:
-        return subprocess.run(["ray", "status"], capture_output=True, timeout=30).returncode == 0
-    except Exception:
-        return False
+def threads_per_task(entries: list[dict]) -> int:
+    """The sweep's ``num-cpus-per-task``, which must be one value for the whole sweep.
 
-
-def ensure_ray_head(mode: str) -> bool:
-    """Make sure the runs will share ONE Ray cluster.
-
-    Each run_icl.py otherwise starts its own Ray head that prestarts ~96 workers, all assuming they
-    own the whole box: simultaneous bring-up deadlocks, and even staggered ones triple-book the CPUs
-    and turn merely-queued candidates into `cpu_starvation` failures. One shared head fixes both.
-
-    Nothing has to be passed to the children: ``sandbox.ray_setup.init_ray`` already tries
-    ``address="auto"`` first and falls back to a private cluster. Returns whether a head is up.
+    ``cpu_scheduler`` is a *detached* actor created with the first run's ``num_cpus_per_task`` and
+    ``get_if_exists=True`` thereafter, so the second run's value is silently ignored and its evals
+    get the first run's group size. Rejecting the mix here beats debugging it later.
     """
-    if mode == "skip":
-        return False
-    if _ray_head_ready():
-        print("[sweep] ray: existing head found — runs will attach to it")
-        return True
-    if mode == "require":
-        raise SweepError("no Ray head reachable and --ray-head=require; run `ray start --head` first")
-    print("[sweep] ray: no head found — starting one (`ray start --head`)")
-    proc = subprocess.run(["ray", "start", "--head"], capture_output=True, text=True, timeout=300)
-    if proc.returncode != 0:
-        print(f"[sweep] WARNING: `ray start --head` failed, runs will each boot their own cluster:\n"
-              f"{proc.stderr.strip()[-500:]}")
-        return False
-    return True
+    values = set()
+    for entry in entries:
+        flags = _flags_from_cmd(entry["cmd"])
+        values.add(int(flags.get("num-cpus-per-task", 1)))
+    if len(values) > 1:
+        raise SweepError(
+            f"runs disagree on num-cpus-per-task ({sorted(values)}). One shared Ray head means one "
+            "detached cpu_scheduler actor, and it is created with whichever value starts first — "
+            "the others are silently ignored. Split this into one sweep file per value.")
+    return values.pop() if values else 1
+
+
+class RayHead:
+    """The sweep's Ray cluster: started here, sized from the cgroup, torn down here.
+
+    Each run_icl.py would otherwise start its own head that prestarts a worker per core, all assuming
+    they own the whole box: simultaneous bring-up deadlocks, and even staggered ones over-book the
+    CPUs and turn merely-queued candidates into `cpu_starvation` failures.
+
+    Runs get the address through ``RAY_ADDRESS`` in their environment rather than through
+    ``address="auto"``, which would otherwise consult ``/tmp/ray/ray_current_cluster`` — a file
+    another machine may have written if /tmp is shared. See sandbox/ray_head.py.
+    """
+
+    def __init__(self) -> None:
+        self.address: str | None = None
+        self.temp_dir: str | None = None
+        self.owned = False                       # only tear down a head we started ourselves
+        self.env: dict[str, str] = {}
+
+    def ensure(self, mode: str, tpt: int, max_parallel: int, cfg: dict) -> None:
+        if mode == "skip":
+            print("[sweep] ray: --ray-head=skip — each run will boot its own cluster")
+            return
+
+        stale = ray_head.diagnose_default_address_file()
+        if stale:
+            print(f"[sweep] ray: NOTE — {stale}")
+
+        existing, refusal = ray_head.head_is_running()
+        if refusal:
+            print(f"[sweep] ray: WARNING — {refusal}")
+        if existing:
+            self.address = existing
+            # Match the head's thread limits anyway: a head someone started by hand may have been
+            # started without them, and the drivers at least should stay consistent.
+            self.env = ray_head.thread_env(tpt)
+            if existing != "auto":
+                self.env["RAY_ADDRESS"] = existing
+            print(f"[sweep] ray: existing head found ({existing}) — attaching, not resizing it. "
+                  "Run `python -m sandbox.ray_doctor` if grading looks slow.")
+            return
+
+        if mode == "require":
+            raise SweepError("no Ray head reachable and --ray-head=require; "
+                             "run `ray start --head` first, or use --ray-head=auto")
+
+        plan = ray_head.plan_head(tpt, max_parallel, cfg)
+        for note in plan.notes:
+            print(f"[sweep] ray: {note}")
+        for warning in plan.warnings:
+            print(f"[sweep] ray: WARNING — {warning}")
+        print(f"[sweep] ray: starting head — {plan.describe()}")
+        try:
+            self.address = ray_head.start_head(plan)
+        except Exception as e:
+            raise SweepError(f"could not start the Ray head, refusing to launch runs that would "
+                             f"each boot their own cluster:\n{e}") from e
+        self.temp_dir = plan.temp_dir
+        self.owned = True
+        self.env = {**plan.env(), "RAY_ADDRESS": self.address, "RAY_TMPDIR": plan.temp_dir}
+        print(f"[sweep] ray: head up at {self.address}  "
+              f"(inspect it with: RAY_ADDRESS={self.address} ray status)")
+
+    def child_env(self) -> dict[str, str]:
+        return {**os.environ, **self.env}
+
+    def teardown(self) -> None:
+        if not (self.owned and self.temp_dir):
+            return
+        n = ray_head.stop_head(self.temp_dir)
+        print(f"[sweep] ray: stopped the head this sweep started ({n} process(es))")
 
 
 def _flags_from_cmd(cmd: list[str]) -> dict[str, str]:
@@ -353,13 +427,13 @@ def print_status(sweep_dir: str) -> None:
 # --------------------------------------------------------------------------------------------------
 # launching
 # --------------------------------------------------------------------------------------------------
-def _launch(entry: dict) -> subprocess.Popen:
+def _launch(entry: dict, env: dict[str, str] | None = None) -> subprocess.Popen:
     os.makedirs(entry["log_path"], exist_ok=True)
     out = open(os.path.join(entry["log_path"], "launch.out"), "a")
     # start_new_session: the run gets its own process group, so Ctrl-C / death of this supervisor
     # does not take the runs down with it.
     proc = subprocess.Popen(entry["cmd"], cwd=HERE, stdout=out,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+                            stderr=subprocess.STDOUT, start_new_session=True, env=env)
     entry["pid"] = proc.pid
     entry["started_at"] = datetime.now().isoformat(timespec="seconds")
     entry["returncode"] = None
@@ -367,7 +441,7 @@ def _launch(entry: dict) -> subprocess.Popen:
 
 
 def supervise(sweep_dir: str, manifest: dict, stagger: float,
-              max_parallel: int, refresh: float) -> int:
+              max_parallel: int, refresh: float, env: dict[str, str] | None = None) -> int:
     """Run the queue to completion: at most ``max_parallel`` runs in flight, ``stagger`` seconds
     between launches, a status table every ``refresh`` seconds. Returns the number that failed."""
     pending = [e for e in manifest["entries"] if e.get("returncode") != 0
@@ -403,7 +477,7 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float,
         now = time.monotonic()
         if pending and len(live) < max_parallel and (not live or now - last_launch >= stagger):
             entry = pending.pop(0)
-            live[entry["name"]] = _launch(entry)
+            live[entry["name"]] = _launch(entry, env)
             last_launch = now
             done = len(manifest["entries"]) - len(pending) - len(live)
             print(f"[sweep] launched {entry['name']} (pid {entry['pid']}) — "
@@ -447,7 +521,7 @@ def build_specs(sweep_file: str, sweep_dir_override: str | None) -> tuple[str, d
         raise SweepError(f"unknown top-level key(s) {sorted(unknown)}; expected sweep/common/grid/runs")
 
     settings = dict(raw.get("sweep") or {})
-    unknown = set(settings) - {"name", "max_parallel", "stagger", "server_max_num_seqs"}
+    unknown = set(settings) - {"name", "max_parallel", "stagger", "server_max_num_seqs", "ray"}
     if unknown:
         raise SweepError(f"unknown key(s) in `sweep`: {sorted(unknown)}")
     name = settings.get("name") or os.path.splitext(os.path.basename(sweep_file))[0]
@@ -496,8 +570,9 @@ def main() -> int:
                    help="Seconds between launches (default: sweep.stagger, else 120).")
     p.add_argument("--refresh", type=float, default=60.0, help="Status-table interval, seconds.")
     p.add_argument("--ray-head", choices=["auto", "require", "skip"], default="auto",
-                   help="auto: start a shared Ray head if none is up; require: fail if none; "
-                        "skip: leave Ray alone (each run boots its own cluster).")
+                   help="auto: start a shared Ray head sized from this box's cgroup if none is up, "
+                        "and stop it when the sweep drains; require: attach to an existing head, "
+                        "fail if none; skip: leave Ray alone (each run boots its own cluster).")
     a = p.parse_args()
 
     if a.status:
@@ -531,17 +606,41 @@ def main() -> int:
     if a.print_cmds:
         print(f"[sweep] {manifest['name']}: {len(manifest['entries'])} run(s) -> {sweep_dir}")
         print(f"[sweep] max_parallel={max_parallel} stagger={stagger:g}s")
+        # Show exactly how the head would be sized on THIS box without starting it: the numbers come
+        # from the cgroup, so this is the way to check a machine before committing a sweep to it.
+        tpt = threads_per_task(manifest["entries"])
+        stale = ray_head.diagnose_default_address_file()
+        if stale:
+            print(f"\n[sweep] ray: NOTE — {stale}")
+        try:
+            plan = ray_head.plan_head(tpt, max_parallel, dict(settings.get("ray") or {}))
+            print("\n# ray head that would be started")
+            for note in plan.notes:
+                print(f"#   {note}")
+            for warning in plan.warnings:
+                print(f"#   WARNING: {warning}")
+            print(f"#   env: " + " ".join(f"{k}={v}" for k, v in plan.env().items()))
+            print(" ".join(plan.argv()))
+        except ValueError as e:
+            print(f"\n# ray head CANNOT be sized on this box: {e}")
         for entry in manifest["entries"]:
             print(f"\n# {entry['name']}\n" + " ".join(entry["cmd"]))
         return 0
 
     check_server(manifest["entries"], max_parallel, settings.get("server_max_num_seqs"))
-    ensure_ray_head(a.ray_head)
+
+    tpt = threads_per_task(manifest["entries"])
+    head = RayHead()
+    head.ensure(a.ray_head, tpt, max_parallel, dict(settings.get("ray") or {}))
 
     _write_manifest(sweep_dir, manifest)
     print(f"[sweep] {manifest['name']}: {len(manifest['entries'])} run(s) -> {sweep_dir} "
           f"(max_parallel={max_parallel}, stagger={stagger:g}s)")
-    return 1 if supervise(sweep_dir, manifest, stagger, max_parallel, a.refresh) else 0
+    # supervise() exits the process on SIGINT/SIGTERM and deliberately leaves the runs alive, so the
+    # head must survive that path — only tear it down when the queue actually drained.
+    failed = supervise(sweep_dir, manifest, stagger, max_parallel, a.refresh, head.child_env())
+    head.teardown()
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
