@@ -1,0 +1,164 @@
+# =================================================================================================
+# SUPERSEDED 2026-07-27 — DO NOT LAUNCH. Split into two files, because circle packing is GPU-bound
+# and erdos/ac are CPU-bound and they want different max_parallel / num-cpus-per-task / eval-timeout:
+#     sweeps/baselines_gptoss_cp.yaml     circle_packing_26 + _32   (20 runs)
+#     sweeps/baselines_gptoss_hard.yaml   erdos + ac1 + ac2         (30 runs)
+# Kept only as the record of what produced runs/baselines_gptoss (2 complete circle_packing runs
+# plus partial erdos/ac1). Those were made at num-cpus-per-task 2 and eval-timeout 530.
+# =================================================================================================
+# EXPERIMENT 0 — no-past-experience baselines, gpt-oss-120b  (INESC-ID, 2x A100 80GB)
+#
+# Two baselines, both with NO past solutions in the prompt (`n-context: 0`):
+#   * parent-source: initial  -> BEST-OF-N. Every generation restarts from the problem's seed
+#     solution 50 x 150 = 7,500 independent samples of the gen-0 prompt.
+#   * parent-source: puct     -> TTT-DISCOVER WITHOUT RL. PUCT picks parents from the buffer, so past
+#     experience reaches the model only through *which solution it is asked to improve*.
+#
+# 5 problems x 5 seeds x 2 baselines = 50 runs. Seeds vary only the AC initial construction and give
+# each replicate its own identity; the real replicate-to-replicate variation is vLLM sampling at
+# temperature 1.0 (unseeded — a run is NOT bit-reproducible, by design).
+#
+# ---------------------------------------------------------------------------------------------
+# 1. START THE SERVER (once, in its own tmux window)
+# ---------------------------------------------------------------------------------------------
+#   cd projects/phd/R2/LLMs/local/vllm_provider/ && source .venv/bin/activate
+#
+#   CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/scratch/vicstorage \
+#   vllm serve openai/gpt-oss-120b \
+#       --tensor-parallel-size 2 \
+#       --async-scheduling \
+#       --gpu-memory-utilization 0.95 \
+#       --max-model-len 128000 \
+#       --max-num-seqs 320 \
+#       --max-num-batched-tokens 16384 \
+#       --reasoning-parser openai_gptoss \
+#       --port 8001
+#
+#   --max-num-seqs 320: peak in-flight sequences = max_parallel(2) x groups-per-batch(5) x
+#       group-size(30) = 300. Below that the excess queues server-side instead of co-batching.
+#   --max-model-len 128000: not a memory reservation (the KV pool is set by
+#       gpu-memory-utilization), so there is nothing to gain by sizing it down. At n-context 0
+#       prompts are ~2-5k tokens, so prompt + max-tokens(34k) is nowhere near the ceiling.
+#   --reasoning-parser openai_gptoss: REQUIRED, and not only for --save-reasoning. Without it the
+#       chain of thought stays inside `content` and code extraction can pick a ```python fence out
+#       of the reasoning instead of the answer.
+#
+# ---------------------------------------------------------------------------------------------
+# 2. LAUNCH (run_sweep starts the shared Ray head itself if none is up)
+# ---------------------------------------------------------------------------------------------
+#   cd src && tmux new -s bl_gptoss
+#   python run_sweep.py sweeps/baselines_gptoss.yaml --print-cmds   # inspect first
+#   python run_sweep.py sweeps/baselines_gptoss.yaml --sweep-dir runs/baselines_gptoss
+#   python run_sweep.py --status /scratch/vicstorage/runs/baselines_gptoss    # any time, any shell
+#
+#   DISK, measured (not guessed) at `reasoning-effort medium`, and small either way:
+#     with reasoning traces     ~22 KB/candidate  -> 159 MB/run -> ~7.9 GB for 50 runs
+#     without (save-reasoning: false, as set below)  ~8 KB      ->  75 MB/run -> ~3.7 GB
+#   Both fit $HOME (95 GB free, 80 % used when this was written). Two reasons to still prefer
+#   /scratch (2.7 TB, local disk): $HOME is an NFS mount, and a campaign writes ~1M small files on
+#   the grading path, where NFS latency is worst; and at `reasoning-effort high` traces would be
+#   ~5x bigger (~25 GB), so the headroom evaporates if that knob changes.
+#
+# ---------------------------------------------------------------------------------------------
+# 3. COST — READ THIS BEFORE LAUNCHING ALL 50 RUNS
+# ---------------------------------------------------------------------------------------------
+# This box delivers ~500 aggregate decode tok/s for gpt-oss-120b (measured: 368k tokens in a 739 s
+# generation of 90 candidates). Cost is therefore set almost entirely by tokens/candidate:
+#
+#   tokens/candidate   s/candidate   h/run (7,500 cand)   50 runs
+#   3,500 (measured @ reasoning-effort medium)   7      15 h     ~31 days
+#   8,000                                       16     33 h     ~69 days
+#   20,000                                      40     83 h     ~7 months
+#
+# `reasoning-effort high` has NOT been measured here, and the one high-effort observation we have is
+# bad: ~70 % of completions produced no code because they exhausted a 26k budget on hidden reasoning.
+# If high effort really averages ~20k tokens/candidate, this sweep is a multi-month job.
+#
+# So: run sweeps/calibrate_gptoss.yaml FIRST (2 runs x 3 generations, ~1 h) and read
+# `tokens_per_completion`, `decode_p99` and `truncated` out of progress.csv. Then either keep this
+# design or use the scaled-down grid at the bottom of this file.
+#
+# gpt-oss has no way to cap reasoning tokens (no thinking_token_budget for harmony — see
+# docs/PERF_KNOBS.md), so max-tokens is the only bound and a candidate that spends it all on
+# reasoning returns nothing. TTT-Discover avoided this with two-phase sampling: cap prompt+thinking
+# at 26k, then re-prompt with "... okay, I am out of thinking tokens" + the final-channel marker to
+# force an answer. We do not implement that yet; it is the fix if truncation turns out to be high.
+# =================================================================================================
+
+sweep:
+  name: baselines_gptoss
+  max_parallel: 2                # 2 runs per server is the biggest campaign-level win: vLLM
+                                 # co-batches them, so one run's generation fills the GPU while the
+                                 # other is grading. More than 2 does not add throughput (the GPU
+                                 # saturates at ~20 concurrent sequences) and slows each run down.
+  stagger: 180                   # long enough that two runs' generation phases interleave rather
+                                 # than land on the same grading barrier
+  server_max_num_seqs: 320
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: openai/gpt-oss-120b
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: medium         # TTT-Discover's renderer is `gpt_oss_high_reasoning`. See the cost
+                                 # note above before trusting this for 50 runs.
+
+  # --- token budgets (fixed across every experiment in this project) --------------------------
+  max-tokens: 34000              # reasoning + answer per candidate. Mirrors TTT-Discover's 32,768
+                                 # context window (their phase1_max_tokens=26000 counts prompt +
+                                 # thinking, leaving ~6.7k for the forced final answer).
+  max-context-tokens: 94000      # inert at n-context 0; kept so the budget is identical when the
+                                 # ICL experiments start using context selection.
+  temperature: 1.0               # TTT-Discover's value
+
+  # --- search shape --------------------------------------------------------------------------
+  n-context: 0                   # THE baseline property: no past solutions in the prompt
+  groups-per-batch: 5            # parents per generation
+  group-size: 20                  # children per parent  -> 100 candidates/generation
+  num-generations: 30            # 7,500 candidates/run (TTT-Discover: 8 x 64 x 50 = 25,600)
+
+  # --- execution -----------------------------------------------------------------------------
+  save-reasoning: false          # traces off for now. Only the FILES go away: the reasoning/answer
+                                 # token split, decode percentiles and truncation counts are still
+                                 # measured (via /tokenize) and land in progress.csv. Note the SFT/RL
+                                 # experiments in the plan train on traces, so if you ever want to
+                                 # reuse these runs as training data they would have to be re-run —
+                                 # ~4 GB extra for all 50, if that ever looks worth it.
+
+  max-gen-concurrency: 5         # = groups-per-batch: all 5 parents' requests in flight at once.
+                                 # No chunking (--grade-chunk-size), measured as no gain here.
+  num-cpus-per-task: 2           # UNIFORM ON PURPOSE. The shared Ray head's cpu_scheduler is a
+                                 # detached actor created by the FIRST run and partitions cores into
+                                 # fixed-size groups, so a queue mixing 1-cpu (circle_packing,
+                                 # erdos) and 2-cpu (ac1, ac2) problems would silently mis-size one
+                                 # family. Pinning everything at 2 costs cp/erdos some grading
+                                 # parallelism (96 -> 48 slots) — cheap, since the run is
+                                 # decode-bound — and keeps one head valid for all 5 problems.
+                                 # Alternative: split this file by family and `ray stop`/`start`
+                                 # between them.
+  # eval-timeout: left at the registry defaults (circle_packing 530 s, erdos/ac 1100 s). PERF_KNOBS
+  # suggests 120 for circle_packing (p95 of valid solves is 72 s); verify with
+  # results/recheck_failures.py on the first finished run before cutting it.
+
+grid:
+  # Key order = launch order. `seed` first means the queue finishes a whole replicate (all problems,
+  # both baselines) before starting the next one, so partial results are already analysable.
+  seed: [1, 2, 3, 4]
+  parent-source: [initial, puct]
+  problem: [circle_packing_26, circle_packing_32, erdos, ac1, ac2]
+  # -> 50 runs named e.g. circle_packing_26_s-1_ps-initial
+
+# =================================================================================================
+# SCALED-DOWN ALTERNATIVE — if calibration says the grid above is too expensive.
+# Same 5 problems and both baselines, 3 seeds, half the candidates per run (25 gens x 5 x 30):
+#   * 30 runs x 3,750 candidates = 112,500 candidates (vs 375,000) = 3.3x cheaper
+#   * 3 seeds still gives a spread; 25 generations is where the best-so-far curve has usually
+#     flattened in past circle_packing runs.
+# Replace `grid:` above with:
+#
+# common:  (change one key)
+#   num-generations: 25
+# grid:
+#   seed: [1, 2, 3]
+#   parent-source: [initial, puct]
+#   problem: [circle_packing_26, circle_packing_32, erdos, ac1, ac2]
+# =================================================================================================

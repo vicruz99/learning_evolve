@@ -1,0 +1,183 @@
+# =================================================================================================
+# EXPERIMENT 0 (part 2 of 2) — no-past-experience baselines, ERDOS + AC1 + AC2, Qwen3.6-27B
+# Bosch, B200 (H200 works unchanged).  Companion file: baselines_qwen_cp.yaml (circle packing).
+#
+# >>> RUN THIS FILE ONLY AFTER RESTARTING THE RAY HEAD <<<
+#       ray stop && ray start --head
+#     `num-cpus-per-task` is baked into a DETACHED `cpu_scheduler` actor created by the first run to
+#     touch the head, and `get_if_exists=True` means a stale actor is silently REUSED with the old
+#     group size. Both files happen to use 1 here, but restart anyway so the actor's group_size is
+#     unambiguous — a mismatch between the actor's pinning and Ray's reservation is exactly the bug
+#     that wasted half the INESC box in the first gpt-oss campaign.
+#
+# Read sweeps/baselines_gptoss_hard.yaml for the full argument behind this split and the parallelism
+# reasoning; it is host-independent and not repeated here. The short version:
+#
+#   These three problems are CPU-BOUND; circle packing is GPU-BOUND. Measured on the gpt-oss campaign
+#   with identical search shape and ~370-410k decode tokens/generation either way:
+#       circle_packing  ~349 s/generation, GPU busy,  ~630 core-s of grading
+#       erdos          ~2273 s/generation, GPU at 0 %, ~40,000 core-s of grading
+#       ac1            ~3452 s/generation, GPU at 0 %
+#   Identical GPU work, 4-6x the wall clock, with the accelerators at literal zero while grading.
+#
+#   MORE PARALLEL RUNS DOES NOT FIX THAT for this family. Total grading work is fixed, so campaign
+#   time = (total eval core-seconds) / (cores) regardless of how many runs are in flight; extra runs
+#   share the same throughput and each goes slower. The only genuine gain is keeping the CPU busy
+#   during the generation phases — and on only 64 cores that window is even smaller, because grading
+#   takes proportionally longer while the decode phase does not. Hence max_parallel 2 here, where the
+#   96-core reference used 3: at identical total throughput, fewer concurrent runs means individual
+#   runs COMPLETE SOONER, which is what makes partial results analysable.
+#   What DOES use the idle GPU is co-scheduling the circle-packing sweep on the same head (its grading
+#   load is far lighter than these problems'). That is a deliberate option, not the default: it
+#   requires one shared head and therefore one num-cpus-per-task for both files (=1, correct for every
+#   problem), and on 64 cores it will visibly slow this file down — check queue_p50 before and after.
+#
+# >>> THIS BOX HAS 64 CORES; the reference measurements above are from a 96-core box. <<<
+#     Grading parallelism is `cores // num-cpus-per-task` = 64 concurrent evals, so this family — which
+#     is 85-93 % grading — runs about 1.5x SLOWER here than those numbers imply. Core count matters far
+#     more for this file than the B200 does: the GPU upgrade and the tighter thinking budget both
+#     shrink only the ~10 % of the wall clock that is decode. Budget accordingly (see COST).
+#
+# ---------------------------------------------------------------------------------------------
+# EVAL TIMEOUT: LEFT AT THE REGISTRY DEFAULT (1100 s) ON PURPOSE
+# ---------------------------------------------------------------------------------------------
+# The maximum time a *valid* erdos/ac solution takes is still unknown — it was never recorded on the
+# gpt-oss side either. What we do know argues against cutting it blind:
+#   * eval_timeout failures are RARE here (erdos 6/800 candidates, ac1 6/500) and were the
+#     generation's straggler in only 1 of 5 and 1 of 4 of the generations containing one — unlike
+#     circle_packing, where the timeout was the straggler 31/31 times. So the payoff is small.
+#   * these evals are genuinely slow (in-flight eval processes were observed at 929 s of runtime), so
+#     the tail sits much closer to 1100 s than circle_packing's did to 530 s. Cutting it would
+#     reclassify slow-but-valid solutions as failures — corrupting results, not just saving time.
+#
+# It is MEASURED now rather than guessed. Every run records, per candidate:
+#     events.jsonl : eval_seconds (the program's own runtime — the only thing --eval-timeout bounds)
+#                    queue_seconds (waiting for a free CPU group)
+#                    grade_seconds (end-to-end)
+#     progress.csv : eval_p50, eval_p90, eval_p99, eval_max, queue_p50, queue_max,
+#                    grade_p50, grade_max
+#     icl.log      : "gen N eval/candidate | p50 .. p99 .. max .. | eval_timeout=1100s (X% used by
+#                    the slowest) | grade p50 .. max .."
+# After the first few generations, read eval_max/eval_p99 over the VALID candidates and set the
+# timeout from that. Two caveats when reading those numbers:
+#   * grade_seconds exceeds eval_seconds by queueing PLUS a fixed per-candidate harness cost, so
+#     compare eval_* (not grade_*) against the timeout and use queue_* to judge contention.
+#   * eval_seconds INCLUDES fresh-interpreter startup. Measured on the INESC box, `import numpy` from
+#     an NFS-mounted venv costs ~1.1 s under a 40-way concurrent burst versus 0.18 s warm and serial.
+#     Irrelevant against these problems' minutes-long evals, but do not mistake it for algorithm time
+#     on cheap candidates. Putting the venv and the run dir on LOCAL disk removes it.
+#
+# ---------------------------------------------------------------------------------------------
+# SERVER: identical to sweeps/baselines_qwen_cp.yaml — see that file for the full command, the
+# vLLM >= 0.19.0 requirement (thinking_token_budget is silently DROPPED by older versions, and the
+# Qwen3_5 architecture is absent from the registry before 0.19.1), the FP8 rationale, and the curl
+# that verifies the reasoning cap is actually enforced. Do not skip that check.
+#
+#   HF_HOME=<scratch> \
+#   vllm serve Qwen/Qwen3.6-27B-FP8 --tensor-parallel-size 1 --async-scheduling \
+#       --gpu-memory-utilization 0.90 --max-model-len 128000 --max-num-seqs 256 \
+#       --max-num-batched-tokens 16384 --enable-prefix-caching \
+#       --reasoning-parser qwen3 --port 8001
+#
+# LAUNCH
+#   ray stop && ray start --head
+#   cd src && tmux new -s bl_qwen_hard
+#   python run_sweep.py sweeps/baselines_qwen_hard.yaml --print-cmds
+#   python run_sweep.py sweeps/baselines_qwen_hard.yaml --sweep-dir <big-disk>/runs/baselines_qwen_hard
+#   python run_sweep.py --status <big-disk>/runs/baselines_qwen_hard
+#   To halt: kill the run_sweep.py pid FIRST (--stop leaves the supervisor alive and it relaunches the
+#   next queued run), then `python run_sweep.py --stop <dir>`.
+#
+#   USE A LOCAL DISK for --sweep-dir. The sandbox writes each candidate's program and reads back its
+#   pickled result through the run directory: ~80 ms/candidate on NFS versus ~0.3 ms on local disk.
+#
+# COST — THIS FILE IS THE EXPENSIVE HALF; READ BEFORE LAUNCHING ALL 30 RUNS
+#   Nothing here is measured on this hardware, and the two hardware differences pull OPPOSITE ways:
+#   the B200 (and the 10k thinking cap) speed up the decode share, which is only ~10 % of the wall for
+#   these problems, while the grading share — 85-93 % — is set by CPU and this box has 64 cores against
+#   the reference 96, making grading ~1.5x SLOWER. Net: expect little or no speedup on this family, and
+#   possibly a slowdown.
+#   Working from the gpt-oss per-generation numbers, with num-cpus-per-task 1 doubling the slots but 64
+#   cores giving back a third of that (~1500-2500 s/generation), 30 runs x 30 generations at
+#   max_parallel 2 is of order 1-2 WEEKS. That is very likely not worth it as configured.
+#   >>> START WITH THE SCALED-DOWN GRID AT THE BOTTOM, or with ONE run per problem: read eval_p90 /
+#       eval_p99 and wall_seconds from the first few generations, then decide the real grid. <<<
+#
+# FIRST RUN ON THIS BOX — read these before scaling up (see baselines_qwen_cp.yaml for detail):
+#   1. reasoning cap enforced?  2. reasoning separated by the parser?  3. success_rate sane on
+#   gpt-oss-era prompts?  4. eval_p99 / eval_max — this is the file where that matters most.
+# =================================================================================================
+
+sweep:
+  name: baselines_qwen_hard
+  max_parallel: 2                # NOT higher: CPU-bound, so extra runs share fixed throughput rather
+                                 # than adding any, and on 64 cores the CPU-idle window that would
+                                 # justify a third run is smaller still. Fewer concurrent runs also
+                                 # means each one finishes sooner at the same total throughput.
+  stagger: 240                   # longer than the cp file: these generations are much longer, and
+                                 # staggering is what keeps two runs' grading bursts from colliding
+  server_max_num_seqs: 256       # must match the server's --max-num-seqs
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: Qwen/Qwen3.6-27B-FP8
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: none         # gpt-oss-only knob; `none` keeps it out of the request entirely
+
+  # --- token budgets (fixed across every experiment in this project) --------------------------
+  thinking-token-budget: 10000   # HARD cap on reasoning tokens; vLLM force-emits </think> at the
+                                 # limit so the candidate still produces an answer. NOT TTT-Discover's
+                                 # 26,000 — deliberately tighter for now. Barely binding on these
+                                 # problems: gpt-oss's MAX decode here was only ~9,200 tokens with zero
+                                 # truncations, so 10k sits just above the observed ceiling. Watch
+                                 # `truncated` and `reasoning_tokens` in progress.csv anyway; Qwen may
+                                 # be more verbose than gpt-oss at medium effort.
+  max-tokens: 34000              # reasoning + answer. Loose on purpose (10k thinking leaves ~24k for
+                                 # the answer): shrinking it would save nothing, since KV was never the
+                                 # binding constraint and preemptions were 0. Kept identical
+                                 # everywhere so budgets never differ between experiments.
+  max-context-tokens: 94000      # inert at n-context 0; kept for budget parity with the ICL runs
+  temperature: 1.0
+
+  # --- search shape --------------------------------------------------------------------------
+  n-context: 0
+  groups-per-batch: 5
+  group-size: 20                 # 100 candidates/generation
+  num-generations: 30
+
+  # --- execution -----------------------------------------------------------------------------
+  save-reasoning: false
+  max-gen-concurrency: 5
+  num-cpus-per-task: 1           # every eval child measured single-threaded and pinned to one core on
+                                 # ALL problems on the INESC box (including ac1, whose registry
+                                 # default is 2), so this reserves what is actually used instead of
+                                 # stranding a core. Uniform across problems on purpose: one value
+                                 # keeps a single cpu_scheduler valid for the whole queue. VERIFY once
+                                 # here with `ps -eo nlwp,cmd | grep -A1 ray::run_program`.
+  # eval-timeout: intentionally NOT set -> registry defaults (erdos 1100 s, ac1/ac2 1100 s).
+  #   See the long note above: the valid-solution tail here is unknown and close to the limit, so
+  #   cutting it blind would corrupt results rather than just save time. The new eval_* columns in
+  #   progress.csv are there to settle it from data after the first runs.
+  # grade-chunk-size: not set. Worth ~20 % HERE (unlike circle packing, where it measured as no gain):
+  #   unchunked, a parent generates all 20 children and only then grades them, so the GPU idles
+  #   through the entire grading phase and all 5 parents dump 100 evals at once. Chunking overlaps
+  #   chunk A's grading with chunk B's generation and smooths the burst. Left off so this campaign
+  #   stays comparable to the circle-packing one; enable it as a deliberate A/B.
+
+grid:
+  seed: [1, 2, 3, 4, 5]
+  parent-source: [initial, puct]
+  problem: [erdos, ac1, ac2]
+  # -> 30 runs named e.g. erdos_s-1_ps-puct
+
+# =================================================================================================
+# SCALED-DOWN ALTERNATIVE — very likely the right starting point for this file (see COST).
+# 3 seeds and 20 generations: 18 runs x 2,000 candidates = 36,000 (vs 90,000), ~2.5x cheaper.
+#
+# common:  (change one key)
+#   num-generations: 20
+# grid:
+#   seed: [1, 2, 3]
+#   parent-source: [initial, puct]
+#   problem: [erdos, ac1, ac2]
+# =================================================================================================
