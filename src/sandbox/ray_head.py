@@ -60,6 +60,10 @@ LSF_MEMLIMIT_FLOOR = 4 * GiB
 # something the submitter chose, and LSF multiplies it by the slot count to get the job ceiling.
 LSF_DEFAULT_PER_SLOT = 2 * GiB
 
+# Must match SandboxRewardEvaluator.TASK_MEMORY: what each eval task reserves from Ray's `memory`
+# resource. Ray admits min(cpu, memory) worth of tasks, so the heap has to cover the core count.
+TASK_MEMORY = GiB
+
 
 def thread_env(threads: int) -> dict[str, str]:
     """Thread-limit variables the head — and therefore every eval worker — must be started with.
@@ -143,6 +147,40 @@ def _cgroup_memory_limit() -> tuple[int | None, str]:
     return best, (best_at or "no memory limit found in this cgroup's ancestry")
 
 
+def _lsf_slots() -> tuple[int | None, str]:
+    """How many slots this job holds, which is the multiplier on every per-slot LSF limit.
+
+    ``LSB_DJOB_NUMPROC`` is the obvious source but is not always exported into the process that ends
+    up running the sweep (a tmux session started outside the job, a re-attached shell). Getting this
+    wrong is not a small error: a per-slot MEMLIMIT read without its multiplier understates the real
+    ceiling by the slot count, which is how a `-M 4096MB` allocation on ~120 slots was mistaken for
+    a 4 GiB budget and throttled a whole sweep to two concurrent evals.
+    """
+    raw = os.environ.get("LSB_DJOB_NUMPROC")
+    if raw and raw.strip().isdigit() and int(raw) > 0:
+        return int(raw), "LSB_DJOB_NUMPROC"
+
+    # "host1 8 host2 8" -> 16. Present in more contexts than LSB_DJOB_NUMPROC.
+    mcpu = os.environ.get("LSB_MCPU_HOSTS")
+    if mcpu:
+        parts = mcpu.split()
+        counts = [int(p) for p in parts[1::2] if p.isdigit()]
+        if counts:
+            return sum(counts), "LSB_MCPU_HOSTS"
+
+    jobid = os.environ.get("LSB_JOBID")
+    if jobid:
+        try:
+            proc = subprocess.run(["bjobs", "-noheader", "-o", "slots", jobid],
+                                  capture_output=True, text=True, timeout=30)
+            text = proc.stdout.strip()
+            if text.isdigit() and int(text) > 0:
+                return int(text), "bjobs slots"
+        except Exception:
+            pass
+    return None, "slot count undeterminable"
+
+
 def _lsf_memlimit() -> tuple[int | None, str]:
     """The memory ceiling LSF will enforce on this job, in bytes.
 
@@ -180,10 +218,13 @@ def _lsf_memlimit() -> tuple[int | None, str]:
     #   * `-M 262144MB` on -n 126 asks for 33 TB, which no host can satisfy, so the job never
     #     leaves PEND -- which is only explicable if -M is per-slot as well.
     # So an explicit -M is scaled identically; there is no "job-wide" spelling of this field.
-    slots = int(os.environ.get("LSB_DJOB_NUMPROC") or 0)
-    if slots > 1:
-        return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots"
-    return per_slot, f"bjobs memlimit={text}"
+    slots, slot_src = _lsf_slots()
+    if slots is None:
+        # Using the per-slot figure unscaled is not a conservative fallback, it is a known-wrong
+        # answer that under-reports the ceiling by the slot count and silently throttles grading.
+        # Better to fall through to node-based sizing than to trust a number we cannot complete.
+        return None, f"MEMLIMIT={text} is per-slot but the {slot_src} — ignoring it"
+    return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots ({slot_src})"
 
 
 def _meminfo_total() -> int:
@@ -481,17 +522,40 @@ def plan_head(threads_per_task: int, max_parallel: int, cfg: dict | None = None)
         raise ValueError(f"memory limit {limit / GiB:.1f}G is too small for a {obj / GiB:.1f}G "
                          "object store; lower sweep.ray.object_store_gb")
     concurrent = max(1, num_cpus // threads_per_task)
+
+    # An explicit override wins over every heuristic above. Provided because the detected limit can
+    # be a cgroup that has nothing to do with the batch allocation, and a wrong one here does not
+    # fail loudly — it silently throttles the whole sweep to a couple of evals.
+    if cfg.get("memory_gb"):
+        memory = int(float(cfg["memory_gb"]) * GiB)
+        notes.append(f"heap memory overridden to {memory / GiB:.0f}G by sweep.ray.memory_gb")
+
+    # Ray admits eval tasks against their declared TASK_MEMORY (1 GiB each), so the heap has to
+    # cover the CPU-bound concurrency or memory quietly becomes the binding constraint: `ray status`
+    # then shows a handful of busy cores, a full memory resource, and hundreds of pending tasks.
+    # Where the ceiling allows it, buy the headroom back rather than leaving cores idle.
+    needed = concurrent * TASK_MEMORY
+    if memory < needed and not cfg.get("memory_gb"):
+        headroom = int(0.95 * limit) - obj if limit else needed
+        if headroom >= needed:
+            notes.append(f"heap raised {memory / GiB:.0f}G -> {needed / GiB:.0f}G so all "
+                         f"{concurrent} eval slots are admissible (was below 1G/eval)")
+            memory = needed
+        else:
+            admits = max(1, int(headroom / TASK_MEMORY))
+            memory = max(memory, min(headroom, needed))
+            warnings.append(
+                f"MEMORY, NOT CPU, WILL LIMIT THIS SWEEP: the {limit / GiB:.1f}G ceiling admits "
+                f"~{admits} concurrent evals but the cores allow {concurrent}, so most of the box "
+                f"sits idle with tasks pending. Either raise the allocation (LSF memory is PER "
+                f"SLOT: `-M 4096MB -R \"rusage[mem=4096]\"`), or if that {limit / GiB:.1f}G figure "
+                "looks wrong for this machine, override it with sweep.ray.memory_gb.")
+
     per_eval = memory / concurrent
-    notes.append(f"heap memory = {frac:g} x limit - object store; {concurrent} concurrent evals "
-                 f"=> {per_eval / GiB:.1f}G each, {(limit - memory) / GiB:.0f}G left for the "
-                 f"{max_parallel} driver(s)")
-    # Ray admits tasks against their declared TASK_MEMORY (1 GiB). If the heap cannot cover the
-    # CPU-bound concurrency, memory silently becomes the binding constraint and cores sit idle.
-    if per_eval < GiB:
-        warnings.append(
-            f"only {per_eval / GiB:.2f}G of heap per concurrent eval, but each eval reserves 1G — "
-            f"Ray will admit ~{int(memory / GiB)} evals instead of the {concurrent} the cores allow, "
-            "leaving cores idle. Raise the LSF memory per slot, or lower max_parallel.")
+    notes.append(f"heap {memory / GiB:.0f}G for {concurrent} concurrent evals => "
+                 f"{per_eval / GiB:.1f}G each" +
+                 (f", {(limit - memory) / GiB:.0f}G left for the {max_parallel} driver(s)"
+                  if limit else ""))
 
     # --- temp dir --------------------------------------------------------------------------------
     # Per-host and per-job. Even if /tmp turns out to be shared between machines, two heads can then

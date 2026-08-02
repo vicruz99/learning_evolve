@@ -309,13 +309,25 @@ def check_server(entries: list[dict], max_parallel: int, server_max_num_seqs: in
             print(f"[sweep] WARNING: {url} does not serve {model!r} (serves: {', '.join(served)}) "
                   f"— every request of those runs will fail")
 
-    concurrency = sorted((int(f.get("max-gen-concurrency", 8)) for f in flagsets), reverse=True)
-    peak = sum(concurrency[:max_parallel])
-    print(f"[sweep] peak in-flight requests: {peak} "
-          f"(top {min(max_parallel, len(concurrency))} runs' --max-gen-concurrency)")
-    if server_max_num_seqs and peak > server_max_num_seqs:
-        print(f"[sweep] WARNING: peak {peak} exceeds the server's --max-num-seqs "
-              f"({server_max_num_seqs}); the excess queues server-side instead of co-batching")
+    # --max-num-seqs counts SEQUENCES, not requests, and each request asks for n=group-size
+    # completions. Comparing request counts against it under-reports the load by that factor.
+    loads = []
+    for f in flagsets:
+        group = int(f.get("group-size", 1))
+        chunk = int(f.get("grade-chunk-size", 0) or 0) or group
+        n_chunks = -(-group // chunk)                       # ceil: requests each group splits into
+        reqs = min(int(f.get("max-gen-concurrency", 8)), int(f.get("groups-per-batch", 1)) * n_chunks)
+        loads.append((reqs * chunk, reqs))
+    loads.sort(reverse=True)
+    peak_seqs = sum(s for s, _ in loads[:max_parallel])
+    peak_reqs = sum(r for _, r in loads[:max_parallel])
+    top = min(max_parallel, len(loads))
+    print(f"[sweep] peak in-flight: {peak_seqs} sequences across {peak_reqs} requests "
+          f"(top {top} run(s); a request carries n=group-size completions)")
+    if server_max_num_seqs and peak_seqs > server_max_num_seqs:
+        print(f"[sweep] WARNING: peak {peak_seqs} sequences exceeds the server's --max-num-seqs "
+              f"({server_max_num_seqs}); the excess queues server-side instead of co-batching. "
+              "If another sweep shares this server, double it.")
 
 
 # --------------------------------------------------------------------------------------------------
