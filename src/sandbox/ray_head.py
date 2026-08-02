@@ -147,6 +147,40 @@ def _cgroup_memory_limit() -> tuple[int | None, str]:
     return best, (best_at or "no memory limit found in this cgroup's ancestry")
 
 
+def _lsf_slots() -> tuple[int | None, str]:
+    """How many slots this job holds, which is the multiplier on every per-slot LSF limit.
+
+    ``LSB_DJOB_NUMPROC`` is the obvious source but is not always exported into the process that ends
+    up running the sweep (a tmux session started outside the job, a re-attached shell). Getting this
+    wrong is not a small error: a per-slot MEMLIMIT read without its multiplier understates the real
+    ceiling by the slot count, which is how a `-M 4096MB` allocation on ~120 slots was mistaken for
+    a 4 GiB budget and throttled a whole sweep to two concurrent evals.
+    """
+    raw = os.environ.get("LSB_DJOB_NUMPROC")
+    if raw and raw.strip().isdigit() and int(raw) > 0:
+        return int(raw), "LSB_DJOB_NUMPROC"
+
+    # "host1 8 host2 8" -> 16. Present in more contexts than LSB_DJOB_NUMPROC.
+    mcpu = os.environ.get("LSB_MCPU_HOSTS")
+    if mcpu:
+        parts = mcpu.split()
+        counts = [int(p) for p in parts[1::2] if p.isdigit()]
+        if counts:
+            return sum(counts), "LSB_MCPU_HOSTS"
+
+    jobid = os.environ.get("LSB_JOBID")
+    if jobid:
+        try:
+            proc = subprocess.run(["bjobs", "-noheader", "-o", "slots", jobid],
+                                  capture_output=True, text=True, timeout=30)
+            text = proc.stdout.strip()
+            if text.isdigit() and int(text) > 0:
+                return int(text), "bjobs slots"
+        except Exception:
+            pass
+    return None, "slot count undeterminable"
+
+
 def _lsf_memlimit() -> tuple[int | None, str]:
     """The memory ceiling LSF will enforce on this job, in bytes.
 
@@ -184,10 +218,13 @@ def _lsf_memlimit() -> tuple[int | None, str]:
     #   * `-M 262144MB` on -n 126 asks for 33 TB, which no host can satisfy, so the job never
     #     leaves PEND -- which is only explicable if -M is per-slot as well.
     # So an explicit -M is scaled identically; there is no "job-wide" spelling of this field.
-    slots = int(os.environ.get("LSB_DJOB_NUMPROC") or 0)
-    if slots > 1:
-        return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots"
-    return per_slot, f"bjobs memlimit={text}"
+    slots, slot_src = _lsf_slots()
+    if slots is None:
+        # Using the per-slot figure unscaled is not a conservative fallback, it is a known-wrong
+        # answer that under-reports the ceiling by the slot count and silently throttles grading.
+        # Better to fall through to node-based sizing than to trust a number we cannot complete.
+        return None, f"MEMLIMIT={text} is per-slot but the {slot_src} — ignoring it"
+    return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots ({slot_src})"
 
 
 def _meminfo_total() -> int:
