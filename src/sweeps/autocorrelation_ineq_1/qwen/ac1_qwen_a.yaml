@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------------------------
+# SERVER (one server serves BOTH halves of this problem)
+#   HF_HOME=<scratch> \
+#   vllm serve Qwen/Qwen3.6-27B-FP8 --tensor-parallel-size 1 --async-scheduling \
+#       --gpu-memory-utilization 0.90 --max-model-len 128000 --max-num-seqs 256 \
+#       --max-num-batched-tokens 16384 --enable-prefix-caching \
+#       --reasoning-parser qwen3 --port 8001
+#
+# LAUNCH -- this is HALF of the ac1_qwen sweep; run _a and _b on two different machines.
+#   Do NOT `ray start` or export OMP_NUM_THREADS by hand. run_sweep.py starts the Ray head itself,
+#   sizes it from this machine's physical cores and LSF slots, sets all five thread limits from
+#   num-cpus-per-task (2 here) on the head process -- the only place that reaches eval workers --
+#   and stops it when the queue drains. Machines with 100 / 120 / 126 cores all size themselves.
+#
+#   LSF memory is PER SLOT. `-M 4096MB -R "rusage[mem=4096]"` on -n 126 is a 504 GB job ceiling;
+#   quoting a job total like `-M 262144MB` is multiplied by the slot count (33 TB) and the job
+#   never leaves PEND. The site's injected default is 1024 MB/slot, which is what killed job
+#   12666907 at exactly 1 G x 128 slots = 128 GB.
+#
+#   cd src && tmux new -s ac1_qwen_a
+#   python run_sweep.py sweeps/autocorrelation_ineq_1/qwen/ac1_qwen_a.yaml --print-cmds     # shows the exact `ray start`
+#   python run_sweep.py sweeps/autocorrelation_ineq_1/qwen/ac1_qwen_a.yaml --sweep-dir runs/ac1_qwen_a
+#   python run_sweep.py --status <big-disk>/runs/ac1_qwen_a
+#
+#   To halt: kill the run_sweep.py pid FIRST -- `--stop` leaves the supervisor alive and it
+#   immediately launches the next queued run -- then `python run_sweep.py --stop <dir>`.
+#
+# THIS FILE: 12 runs x 2400 candidates = 28,800 candidates, max_parallel 2.
+#   half a = every baseline (BoN + PUCT) plus a complete seed-1 replicate of both context sizes
+# ---------------------------------------------------------------------------------------------
+
+sweep:
+  name: ac1_qwen_a
+  max_parallel: 2                # grading throughput is fixed, so extra runs share it rather than
+                                 # adding any. The dial is queue_p50 in progress.csv.
+  stagger: 500                   # long generations; keep grading bursts out of phase
+  server_max_num_seqs: 256       # BOTH halves hit one server: peak in-flight is 4 x 5 = 20
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: Qwen/Qwen3.6-27B-FP8
+  vllm-base-url: http://rng-dl01-w26n08:8001/v1
+  reasoning-effort: none         # gpt-oss-only knob; `none` keeps it out of the request
+  thinking-token-budget: 12000   # HARD reasoning cap; vLLM force-emits </think> at the limit so the
+                                 # candidate still answers. Watch `truncated` / `reasoning_tokens`.
+
+  # --- token budgets (fixed across every experiment in this project) --------------------------
+  max-tokens: 34000              # max decode observed 21,241 (62 %) on cp26, ~8,900 on ac1
+  max-context-tokens: 84000      # the budget the context block is packed against
+  temperature: 1.0
+
+  # --- execution -----------------------------------------------------------------------------
+  save-reasoning: false
+  num-cpus-per-task: 2
+
+  # --- shape shared by every arm ---------------------------------------------------------------
+  problem: ac1
+  groups-per-batch: 6
+  group-size: 16                 # 6 x 16 = 96 candidates/generation
+  num-generations: 25            # 2400 candidates/run, identical across every arm
+  max-gen-concurrency: 5
+
+runs:
+  # --- Best-of-N, 3 seeds ---------------------------------------------------------------
+  # Same 2400 i.i.d. candidates as before, but drawn 96 at a time instead of all at once.
+  # parent-source=initial + n-context=0 means every candidate is sampled from the initial
+  # state with no information from earlier generations, so the generational split changes
+  # the batching and nothing else. It matters because loop.py gathers a whole generation
+  # before returning: 150 groups held 2400 live results and hit the LSF memory ceiling.
+  - {name: bon_s1, seed: 1, parent-source: initial, n-context: 0, groups-per-batch: 6, group-size: 16, num-generations: 25, max-gen-concurrency: 5}
+  - {name: bon_s2, seed: 2, parent-source: initial, n-context: 0, groups-per-batch: 6, group-size: 16, num-generations: 25, max-gen-concurrency: 5}
+  - {name: bon_s3, seed: 3, parent-source: initial, n-context: 0, groups-per-batch: 6, group-size: 16, num-generations: 25, max-gen-concurrency: 5}
+  # --- PUCT baseline, n-context 0, 3 seeds ----------------------------------------------
+  - {name: puct_s1, seed: 1, parent-source: puct, n-context: 0}
+  - {name: puct_s2, seed: 2, parent-source: puct, n-context: 0}
+  - {name: puct_s3, seed: 3, parent-source: puct, n-context: 0}
+  # --- seed 1 of both context sizes: a complete single-seed replicate of every arm ------
+  - {name: n10_s1_random, seed: 1, parent-source: puct, n-context: 10, context-strategy: random}
+  - {name: n10_s1_best, seed: 1, parent-source: puct, n-context: 10, context-strategy: best}
+  - {name: n10_s1_contrastive, seed: 1, parent-source: puct, n-context: 10, context-strategy: contrastive, mix-fraction: 0.7, mmr-lambda: 0.7}
+  - {name: n05_s1_random, seed: 1, parent-source: puct, n-context: 5, context-strategy: random}
+  - {name: n05_s1_best, seed: 1, parent-source: puct, n-context: 5, context-strategy: best}
+  - {name: n05_s1_contrastive, seed: 1, parent-source: puct, n-context: 5, context-strategy: contrastive, mix-fraction: 0.7, mmr-lambda: 0.7}
