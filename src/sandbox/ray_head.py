@@ -56,6 +56,10 @@ MAX_TEMP_DIR_LEN = 45
 # to enforce. One eval reserves 1 GiB, so honouring anything smaller would admit no tasks at all.
 LSF_MEMLIMIT_FLOOR = 4 * GiB
 
+# At or below this, a per-slot MEMLIMIT is the site's boilerplate rusage[mem=1024] rather than
+# something the submitter chose, and LSF multiplies it by the slot count to get the job ceiling.
+LSF_DEFAULT_PER_SLOT = 2 * GiB
+
 
 def thread_env(threads: int) -> dict[str, str]:
     """Thread-limit variables the head — and therefore every eval worker — must be started with.
@@ -168,7 +172,19 @@ def _lsf_memlimit() -> tuple[int | None, str]:
     if not match:
         return None, f"bjobs reported memlimit={text!r}"
     scale = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-    return int(float(match.group(1)) * scale[match.group(2).upper()]), f"bjobs memlimit={text}"
+    per_slot = int(float(match.group(1)) * scale[match.group(2).upper()])
+
+    # A small MEMLIMIT is the site's injected rusage[mem=1024] default, which LSF scales by slot
+    # count: "1 G" on -n 128 is a hard 128 GB job ceiling, and exceeding it is TERM_MEMLIMIT while
+    # the node itself sits nearly empty. Confirmed against a real kill at exactly 1G x 128.
+    #
+    # Whether an EXPLICIT -M is also per-slot is site configuration we have not confirmed, so it is
+    # left unscaled. The asymmetry is deliberate: under-estimating the ceiling only costs some
+    # unused headroom, while over-estimating it gets the job killed hours in.
+    slots = int(os.environ.get("LSB_DJOB_NUMPROC") or 0)
+    if slots > 1 and per_slot <= LSF_DEFAULT_PER_SLOT:
+        return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots"
+    return per_slot, f"bjobs memlimit={text} (treated as job-wide)"
 
 
 def _meminfo_total() -> int:
@@ -416,6 +432,21 @@ def plan_head(threads_per_task: int, max_parallel: int, cfg: dict | None = None)
         limit = min([v for v in (cg_mem, lsf_mem, total) if v])
         which = mem_where if cg_mem and limit == cg_mem else lsf_where
         notes.append(f"memory limit {limit / GiB:.1f}G from {which}")
+
+        if lsf_mem and "/slot" in lsf_where:
+            warnings.append(
+                f"this {lsf_mem / GiB:.0f}G ceiling is a SIDE EFFECT of -n, not a choice: the site "
+                f"injects rusage[mem=1024] per slot. Exceed it and LSF kills the job with "
+                "TERM_MEMLIMIT (SIGINT, then SIGTERM, then SIGKILL 10s apart) — and if the job is "
+                'an interactive shell, your terminal dies with it. Submit with an explicit '
+                '`-M 262144MB -R "rusage[mem=262144]"` to decouple memory from core count.')
+        # Ray's own OOM guard measures NODE memory, so on a big shared box it never fires before
+        # LSF's per-job ceiling does. Worth saying out loud: Ray will not save this job.
+        if total and limit < 0.5 * total:
+            warnings.append(
+                f"Ray's memory monitor watches NODE memory ({total / GiB:.0f}G), not your "
+                f"{limit / GiB:.0f}G LSF ceiling, so it will not fire before LSF kills the job. "
+                "Task admission below is the only in-process guard; size the request with headroom.")
     else:
         # No cgroup memory limit means the batch system handed out CPU slots but is NOT confining
         # our memory — so nothing stops us from taking the whole node's RAM. Sizing Ray from
