@@ -190,27 +190,35 @@ def _lsf_memlimit() -> tuple[int | None, str]:
     node's RAM and hands LSF a reason to kill the job hours into a sweep. Fails open: an
     undetectable limit returns None rather than guessing.
     """
-    raw = os.environ.get("LSB_CG_MEMLIMIT")            # set when cgroup enforcement IS on; bytes
+    per_slot: int | None = None
+    src = ""
+
+    # LSB_CG_MEMLIMIT carries the -M value verbatim, in bytes. It reads like a job-wide cgroup
+    # number and is NOT one: `-M 4096MB` on 122 slots sets it to 4 GiB, while the ceiling LSF
+    # actually enforces is 4 GiB x 122. Scaling it identically to the bjobs value is what keeps the
+    # two sources agreeing; reading it raw is how a 488 G allocation was mistaken for 4 G.
+    raw = os.environ.get("LSB_CG_MEMLIMIT")
     if raw:
         try:
-            return int(raw, 0), "LSB_CG_MEMLIMIT"
+            per_slot, src = int(raw, 0), "LSB_CG_MEMLIMIT"
         except ValueError:
             pass
 
-    jobid = os.environ.get("LSB_JOBID")
-    if not jobid:
-        return None, "not an LSF job"
-    try:
-        proc = subprocess.run(["bjobs", "-noheader", "-o", "memlimit", jobid],
-                              capture_output=True, text=True, timeout=30)
-    except Exception:
-        return None, "bjobs unavailable"
-    text = proc.stdout.strip()
-    match = re.match(r"([\d.]+)\s*([KMGT]?)B?", text, re.IGNORECASE)
-    if not match:
-        return None, f"bjobs reported memlimit={text!r}"
-    scale = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-    per_slot = int(float(match.group(1)) * scale[match.group(2).upper()])
+    if per_slot is None:
+        jobid = os.environ.get("LSB_JOBID")
+        if not jobid:
+            return None, "not an LSF job"
+        try:
+            proc = subprocess.run(["bjobs", "-noheader", "-o", "memlimit", jobid],
+                                  capture_output=True, text=True, timeout=30)
+        except Exception:
+            return None, "bjobs unavailable"
+        text = proc.stdout.strip()
+        match = re.match(r"([\d.]+)\s*([KMGT]?)B?", text, re.IGNORECASE)
+        if not match:
+            return None, f"bjobs reported memlimit={text!r}"
+        scale = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+        per_slot, src = int(float(match.group(1)) * scale[match.group(2).upper()]), "bjobs memlimit"
 
     # MEMLIMIT is PER SLOT and LSF enforces per_slot x nslots against the job's total RSS. Both ends
     # of this are confirmed empirically at this site:
@@ -223,8 +231,15 @@ def _lsf_memlimit() -> tuple[int | None, str]:
         # Using the per-slot figure unscaled is not a conservative fallback, it is a known-wrong
         # answer that under-reports the ceiling by the slot count and silently throttles grading.
         # Better to fall through to node-based sizing than to trust a number we cannot complete.
-        return None, f"MEMLIMIT={text} is per-slot but the {slot_src} — ignoring it"
-    return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots ({slot_src})"
+        return None, f"{src} is per-slot but the {slot_src} — ignoring it"
+
+    # Sanity: a scaled ceiling above the node's own RAM cannot be what LSF enforces, which means the
+    # value was job-wide after all (or the request was nonsense). Fall back to the raw figure.
+    total = _meminfo_total()
+    if total and per_slot * slots > total:
+        return per_slot, f"{src}={per_slot / GiB:.0f}G (x{slots} slots exceeds node RAM; job-wide)"
+    return (per_slot * slots,
+            f"{src}={per_slot / GiB:.0f}G/slot x {slots} slots ({slot_src})")
 
 
 def _meminfo_total() -> int:
