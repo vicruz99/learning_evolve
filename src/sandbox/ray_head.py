@@ -56,6 +56,10 @@ MAX_TEMP_DIR_LEN = 45
 # to enforce. One eval reserves 1 GiB, so honouring anything smaller would admit no tasks at all.
 LSF_MEMLIMIT_FLOOR = 4 * GiB
 
+# At or below this, a per-slot MEMLIMIT is the site's boilerplate rusage[mem=1024] rather than
+# something the submitter chose, and LSF multiplies it by the slot count to get the job ceiling.
+LSF_DEFAULT_PER_SLOT = 2 * GiB
+
 
 def thread_env(threads: int) -> dict[str, str]:
     """Thread-limit variables the head — and therefore every eval worker — must be started with.
@@ -168,7 +172,18 @@ def _lsf_memlimit() -> tuple[int | None, str]:
     if not match:
         return None, f"bjobs reported memlimit={text!r}"
     scale = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-    return int(float(match.group(1)) * scale[match.group(2).upper()]), f"bjobs memlimit={text}"
+    per_slot = int(float(match.group(1)) * scale[match.group(2).upper()])
+
+    # MEMLIMIT is PER SLOT and LSF enforces per_slot x nslots against the job's total RSS. Both ends
+    # of this are confirmed empirically at this site:
+    #   * the injected rusage[mem=1024] default killed a -n 128 job at exactly 1G x 128 = 128 GB;
+    #   * `-M 262144MB` on -n 126 asks for 33 TB, which no host can satisfy, so the job never
+    #     leaves PEND -- which is only explicable if -M is per-slot as well.
+    # So an explicit -M is scaled identically; there is no "job-wide" spelling of this field.
+    slots = int(os.environ.get("LSB_DJOB_NUMPROC") or 0)
+    if slots > 1:
+        return per_slot * slots, f"bjobs memlimit={text}/slot x {slots} slots"
+    return per_slot, f"bjobs memlimit={text}"
 
 
 def _meminfo_total() -> int:
@@ -416,6 +431,21 @@ def plan_head(threads_per_task: int, max_parallel: int, cfg: dict | None = None)
         limit = min([v for v in (cg_mem, lsf_mem, total) if v])
         which = mem_where if cg_mem and limit == cg_mem else lsf_where
         notes.append(f"memory limit {limit / GiB:.1f}G from {which}")
+
+        if lsf_mem and "/slot" in lsf_where and lsf and lsf_mem <= LSF_DEFAULT_PER_SLOT * lsf:
+            warnings.append(
+                f"this {lsf_mem / GiB:.0f}G ceiling is the site's injected rusage[mem=1024] scaled "
+                f"by -n, not a choice. Exceed it and LSF kills the job with TERM_MEMLIMIT (SIGINT, "
+                "SIGTERM, SIGKILL, 10s apart) — an interactive shell dies with it. Raise it "
+                'PER SLOT, e.g. `-M 4096MB -R "rusage[mem=4096]"`; a job-total figure like '
+                "-M 262144MB is multiplied by the slot count and the job never leaves PEND.")
+        # Ray's own OOM guard measures NODE memory, so on a big shared box it never fires before
+        # LSF's per-job ceiling does. Worth saying out loud: Ray will not save this job.
+        if total and limit < 0.5 * total:
+            warnings.append(
+                f"Ray's memory monitor watches NODE memory ({total / GiB:.0f}G), not your "
+                f"{limit / GiB:.0f}G LSF ceiling, so it will not fire before LSF kills the job. "
+                "Task admission below is the only in-process guard; size the request with headroom.")
     else:
         # No cgroup memory limit means the batch system handed out CPU slots but is NOT confining
         # our memory — so nothing stops us from taking the whole node's RAM. Sizing Ray from
@@ -450,7 +480,18 @@ def plan_head(threads_per_task: int, max_parallel: int, cfg: dict | None = None)
     if memory <= 0:
         raise ValueError(f"memory limit {limit / GiB:.1f}G is too small for a {obj / GiB:.1f}G "
                          "object store; lower sweep.ray.object_store_gb")
-    notes.append(f"heap memory = {frac:g} x limit - object store")
+    concurrent = max(1, num_cpus // threads_per_task)
+    per_eval = memory / concurrent
+    notes.append(f"heap memory = {frac:g} x limit - object store; {concurrent} concurrent evals "
+                 f"=> {per_eval / GiB:.1f}G each, {(limit - memory) / GiB:.0f}G left for the "
+                 f"{max_parallel} driver(s)")
+    # Ray admits tasks against their declared TASK_MEMORY (1 GiB). If the heap cannot cover the
+    # CPU-bound concurrency, memory silently becomes the binding constraint and cores sit idle.
+    if per_eval < GiB:
+        warnings.append(
+            f"only {per_eval / GiB:.2f}G of heap per concurrent eval, but each eval reserves 1G — "
+            f"Ray will admit ~{int(memory / GiB)} evals instead of the {concurrent} the cores allow, "
+            "leaving cores idle. Raise the LSF memory per slot, or lower max_parallel.")
 
     # --- temp dir --------------------------------------------------------------------------------
     # Per-host and per-job. Even if /tmp turns out to be shared between machines, two heads can then
