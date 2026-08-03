@@ -1,12 +1,15 @@
 """Unit tests for the sweep launcher's parsing/validation (pure; launches nothing)."""
+import glob
 import json
 import os
+import shutil
 
 import pytest
 import yaml
 
 import run_sweep
 from run_sweep import SweepError, _expand, _flag_tables, _state, _to_argv, build_specs
+from tests.test_resume import _write_run
 
 
 def _write(tmp_path, doc: dict, name: str = "s.yaml") -> str:
@@ -116,14 +119,24 @@ def test_sweep_dir_defaults_to_the_file_stem(tmp_path):
 
 # ---- state reconciliation ------------------------------------------------------------------------
 def test_state_distinguishes_died_from_complete_and_pending():
-    complete = {"gens": 3, "best": 1.0, "status": "complete", "wall": 1, "tok_s": 1, "updated": None}
-    partial = {**complete, "status": "running", "gens": 1}
+    complete = {"gens": 3, "best": 1.0, "status": "complete", "complete": True, "wall": 1,
+                "tok_s": 1, "updated": None}
+    partial = {**complete, "status": "running", "complete": False, "gens": 1}
     # a pid that is gone while the run never reported completion is the case that was invisible before
     assert _state({"pid": 999_999_999}, partial) == "DIED"
     assert _state({"pid": 999_999_999}, complete) == "complete"
     assert _state({"pid": None}, partial) == "pending"
     assert _state({"pid": 999_999_999, "returncode": 1}, partial) == "exit 1"
     assert _state({"pid": os.getpid()}, partial) == "running"
+
+
+def test_state_flags_a_complete_summary_its_files_do_not_back():
+    """summary.json says the run finished, its generations are gone: the state that used to read
+    'complete' (and made --resume skip the run) has to be visible."""
+    hollow = {"gens": 3, "status": "complete", "complete": False, "best": None, "wall": None,
+              "tok_s": None, "updated": None}
+    assert _state({"pid": None}, hollow) == "DAMAGED"
+    assert _state({"pid": 999_999_999}, hollow) == "DAMAGED"
 
 
 def test_progress_reads_wall_and_tokens_from_summary(tmp_path):
@@ -146,6 +159,89 @@ def test_progress_tolerates_a_missing_or_half_written_summary(tmp_path):
     run_dir.mkdir()
     (run_dir / "summary.json").write_text('{"status": "runn')
     assert run_sweep._run_progress(str(run_dir))["status"] is None
+
+
+def test_progress_separates_what_the_summary_claims_from_what_is_verifiable(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, snapshot_steps=[2, 3], drop_group_in=2)
+    prog = run_sweep._run_progress(run_dir, 5)
+    assert prog["gens"] == 3                     # summary.json's own account
+    assert prog["good"] == 2 and prog["resume_step"] == 2 and prog["complete"] is False
+
+
+# ---- resume planning -----------------------------------------------------------------------------
+def _entry(name: str, run_dir: str, want: int = 5, cmd_extra: list | None = None) -> dict:
+    return {"name": name, "log_path": run_dir, "num_generations": want, "pid": 4242, "returncode": 0,
+            "cmd": ["python", "run_icl.py", "--log-path", run_dir] + (cmd_extra or [])}
+
+
+def test_resume_restarts_an_incomplete_run_from_its_first_generation(tmp_path, capsys):
+    """A sweep resume is whole-run granular: partial runs start over rather than being continued, so
+    no run's generations are a mixture of two processes with the interruption buried inside."""
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed", snapshot_steps=[2, 3])
+    manifest = {"entries": [_entry("r", run_dir)]}
+    run_sweep.plan_resume(manifest)
+    assert "--resume-step" not in manifest["entries"][0]["cmd"]
+    assert manifest["entries"][0]["pid"] is None
+    # everything the interrupted attempt produced is set aside, not appended to
+    assert os.listdir(os.path.join(run_dir, "generations")) == []
+    assert sum(1 for _ in open(os.path.join(run_dir, "events.jsonl"))) == 0
+    assert sum(1 for _ in open(os.path.join(run_dir, "buffer", "context_pool.jsonl"))) == 0
+    assert not glob.glob(os.path.join(run_dir, "solutions", "sol_*.py"))
+    stale = [d for d in os.listdir(run_dir) if d.startswith("stale_")]
+    assert len(stale) == 1
+    assert sorted(os.listdir(os.path.join(run_dir, stale[0], "generations"))) == [
+        "gen_0000", "gen_0001", "gen_0002"]
+    out = capsys.readouterr().out
+    assert "restarting from generation 0 (discarding 3 verified generation(s))" in out
+
+
+def test_resume_redoes_a_run_whose_data_was_deleted_under_a_complete_summary(tmp_path, capsys):
+    """The reported bug: the folders were deleted, --resume called the runs complete and skipped them."""
+    run_dir = _write_run(tmp_path / "r", 5, want=5)
+    shutil.rmtree(os.path.join(run_dir, "generations"))
+    shutil.rmtree(os.path.join(run_dir, "buffer"))
+    manifest = {"entries": [_entry("r", run_dir)]}
+    run_sweep.plan_resume(manifest)
+    assert "--resume-step" not in manifest["entries"][0]["cmd"]
+    assert "restarting from generation 0" in capsys.readouterr().out
+    assert run_sweep._run_progress(run_dir, 5)["complete"] is False
+
+
+def test_resume_leaves_a_verifiably_complete_run_alone(tmp_path, capsys):
+    run_dir = _write_run(tmp_path / "r", 5, want=5)
+    manifest = {"entries": [_entry("r", run_dir)]}
+    run_sweep.plan_resume(manifest)
+    assert "--resume-step" not in manifest["entries"][0]["cmd"]
+    assert "complete (5/5) — skipping" in capsys.readouterr().out
+    assert not any(d.startswith("stale_") for d in os.listdir(run_dir))
+
+
+def test_resume_drops_a_resume_step_left_by_an_earlier_relaunch(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 2, want=5, status="failed")
+    manifest = {"entries": [_entry("r", run_dir, cmd_extra=["--resume-step", "9", "--seed", "1"])]}
+    run_sweep.plan_resume(manifest)
+    cmd = manifest["entries"][0]["cmd"]
+    assert "--resume-step" not in cmd and cmd[-2:] == ["--seed", "1"]
+
+
+def test_resume_with_print_cmds_touches_nothing(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed", snapshot_steps=[2, 3])
+    before = sorted(os.listdir(os.path.join(run_dir, "generations")))
+    manifest = {"entries": [_entry("r", run_dir)]}
+    run_sweep.plan_resume(manifest, dry_run=True)
+    assert "--resume-step" not in manifest["entries"][0]["cmd"]
+    assert sorted(os.listdir(os.path.join(run_dir, "generations"))) == before
+    assert not any(d.startswith("stale_") for d in os.listdir(run_dir))
+
+
+def test_launching_at_generation_zero_sets_the_old_attempt_aside(tmp_path):
+    """A sweep relaunch without --resume-step starts at generation 0; the previous attempt's
+    events/progress/solutions must not stay behind for it to append to (one run dir on disk ended up
+    with 21 progress rows for 15 generations that way)."""
+    run_dir = _write_run(tmp_path / "r", 2, want=5, status="failed")
+    run_sweep._clear_for_launch(_entry("r", run_dir))
+    assert os.listdir(os.path.join(run_dir, "generations")) == []
+    assert sum(1 for _ in open(os.path.join(run_dir, "events.jsonl"))) == 0
 
 
 def test_grid_over_problems_does_not_repeat_the_problem_in_the_name():

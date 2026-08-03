@@ -129,8 +129,25 @@ runs:                        # optional explicit entries, each overriding `commo
 | `run_sweep.py FILE` | Expand, preflight-check, launch, and supervise the queue. |
 | `run_sweep.py FILE --print-cmds` | Print the exact `run_icl.py` commands; launch nothing. |
 | `run_sweep.py --status DIR` | Status table (works any time, even after the supervisor exits). |
-| `run_sweep.py --resume DIR` | Relaunch every run that is not `complete`, from its last generation. |
+| `run_sweep.py --resume DIR` | **Restart** every run that is not complete, from its first generation. |
+| `run_sweep.py --resume DIR --print-cmds` | Show what a resume would decide and launch nothing (also moves nothing). |
 | `run_sweep.py --stop DIR` | `SIGTERM` every live run of the sweep. |
+
+**What "complete" means** — never `summary.json`'s `status` field: that survives the deletion of
+everything it describes, and an older resume could rewrite it with only part of the run.
+`results/resume.py` counts a generation as done only when its `generations/gen_NNNN/meta.json` is
+present *and* every parent group in it recorded a full `group_size` of candidates (a group with none
+means `icl.loop` swallowed a failed LLM request), the context pool holds the solutions those
+generations produced, and the step's PUCT snapshot loads. Inspect one run dir on its own with
+`python -m results.resume <run_dir>`.
+
+**A sweep resume is whole-run granular.** Any run that is not verifiably complete starts over: its
+whole dir is moved to `<run>/stale_<timestamp>/` (nothing is deleted) and it is relaunched from
+generation 0. Continuing mid-run is cheaper, but it makes a run's generations a mixture of two
+processes with the interruption's cause — dead server, throttled box, evicted job — sitting somewhere
+inside the search it produced, and nothing in the results saying where. `--resume --print-cmds` prints
+how many verified generations each restart discards before you commit to it. For one long run where
+that cost is not acceptable, `run_icl.py --resume-step auto` still continues where it stopped.
 
 ```
 run                  pid       state     gens   best    gen wall  tok/s  updated
@@ -161,7 +178,7 @@ was previously invisible. Overrides: `--max-parallel`, `--stagger`, `--refresh`,
 - `--problem` *(required)* — one of the registered problems (`circle_packing_26/32`, `ac1`, `ac2`, `erdos_min_overlap`, `toy_ee`).
 - `--log-path` — output dir (default `runs/<problem>_<strategy>_n<ctx>_g<gs>x<gpb>_<timestamp>`).
 - `--num-generations` (50) — number of search generations.
-- `--resume-step N` — resume an interrupted run: point `--log-path` at the existing run dir and set `N` to the generation to restart from (the sampler reloads that step's buffer snapshot, `buffer/puct_sampler_step_<NNNNNN>.json`, and continues).
+- `--resume-step N|auto` — continue an interrupted run: point `--log-path` at the existing run dir. `auto` uses the last generation that run's own files can back (see `results/resume.py`); an explicit `N` is checked against the buffer snapshots (`buffer/puct_sampler_step_<NNNNNN>.json`) and refused with the available steps if it cannot be loaded. Either way the run reloads that snapshot plus `buffer/context_pool.jsonl`, and anything after the resume point is moved to `<log-path>/stale_<timestamp>/` so the relaunch does not write on top of the attempt it replaces. Totals, best-so-far, solution numbering and `summary.json` continue rather than restarting.
 
 **Model / server**
 - `--model` (`openai/gpt-oss-120b`), `--vllm-base-url` (`http://localhost:8000/v1`).

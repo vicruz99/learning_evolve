@@ -111,3 +111,49 @@ def test_tracker_minimize_direction(tmp_path):
     assert summ["worst_valid"]["score"] == 0.5
     # save_completions=False => no child_*.txt
     assert not glob.glob(str(run_dir / "generations" / "gen_0000" / "parent_00" / "child_*.txt"))
+
+
+def test_a_resumed_tracker_continues_the_run_instead_of_restarting_its_books(tmp_path):
+    """A resumed run used to open a NEW set of books: per_generation started empty, so summary.json was
+    rewritten with only the post-resume generations (a 3-generation summary for a 15-generation run,
+    then 'status: complete'), totals/best reset, and solution ids restarted at sol_000001 — silently
+    overwriting the .py files of the generations that were kept."""
+    run_dir = tmp_path / "run"
+    cfg = {**_cfg(), "num_generations": 3}
+    sampler = _Sampler()
+    seed = State(timestep=-1, construction=None, code="", value=None)
+
+    tr = ExperimentTracker(str(run_dir), cfg, _Spec())
+    for gen in (0, 1):
+        tr.start_generation(gen, [seed])
+        tr.record_group(gen, 0, seed, f"P{gen}", ["c0", "c1"], [_valid(1.0 + gen, gen), _fail()])
+        tr.end_generation(gen, sampler)
+    tr.close(status="failed")                       # killed after two generations
+    first_started_at = json.load(open(run_dir / "summary.json"))["started_at"]
+
+    tr = ExperimentTracker(str(run_dir), cfg, _Spec(), resume_step=2)
+    tr.start_generation(2, [seed])
+    tr.record_group(2, 0, seed, "P2", ["c0", "c1"], [_valid(5.0, 2), _valid(0.5, 2)])
+    tr.end_generation(2, sampler)
+    tr.close()
+
+    summ = json.load(open(run_dir / "summary.json"))
+    assert [g["generation"] for g in summ["per_generation"]] == [0, 1, 2]
+    assert summ["totals"]["candidates"] == 6 and summ["totals"]["succeeded"] == 4
+    assert summ["best"]["score"] == 5.0             # from the resumed generation
+    assert summ["worst_valid"]["score"] == 0.5
+    assert summ["started_at"] == first_started_at   # one run, not a new one
+    assert summ["resumes"] == [{**summ["resumes"][0], "from_generation": 2}]
+
+    # the resumed generation's solutions keep numbering where the run left off
+    sols = sorted(os.path.basename(p) for p in glob.glob(str(run_dir / "solutions" / "sol_*.py")))
+    assert sols == ["sol_000001.py", "sol_000002.py", "sol_000003.py", "sol_000004.py"]
+    manifest = [json.loads(l) for l in open(run_dir / "solutions" / "manifest.jsonl")]
+    assert len({m["sol"] for m in manifest}) == len(manifest) == 4
+    assert sum(1 for _ in open(run_dir / "events.jsonl")) == 6
+
+    # the per-generation meta.json files (what a later resume rebuilds from) agree with that summary
+    from results.resume import prior_state
+    prior = prior_state(str(run_dir), 3)
+    assert [g["generation"] for g in prior.per_generation] == [0, 1, 2]
+    assert prior.candidates == 6 and prior.succeeded == 4 and prior.sol_seq == 4

@@ -13,7 +13,10 @@ Usage
     python run_sweep.py sweeps/ctx_strategies.yaml                 # launch (stays in the foreground)
     python run_sweep.py sweeps/ctx_strategies.yaml --print-cmds    # expand + print, launch nothing
     python run_sweep.py --status runs/ctx_strategies               # table of a sweep's state
-    python run_sweep.py --resume runs/ctx_strategies               # relaunch whatever is not complete
+    python run_sweep.py --resume runs/ctx_strategies               # restart whatever is not complete,
+                                                                   #   each from generation 0 (verified
+                                                                   #   against the run dir; add
+                                                                   #   --print-cmds to just look)
     python run_sweep.py --stop   runs/ctx_strategies               # SIGTERM every live run
 
 Run it under ``tmux`` for anything long: the supervisor must stay alive to enforce ``max_parallel``,
@@ -81,6 +84,7 @@ from typing import Any
 
 import yaml
 
+from results.resume import inspect_run, rewind, tail_exists
 from run_icl import build_parser
 from sandbox import ray_head
 
@@ -359,38 +363,34 @@ def _alive(pid: int | None) -> bool:
         return isinstance(e, PermissionError)                # exists but not ours
 
 
-def _run_progress(log_path: str) -> dict:
-    """Latest per-generation numbers for one run, read from the files the tracker already writes."""
-    out = {"gens": 0, "best": None, "status": None, "wall": None, "tok_s": None, "updated": None}
-    summary = os.path.join(log_path, "summary.json")
-    if os.path.exists(summary):
-        try:
-            with open(summary) as f:
-                d = json.load(f)
-            out["status"] = d.get("status")
-            out["gens"] = len(d.get("per_generation") or [])
-            out["best"] = (d.get("best") or {}).get("score")
-            out["updated"] = d.get("updated_at")
-            per_gen = d.get("per_generation") or []
-            if per_gen:
-                last = per_gen[-1]
-                wall = last.get("wall_seconds")
-                ct = (last.get("usage") or {}).get("completion_tokens") or 0
-                out["wall"] = wall
-                out["tok_s"] = round(ct / wall) if wall else None
-        except Exception:
-            pass                                             # a half-written summary is not an error
-    return out
+def _run_progress(log_path: str, num_generations: int | None = None) -> dict:
+    """One run's state, VERIFIED against its artifacts (see results.resume).
+
+    ``gens`` is what summary.json claims and ``good`` is what the generation directories, the PUCT
+    snapshot and the context pool can actually back. ``complete`` is the launch decision — never
+    summary.json's ``status``, which survives the deletion of everything it describes.
+    """
+    prog = inspect_run(log_path, num_generations)
+    return {
+        "gens": prog.summary_generations, "status": prog.summary_status,
+        "best": prog.best, "wall": prog.wall, "tok_s": prog.tok_s, "updated": prog.updated_at,
+        "good": prog.good_generations, "resume_step": prog.resume_step,
+        "complete": prog.complete, "damage": prog.damage,
+    }
 
 
 def _state(entry: dict, prog: dict) -> str:
     """Reconcile 'what the manifest says' with 'what is actually true on the box'."""
-    if prog["status"] == "complete":
+    if prog.get("complete"):
         return "complete"
     if _alive(entry.get("pid")):
         return "running"
     if entry.get("returncode") not in (None, 0):
         return f"exit {entry['returncode']}"
+    if prog.get("status") == "complete":
+        # summary.json claims the run finished but its generations do not back that up: data was
+        # deleted under it, or an older resume rewrote the summary with only part of the run.
+        return "DAMAGED"
     if prog["status"] == "failed":
         return "failed"
     if entry.get("pid") is None:
@@ -411,19 +411,27 @@ def _age(iso: str | None) -> str:
     return f"{int(delta)}s ago"
 
 
+def _entry_generations(entry: dict, manifest: dict) -> int | None:
+    return entry.get("num_generations") or manifest.get("num_generations")
+
+
 def print_status(sweep_dir: str) -> None:
     manifest = _read_manifest(sweep_dir)
-    total = manifest.get("num_generations")
-    rows = []
+    rows, notes = [], []
     for entry in manifest["entries"]:
-        prog = _run_progress(entry["log_path"])
-        gens = f"{prog['gens']}/{entry.get('num_generations') or total or '?'}"
+        want = _entry_generations(entry, manifest)
+        prog = _run_progress(entry["log_path"], want)
+        # `gens` is what the artifacts back; where summary.json claims more, the difference is damage
+        # and is spelled out under the table rather than hidden behind one number.
+        gens = f"{prog['good']}/{want or '?'}"
         rows.append([
             entry["name"], str(entry.get("pid") or "-"), _state(entry, prog), gens,
             f"{prog['best']:.4f}" if isinstance(prog["best"], (int, float)) else "-",
             f"{prog['wall']:.0f}s" if prog["wall"] else "-",
             str(prog["tok_s"] or "-"), _age(prog["updated"]),
         ])
+        for line in prog["damage"]:
+            notes.append(f"  {entry['name']}: {line}")
     header = ["run", "pid", "state", "gens", "best", "gen wall", "tok/s", "updated"]
     widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h)
               for i, h in enumerate(header)]
@@ -433,13 +441,80 @@ def print_status(sweep_dir: str) -> None:
     print("  ".join("-" * w for w in widths))
     for r in rows:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths)))
+    if notes:
+        print("\n[sweep] gens counts only VERIFIED generations; --resume restarts any run short of "
+              "its target from generation 0:")
+        for n in notes:
+            print(n)
     print()
+
+
+def plan_resume(manifest: dict, *, dry_run: bool = False) -> None:
+    """Requeue every run of a sweep that is not verifiably complete, each FROM ITS FIRST GENERATION.
+
+    A sweep resume is whole-run granular on purpose. Continuing mid-run is the cheaper option and it
+    is the one this used to take, but it makes a run's generations a mixture of two processes — with
+    the interruption's cause (a dead server, a throttled box, an evicted job) sitting somewhere in the
+    middle of the search it produced, and nothing in the results saying where. A restarted run is one
+    process, one context pool, one clean lineage; that is what the arms are compared on. So the whole
+    run dir is moved to ``stale_<timestamp>/`` and the run starts over.
+
+    Complete runs are left untouched and skipped by the supervisor. For the cheaper path on a single
+    long run, ``run_icl.py --resume-step auto`` still continues one where it stopped.
+    """
+    for entry in manifest["entries"]:
+        want = _entry_generations(entry, manifest)
+        prog = inspect_run(entry["log_path"], want)
+        for line in prog.damage:
+            print(f"[sweep] resume: {entry['name']}: {line}")
+        if prog.complete:
+            print(f"[sweep] resume: {entry['name']}: {prog.describe()} — skipping")
+        else:
+            had = (f" (discarding {prog.good_generations} verified generation(s))"
+                   if prog.good_generations else "")
+            print(f"[sweep] resume: {entry['name']}: restarting from generation 0{had}"
+                  + (" — nothing moved: --print-cmds" if dry_run and prog.has_tail else ""))
+            if not dry_run and tail_exists(entry["log_path"], 0):
+                for line in rewind(entry["log_path"], 0):
+                    print(f"[sweep] resume: {entry['name']}: moved {line}")
+        # No --resume-step is ever added here, and a stale one from an earlier relaunch is dropped:
+        # the command has to say "start at generation 0", which is what the run dir now holds.
+        cmd = [tok for tok in entry["cmd"]]
+        if "--resume-step" in cmd:
+            i = cmd.index("--resume-step")
+            del cmd[i:i + 2]
+        entry["cmd"] = cmd
+        entry["pid"], entry["returncode"] = None, None
 
 
 # --------------------------------------------------------------------------------------------------
 # launching
 # --------------------------------------------------------------------------------------------------
+def _clear_for_launch(entry: dict) -> None:
+    """Make the run dir match the command about to run.
+
+    A relaunch writes into the dir the previous attempt left behind: without ``--resume-step`` it
+    starts at generation 0 while events.jsonl / progress.csv / solutions/ still hold the old attempt,
+    and the two accounts interleave in one file (we have a run dir on disk with 21 progress rows for
+    15 generations, and generation dirs written before generation 0's). Whatever the command does not
+    claim goes to stale_<timestamp>/ first.
+    """
+    cmd = entry["cmd"]
+    step = 0
+    if "--resume-step" in cmd:
+        try:
+            step = int(cmd[cmd.index("--resume-step") + 1])
+        except (IndexError, ValueError):
+            step = 0
+    if tail_exists(entry["log_path"], step):
+        where = "generation 0" if step == 0 else f"generation {step}"
+        print(f"[sweep] {entry['name']}: relaunching at {where}; moving what is already on disk aside")
+        for line in rewind(entry["log_path"], step):
+            print(f"[sweep] {entry['name']}: moved {line}")
+
+
 def _launch(entry: dict, env: dict[str, str] | None = None) -> subprocess.Popen:
+    _clear_for_launch(entry)
     os.makedirs(entry["log_path"], exist_ok=True)
     out = open(os.path.join(entry["log_path"], "launch.out"), "a")
     # start_new_session: the run gets its own process group, so Ctrl-C / death of this supervisor
@@ -456,8 +531,10 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float,
               max_parallel: int, refresh: float, env: dict[str, str] | None = None) -> int:
     """Run the queue to completion: at most ``max_parallel`` runs in flight, ``stagger`` seconds
     between launches, a status table every ``refresh`` seconds. Returns the number that failed."""
+    # "Complete" is verified against the run's artifacts, not read off summary.json: a run whose data
+    # was deleted (or whose summary an older resume rewrote) must be redone, not skipped.
     pending = [e for e in manifest["entries"] if e.get("returncode") != 0
-               and _run_progress(e["log_path"])["status"] != "complete"]
+               and not _run_progress(e["log_path"], _entry_generations(e, manifest))["complete"]]
     live: dict[str, subprocess.Popen] = {}
     last_launch = 0.0
     last_render = 0.0
@@ -573,7 +650,12 @@ def main() -> int:
     p.add_argument("--status", metavar="SWEEP_DIR", help="Print a sweep's status table and exit.")
     p.add_argument("--stop", metavar="SWEEP_DIR", help="SIGTERM every live run of a sweep and exit.")
     p.add_argument("--resume", metavar="SWEEP_DIR",
-                   help="Relaunch every run of a sweep that is not complete (keeps its log dir).")
+                   help="Restart every run of a sweep that is not complete, from its FIRST generation "
+                        "(a partial run is never continued mid-run: one run = one process = one "
+                        "lineage). 'Complete' is verified against the run dir, never read off "
+                        "summary.json; a restarted run's old dir is moved to <run>/stale_<timestamp>/ "
+                        "rather than deleted. Combine with --print-cmds to see the decisions, and how "
+                        "much each restart discards, without touching anything.")
     p.add_argument("--print-cmds", action="store_true",
                    help="Expand the sweep and print the exact commands; launch nothing.")
     p.add_argument("--max-parallel", type=int, default=None,
@@ -598,15 +680,9 @@ def main() -> int:
         sweep_dir = a.resume
         manifest = _read_manifest(sweep_dir)
         settings = manifest.get("settings") or {}
-        for entry in manifest["entries"]:
-            prog = _run_progress(entry["log_path"])
-            if prog["status"] != "complete" and prog["gens"]:
-                # Continue where the run stopped rather than redoing finished generations.
-                if "--resume-step" not in entry["cmd"]:
-                    entry["cmd"] += ["--resume-step", str(prog["gens"])]
-                else:
-                    entry["cmd"][entry["cmd"].index("--resume-step") + 1] = str(prog["gens"])
-            entry["pid"], entry["returncode"] = None, None
+        plan_resume(manifest, dry_run=a.print_cmds)
+        if not a.print_cmds:
+            _write_manifest(sweep_dir, manifest)
     else:
         if not a.sweep_file:
             p.error("give a sweep file, or one of --status/--stop/--resume")

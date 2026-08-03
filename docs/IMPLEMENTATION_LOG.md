@@ -638,3 +638,83 @@ programs elaborate, so n=30 means 27k of prompt early and ~71k late (max seen 10
 Late-run, `random` costs 2,537 tokens/solution against `contrastive`'s 1,796. Worst-case sizing for
 the ICL runs: 4k/solution for cp/erdos/ac1 and ~8k for ac2 (the latter projected from cp's drift —
 only gen-1 data exists for ac2).
+
+---
+
+## 2026-08-03 — `--resume` verified against the artifacts (it was trusting one field, and that field lies)
+
+**Problem** — a sweep hit LLM request timeouts; the damaged run folders were deleted by hand, and
+`python run_sweep.py --resume <dir>` then reported those runs **complete** and skipped them.
+
+**Diagnosis** — `--resume` (and the supervisor's pending filter) read exactly one thing:
+`summary.json`'s `status`. Reproduced with a synthetic sweep — three separate ways that field lies:
+
+1. **Deleted data, surviving summary.** Delete `generations/` + `buffer/` and the `"status":
+   "complete"` left at the run root still reads as complete: the run is skipped forever. (Deleting the
+   *whole* run dir did relaunch it, which is why the failure looked intermittent.)
+2. **Resume rewrote the summary with only part of the run.** `ExperimentTracker.__init__` built empty
+   books on a resume — `_per_gen = []`, totals 0, `best = None`, `_sol_seq = 0` — and `_write_summary`
+   truncates. A run resumed at generation 12 of 15 therefore ended with a summary describing **3**
+   generations and `status: complete`: the run's own record of generations 0–11 was destroyed, the next
+   `--resume` would rewind to 3, and `sol_000001…` were rewritten on top of kept solutions.
+3. **A generation the LLM never answered still counts.** `icl.loop._run_group` catches a failed
+   request, logs a warning, calls `record_group(..., [], [])` and returns — so a generation whose
+   groups all timed out is recorded as an ordinary finished generation and resume walks straight past
+   it. Per the decision on this: if the LLM was unreachable, that generation is corrupt.
+
+Evidence of (2) already on disk: `runs/ac1_gptoss/puct_s3/progress.csv` has **21 rows for 15
+generations** (9,0,1,2,10,3,… — two processes interleaved into one run dir), and `gen_0009`'s mtime
+(03:14) precedes `gen_0000`'s (03:35). One of them was a manual resume, the other a sweep relaunch;
+its `events.jsonl`/`summary.json` happen to be self-consistent, so its analysis stands.
+
+**Built** — `src/results/resume.py`. Every number comes from artifacts that are written **once**:
+
+* `inspect_run()` walks generations from 0 and stops at the first that is not whole:
+  `generations/gen_NNNN/meta.json` present and parseable (it is written last, by `end_generation`),
+  every parent group non-empty, `len(children) == group_size`, group count == `groups_per_batch`.
+  Then `buffer/context_pool.jsonl` must hold `sum(valid_candidates)` lines for the surviving prefix
+  (a short pool is reloaded as-is, so resuming on it silently shrinks every later prompt), and the
+  step's `buffer/puct_sampler_step_NNNNNN.json` must exist and parse. `complete` means the artifacts
+  back all `num_generations`; nothing reads `status` to make a decision.
+* `rewind(run_dir, keep)` moves everything from generation `keep` on into `stale_<timestamp>/`
+  (nothing deleted): generation dirs, their solutions, orphan snapshots, torn `*.tmp.*` writes, and
+  the tails of `events.jsonl` / `progress.csv` / `solutions/manifest.jsonl` / `context_pool.jsonl`.
+* `prior_state(run_dir, keep)` rebuilds per-generation stats, usage, totals, failure types, best /
+  worst_valid, the next solution id and `state_id -> sol` from the `meta.json` files plus
+  `manifest.jsonl` — `ExperimentTracker(..., resume_step=N)` loads it, so a resumed run keeps ONE
+  cumulative summary, its original `started_at`, and a `resumes: [...]` provenance list.
+
+**Wired in** — `run_sweep.py --resume` now prints a decision per run (`complete … skipping` /
+`resume at generation N/M` / `start over`), rewinds first, and rebuilds `--resume-step` from scratch
+(a stale one used to survive into a run that had to start over). `_launch` rewinds to whatever step
+its own command line claims, so a relaunch can no longer append onto the previous attempt.
+`--status` shows VERIFIED generations, a `DAMAGED` state for "summary says complete, files disagree",
+and spells out each run's damage under the table. `run_icl.py --resume-step` accepts `auto` (use the
+verified point) and validates an explicit N against the snapshots instead of dying inside the sampler;
+`_open_context_pool` now refuses a resume whose pool file is gone instead of truncating it.
+
+**Verified** — `tests/test_resume.py` (18 cases), new sweep-level and tracker-level cases, and
+`tests/smoke_icl.py`, whose stub was two interfaces out of date (`GenResult`, `cache_counters`,
+`count_tokens`) and which now also runs a **resume leg** end to end. Plus a scripted end-to-end of the
+reported scenario: a run whose last generation loses its group to a `TimeoutError` finishes with
+`status: complete`, is caught as `resume at generation 2/3`, is rewound, and comes out verified
+complete with no duplicate rows, events or solution ids.
+
+**Not changed** — `_run_group` still swallows LLM failures and records an empty group (a run survives
+a server blip and keeps its earlier generations). That is now *detected* rather than trusted, but a
+generation of pure timeouts is still written; the resume path is what refuses to build on it.
+
+**Same-day revision — a sweep resume restarts whole runs, it does not continue them.** The first cut
+of `--resume` continued each incomplete run from its last verified generation. Decision: don't. A
+continued run's generations are a mixture of two processes, with the interruption's cause (dead server,
+throttled box, evicted job) sitting somewhere inside the search it produced and nothing in the results
+saying where — for an experiment whose whole output is a comparison between arms, that is the wrong
+trade against saved GPU hours. `plan_resume` now calls `rewind(run_dir, 0)` on anything not verifiably
+complete and never passes `--resume-step`; the whole old dir goes to `stale_<timestamp>/`, and the
+decision line says how many verified generations the restart discards (e.g. `n10_s3_random: restarting
+from generation 0 (discarding 12 verified generation(s))`, ~7 h of grading). `--resume --print-cmds`
+shows every such line without moving anything, so the cost is visible before committing.
+
+The mid-run machinery stays and is still tested — `run_icl.py --resume-step N|auto` continues one run by
+hand (verified point, rewind of the tail, cumulative summary via `prior_state`). It is now the explicit
+per-run escape hatch rather than what a sweep does silently.
