@@ -17,14 +17,26 @@ import tempfile
 from icl.config import ICLConfig
 from icl.loop import ICLRunner
 from context import select_best_n, build_context_block
+from generation.vllm_client import GenResult
+from results.resume import inspect_run
 
 
 class _StubLLM:
     """Returns canned valid ac2 solutions, each a DISTINCT construction (so the buffer's dedup
-    doesn't reject them): the seed sequence plus a unique number of small positive elements."""
-    def __init__(self):
+    doesn't reject them): the seed sequence plus a unique number of small positive elements.
+
+    Stands in for ``VLLMClient``, so it has to answer the same two calls the loop makes per
+    generation: ``generate`` (a GenResult, not a list of strings) and ``cache_counters``.
+    """
+    def __init__(self, counter: int = 0):
         self.prompts_seen: list[str] = []
-        self._counter = 0
+        self._counter = counter
+
+    async def cache_counters(self):
+        return {}                            # no server to scrape; the loop treats {} as "unknown"
+
+    async def count_tokens(self, texts):
+        return []                            # no /tokenize; the loop falls back to its chars estimate
 
     async def generate(self, prompt, n, temperature, max_tokens):
         self.prompts_seen.append(prompt)
@@ -38,7 +50,8 @@ class _StubLLM:
                 f"    return list(height_sequence_1) + [0.001] * {k}\n"
                 "```"
             )
-        return outs
+        return GenResult(texts=outs, reasonings=[""] * n, finish_reasons=["stop"] * n,
+                         prompt_tokens=100, completion_tokens=20 * n, latency=0.01)
 
 
 async def main() -> None:
@@ -90,6 +103,47 @@ async def main() -> None:
                                     metric_name="lower bound", maximize=True)
         assert "lower bound" in block
         print("\nICL loop smoke test passed.")
+
+        await _resume_leg(td, summ)
+
+
+async def _resume_leg(run_dir: str, before: dict) -> None:
+    """Continue the finished run for two more generations via --resume-step, the way run_sweep does.
+
+    This is the leg that used to lose data: the tracker built empty books, so summary.json came back
+    describing only the generations done after the resume (and still said `complete`), which then made
+    --resume rewind to that wrong point.
+    """
+    prog = inspect_run(run_dir)
+    assert prog.complete and prog.good_generations == 2 and prog.resume_step == 2, prog
+    assert prog.damage == [], prog.damage
+
+    cfg = ICLConfig(problem="ac2", log_path=run_dir, groups_per_batch=1, group_size=2,
+                    num_generations=4, n_context=3, resume_step=2)
+    runner = ICLRunner(cfg)
+    runner.llm = _StubLLM(counter=1000)          # distinct constructions from the first leg
+    await runner.run()
+
+    summ = json.load(open(os.path.join(run_dir, "summary.json")))
+    assert [g["generation"] for g in summ["per_generation"]] == [0, 1, 2, 3], summ["per_generation"]
+    assert summ["totals"]["candidates"] == before["totals"]["candidates"] + 4
+    assert summ["totals"]["succeeded"] >= before["totals"]["succeeded"]
+    assert summ["started_at"] == before["started_at"], "a resume must not restart the run's clock"
+    assert summ["resumes"] and summ["resumes"][-1]["from_generation"] == 2
+    # every solution file is still there: numbering continued instead of overwriting sol_000001
+    n_sol = len(glob.glob(os.path.join(run_dir, "solutions", "sol_*.py")))
+    assert n_sol == summ["totals"]["unique_solutions"] == sum(
+        1 for _ in open(os.path.join(run_dir, "solutions", "manifest.jsonl"))), n_sol
+    assert len({json.loads(l)["sol"] for l in
+                open(os.path.join(run_dir, "solutions", "manifest.jsonl"))}) == n_sol
+    rows = open(os.path.join(run_dir, "progress.csv")).read().strip().splitlines()
+    assert [r.split(",")[0] for r in rows[1:]] == ["0", "1", "2", "3"], rows
+
+    prog = inspect_run(run_dir)
+    assert prog.complete and prog.good_generations == 4, prog
+    assert prog.damage == [], prog.damage
+    print(f"resume leg passed: {prog.good_generations} generations, {n_sol} solutions, "
+          f"one cumulative summary.")
 
 
 if __name__ == "__main__":

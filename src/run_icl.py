@@ -104,13 +104,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-cpus-per-task", type=int, default=None)
     p.add_argument("--grade-timeout", type=float, default=8000.0)
 
-    p.add_argument("--resume-step", type=int, default=None)
+    p.add_argument("--resume-step", default=None, metavar="N|auto",
+                   help="Continue an interrupted run in --log-path: N restarts from generation N, "
+                        "'auto' uses the last generation that run's own files can back. Anything "
+                        "after the resume point is moved to <log-path>/stale_<timestamp>/ so the "
+                        "relaunch does not write on top of the attempt it replaces.")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"],
                    help="Console log level; icl.log always captures DEBUG.")
     p.add_argument("--dry-run", action="store_true",
                    help="Build & print one assembled prompt (base + context block), then exit. No server/ray.")
 
     return p
+
+
+def _resolve_resume_step(raw: str | None, log_path: str) -> int | None:
+    """Turn ``--resume-step`` into a generation index the run dir can actually back.
+
+    ``auto`` asks ``results.resume`` where the run's artifacts stop being trustworthy. An explicit N is
+    honoured, but checked and reported first: the ways it used to go wrong were silent or cryptic — a
+    missing buffer snapshot surfaced as a FileNotFoundError from inside the sampler, and a context pool
+    that did not reach N left every later prompt with an empty context block. Either way the tail after
+    the resume point is set aside, because a resumed run appends to events.jsonl / progress.csv /
+    solutions/ and would otherwise interleave with the attempt it replaces.
+    """
+    if raw is None:
+        return None
+    from results.resume import inspect_run, rewind, tail_exists
+
+    prog = inspect_run(log_path)
+    for line in prog.damage:
+        print(f"[resume] {line}")
+    if str(raw).strip().lower() in ("auto", "last"):
+        step = prog.resume_step
+        print(f"[resume] {log_path}: {prog.describe()}")
+    else:
+        try:
+            step = int(raw)
+        except ValueError:
+            raise SystemExit(f"--resume-step: expected a generation number or 'auto', got {raw!r}")
+        if step < 0:
+            raise SystemExit("--resume-step: must be >= 0")
+        if step and step not in prog.snapshots:
+            have = ", ".join(str(s) for s in prog.snapshots) or "none"
+            raise SystemExit(
+                f"--resume-step {step}: {log_path} has no loadable PUCT snapshot for that step "
+                f"(have: {have}). Use --resume-step auto to continue from {prog.resume_step}.")
+        if step > prog.good_generations:
+            print(f"[resume] WARNING: only {prog.good_generations} generation(s) of {log_path} are "
+                  f"verifiable, but you asked to continue from {step} — generations "
+                  f"{prog.good_generations}..{step - 1} are damaged or missing.")
+    if tail_exists(log_path, step):
+        for line in rewind(log_path, step):
+            print(f"[resume] moved {line}")
+    return step or None
 
 
 def parse_args() -> ICLConfig:
@@ -163,7 +209,8 @@ def parse_args() -> ICLConfig:
         eval_timeout=a.eval_timeout,
         num_cpus_per_task=a.num_cpus_per_task,
         grade_timeout=a.grade_timeout,
-        resume_step=a.resume_step,
+        # --dry-run only prints a prompt: never let it rewind a run dir.
+        resume_step=None if a.dry_run else _resolve_resume_step(a.resume_step, log_path),
         dry_run=a.dry_run,
     )
 

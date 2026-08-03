@@ -12,6 +12,13 @@ machine-readable:
       generations/gen_XXXX/  meta.json + parent_SS/{prompt.txt, child_CC.txt}
       buffer/          PUCT snapshots (written by the sampler)
     <run_dir>/../index.csv   one row per run (cross-experiment view)
+      stale_<timestamp>/     a rewound resume's discarded tail (results.resume, never written here)
+
+Pass ``resume_step=N`` to continue a run rather than start one: the books of generations before N are
+reloaded from the per-generation ``meta.json`` files and ``solutions/manifest.jsonl`` (see
+``results.resume.prior_state``), so summary.json stays ONE cumulative account of the run and solution
+ids keep counting. ``status`` in summary.json is therefore a claim about the last process to write it —
+whether a run is finished is a question about the artifacts, which ``results.resume`` answers.
 
 Standalone (no dependency on puct/envs internals beyond the public State/RolloutResult shapes) so
 the RL/SFT variants can reuse it. All methods are synchronous and contain no ``await``, so they are
@@ -112,8 +119,9 @@ def _native(value: float | None, maximize: bool) -> float | None:
 
 class ExperimentTracker:
     def __init__(self, run_dir: str, cfg_dict: dict[str, Any], spec, save_completions: bool = True,
-                 save_reasoning: bool = True):
+                 save_reasoning: bool = True, resume_step: int | None = None):
         self.run_dir = run_dir
+        self.resume_step = resume_step or 0
         self.spec = spec
         self.save_completions = save_completions
         self.save_reasoning = save_reasoning
@@ -133,15 +141,30 @@ class ExperimentTracker:
         for d in (run_dir, self.sol_dir, self.gen_dir, os.path.join(run_dir, "buffer")):
             os.makedirs(d, exist_ok=True)
 
+        # A resumed run continues the SAME run: keep its original start time (and record every resume)
+        # so summary.json/config.json stay one account of one run rather than of the last relaunch.
+        prior_config = {}
+        if self.resume_step:
+            try:
+                with open(os.path.join(run_dir, "config.json")) as f:
+                    prior_config = json.load(f)
+            except Exception:
+                prior_config = {}
         config = dict(cfg_dict)
         config["_meta"] = {
             "git_sha": _git_sha(),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "created_at": ((prior_config.get("_meta") or {}).get("created_at")
+                           or datetime.now().isoformat(timespec="seconds")),
             "host": socket.gethostname(),
             "entrypoint": spec.entrypoint,
             "metric_name": spec.metric_name,
             "maximize": spec.maximize,
         }
+        self.resumes = list((prior_config.get("_meta") or {}).get("resumes") or [])
+        if self.resume_step:
+            self.resumes.append({"at": datetime.now().isoformat(timespec="seconds"),
+                                 "from_generation": self.resume_step})
+            config["_meta"]["resumes"] = self.resumes
         self.started_at = config["_meta"]["created_at"]
         with open(os.path.join(run_dir, "config.json"), "w") as f:
             json.dump(config, f, indent=2)
@@ -183,6 +206,33 @@ class ExperimentTracker:
         self.worst_valid: dict | None = None
         self._per_gen: list[dict] = []
         self._cur: dict | None = None
+        if self.resume_step:
+            self._load_prior_state()
+
+    def _load_prior_state(self) -> None:
+        """Reload the books of generations before ``resume_step``.
+
+        Without this a resumed run started its totals, its best-so-far, its solution numbering and its
+        per_generation list from zero, then overwrote summary.json with only the generations done after
+        the resume — so a 15-generation run that was resumed at 12 ended up claiming 3 generations and
+        ``status: complete``, and the next --resume rewound to generation 3. The prior numbers are
+        rebuilt from the per-generation meta.json files and solutions/manifest.jsonl, which are written
+        once each (see results.resume). Import is local: results.resume imports this module.
+        """
+        from results.resume import prior_state
+
+        prior = prior_state(self.run_dir, self.resume_step)
+        self._per_gen = list(prior.per_generation)
+        self._usage = dict(prior.usage)
+        self.total_candidates = prior.candidates
+        self.total_success = prior.succeeded
+        self.total_failed = prior.failed
+        self._failure_types = dict(prior.failure_types)
+        self._sol_seq = prior.sol_seq
+        self._state_to_sol = dict(prior.state_to_sol)
+        self.best, self.worst_valid = prior.best, prior.worst_valid
+        if prior.started_at:
+            self.started_at = prior.started_at
 
     # ---- paths -------------------------------------------------------------
     def _gen_path(self, gen: int) -> str:
@@ -471,6 +521,9 @@ class ExperimentTracker:
             "per_generation": self._per_gen,
             "started_at": self.started_at,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
+            # Empty for a run that never stopped; one entry per relaunch otherwise. A run with entries
+            # here has generations produced by different processes (same config, different wall clock).
+            "resumes": self.resumes,
         }
         with open(os.path.join(self.run_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)

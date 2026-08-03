@@ -229,7 +229,18 @@ class ICLRunner:
 
     def _open_context_pool(self, path: str, resume: bool = False) -> None:
         """Open the append-only context-pool log. On resume, reload prior valid solutions into memory
-        first (so context is complete from the first resumed generation); otherwise start fresh."""
+        first (so context is complete from the first resumed generation); otherwise start fresh.
+
+        A resume whose pool file is gone used to fall through to the fresh branch and TRUNCATE it: the
+        run continued with an empty pool, so every generation after the resume was prompted with less
+        context than the ones before it — invisible in the logs and fatal to the comparison. Refuse
+        instead; ``results.resume`` decides which generation still has a pool behind it."""
+        if resume and not os.path.exists(path) and self.cfg.n_context > 0:
+            raise FileNotFoundError(
+                f"--resume-step {self.cfg.resume_step} needs the run's context pool, but {path} does "
+                f"not exist. Resuming without it would prompt every later generation with an empty "
+                f"context block. Run `python -m results.resume {self.cfg.log_path}` to see the last "
+                f"resumable generation (or start the run over).")
         if resume and os.path.exists(path):
             with open(path) as f:
                 for line in f:
@@ -440,7 +451,7 @@ class ICLRunner:
             logger.info("skipping Ray init: problem uses an in-process (sandbox-free) evaluator")
         # Tracker first: it creates the run-dir layout (incl. buffer/) the sampler writes into.
         self.tracker = ExperimentTracker(cfg.log_path, cfg.to_dict(), spec, cfg.save_completions,
-                                         cfg.save_reasoning)
+                                         cfg.save_reasoning, resume_step=cfg.resume_step)
         self.sampler = self._make_sampler(os.path.join(cfg.log_path, "buffer", "puct_sampler.json"))
         self._open_context_pool(os.path.join(cfg.log_path, "buffer", "context_pool.jsonl"),
                                 resume=bool(cfg.resume_step))
