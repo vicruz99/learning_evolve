@@ -421,3 +421,40 @@ def test_continue_specs_reject_ambiguity():
         run_sweep.parse_continue_specs(["a", "b"], "3", "runs/sw")
     with pytest.raises(SweepError, match="both say where to continue"):
         run_sweep.parse_continue_specs(["a:2"], "3", "runs/sw")
+
+
+# ---- the queue supervise actually launches ---------------------------------------------------------
+def test_a_manifest_returncode_of_zero_does_not_keep_an_incomplete_run_from_launching(tmp_path):
+    """The Bosch symptom: --resume planned 12 runs, then the sweep printed a status table and exited
+    without launching anything. The manifest remembered returncode 0 from a past process, and "exited
+    0" is not "did all its generations" — only the artifacts can say that."""
+    partial = _write_run(tmp_path / "partial", 14, want=25, status="failed",
+                         snapshot_steps=list(range(1, 15)))
+    gone = str(tmp_path / "gone")                                  # run dir deleted
+    done = _write_run(tmp_path / "done", 25, want=25)
+    manifest = {"name": "s", "entries": [
+        {**_entry("partial", partial, want=25), "returncode": 0},
+        {**_entry("gone", gone, want=25), "returncode": 0},
+        {**_entry("done", done, want=25), "returncode": 0}]}
+    pending, skipped = run_sweep.plan_queue(manifest, only={"partial", "gone"})
+    assert [e["name"] for e in pending] == ["partial", "gone"]
+    assert skipped == []                       # 'done' is complete but was not part of this invocation
+
+
+def test_the_queue_skips_only_what_the_artifacts_show_is_complete(tmp_path):
+    done = _write_run(tmp_path / "done", 25, want=25)
+    hollow = _write_run(tmp_path / "hollow", 25, want=25)           # complete summary, data deleted
+    shutil.rmtree(os.path.join(hollow, "generations"))
+    shutil.rmtree(os.path.join(hollow, "buffer"))
+    manifest = {"name": "s", "entries": [_entry("done", done, want=25),
+                                         _entry("hollow", hollow, want=25)]}
+    pending, skipped = run_sweep.plan_queue(manifest)
+    assert [e["name"] for e in pending] == ["hollow"]
+    assert skipped == ["done (complete: 25/25 verified)"]
+
+
+def test_the_queue_is_empty_only_when_every_planned_run_verifies_complete(tmp_path):
+    done = _write_run(tmp_path / "done", 25, want=25)
+    manifest = {"name": "s", "entries": [_entry("done", done, want=25)]}
+    pending, skipped = run_sweep.plan_queue(manifest)
+    assert pending == [] and len(skipped) == 1

@@ -748,3 +748,21 @@ queued, so nothing else can slip in). `--continue-run` takes a run dir OR — wi
 sweep — a bare run name, with `:N` as the general way to say the generation (`--from-generation` stays
 as sugar for the single-run case, and is an error alongside `:N` or several runs). Cross-sweep paths,
 duplicate names and unknown run names are all refused before anything moves.
+
+**Follow-up 3 — a sweep that launches nothing must not report "12 ok".** On Bosch, `--resume
+runs/ac2_qwen_b --continue-run n10_s2_random --from-generation 14` planned all 12 runs correctly, then
+printed a status table and exited with `done: 12 ok, 0 failed` having launched none of them.
+
+`supervise`'s queue filter still carried a pre-existing condition, `e.get("returncode") != 0`. That
+return code is one number remembered from a past process, and "exited 0" is not "did all its
+generations": a manifest whose entries carry 0 (a run LSF killed at a generation boundary, a relaunch
+that exited early, a sweep whose runs finished before their dirs were deleted) empties the queue
+completely — reproduced with a 12-entry synthetic sweep, `pending = 0`. Completeness is now decided in
+exactly one place, `plan_queue()`, and only from the artifacts (`results.resume`); the return code is
+not consulted at all.
+
+Two reporting fixes so this cannot be silent again: `supervise` prints the queue it is about to run
+(`queue: 12 run(s) to launch: ...`, plus which runs it skipped as verifiably complete and why), says
+`nothing to launch` outright when the queue is empty, and the closing line counts what THIS invocation
+did (`done: N launched, N ok, N failed`) instead of `len(entries) - failed`, which is what called a
+sweep that launched nothing "12 ok".

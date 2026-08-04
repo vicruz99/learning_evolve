@@ -683,6 +683,31 @@ def _clear_for_launch(entry: dict) -> None:
             print(f"[sweep] {entry['name']}: moved {line}")
 
 
+def plan_queue(manifest: dict, only: set[str] | None = None) -> tuple[list[dict], list[str]]:
+    """Split a sweep's entries into (to launch, skipped-as-complete-with-reasons).
+
+    Two rules, and no third one:
+
+      * ``only`` — the runs this invocation planned. ``None`` means every entry is a candidate.
+      * the ARTIFACTS say whether a run is finished (``results.resume``), not summary.json's status and
+        NOT the manifest's ``returncode``. That return code is one number remembered from a past
+        process, and "exited 0" is not "did all its generations": a run killed at a generation boundary
+        by LSF, or one whose relaunch exited 0 early, carried a 0 that skipped it from then on — the
+        sweep would print a status table and exit having launched nothing.
+    """
+    pending, skipped = [], []
+    for entry in manifest["entries"]:
+        if only is not None and entry["name"] not in only:
+            continue
+        want = _entry_generations(entry, manifest)
+        prog = _run_progress(entry["log_path"], want)
+        if prog["complete"]:
+            skipped.append(f"{entry['name']} (complete: {prog['good']}/{want or '?'} verified)")
+        else:
+            pending.append(entry)
+    return pending, skipped
+
+
 def _launch(entry: dict, env: dict[str, str] | None = None) -> subprocess.Popen:
     _clear_for_launch(entry)
     os.makedirs(entry["log_path"], exist_ok=True)
@@ -705,12 +730,16 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int,
     ``only`` restricts what may be launched to those run names (``--continue-run`` queues exactly one)
     while the manifest written back stays the sweep's full one.
     """
-    # "Complete" is verified against the run's artifacts, not read off summary.json: a run whose data
-    # was deleted (or whose summary an older resume rewrote) must be redone, not skipped.
-    pending = [e for e in manifest["entries"]
-               if (only is None or e["name"] in only)
-               and e.get("returncode") != 0
-               and not _run_progress(e["log_path"], _entry_generations(e, manifest))["complete"]]
+    pending, skipped = plan_queue(manifest, only)
+    print(f"[sweep] queue: {len(pending)} run(s) to launch"
+          + (": " + ", ".join(e["name"] for e in pending) if pending else ""))
+    if skipped:
+        print(f"[sweep] queue: skipping {len(skipped)} verifiably complete run(s): "
+              + ", ".join(skipped))
+    if not pending:
+        print("[sweep] nothing to launch. `--status` shows each run's verified generation count; "
+              "`--resume` restarts anything short of its target.")
+    launched = 0
     live: dict[str, subprocess.Popen] = {}
     last_launch = 0.0
     last_render = 0.0
@@ -727,7 +756,8 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int,
             entry = pending.pop(0)
             live[entry["name"]] = _launch(entry, env)
             last_launch = now
-            done = len(manifest["entries"]) - len(pending) - len(live)
+            launched += 1
+            done = launched - len(live)
             print(f"[sweep] launched {entry['name']} (pid {entry['pid']}) — "
                   f"{len(live)} running, {len(pending)} queued, {done} finished")
             _write_manifest(sweep_dir, manifest)
@@ -739,7 +769,9 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int,
 
     _write_manifest(sweep_dir, manifest)
     print_status(sweep_dir)
-    print(f"[sweep] done: {len(manifest['entries']) - failed} ok, {failed} failed")
+    # Counts of what THIS invocation did. It used to report len(entries) - failed as "ok", which called
+    # a sweep that launched nothing "12 ok".
+    print(f"[sweep] done: {launched} launched, {launched - failed} ok, {failed} failed")
     return failed
 
 
