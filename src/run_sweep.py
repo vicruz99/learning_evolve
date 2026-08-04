@@ -17,6 +17,8 @@ Usage
                                                                    #   each from generation 0 (verified
                                                                    #   against the run dir; add
                                                                    #   --print-cmds to just look)
+    python run_sweep.py --continue-run runs/ctx_strategies/cp26_cs-best        # continue ONE run where
+    python run_sweep.py --continue-run runs/.../cp26_cs-best --from-generation 7   # it stopped, or at 7
     python run_sweep.py --stop   runs/ctx_strategies               # SIGTERM every live run
 
 Run it under ``tmux`` for anything long: the supervisor must stay alive to enforce ``max_parallel``,
@@ -415,6 +417,22 @@ def _entry_generations(entry: dict, manifest: dict) -> int | None:
     return entry.get("num_generations") or manifest.get("num_generations")
 
 
+def _check_log_path(entry: dict) -> None:
+    """The dir we verify and rewind must be the dir the run writes to.
+
+    ``build_specs`` sets ``log_path`` and the command's ``--log-path`` from the same value, so these
+    agree unless a manifest was hand-edited — in which case a resume would inspect one run and relaunch
+    into another, which is precisely the silent mismatch this module exists to stop."""
+    cmd = entry["cmd"]
+    if "--log-path" not in cmd:
+        raise SweepError(f"{entry['name']}: its recorded command has no --log-path")
+    in_cmd = cmd[cmd.index("--log-path") + 1]
+    if os.path.normpath(in_cmd) != os.path.normpath(entry["log_path"]):
+        raise SweepError(f"{entry['name']}: the manifest's log_path ({entry['log_path']}) and its "
+                         f"command's --log-path ({in_cmd}) disagree — fix the manifest before "
+                         f"resuming, or the run would be verified in one dir and written in another")
+
+
 def print_status(sweep_dir: str) -> None:
     manifest = _read_manifest(sweep_dir)
     rows, notes = [], []
@@ -463,6 +481,7 @@ def plan_resume(manifest: dict, *, dry_run: bool = False) -> None:
     long run, ``run_icl.py --resume-step auto`` still continues one where it stopped.
     """
     for entry in manifest["entries"]:
+        _check_log_path(entry)
         want = _entry_generations(entry, manifest)
         prog = inspect_run(entry["log_path"], want)
         for line in prog.damage:
@@ -485,6 +504,78 @@ def plan_resume(manifest: dict, *, dry_run: bool = False) -> None:
             del cmd[i:i + 2]
         entry["cmd"] = cmd
         entry["pid"], entry["returncode"] = None, None
+
+
+def plan_continue_run(run_dir: str, from_generation: str | None = None, *,
+                      dry_run: bool = False) -> tuple[str, dict, dict, str]:
+    """Continue ONE run of a sweep mid-run, reusing the exact command line the sweep recorded for it.
+
+    The per-run counterpart of ``--resume``: that restarts whole runs because a sweep's arms are
+    compared across runs, but when one long run is 12 generations in, redoing those 12 can cost more
+    than the mixed-lineage caveat is worth. This is where that trade is made explicitly, on one named
+    run, with the generation either verified (``auto``) or stated outright.
+
+    Returns (sweep_dir, settings, manifest, run_name); the manifest is the sweep's FULL manifest, so
+    ``--status`` keeps working, and only ``run_name`` is queued for launch.
+    """
+    run_dir = os.path.normpath(run_dir)
+    sweep_dir = os.path.dirname(run_dir) or "."
+    name = os.path.basename(run_dir)
+    manifest = _read_manifest(sweep_dir)
+    entry = next((e for e in manifest["entries"] if e["name"] == name), None)
+    if entry is None:
+        raise SweepError(f"{name!r} is not a run of the sweep in {sweep_dir} (runs: "
+                         + ", ".join(e["name"] for e in manifest["entries"]) + ")")
+
+    _check_log_path(entry)
+    want = _entry_generations(entry, manifest)
+    prog = inspect_run(entry["log_path"], want)
+    for line in prog.damage:
+        print(f"[sweep] continue: {name}: {line}")
+    asked = (from_generation or "auto").strip().lower()
+    if asked in ("auto", "last"):
+        if prog.complete:
+            raise SweepError(f"{name} is already complete ({prog.good_generations}/{want}) — nothing "
+                             f"to continue. Pass --from-generation N to redo it from generation N.")
+        step = prog.resume_step
+    else:
+        try:
+            step = int(asked)
+        except ValueError:
+            raise SweepError(f"--from-generation: expected a generation number or 'auto', got {asked!r}")
+        if step < 0:
+            raise SweepError("--from-generation: must be >= 0")
+        if want is not None and step >= want:
+            raise SweepError(f"--from-generation {step}: the run only has {want} generations "
+                             f"(0..{want - 1}) — nothing would be left to run")
+        if step and step not in prog.snapshots:
+            have = ", ".join(str(s) for s in prog.snapshots) or "none"
+            raise SweepError(
+                f"--from-generation {step}: {entry['log_path']} has no loadable PUCT snapshot for that "
+                f"step (have: {have}); a run can only continue from a generation whose buffer survived. "
+                f"Use --from-generation auto for {prog.resume_step}, or 0 to start the run over.")
+        if step > prog.good_generations:
+            print(f"[sweep] continue: {name}: WARNING only {prog.good_generations} generation(s) are "
+                  f"verifiable, but you asked to continue from {step} — generations "
+                  f"{prog.good_generations}..{step - 1} are damaged or missing")
+
+    verified = "" if asked not in ("auto", "last") else " (the last generation its files can back)"
+    where = "generation 0, from scratch" if step == 0 else f"generation {step}{verified}"
+    print(f"[sweep] continue: {name}: {prog.good_generations}/{want or '?'} verified -> continuing at "
+          f"{where}" + (" — nothing moved: --print-cmds" if dry_run else ""))
+    if not dry_run and tail_exists(entry["log_path"], step):
+        for line in rewind(entry["log_path"], step):
+            print(f"[sweep] continue: {name}: moved {line}")
+
+    cmd = [tok for tok in entry["cmd"]]
+    if "--resume-step" in cmd:
+        i = cmd.index("--resume-step")
+        del cmd[i:i + 2]
+    if step:
+        cmd += ["--resume-step", str(step)]
+    entry["cmd"] = cmd
+    entry["pid"], entry["returncode"] = None, None
+    return sweep_dir, (manifest.get("settings") or {}), manifest, name
 
 
 # --------------------------------------------------------------------------------------------------
@@ -527,13 +618,19 @@ def _launch(entry: dict, env: dict[str, str] | None = None) -> subprocess.Popen:
     return proc
 
 
-def supervise(sweep_dir: str, manifest: dict, stagger: float,
-              max_parallel: int, refresh: float, env: dict[str, str] | None = None) -> int:
+def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int, refresh: float,
+              env: dict[str, str] | None = None, only: set[str] | None = None) -> int:
     """Run the queue to completion: at most ``max_parallel`` runs in flight, ``stagger`` seconds
-    between launches, a status table every ``refresh`` seconds. Returns the number that failed."""
+    between launches, a status table every ``refresh`` seconds. Returns the number that failed.
+
+    ``only`` restricts what may be launched to those run names (``--continue-run`` queues exactly one)
+    while the manifest written back stays the sweep's full one.
+    """
     # "Complete" is verified against the run's artifacts, not read off summary.json: a run whose data
     # was deleted (or whose summary an older resume rewrote) must be redone, not skipped.
-    pending = [e for e in manifest["entries"] if e.get("returncode") != 0
+    pending = [e for e in manifest["entries"]
+               if (only is None or e["name"] in only)
+               and e.get("returncode") != 0
                and not _run_progress(e["log_path"], _entry_generations(e, manifest))["complete"]]
     live: dict[str, subprocess.Popen] = {}
     last_launch = 0.0
@@ -544,24 +641,7 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float,
         print(f"\n[sweep] signal {signum} — leaving {len(live)} run(s) alive "
               f"(stop them with: python run_sweep.py --stop {sweep_dir})")
         _write_manifest(sweep_dir, manifest)
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
-
-    while pending or live:
-        for name, proc in list(live.items()):
-            rc = proc.poll()
-            if rc is None:
-                continue
-            entry = next(e for e in manifest["entries"] if e["name"] == name)
-            entry["returncode"] = rc
-            entry["finished_at"] = datetime.now().isoformat(timespec="seconds")
-            failed += rc != 0
-            print(f"[sweep] {name} finished (exit {rc})"
-                  + ("" if rc == 0 else f" — see {entry['log_path']}/launch.out"))
-            live.pop(name)
-            _write_manifest(sweep_dir, manifest)
+        _write_manifest(sweep_dir, manifest)
 
         now = time.monotonic()
         if pending and len(live) < max_parallel and (not live or now - last_launch >= stagger):
@@ -656,6 +736,15 @@ def main() -> int:
                         "summary.json; a restarted run's old dir is moved to <run>/stale_<timestamp>/ "
                         "rather than deleted. Combine with --print-cmds to see the decisions, and how "
                         "much each restart discards, without touching anything.")
+    p.add_argument("--continue-run", metavar="RUN_DIR",
+                   help="Continue ONE run of a sweep (runs/<sweep>/<run>) mid-run instead of "
+                        "restarting it, reusing the command line the sweep recorded. Picks up at the "
+                        "last generation the run's files can back unless --from-generation says "
+                        "otherwise; the rest of the sweep is left alone.")
+    p.add_argument("--from-generation", metavar="N|auto", default=None,
+                   help="With --continue-run: the generation to continue at. 'auto' (default) uses the "
+                        "last verifiable one; N is checked against the run's buffer snapshots; 0 "
+                        "restarts that one run. Generations from N on move to <run>/stale_<timestamp>/.")
     p.add_argument("--print-cmds", action="store_true",
                    help="Expand the sweep and print the exact commands; launch nothing.")
     p.add_argument("--max-parallel", type=int, default=None,
@@ -676,7 +765,19 @@ def main() -> int:
         stop_sweep(a.stop)
         return 0
 
-    if a.resume:
+    if a.resume and a.continue_run:
+        p.error("--resume restarts whole runs and --continue-run continues one mid-run; pick one")
+    if a.from_generation and not a.continue_run:
+        p.error("--from-generation only applies to --continue-run (--resume always starts at 0)")
+
+    only: set[str] | None = None
+    if a.continue_run:
+        sweep_dir, settings, manifest, name = plan_continue_run(
+            a.continue_run, a.from_generation, dry_run=a.print_cmds)
+        only = {name}
+        if not a.print_cmds:
+            _write_manifest(sweep_dir, manifest)
+    elif a.resume:
         sweep_dir = a.resume
         manifest = _read_manifest(sweep_dir)
         settings = manifest.get("settings") or {}
@@ -685,18 +786,19 @@ def main() -> int:
             _write_manifest(sweep_dir, manifest)
     else:
         if not a.sweep_file:
-            p.error("give a sweep file, or one of --status/--stop/--resume")
+            p.error("give a sweep file, or one of --status/--stop/--resume/--continue-run")
         sweep_dir, settings, manifest = build_specs(a.sweep_file, a.sweep_dir)
 
-    max_parallel = a.max_parallel or int(settings.get("max_parallel", 1))
+    launching = [e for e in manifest["entries"] if only is None or e["name"] in only]
+    max_parallel = a.max_parallel or (1 if only else int(settings.get("max_parallel", 1)))
     stagger = a.stagger if a.stagger is not None else float(settings.get("stagger", 120))
 
     if a.print_cmds:
-        print(f"[sweep] {manifest['name']}: {len(manifest['entries'])} run(s) -> {sweep_dir}")
+        print(f"[sweep] {manifest['name']}: {len(launching)} run(s) -> {sweep_dir}")
         print(f"[sweep] max_parallel={max_parallel} stagger={stagger:g}s")
         # Show exactly how the head would be sized on THIS box without starting it: the numbers come
         # from the cgroup, so this is the way to check a machine before committing a sweep to it.
-        tpt = threads_per_task(manifest["entries"])
+        tpt = threads_per_task(launching)
         stale = ray_head.diagnose_default_address_file()
         if stale:
             print(f"\n[sweep] ray: NOTE — {stale}")
@@ -711,22 +813,23 @@ def main() -> int:
             print(" ".join(plan.argv()))
         except ValueError as e:
             print(f"\n# ray head CANNOT be sized on this box: {e}")
-        for entry in manifest["entries"]:
+        for entry in launching:
             print(f"\n# {entry['name']}\n" + " ".join(entry["cmd"]))
         return 0
 
-    check_server(manifest["entries"], max_parallel, settings.get("server_max_num_seqs"))
+    check_server(launching, max_parallel, settings.get("server_max_num_seqs"))
 
-    tpt = threads_per_task(manifest["entries"])
+    tpt = threads_per_task(launching)
     head = RayHead()
     head.ensure(a.ray_head, tpt, max_parallel, dict(settings.get("ray") or {}))
 
     _write_manifest(sweep_dir, manifest)
-    print(f"[sweep] {manifest['name']}: {len(manifest['entries'])} run(s) -> {sweep_dir} "
+    print(f"[sweep] {manifest['name']}: {len(launching)} run(s) -> {sweep_dir} "
           f"(max_parallel={max_parallel}, stagger={stagger:g}s)")
     # supervise() exits the process on SIGINT/SIGTERM and deliberately leaves the runs alive, so the
     # head must survive that path — only tear it down when the queue actually drained.
-    failed = supervise(sweep_dir, manifest, stagger, max_parallel, a.refresh, head.child_env())
+    failed = supervise(sweep_dir, manifest, stagger, max_parallel, a.refresh, head.child_env(),
+                       only=only)
     head.teardown()
     return 1 if failed else 0
 

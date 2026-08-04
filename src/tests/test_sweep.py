@@ -261,3 +261,85 @@ def test_grid_over_problems_does_not_repeat_the_problem_in_the_name():
 def test_grid_over_problem_only_names_runs_after_the_problem():
     runs = _expand({"common": {"n-context": 0}, "grid": {"problem": ["erdos", "ac1"]}})
     assert [r["name"] for r in runs] == ["erdos", "ac1"]
+
+
+# ---- continuing one run mid-run -------------------------------------------------------------------
+def _sweep(tmp_path, *entries) -> str:
+    sweep_dir = str(tmp_path)
+    json.dump({"name": "s", "entries": list(entries), "settings": {"max_parallel": 2}},
+              open(os.path.join(sweep_dir, "sweep.json"), "w"))
+    return sweep_dir
+
+
+def test_continue_run_picks_up_at_the_last_verifiable_generation(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed", snapshot_steps=[2, 3])
+    _sweep(tmp_path, _entry("r", run_dir), _entry("other", str(tmp_path / "other")))
+    _sd, _settings, manifest, name = run_sweep.plan_continue_run(run_dir)
+    assert name == "r"
+    entry = next(e for e in manifest["entries"] if e["name"] == "r")
+    assert entry["cmd"][-2:] == ["--resume-step", "3"]
+    assert entry["pid"] is None
+    # generations 0..2 stay; only what the resume would append onto is set aside
+    assert sorted(os.listdir(os.path.join(run_dir, "generations"))) == [
+        "gen_0000", "gen_0001", "gen_0002"]
+    # the rest of the sweep is untouched and still in the manifest, so --status keeps working
+    assert [e["name"] for e in manifest["entries"]] == ["r", "other"]
+
+
+def test_continue_run_takes_an_explicit_generation(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed", snapshot_steps=[1, 2, 3])
+    _sweep(tmp_path, _entry("r", run_dir))
+    _sd, _s, manifest, _n = run_sweep.plan_continue_run(run_dir, "1")
+    assert manifest["entries"][0]["cmd"][-2:] == ["--resume-step", "1"]
+    assert sorted(os.listdir(os.path.join(run_dir, "generations"))) == ["gen_0000"]
+    stale = [d for d in os.listdir(run_dir) if d.startswith("stale_")][0]
+    assert sorted(os.listdir(os.path.join(run_dir, stale, "generations"))) == ["gen_0001", "gen_0002"]
+    assert sum(1 for _ in open(os.path.join(run_dir, "buffer", "context_pool.jsonl"))) == 2
+
+
+def test_continue_run_from_generation_zero_restarts_that_one_run(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed")
+    _sweep(tmp_path, _entry("r", run_dir))
+    _sd, _s, manifest, _n = run_sweep.plan_continue_run(run_dir, "0")
+    assert "--resume-step" not in manifest["entries"][0]["cmd"]
+    assert os.listdir(os.path.join(run_dir, "generations")) == []
+
+
+def test_continue_run_refuses_a_generation_with_no_surviving_buffer(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed", snapshot_steps=[3])
+    _sweep(tmp_path, _entry("r", run_dir))
+    with pytest.raises(SweepError, match="no loadable PUCT snapshot"):
+        run_sweep.plan_continue_run(run_dir, "2")
+    # ...and does not touch the run dir on the way out
+    assert sorted(os.listdir(os.path.join(run_dir, "generations"))) == [
+        "gen_0000", "gen_0001", "gen_0002"]
+
+
+def test_continue_run_refuses_a_finished_run_unless_a_generation_is_named(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 5, want=5, snapshot_steps=[3, 5])
+    _sweep(tmp_path, _entry("r", run_dir))
+    with pytest.raises(SweepError, match="already complete"):
+        run_sweep.plan_continue_run(run_dir)
+    _sd, _s, manifest, _n = run_sweep.plan_continue_run(run_dir, "3")   # redoing the tail is allowed
+    assert manifest["entries"][0]["cmd"][-2:] == ["--resume-step", "3"]
+
+
+def test_continue_run_rejects_unknown_runs_and_bad_generations(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed")
+    _sweep(tmp_path, _entry("r", run_dir))
+    with pytest.raises(SweepError, match="is not a run of the sweep"):
+        run_sweep.plan_continue_run(str(tmp_path / "nope"))
+    with pytest.raises(SweepError, match="expected a generation number"):
+        run_sweep.plan_continue_run(run_dir, "seven")
+    with pytest.raises(SweepError, match="nothing would be left to run"):
+        run_sweep.plan_continue_run(run_dir, "5")
+
+
+def test_continue_run_with_print_cmds_touches_nothing(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed", snapshot_steps=[1, 2, 3])
+    _sweep(tmp_path, _entry("r", run_dir))
+    _sd, _s, manifest, _n = run_sweep.plan_continue_run(run_dir, "1", dry_run=True)
+    assert manifest["entries"][0]["cmd"][-2:] == ["--resume-step", "1"]
+    assert sorted(os.listdir(os.path.join(run_dir, "generations"))) == [
+        "gen_0000", "gen_0001", "gen_0002"]
+    assert not any(d.startswith("stale_") for d in os.listdir(run_dir))

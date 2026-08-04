@@ -718,3 +718,18 @@ shows every such line without moving anything, so the cost is visible before com
 The mid-run machinery stays and is still tested — `run_icl.py --resume-step N|auto` continues one run by
 hand (verified point, rewind of the tail, cumulative summary via `prior_state`). It is now the explicit
 per-run escape hatch rather than what a sweep does silently.
+
+**Follow-up — `--continue-run`, the deliberate per-run mid-run resume.** `--resume` restarting whole
+runs is right for a sweep but wrong for one long run that is 12 generations in: redoing those costs ~7 h
+of grading. The mid-run path already existed on `run_icl.py --resume-step N|auto`, but using it meant
+retyping ~20 flags by hand — the same manual-relaunch move that put two processes in
+`runs/ac1_gptoss/puct_s3`. So `run_sweep.py --continue-run runs/<sweep>/<run> [--from-generation N|auto]`
+now reuses the command line the manifest already records for that run, rewinds from the chosen
+generation, queues that run ALONE (`supervise(..., only={name})`) and writes the sweep's full manifest
+back so `--status` keeps working. `--from-generation` is refused unless that step's PUCT snapshot
+survived (the error lists what did), `0` restarts just that run, and a complete run needs an explicit
+generation before it will redo anything. `--resume` + `--continue-run` and `--from-generation` without
+`--continue-run` are argparse errors, not silent precedence.
+
+Also added `_check_log_path`: both planners now refuse an entry whose manifest `log_path` and command
+`--log-path` disagree, which would otherwise verify one dir and relaunch into another.
