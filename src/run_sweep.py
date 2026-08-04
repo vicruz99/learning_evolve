@@ -749,7 +749,24 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int,
         print(f"\n[sweep] signal {signum} — leaving {len(live)} run(s) alive "
               f"(stop them with: python run_sweep.py --stop {sweep_dir})")
         _write_manifest(sweep_dir, manifest)
-        _write_manifest(sweep_dir, manifest)
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    while pending or live:
+        for name, proc in list(live.items()):
+            rc = proc.poll()
+            if rc is None:
+                continue
+            entry = next(e for e in manifest["entries"] if e["name"] == name)
+            entry["returncode"] = rc
+            entry["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            failed += rc != 0
+            print(f"[sweep] {name} finished (exit {rc})"
+                  + ("" if rc == 0 else f" — see {entry['log_path']}/launch.out"))
+            live.pop(name)
+            _write_manifest(sweep_dir, manifest)
 
         now = time.monotonic()
         if pending and len(live) < max_parallel and (not live or now - last_launch >= stagger):
