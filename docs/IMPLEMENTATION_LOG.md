@@ -766,3 +766,25 @@ Two reporting fixes so this cannot be silent again: `supervise` prints the queue
 `nothing to launch` outright when the queue is empty, and the closing line counts what THIS invocation
 did (`done: N launched, N ok, N failed`) instead of `len(entries) - failed`, which is what called a
 sweep that launched nothing "12 ok".
+
+**Follow-up 4 — the launch loop was missing from three commits, and no test noticed.** On Bosch the
+sweep printed `queue: 12 run(s) to launch: ...` and then `done: 0 launched`. Cause: the commits at
+`0bc5585`, `e06c985` and `d78e81e` were assembled by splitting a working tree that also held an
+unrelated in-flight memory-watchdog stream, and the script that stripped that stream out cut from a
+comment inside `supervise`'s `shutdown()` to "the next `_write_manifest(...)` line" — which sat far
+below. That deleted `sys.exit(130)`, both `signal.signal` registrations, the `while pending or live:`
+header and the process-reaping block, leaving the launch block INSIDE `shutdown()`: dead code unless a
+signal arrives. The working tree was never mangled, so every local run and all 109 tests passed.
+
+Why the tests passed: nothing in the suite ever ran `supervise`'s loop. `tests/test_sweep.py` now has
+`test_supervise_actually_launches_its_queue`, which gives it a `/bin/sh -c "echo ran > marker"` entry
+and asserts the marker file exists, the manifest records the pid and returncode, and the output says
+`launched r (pid ...)` / `done: 1 launched`; plus a failing-run case for the reaping path. Both fail
+against the mangled file.
+
+The reconstruction now verifies structure rather than just compiling: the AST must show a `while` loop
+in `supervise` containing the `_launch` and `poll` calls, and `shutdown` must still contain
+`sys.exit(130)` and NOT `_launch`. It also checks cross-module: every `ray_head.X` the committed file
+calls has to exist in the COMMITTED `sandbox/ray_head.py` — `teardown` had picked up calls to
+`archive_logs`/`remove_temp_dir`, which live only in the uncommitted stream, so the committed tree would
+have raised AttributeError on teardown.

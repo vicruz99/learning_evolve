@@ -458,3 +458,35 @@ def test_the_queue_is_empty_only_when_every_planned_run_verifies_complete(tmp_pa
     manifest = {"name": "s", "entries": [_entry("done", done, want=25)]}
     pending, skipped = run_sweep.plan_queue(manifest)
     assert pending == [] and len(skipped) == 1
+
+
+def test_supervise_actually_launches_its_queue(tmp_path, capsys):
+    """The one test the suite was missing, and it is the one that mattered: supervise must SPAWN the
+    pending runs. Nothing exercised the launch loop, so a mangled supervise — the launch block folded
+    into the signal handler, `while pending or live` gone — passed 109 tests and made every sweep on
+    the cluster print its queue and exit with `done: 0 launched`."""
+    run_dir = str(tmp_path / "r")
+    marker = tmp_path / "ran.txt"
+    entry = {"name": "r", "log_path": run_dir, "num_generations": 3, "pid": None, "returncode": None,
+             "cmd": ["/bin/sh", "-c", f"echo ran > {marker}", "--log-path", run_dir]}
+    manifest = {"name": "s", "entries": [entry]}
+
+    failed = run_sweep.supervise(str(tmp_path), manifest, stagger=0, max_parallel=1, refresh=10 ** 9)
+
+    assert failed == 0
+    assert marker.read_text().strip() == "ran"          # the child really ran
+    assert entry["pid"] and entry["returncode"] == 0     # ...and was reaped into the manifest
+    out = capsys.readouterr().out
+    assert "queue: 1 run(s) to launch: r" in out
+    assert "launched r (pid" in out
+    assert "done: 1 launched, 1 ok, 0 failed" in out
+
+
+def test_supervise_reaps_a_failing_run(tmp_path):
+    run_dir = str(tmp_path / "r")
+    entry = {"name": "r", "log_path": run_dir, "num_generations": 3, "pid": None, "returncode": None,
+             "cmd": ["/bin/sh", "-c", "exit 3"]}
+    manifest = {"name": "s", "entries": [entry]}
+    assert run_sweep.supervise(str(tmp_path), manifest, stagger=0, max_parallel=1,
+                               refresh=10 ** 9) == 1
+    assert entry["returncode"] == 3
