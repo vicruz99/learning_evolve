@@ -131,6 +131,8 @@ runs:                        # optional explicit entries, each overriding `commo
 | `run_sweep.py --status DIR` | Status table (works any time, even after the supervisor exits). |
 | `run_sweep.py --resume DIR` | **Restart** every run that is not complete, from its first generation. |
 | `run_sweep.py --resume DIR --print-cmds` | Show what a resume would decide and launch nothing (also moves nothing). |
+| `run_sweep.py --continue-run DIR/RUN` | Continue **one** run mid-run, at the last generation its files can back. |
+| `run_sweep.py --continue-run DIR/RUN --from-generation N` | Same, at a generation you name (`0` restarts just that run). |
 | `run_sweep.py --stop DIR` | `SIGTERM` every live run of the sweep. |
 
 **What "complete" means** — never `summary.json`'s `status` field: that survives the deletion of
@@ -146,8 +148,25 @@ whole dir is moved to `<run>/stale_<timestamp>/` (nothing is deleted) and it is 
 generation 0. Continuing mid-run is cheaper, but it makes a run's generations a mixture of two
 processes with the interruption's cause — dead server, throttled box, evicted job — sitting somewhere
 inside the search it produced, and nothing in the results saying where. `--resume --print-cmds` prints
-how many verified generations each restart discards before you commit to it. For one long run where
-that cost is not acceptable, `run_icl.py --resume-step auto` still continues where it stopped.
+how many verified generations each restart discards before you commit to it.
+
+**When that cost is too high, continue one named run instead.** `--continue-run` is the deliberate
+per-run version: it reuses the exact command line the sweep recorded for that run (no flags to retype),
+picks up at the last generation the run's files can back, moves generations from there on to
+`stale_<timestamp>/`, and leaves every other run of the sweep alone.
+
+```bash
+python run_sweep.py --continue-run runs/ac1_gptoss_rest/n10_s3_random --print-cmds   # decide, move nothing
+python run_sweep.py --continue-run runs/ac1_gptoss_rest/n10_s3_random                # 12/15 -> continue at 12
+python run_sweep.py --continue-run runs/ac1_gptoss_rest/n10_s3_random --from-generation 7
+```
+
+`--from-generation N` must name a generation whose PUCT snapshot survived (`buffer/puct_sampler_step_<N>.json`);
+if it did not, the error lists the steps that are available. `0` restarts that one run. The continued
+run keeps one cumulative `summary.json` — totals, best-so-far and solution numbering carry on — and
+records the resume in `summary.json`'s `resumes[]` and `config.json`'s `_meta.resumes`, so a run built
+by more than one process says so. `run_icl.py --resume-step N|auto` does the same for a run that no
+sweep manifest knows about.
 
 ```
 run                  pid       state     gens   best    gen wall  tok/s  updated
