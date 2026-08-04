@@ -327,11 +327,11 @@ def test_continue_run_refuses_a_finished_run_unless_a_generation_is_named(tmp_pa
 def test_continue_run_rejects_unknown_runs_and_bad_generations(tmp_path):
     run_dir = _write_run(tmp_path / "r", 3, want=5, status="failed")
     _sweep(tmp_path, _entry("r", run_dir))
-    with pytest.raises(SweepError, match="is not a run of the sweep"):
+    with pytest.raises(SweepError, match="not run.s. of this sweep"):
         run_sweep.plan_continue_run(str(tmp_path / "nope"))
     with pytest.raises(SweepError, match="expected a generation number"):
         run_sweep.plan_continue_run(run_dir, "seven")
-    with pytest.raises(SweepError, match="nothing would be left to run"):
+    with pytest.raises(SweepError, match="leave nothing to run"):
         run_sweep.plan_continue_run(run_dir, "5")
 
 
@@ -343,3 +343,81 @@ def test_continue_run_with_print_cmds_touches_nothing(tmp_path):
     assert sorted(os.listdir(os.path.join(run_dir, "generations"))) == [
         "gen_0000", "gen_0001", "gen_0002"]
     assert not any(d.startswith("stale_") for d in os.listdir(run_dir))
+
+
+# ---- resuming a sweep while continuing named runs mid-run ------------------------------------------
+def test_resume_can_continue_one_run_while_restarting_the_others(tmp_path):
+    """The mode that matters when one long run is deep in and the rest of the sweep still has to go:
+    that run picks up where it stopped, everything else starts over, one queue supervises the lot."""
+    deep = _write_run(tmp_path / "deep", 12, want=15, status="failed", snapshot_steps=[12])
+    shallow = _write_run(tmp_path / "shallow", 2, want=15, status="failed", snapshot_steps=[2])
+    done = _write_run(tmp_path / "done", 15, want=15)
+    manifest = {"name": "s", "entries": [_entry("deep", deep, want=15),
+                                         _entry("shallow", shallow, want=15),
+                                         _entry("done", done, want=15)]}
+    queued = run_sweep.plan_runs(manifest, continue_at={"deep": "auto"}, restart_others=True)
+
+    assert queued == {"deep", "shallow"}                       # 'done' verifies complete, not queued
+    by_name = {e["name"]: e for e in manifest["entries"]}
+    assert by_name["deep"]["cmd"][-2:] == ["--resume-step", "12"]
+    assert len(os.listdir(os.path.join(deep, "generations"))) == 12      # kept
+    assert "--resume-step" not in by_name["shallow"]["cmd"]
+    assert os.listdir(os.path.join(shallow, "generations")) == []        # restarted
+    assert len(os.listdir(os.path.join(done, "generations"))) == 15      # untouched
+    assert not any(d.startswith("stale_") for d in os.listdir(done))
+
+
+def test_continuing_several_runs_at_different_generations(tmp_path):
+    a = _write_run(tmp_path / "a", 12, want=15, status="failed", snapshot_steps=[8, 12])
+    b = _write_run(tmp_path / "b", 5, want=15, status="failed", snapshot_steps=[5])
+    manifest = {"name": "s", "entries": [_entry("a", a, want=15), _entry("b", b, want=15)]}
+    queued = run_sweep.plan_runs(manifest, continue_at={"a": "8", "b": "auto"}, restart_others=True)
+    assert queued == {"a", "b"}
+    by_name = {e["name"]: e for e in manifest["entries"]}
+    assert by_name["a"]["cmd"][-2:] == ["--resume-step", "8"]
+    assert by_name["b"]["cmd"][-2:] == ["--resume-step", "5"]
+    assert len(os.listdir(os.path.join(a, "generations"))) == 8
+
+
+def test_continue_only_mode_leaves_the_sweeps_other_unfinished_runs_alone(tmp_path):
+    deep = _write_run(tmp_path / "deep", 12, want=15, status="failed", snapshot_steps=[12])
+    other = _write_run(tmp_path / "other", 2, want=15, status="failed", snapshot_steps=[2])
+    manifest = {"name": "s", "entries": [_entry("deep", deep, want=15),
+                                         _entry("other", other, want=15)]}
+    queued = run_sweep.plan_runs(manifest, continue_at={"deep": "auto"}, restart_others=False)
+    assert queued == {"deep"}
+    assert len(os.listdir(os.path.join(other, "generations"))) == 2      # untouched, not queued
+    assert "--resume-step" not in next(e for e in manifest["entries"] if e["name"] == "other")["cmd"]
+
+
+def test_a_named_run_that_is_complete_can_still_be_redone_from_a_generation(tmp_path):
+    done = _write_run(tmp_path / "done", 15, want=15, snapshot_steps=[10, 15])
+    manifest = {"name": "s", "entries": [_entry("done", done, want=15)]}
+    with pytest.raises(SweepError, match="already complete"):
+        run_sweep.plan_runs(manifest, continue_at={"done": "auto"})
+    queued = run_sweep.plan_runs(manifest, continue_at={"done": "10"})
+    assert queued == {"done"} and manifest["entries"][0]["cmd"][-2:] == ["--resume-step", "10"]
+
+
+# ---- --continue-run spec parsing -------------------------------------------------------------------
+def test_continue_specs_accept_names_paths_and_generations():
+    assert run_sweep.parse_continue_specs(["r1"], None, "runs/sw") == ("runs/sw", {"r1": "auto"})
+    assert run_sweep.parse_continue_specs(["r1:7"], None, "runs/sw") == ("runs/sw", {"r1": "7"})
+    assert run_sweep.parse_continue_specs(["runs/sw/r1"], None, None) == ("runs/sw", {"r1": "auto"})
+    assert run_sweep.parse_continue_specs(["runs/sw/r1:7"], None, None) == ("runs/sw", {"r1": "7"})
+    # --from-generation is sugar for a single run's :N
+    assert run_sweep.parse_continue_specs(["r1"], "3", "runs/sw") == ("runs/sw", {"r1": "3"})
+    assert run_sweep.parse_continue_specs(["a:1", "b"], None, "runs/sw")[1] == {"a": "1", "b": "auto"}
+
+
+def test_continue_specs_reject_ambiguity():
+    with pytest.raises(SweepError, match="give the run's directory"):
+        run_sweep.parse_continue_specs(["r1"], None, None)          # which sweep?
+    with pytest.raises(SweepError, match="but the sweep being resumed is"):
+        run_sweep.parse_continue_specs(["runs/other/r1"], None, "runs/sw")
+    with pytest.raises(SweepError, match="named twice"):
+        run_sweep.parse_continue_specs(["r1", "r1:4"], None, "runs/sw")
+    with pytest.raises(SweepError, match="applies to a single --continue-run"):
+        run_sweep.parse_continue_specs(["a", "b"], "3", "runs/sw")
+    with pytest.raises(SweepError, match="both say where to continue"):
+        run_sweep.parse_continue_specs(["a:2"], "3", "runs/sw")

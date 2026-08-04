@@ -19,6 +19,8 @@ Usage
                                                                    #   --print-cmds to just look)
     python run_sweep.py --continue-run runs/ctx_strategies/cp26_cs-best        # continue ONE run where
     python run_sweep.py --continue-run runs/.../cp26_cs-best --from-generation 7   # it stopped, or at 7
+    python run_sweep.py --resume runs/ctx_strategies --continue-run cp26_cs-best:7   # ...and keep the
+                                                                   #   rest of the sweep going too
     python run_sweep.py --stop   runs/ctx_strategies               # SIGTERM every live run
 
 Run it under ``tmux`` for anything long: the supervisor must stay alive to enforce ``max_parallel``,
@@ -249,8 +251,22 @@ class RayHead:
             self.env = ray_head.thread_env(tpt)
             if existing != "auto":
                 self.env["RAY_ADDRESS"] = existing
-            print(f"[sweep] ray: existing head found ({existing}) — attaching, not resizing it. "
-                  "Run `python -m sandbox.ray_doctor` if grading looks slow.")
+            # Learn where an ATTACHED head keeps its logs, so they can still be archived. `owned`
+            # stays False -- we must never stop or delete a head we did not start -- but archiving is
+            # read-only, and this is the case that matters most: jobs/icl_sweep.bsub starts the head
+            # itself and passes --ray-head require, so without this the one artifact that could
+            # explain a kill is never captured on the path where a kill actually happens.
+            attached_tmp = os.environ.get("RAY_TMPDIR")
+            if attached_tmp and os.path.isdir(attached_tmp):
+                self.temp_dir = attached_tmp
+                print(f"[sweep] ray: existing head found ({existing}) — attaching, not resizing it. "
+                      f"Its logs ({attached_tmp}) will still be archived on exit. "
+                      "Run `python -m sandbox.ray_doctor` if grading looks slow.")
+            else:
+                print(f"[sweep] ray: existing head found ({existing}) — attaching, not resizing it. "
+                      "RAY_TMPDIR is unset, so this sweep CANNOT archive that head's logs: export it "
+                      "in the shell that ran `ray start`, or use --ray-head auto and let the sweep "
+                      "own the head. Run `python -m sandbox.ray_doctor` if grading looks slow.")
             return
 
         if mode == "require":
@@ -467,115 +483,178 @@ def print_status(sweep_dir: str) -> None:
     print()
 
 
-def plan_resume(manifest: dict, *, dry_run: bool = False) -> None:
-    """Requeue every run of a sweep that is not verifiably complete, each FROM ITS FIRST GENERATION.
+def _continue_step(name: str, entry: dict, prog, want: int | None, asked: str) -> int:
+    """The generation one named run may continue at, or a SweepError saying why it may not.
 
-    A sweep resume is whole-run granular on purpose. Continuing mid-run is the cheaper option and it
-    is the one this used to take, but it makes a run's generations a mixture of two processes — with
-    the interruption's cause (a dead server, a throttled box, an evicted job) sitting somewhere in the
-    middle of the search it produced, and nothing in the results saying where. A restarted run is one
-    process, one context pool, one clean lineage; that is what the arms are compared on. So the whole
-    run dir is moved to ``stale_<timestamp>/`` and the run starts over.
-
-    Complete runs are left untouched and skipped by the supervisor. For the cheaper path on a single
-    long run, ``run_icl.py --resume-step auto`` still continues one where it stopped.
+    ``asked`` is ``auto`` (the last generation the run's files can back) or a generation number. A
+    number is honoured but checked: continuing needs that step's buffer snapshot, and the ways it went
+    wrong before were silent or cryptic (a FileNotFoundError from inside the sampler, or a context pool
+    that never reached N so every later prompt lost its context block).
     """
+    if asked in ("auto", "last"):
+        if prog.complete:
+            raise SweepError(f"{name} is already complete ({prog.good_generations}/{want}) — nothing "
+                             f"to continue. Name a generation ({name}:N) to redo it from there.")
+        return prog.resume_step
+    try:
+        step = int(asked)
+    except ValueError:
+        raise SweepError(f"{name}: expected a generation number or 'auto', got {asked!r}")
+    if step < 0:
+        raise SweepError(f"{name}: the generation to continue at must be >= 0")
+    if want is not None and step >= want:
+        raise SweepError(f"{name}: the run only has {want} generations (0..{want - 1}), so continuing "
+                         f"at {step} would leave nothing to run")
+    if step and step not in prog.snapshots:
+        have = ", ".join(str(s) for s in prog.snapshots) or "none"
+        raise SweepError(
+            f"{name}: no loadable PUCT snapshot for generation {step} in {entry['log_path']} (have: "
+            f"{have}); a run can only continue from a generation whose buffer survived. Use 'auto' for "
+            f"{prog.resume_step}, or 0 to start that run over.")
+    if step > prog.good_generations:
+        print(f"[sweep] continue: {name}: WARNING only {prog.good_generations} generation(s) are "
+              f"verifiable, but you asked to continue from {step} — generations "
+              f"{prog.good_generations}..{step - 1} are damaged or missing")
+    return step
+
+
+def plan_runs(manifest: dict, *, continue_at: dict[str, str] | None = None,
+              restart_others: bool = True, dry_run: bool = False) -> set[str]:
+    """Decide what each run of a sweep does next, make its dir match, and return the names to queue.
+
+    Two dials, because the two costs pull opposite ways:
+
+    ``restart_others=True`` (a ``--resume``) requeues every run that is not verifiably complete FROM
+    ITS FIRST GENERATION. Continuing mid-run is cheaper, but it makes a run's generations a mixture of
+    two processes — with the interruption's cause (a dead server, a throttled box, an evicted job)
+    sitting somewhere inside the search it produced, and nothing in the results saying where. One
+    process, one context pool, one clean lineage is what the arms are compared on.
+
+    ``continue_at={name: "auto"|"N"}`` exempts named runs from that: they continue where they stopped
+    instead, because redoing 12 generations of a long run can cost more than the mixed-lineage caveat
+    is worth. Both dials compose — continue the one expensive run, restart the rest of the sweep,
+    supervise the lot as one queue.
+
+    Either way the run dir is made to match the command that will run: everything from the resume point
+    on goes to ``stale_<timestamp>/`` (nothing deleted), so a relaunch cannot append onto the attempt it
+    replaces. Verifiably complete runs are left untouched and are not queued.
+    """
+    continue_at = {k: (v or "auto").strip().lower() for k, v in (continue_at or {}).items()}
+    names = [e["name"] for e in manifest["entries"]]
+    unknown = sorted(set(continue_at) - set(names))
+    if unknown:
+        raise SweepError(f"not run(s) of this sweep: {', '.join(unknown)} "
+                         f"(runs: {', '.join(names)})")
+
+    queued: set[str] = set()
     for entry in manifest["entries"]:
+        name = entry["name"]
+        asked = continue_at.get(name)
+        if asked is None and not restart_others:
+            continue                                   # this call is only about the named runs
         _check_log_path(entry)
         want = _entry_generations(entry, manifest)
         prog = inspect_run(entry["log_path"], want)
+        tag = "continue" if asked is not None else "resume"
         for line in prog.damage:
-            print(f"[sweep] resume: {entry['name']}: {line}")
-        if prog.complete:
-            print(f"[sweep] resume: {entry['name']}: {prog.describe()} — skipping")
+            print(f"[sweep] {tag}: {name}: {line}")
+
+        if asked is not None:
+            step = _continue_step(name, entry, prog, want, asked)
+            verified = " (the last generation its files can back)" if asked in ("auto", "last") else ""
+            where = "generation 0, from scratch" if step == 0 else f"generation {step}{verified}"
+            print(f"[sweep] continue: {name}: {prog.good_generations}/{want or '?'} verified -> "
+                  f"continuing at {where}"
+                  + (" — nothing moved: --print-cmds" if dry_run else ""))
+        elif prog.complete:
+            print(f"[sweep] resume: {name}: {prog.describe()} — skipping")
+            continue
         else:
+            step = 0
             had = (f" (discarding {prog.good_generations} verified generation(s))"
                    if prog.good_generations else "")
-            print(f"[sweep] resume: {entry['name']}: restarting from generation 0{had}"
+            print(f"[sweep] resume: {name}: restarting from generation 0{had}"
                   + (" — nothing moved: --print-cmds" if dry_run and prog.has_tail else ""))
-            if not dry_run and tail_exists(entry["log_path"], 0):
-                for line in rewind(entry["log_path"], 0):
-                    print(f"[sweep] resume: {entry['name']}: moved {line}")
-        # No --resume-step is ever added here, and a stale one from an earlier relaunch is dropped:
-        # the command has to say "start at generation 0", which is what the run dir now holds.
+
+        if not dry_run and tail_exists(entry["log_path"], step):
+            for line in rewind(entry["log_path"], step):
+                print(f"[sweep] {tag}: {name}: moved {line}")
+        # Rebuild the flag from the decision: a stale --resume-step from an earlier relaunch must not
+        # survive into a run that now starts over, and a restarted run must carry none.
         cmd = [tok for tok in entry["cmd"]]
         if "--resume-step" in cmd:
             i = cmd.index("--resume-step")
             del cmd[i:i + 2]
+        if step:
+            cmd += ["--resume-step", str(step)]
         entry["cmd"] = cmd
         entry["pid"], entry["returncode"] = None, None
+        queued.add(name)
+    return queued
+
+
+def plan_resume(manifest: dict, *, continue_at: dict[str, str] | None = None,
+                dry_run: bool = False) -> set[str]:
+    """A whole-sweep resume: restart every incomplete run, except those ``continue_at`` names."""
+    return plan_runs(manifest, continue_at=continue_at, restart_others=True, dry_run=dry_run)
 
 
 def plan_continue_run(run_dir: str, from_generation: str | None = None, *,
                       dry_run: bool = False) -> tuple[str, dict, dict, str]:
-    """Continue ONE run of a sweep mid-run, reusing the exact command line the sweep recorded for it.
-
-    The per-run counterpart of ``--resume``: that restarts whole runs because a sweep's arms are
-    compared across runs, but when one long run is 12 generations in, redoing those 12 can cost more
-    than the mixed-lineage caveat is worth. This is where that trade is made explicitly, on one named
-    run, with the generation either verified (``auto``) or stated outright.
+    """Continue ONE run of a sweep and touch nothing else — not even the sweep's other unfinished runs.
 
     Returns (sweep_dir, settings, manifest, run_name); the manifest is the sweep's FULL manifest, so
-    ``--status`` keeps working, and only ``run_name`` is queued for launch.
+    ``--status`` keeps working, and only ``run_name`` is queued.
     """
     run_dir = os.path.normpath(run_dir)
     sweep_dir = os.path.dirname(run_dir) or "."
     name = os.path.basename(run_dir)
     manifest = _read_manifest(sweep_dir)
-    entry = next((e for e in manifest["entries"] if e["name"] == name), None)
-    if entry is None:
-        raise SweepError(f"{name!r} is not a run of the sweep in {sweep_dir} (runs: "
-                         + ", ".join(e["name"] for e in manifest["entries"]) + ")")
-
-    _check_log_path(entry)
-    want = _entry_generations(entry, manifest)
-    prog = inspect_run(entry["log_path"], want)
-    for line in prog.damage:
-        print(f"[sweep] continue: {name}: {line}")
-    asked = (from_generation or "auto").strip().lower()
-    if asked in ("auto", "last"):
-        if prog.complete:
-            raise SweepError(f"{name} is already complete ({prog.good_generations}/{want}) — nothing "
-                             f"to continue. Pass --from-generation N to redo it from generation N.")
-        step = prog.resume_step
-    else:
-        try:
-            step = int(asked)
-        except ValueError:
-            raise SweepError(f"--from-generation: expected a generation number or 'auto', got {asked!r}")
-        if step < 0:
-            raise SweepError("--from-generation: must be >= 0")
-        if want is not None and step >= want:
-            raise SweepError(f"--from-generation {step}: the run only has {want} generations "
-                             f"(0..{want - 1}) — nothing would be left to run")
-        if step and step not in prog.snapshots:
-            have = ", ".join(str(s) for s in prog.snapshots) or "none"
-            raise SweepError(
-                f"--from-generation {step}: {entry['log_path']} has no loadable PUCT snapshot for that "
-                f"step (have: {have}); a run can only continue from a generation whose buffer survived. "
-                f"Use --from-generation auto for {prog.resume_step}, or 0 to start the run over.")
-        if step > prog.good_generations:
-            print(f"[sweep] continue: {name}: WARNING only {prog.good_generations} generation(s) are "
-                  f"verifiable, but you asked to continue from {step} — generations "
-                  f"{prog.good_generations}..{step - 1} are damaged or missing")
-
-    verified = "" if asked not in ("auto", "last") else " (the last generation its files can back)"
-    where = "generation 0, from scratch" if step == 0 else f"generation {step}{verified}"
-    print(f"[sweep] continue: {name}: {prog.good_generations}/{want or '?'} verified -> continuing at "
-          f"{where}" + (" — nothing moved: --print-cmds" if dry_run else ""))
-    if not dry_run and tail_exists(entry["log_path"], step):
-        for line in rewind(entry["log_path"], step):
-            print(f"[sweep] continue: {name}: moved {line}")
-
-    cmd = [tok for tok in entry["cmd"]]
-    if "--resume-step" in cmd:
-        i = cmd.index("--resume-step")
-        del cmd[i:i + 2]
-    if step:
-        cmd += ["--resume-step", str(step)]
-    entry["cmd"] = cmd
-    entry["pid"], entry["returncode"] = None, None
+    plan_runs(manifest, continue_at={name: from_generation or "auto"}, restart_others=False,
+              dry_run=dry_run)
     return sweep_dir, (manifest.get("settings") or {}), manifest, name
+
+
+def parse_continue_specs(values: list[str], from_generation: str | None,
+                         sweep_dir: str | None) -> tuple[str, dict[str, str]]:
+    """Turn ``--continue-run`` values into (sweep_dir, {run name: generation}).
+
+    A value is a run name, a name with the generation appended (``n10_s3_random:7``), or the run's
+    directory in either form — the path is what shell completion gives you, and it is what says which
+    sweep is meant when there is no ``--resume``.
+    """
+    resolved: dict[str, str] = {}
+    for raw in values:
+        value, gen = raw, None
+        head, sep, tail = raw.rpartition(":")
+        if sep and (tail.isdigit() or tail.strip().lower() in ("auto", "last")):
+            value, gen = head, tail.strip().lower()
+        value = os.path.normpath(value.rstrip(os.sep))
+        if os.sep in value:
+            parent, name = os.path.dirname(value), os.path.basename(value)
+            if sweep_dir is not None and os.path.normpath(sweep_dir) != parent:
+                raise SweepError(f"{raw}: that run is in {parent}, but the sweep being resumed is "
+                                 f"{sweep_dir} — pass just the run name, or resume the other sweep")
+            sweep_dir = parent
+        else:
+            name = value
+            if sweep_dir is None:
+                raise SweepError(f"--continue-run {raw}: give the run's directory "
+                                 f"(runs/<sweep>/{name}) so the sweep is unambiguous, or add "
+                                 f"--resume runs/<sweep> to keep the rest of the sweep going")
+        if name in resolved:
+            raise SweepError(f"--continue-run {name}: named twice")
+        resolved[name] = gen or "auto"
+
+    if from_generation is not None:
+        if len(resolved) != 1:
+            raise SweepError("--from-generation applies to a single --continue-run; with several, "
+                             "append the generation to each (--continue-run NAME:7)")
+        name, gen = next(iter(resolved.items()))
+        if gen != "auto":
+            raise SweepError(f"--from-generation and {name}:{gen} both say where to continue — keep one")
+        resolved[name] = from_generation.strip().lower()
+    return sweep_dir, resolved
 
 
 # --------------------------------------------------------------------------------------------------
@@ -736,15 +815,17 @@ def main() -> int:
                         "summary.json; a restarted run's old dir is moved to <run>/stale_<timestamp>/ "
                         "rather than deleted. Combine with --print-cmds to see the decisions, and how "
                         "much each restart discards, without touching anything.")
-    p.add_argument("--continue-run", metavar="RUN_DIR",
-                   help="Continue ONE run of a sweep (runs/<sweep>/<run>) mid-run instead of "
-                        "restarting it, reusing the command line the sweep recorded. Picks up at the "
-                        "last generation the run's files can back unless --from-generation says "
-                        "otherwise; the rest of the sweep is left alone.")
+    p.add_argument("--continue-run", metavar="RUN[:N]", action="append",
+                   help="Continue a run mid-run instead of restarting it, reusing the command line the "
+                        "sweep recorded for it. Takes a run directory (runs/<sweep>/<run>) or, "
+                        "alongside --resume, just the run name; append :N to name the generation. "
+                        "Repeatable. On its own it touches only the runs named; WITH --resume the rest "
+                        "of the sweep is planned as usual and everything runs in one queue.")
     p.add_argument("--from-generation", metavar="N|auto", default=None,
-                   help="With --continue-run: the generation to continue at. 'auto' (default) uses the "
-                        "last verifiable one; N is checked against the run's buffer snapshots; 0 "
-                        "restarts that one run. Generations from N on move to <run>/stale_<timestamp>/.")
+                   help="The generation a single --continue-run continues at (same as RUN:N). 'auto' "
+                        "(default) uses the last verifiable one; N is checked against the run's buffer "
+                        "snapshots; 0 restarts that run. Generations from N on move to "
+                        "<run>/stale_<timestamp>/.")
     p.add_argument("--print-cmds", action="store_true",
                    help="Expand the sweep and print the exact commands; launch nothing.")
     p.add_argument("--max-parallel", type=int, default=None,
@@ -765,23 +846,22 @@ def main() -> int:
         stop_sweep(a.stop)
         return 0
 
-    if a.resume and a.continue_run:
-        p.error("--resume restarts whole runs and --continue-run continues one mid-run; pick one")
-    if a.from_generation and not a.continue_run:
+    if a.from_generation is not None and not a.continue_run:
         p.error("--from-generation only applies to --continue-run (--resume always starts at 0)")
 
     only: set[str] | None = None
-    if a.continue_run:
-        sweep_dir, settings, manifest, name = plan_continue_run(
-            a.continue_run, a.from_generation, dry_run=a.print_cmds)
-        only = {name}
-        if not a.print_cmds:
-            _write_manifest(sweep_dir, manifest)
-    elif a.resume:
-        sweep_dir = a.resume
+    if a.continue_run or a.resume:
+        # --continue-run alone touches only the runs it names; with --resume the rest of the sweep is
+        # planned too (incomplete restarted, complete skipped) and the lot is supervised as one queue.
+        sweep_dir, continue_at = parse_continue_specs(
+            a.continue_run or [], a.from_generation, a.resume)
         manifest = _read_manifest(sweep_dir)
         settings = manifest.get("settings") or {}
-        plan_resume(manifest, dry_run=a.print_cmds)
+        only = plan_runs(manifest, continue_at=continue_at, restart_others=bool(a.resume),
+                         dry_run=a.print_cmds)
+        if not only:
+            print("[sweep] nothing to launch — every run of this sweep verifies as complete")
+            return 0
         if not a.print_cmds:
             _write_manifest(sweep_dir, manifest)
     else:
@@ -790,7 +870,8 @@ def main() -> int:
         sweep_dir, settings, manifest = build_specs(a.sweep_file, a.sweep_dir)
 
     launching = [e for e in manifest["entries"] if only is None or e["name"] in only]
-    max_parallel = a.max_parallel or (1 if only else int(settings.get("max_parallel", 1)))
+    single = only is not None and len(only) == 1
+    max_parallel = a.max_parallel or (1 if single else int(settings.get("max_parallel", 1)))
     stagger = a.stagger if a.stagger is not None else float(settings.get("stagger", 120))
 
     if a.print_cmds:

@@ -131,8 +131,9 @@ runs:                        # optional explicit entries, each overriding `commo
 | `run_sweep.py --status DIR` | Status table (works any time, even after the supervisor exits). |
 | `run_sweep.py --resume DIR` | **Restart** every run that is not complete, from its first generation. |
 | `run_sweep.py --resume DIR --print-cmds` | Show what a resume would decide and launch nothing (also moves nothing). |
-| `run_sweep.py --continue-run DIR/RUN` | Continue **one** run mid-run, at the last generation its files can back. |
+| `run_sweep.py --continue-run DIR/RUN` | Continue **one** run mid-run, at the last generation its files can back; the sweep's other runs are left alone. |
 | `run_sweep.py --continue-run DIR/RUN --from-generation N` | Same, at a generation you name (`0` restarts just that run). |
+| `run_sweep.py --resume DIR --continue-run RUN[:N]` | Resume the whole sweep, but let the named run(s) continue mid-run instead of restarting. Repeatable. |
 | `run_sweep.py --stop DIR` | `SIGTERM` every live run of the sweep. |
 
 **What "complete" means** — never `summary.json`'s `status` field: that survives the deletion of
@@ -150,16 +151,25 @@ processes with the interruption's cause — dead server, throttled box, evicted 
 inside the search it produced, and nothing in the results saying where. `--resume --print-cmds` prints
 how many verified generations each restart discards before you commit to it.
 
-**When that cost is too high, continue one named run instead.** `--continue-run` is the deliberate
-per-run version: it reuses the exact command line the sweep recorded for that run (no flags to retype),
-picks up at the last generation the run's files can back, moves generations from there on to
-`stale_<timestamp>/`, and leaves every other run of the sweep alone.
+**When that cost is too high, exempt the named run(s).** `--continue-run` reuses the exact command line
+the sweep recorded for a run (no flags to retype), picks up at the last generation its files can back,
+and moves generations from there on to `stale_<timestamp>/`. It composes with `--resume`, which is how
+you continue one expensive run *and* keep the rest of the sweep going in the same queue:
 
 ```bash
+# just that run; the sweep's other unfinished runs are not touched or launched
 python run_sweep.py --continue-run runs/ac1_gptoss_rest/n10_s3_random --print-cmds   # decide, move nothing
 python run_sweep.py --continue-run runs/ac1_gptoss_rest/n10_s3_random                # 12/15 -> continue at 12
 python run_sweep.py --continue-run runs/ac1_gptoss_rest/n10_s3_random --from-generation 7
+
+# the whole sweep, but n10_s3_random continues instead of restarting (run NAMES here, `:N` optional)
+python run_sweep.py --resume runs/ac1_gptoss_rest --continue-run n10_s3_random
+python run_sweep.py --resume runs/ac1_gptoss_rest --continue-run n10_s3_random:8 \
+                                                  --continue-run n10_s3_best
 ```
+
+With `--resume`, every run not named continues to follow the restart rule (incomplete → generation 0,
+complete → skipped), and all queued runs share one supervisor, `max_parallel` and `stagger`.
 
 `--from-generation N` must name a generation whose PUCT snapshot survived (`buffer/puct_sampler_step_<N>.json`);
 if it did not, the error lists the steps that are available. `0` restarts that one run. The continued

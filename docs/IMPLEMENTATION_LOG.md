@@ -733,3 +733,18 @@ generation before it will redo anything. `--resume` + `--continue-run` and `--fr
 
 Also added `_check_log_path`: both planners now refuse an entry whose manifest `log_path` and command
 `--log-path` disagree, which would otherwise verify one dir and relaunch into another.
+
+**Follow-up 2 — the two dials compose.** `--continue-run` on its own touches only the runs it names,
+which is wrong when the rest of the sweep is also unfinished: continuing one run then meant the other
+runs sat idle until a second command. `plan_resume`/`plan_continue_run` are now one planner,
+`plan_runs(manifest, continue_at={name: "auto"|"N"}, restart_others=bool)`, and `--continue-run` is
+repeatable and composes with `--resume`:
+
+    python run_sweep.py --resume runs/<sweep> --continue-run deep:8 --continue-run other
+
+Named runs continue at that generation, every other incomplete run still restarts from 0, complete runs
+are still skipped, and the queue is supervised as one thing (`only=` the set the planner actually
+queued, so nothing else can slip in). `--continue-run` takes a run dir OR — with `--resume` naming the
+sweep — a bare run name, with `:N` as the general way to say the generation (`--from-generation` stays
+as sugar for the single-run case, and is an error alongside `:N` or several runs). Cross-sweep paths,
+duplicate names and unknown run names are all refused before anything moves.
