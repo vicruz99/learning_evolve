@@ -110,6 +110,31 @@ def test_build_specs_assigns_log_paths_and_rejects_unknown_sections(tmp_path):
         build_specs(bad2, None)
 
 
+def test_ray_block_keys_are_validated(tmp_path):
+    """plan_head reads this block with cfg.get(), so an unrejected typo runs the sweep at a size
+    nobody chose -- indistinguishable from not having set it at all."""
+    ok = _write(tmp_path, {"sweep": {"ray": {"num_cpus": 16, "reserve_cpus": 2}},
+                           "common": {"problem": "toy"}, "grid": {"n-context": [1]}}, "ok.yaml")
+    _sweep_dir, settings, _manifest = build_specs(ok, None)
+    assert settings["ray"]["num_cpus"] == 16
+
+    bad = _write(tmp_path, {"sweep": {"ray": {"num_cpu": 16}}, "common": {"problem": "toy"},
+                            "grid": {"n-context": [1]}}, "badray.yaml")
+    with pytest.raises(SweepError, match=r"unknown key\(s\) in `sweep.ray`"):
+        build_specs(bad, None)
+
+
+def test_ray_num_cpus_flag_overrides_the_sweep_file():
+    """--print-cmds prints the plan and ensure() starts the head from the same helper, so the head
+    described and the head started cannot disagree."""
+    settings = {"ray": {"num_cpus": 16, "reserve_cpus": 2}}
+    assert run_sweep._ray_cfg(settings, None)["num_cpus"] == 16          # yaml alone
+    assert run_sweep._ray_cfg(settings, 8)["num_cpus"] == 8              # flag wins
+    assert run_sweep._ray_cfg(settings, 8)["reserve_cpus"] == 2          # rest of the block survives
+    assert "num_cpus" not in run_sweep._ray_cfg({}, None)                # absent stays absent
+    assert run_sweep._ray_cfg(settings, 8) is not settings["ray"]        # never mutates the manifest
+
+
 def test_sweep_dir_defaults_to_the_file_stem(tmp_path):
     path = _write(tmp_path, {"common": {"problem": "toy"}, "grid": {"n-context": [1]}}, "mysweep.yaml")
     sweep_dir, _settings, manifest = build_specs(path, None)
@@ -192,7 +217,7 @@ def test_resume_restarts_an_incomplete_run_from_its_first_generation(tmp_path, c
     assert sorted(os.listdir(os.path.join(run_dir, stale[0], "generations"))) == [
         "gen_0000", "gen_0001", "gen_0002"]
     out = capsys.readouterr().out
-    assert "restarting from generation 0 (discarding 3 verified generation(s))" in out
+    assert "restarting from generation 0 (discarding 3 generation(s) of work)" in out
 
 
 def test_resume_redoes_a_run_whose_data_was_deleted_under_a_complete_summary(tmp_path, capsys):
@@ -490,3 +515,114 @@ def test_supervise_reaps_a_failing_run(tmp_path):
     assert run_sweep.supervise(str(tmp_path), manifest, stagger=0, max_parallel=1,
                                refresh=10 ** 9) == 1
     assert entry["returncode"] == 3
+
+
+# ---- live runs, halting, and honest reporting -----------------------------------------------------
+def _sleeper():
+    """A real live process to point a manifest entry at."""
+    import subprocess
+    return subprocess.Popen(["/bin/sleep", "30"])
+
+
+def test_alive_rejects_a_recycled_pid():
+    """PIDs are reused, and a sweep manifest outlives the job that wrote it. Without the start-time
+    stamp, a dead run whose pid was inherited by something else reads as 'running' — and --stop would
+    have signalled that stranger's process group."""
+    proc = _sleeper()
+    try:
+        start = run_sweep._proc_start(proc.pid)
+        assert run_sweep._alive(proc.pid, start)
+        assert not run_sweep._alive(proc.pid, start + 1)     # same pid, different process
+        assert run_sweep._alive(proc.pid, None)              # no stamp recorded: the old, weaker test
+    finally:
+        proc.kill(); proc.wait()
+
+
+def test_relaunching_over_a_live_run_is_refused_without_a_terminal(tmp_path):
+    """pytest's stdin is not a tty, which is also true of every batch job — the case where proceeding
+    silently would rewind a run directory under a live writer."""
+    run_dir = _write_run(tmp_path / "r", 2, want=5)
+    proc = _sleeper()
+    try:
+        entry = _entry("r", run_dir)
+        entry.update(pid=proc.pid, pid_start=run_sweep._proc_start(proc.pid))
+        run_sweep._write_manifest(str(tmp_path), {"name": "s", "entries": [entry]})
+
+        with pytest.raises(SweepError, match="refusing to resume 1 live run"):
+            run_sweep.guard_live_runs(str(tmp_path), action="resume")
+        # ...and the escape hatch does not raise
+        run_sweep.guard_live_runs(str(tmp_path), action="resume", force=True)
+    finally:
+        proc.kill(); proc.wait()
+
+
+def test_the_live_run_guard_ignores_finished_runs(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 2, want=5)
+    proc = _sleeper()
+    proc.kill(); proc.wait()
+    entry = _entry("r", run_dir)
+    entry.update(pid=proc.pid, pid_start=987654321)          # stale pid from a previous job
+    run_sweep._write_manifest(str(tmp_path), {"name": "s", "entries": [entry]})
+
+    run_sweep.guard_live_runs(str(tmp_path))                 # must not raise
+
+
+def test_stop_halts_the_queue_instead_of_advancing_it(tmp_path, capsys):
+    """--stop used to only SIGTERM the live runs; the supervisor reaped them and immediately launched
+    the next queued one, so stopping a 12-run sweep at max_parallel 2 killed two and started two."""
+    entries = [{"name": f"r{i}", "log_path": str(tmp_path / f"r{i}"), "num_generations": 3,
+                "pid": None, "returncode": None, "cmd": ["/bin/true"]} for i in range(3)]
+    manifest = {"name": "s", "entries": entries}
+    run_sweep._write_manifest(str(tmp_path), manifest)
+    run_sweep.stop_sweep(str(tmp_path))                      # writes the marker; nothing is alive
+
+    run_sweep.supervise(str(tmp_path), manifest, stagger=0, max_parallel=1, refresh=10 ** 9)
+
+    out = capsys.readouterr().out
+    assert "halted by --stop: dropping 3 queued run(s)" in out
+    assert "launched r0" not in out
+    assert all(e["pid"] is None for e in entries)
+
+
+def test_a_relaunch_clears_a_previous_halt(tmp_path):
+    run_sweep._set_halt(str(tmp_path))
+    assert os.path.exists(run_sweep._halt_path(str(tmp_path)))
+    assert run_sweep._clear_halt(str(tmp_path))
+    assert not run_sweep._clear_halt(str(tmp_path))          # idempotent
+
+
+def test_resume_reports_the_generations_it_actually_discards(tmp_path, capsys):
+    """A run damaged in the middle has few VERIFIED generations and many on disk. It was the verified
+    count that got printed, so '--resume' captioned throwing away 10 generations as 'discarding 2'."""
+    run_dir = _write_run(tmp_path / "r", 10, want=10, drop_group_in=2,
+                         snapshot_steps=list(range(11)))
+    run_sweep.plan_resume({"entries": [_entry("r", run_dir)]}, dry_run=True)
+
+    out = capsys.readouterr().out
+    assert "discarding 10 generation(s) of work, only 2 of them verified" in out
+
+
+def test_a_token_budget_with_no_headroom_is_warned_about(capsys):
+    """max-context-tokens bounds only the CONTEXT BLOCK; the intro and the rules + current-solution
+    tail are added on top, and the block itself is trimmed by a chars/4 estimate. A budget summing to
+    exactly the window has no room for either, and the overflow is a 400 that stops the run."""
+    run_sweep._check_token_budget(
+        [{"model": "Qwen/Qwen3.6-27B-FP8", "max-context-tokens": "94000", "max-tokens": "34000"}],
+        {"Qwen/Qwen3.6-27B-FP8": 128000})
+    out = capsys.readouterr().out
+    assert "leaves only 0 for the problem intro" in out
+    assert "Lower max-context-tokens to <= 86,000" in out
+
+
+def test_a_token_budget_with_headroom_is_silent(capsys):
+    run_sweep._check_token_budget(
+        [{"model": "m", "max-context-tokens": "60000", "max-tokens": "34000"}], {"m": 128000})
+    assert capsys.readouterr().out == ""
+
+
+def test_the_token_budget_check_is_skipped_when_the_server_does_not_report_a_window(capsys):
+    """Not every vLLM build puts max_model_len on the model card; an absent field must not become a
+    warning about a budget nobody can check."""
+    run_sweep._check_token_budget(
+        [{"model": "m", "max-context-tokens": "94000", "max-tokens": "34000"}], {"m": None})
+    assert capsys.readouterr().out == ""

@@ -22,6 +22,7 @@ import time
 
 from puct import PUCTSampler, State
 from sandbox import init_ray
+from sandbox import memwatch
 from envs import EnvConfig, get_problem
 from generation import GenResult, VLLMClient
 from context import build_context_block, get_strategy, SelectionParams
@@ -29,6 +30,35 @@ from results import ExperimentTracker
 from icl.config import ICLConfig
 
 logger = logging.getLogger("icl")
+
+
+class GenerationAborted(RuntimeError):
+    """A generation could not be completed, so the run stops here rather than walking past it.
+
+    Raised once every group of the generation has settled (never mid-flight), and always BEFORE
+    ``tracker.end_generation``, so no ``meta.json`` is written for it. That is what makes the stop
+    resumable: ``results.resume`` reads the partial generation directory as "never finished", puts the
+    resume point at the last complete generation, and ``rewind`` moves the partial one aside.
+
+    The alternative, which this replaces, was to catch the error per group, record a group with no
+    candidates and continue. The run then finished all its generations, and every one of them after
+    the failure was conditioned on a buffer and a context pool missing that group's children — the
+    same configuration on paper, a different experiment in fact.
+    """
+
+
+class LLMUnavailable(GenerationAborted):
+    """The model server did not come back within ``--llm-max-wait``."""
+
+
+# Errors that will not fix themselves by waiting: the request is wrong, not the server. Retrying an
+# unknown model name or an over-length prompt for an hour only delays finding out.
+_PERMANENT_STATUS = {400, 401, 403, 404, 413, 422}
+
+
+def _is_permanent(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in _PERMANENT_STATUS
 
 
 def _setup_logging(log_path: str, console_level: str = "INFO") -> None:
@@ -270,6 +300,47 @@ class ICLRunner:
             rem -= sizes[-1]
         return sizes
 
+    async def _generate_waiting(self, prompt: str, n: int, gen: int, slot: int) -> GenResult:
+        """``llm.generate``, but a server that is merely *absent* is waited out rather than lost.
+
+        The client already retries transient errors inside one request (``max_retries``); this is the
+        layer above that, for the case those retries cannot cover — the server's own job being
+        requeued, a node reboot, a restart to change flags. Backs off 5s -> 60s and re-probes
+        ``/health`` so the log says whether we are waiting on a dead server or a sick one.
+
+        Gives up after ``cfg.llm_max_wait`` seconds (0 = never) by raising ``LLMUnavailable``, which
+        stops the run at its last complete generation.
+        """
+        waited, delay = 0.0, 5.0
+        while True:
+            try:
+                return await self.llm.generate(prompt, n=n, temperature=self.cfg.temperature,
+                                               max_tokens=self.cfg.max_tokens)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if _is_permanent(e):
+                    raise LLMUnavailable(
+                        f"gen {gen} p{slot}: the server rejected the request and retrying will not "
+                        f"change that ({e!r}). Check --model against what the server serves and "
+                        f"--max-tokens/--max-context-tokens against its --max-model-len.") from e
+                limit = self.cfg.llm_max_wait
+                if limit and waited >= limit:
+                    raise LLMUnavailable(
+                        f"gen {gen} p{slot}: no response from {self.cfg.vllm_base_url} after "
+                        f"{waited:.0f}s of retrying ({e!r}). Stopping at the last complete "
+                        f"generation — resume this run once the server is back.") from e
+                healthy = await self.llm.health()
+                budget = "no limit" if not limit else f"{limit - waited:.0f}s left"
+                logger.warning(
+                    f"gen {gen} p{slot}: model server unreachable ({e!r}); /health "
+                    f"{'answers but the request still failed' if healthy else 'does not answer'}. "
+                    f"Waiting {delay:.0f}s and retrying — the generation does NOT advance until it "
+                    f"comes back ({budget}).")
+                await asyncio.sleep(delay)
+                waited += delay
+                delay = min(delay * 2, 60.0)
+
     async def _run_group(self, gen: int, slot: int, parent: State) -> list:
         cfg, spec = self.cfg, self.spec
         env = spec.env_type(initial_state=parent, sampler=self.sampler, config=self.env_config)
@@ -291,15 +362,24 @@ class ICLRunner:
             Running these coroutines concurrently overlaps one chunk's grading (CPU/sandbox) with
             another chunk's still-in-flight generation (GPU)."""
             nonlocal graded_done
-            gen_res = await self.llm.generate(
-                prompt, n=sz, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-            )
+            gen_res = await self._generate_waiting(prompt, sz, gen, slot)
             self._gen_results.append(gen_res)
             comps = gen_res.texts
             if multi_chunk:
                 logger.info(f"gen {gen} p{slot}: chunk returned ({sz} completion(s)), grading "
                             f"[{graded_done}/{cfg.group_size} graded so far]")
-            res = await asyncio.gather(*[env.rollout_step(c, gen) for c in comps])
+            # Grading failures are kept distinct from generation ones: a dead Ray worker used to be
+            # recorded as "the LLM was unreachable", and re-generating on a grading failure would pay
+            # for the decode twice. Neither is retried here -- both abort the generation.
+            try:
+                res = await asyncio.gather(*[env.rollout_step(c, gen) for c in comps])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                raise GenerationAborted(
+                    f"gen {gen} p{slot}: grading failed after the model had answered ({e!r}). The "
+                    f"candidates are in this generation's directory but were never scored, so the "
+                    f"buffer would be missing them; stopping at the last complete generation.") from e
             if multi_chunk:
                 graded_done += len(res)
                 nv = sum(1 for r in res if r.correctness > 0 and r.next_state is not None)
@@ -307,13 +387,10 @@ class ICLRunner:
                             f"[{graded_done}/{cfg.group_size} graded]")
             return gen_res, res
 
-        try:
-            chunk_out = await asyncio.gather(*[_gen_grade_chunk(sz) for sz in sizes])
-        except Exception as e:
-            logger.warning(f"gen {gen} p{slot}: generation FAILED: {e}")
-            if self.tracker is not None:
-                self.tracker.record_group(gen, slot, parent, prompt, [], [])
-            return []
+        # No swallow-and-continue here. A group that cannot be completed ends the generation, and the
+        # generation is abandoned before meta.json is written, so the run stays resumable at the last
+        # complete one. See GenerationAborted.
+        chunk_out = await asyncio.gather(*[_gen_grade_chunk(sz) for sz in sizes])
 
         gen_results = [g for g, _ in chunk_out]
         completions = [c for g, _ in chunk_out for c in g.texts]
@@ -372,6 +449,20 @@ class ICLRunner:
                 g.reasoning_tokens = sum(r_counts[i:i + n])
             i += n
         return r_counts, a_counts
+
+    def _failure_mix(self, gen: int) -> dict[str, int]:
+        """This generation's failure_type counts, as the tracker recorded them.
+
+        Which failure dominates is what separates the causes of a barren generation: `cpu_starvation`
+        says the scheduler ran out of CPU groups, `timeout` says the candidates are too slow for
+        --eval-timeout, `invalid_result` says the model's code is wrong. Read off the tracker rather
+        than recounted here so the log line and meta.json cannot disagree.
+        """
+        per_gen = self.tracker._per_gen if self.tracker is not None else []
+        for stats in reversed(per_gen):
+            if stats.get("generation") == gen:
+                return dict(stats.get("failure_types") or {})
+        return {}
 
     def _warn_if_no_reasoning(self, usage: dict) -> None:
         """Warn once if a whole generation came back with no reasoning text while we were asked to save it.
@@ -446,7 +537,7 @@ class ICLRunner:
                     f"throttled into waves). Set --max-gen-concurrency >= {reqs} to keep it parallel.")
 
         if spec.env_type.uses_sandbox:
-            init_ray(self.num_cpus)
+            init_ray(self.num_cpus, ray_num_cpus=cfg.ray_num_cpus)
         else:
             logger.info("skipping Ray init: problem uses an in-process (sandbox-free) evaluator")
         # Tracker first: it creates the run-dir layout (incl. buffer/) the sampler writes into.
@@ -456,6 +547,27 @@ class ICLRunner:
         self._open_context_pool(os.path.join(cfg.log_path, "buffer", "context_pool.jsonl"),
                                 resume=bool(cfg.resume_step))
 
+        # Resolved once: detection can shell out to `bjobs`, and the ceiling cannot change under a
+        # running job. A run that cannot find a ceiling still logs its own RSS every generation --
+        # the absolute number is the useful half, and it is what a post-mortem has to work with.
+        mem_limit, mem_limit_where = memwatch.ceiling()
+        if mem_limit:
+            action = (f"stopping cleanly above {100 * cfg.memory_stop_fraction:.0f}%"
+                      if cfg.memory_stop_fraction else "self-stop disabled")
+            logger.info(f"memory ceiling {mem_limit / memwatch.GiB:.0f}G "
+                        f"({mem_limit_where}); {action}")
+        else:
+            logger.info(f"memory ceiling: {mem_limit_where} — logging job RSS per generation anyway, "
+                        "but nothing can warn before the batch system kills this job")
+        # Said once, not on every generation's line: how to read the two numbers that follow.
+        logger.info("reading the per-generation `memory` line: job rss is the process-tree total the "
+                    "batch system kills on; per-eval peak is one candidate's own high-water mark. "
+                    "Job climbing while per-eval stays flat = accumulation in the long-lived "
+                    "processes (Ray workers, driver), not a greedy candidate.")
+
+        stopped_for_memory = False
+        stopped_for_no_yield = False
+        empty_streak = 0                     # consecutive generations that graded nothing valid
         try:
             start = cfg.resume_step or 0
             for gen in range(start, cfg.num_generations):
@@ -469,9 +581,26 @@ class ICLRunner:
                             f"(buffer={len(self.sampler._states)})")
                 self.tracker.start_generation(gen, parents)
 
-                group_results = await asyncio.gather(
-                    *[self._run_group(gen, slot, p) for slot, p in enumerate(parents)]
+                # return_exceptions: let every group settle before deciding. Without it the first
+                # failure unwinds run() while its sibling groups are still generating and grading in
+                # the background -- evals left running against a Ray head the process is about to
+                # abandon, and a partial generation dir still growing while resume inspects it.
+                settled = await asyncio.gather(
+                    *[self._run_group(gen, slot, p) for slot, p in enumerate(parents)],
+                    return_exceptions=True,
                 )
+                failures = [r for r in settled if isinstance(r, BaseException)]
+                if failures:
+                    for f in failures:
+                        logger.error(f"gen {gen}: {f}")
+                    logger.error(
+                        f"gen {gen}: {len(failures)}/{len(parents)} group(s) did not complete — "
+                        f"ABANDONING this generation instead of recording it with missing groups. "
+                        f"Generations 0..{gen - 1} are complete on disk; resume this run to continue "
+                        f"from generation {gen}.")
+                    first = next((f for f in failures if isinstance(f, GenerationAborted)), failures[0])
+                    raise first
+                group_results = list(settled)
                 self.sampler.flush(step=gen + 1)
                 # Feed this generation's valid solutions into the context pool for LATER generations
                 # (done after the whole generation so all parents in a generation share one snapshot).
@@ -482,8 +611,12 @@ class ICLRunner:
                 usage.update(_counter_delta(cache0, await self.llm.cache_counters()))
                 gen_wall = time.perf_counter() - t_gen
                 decode_pct = _percentiles(self._gen_decode)
+                # Sampled at the boundary, where the previous generation's eval workers have exited
+                # and the next generation's have not started: the closest thing to a steady-state
+                # reading, and the point a clean stop can happen from.
+                mem = memwatch.sample(mem_limit)
                 self.tracker.end_generation(gen, self.sampler, usage=usage, wall_seconds=gen_wall,
-                                            decode_percentiles=decode_pct)
+                                            decode_percentiles=decode_pct, memory=mem)
 
                 n_valid = sum(1 for group in group_results for r in group if r.correctness > 0)
                 n_total = sum(len(group) for group in group_results)
@@ -515,6 +648,11 @@ class ICLRunner:
                         f"{self.eval_timeout}s ({100.0 * ev['max'] / self.eval_timeout:.0f}% used by "
                         f"the slowest) | grade p50 {gr.get('p50', 0):.1f}s max {gr.get('max', 0):.1f}s "
                         f"(grade-eval gap = CPU-group queueing + ~2s/candidate Ray+pickle overhead)")
+                rss = self.tracker._per_gen[-1].get("rss_percentiles") or {}
+                logger.info(
+                    f"gen {gen} memory | job {memwatch.describe(mem)}"
+                    + (f" | per-eval peak p50 {rss['p50']:.0f}M p99 {rss['p99']:.0f}M "
+                       f"max {rss['max']:.0f}M" if rss else ""))
                 self._warn_if_no_reasoning(usage)
                 if usage["truncated"]:
                     logger.warning(
@@ -522,16 +660,76 @@ class ICLRunner:
                         f"max_tokens={cfg.max_tokens} cap (finish_reason=length) — these burn the full "
                         f"budget, usually emit no code block, and gate their request's return. "
                         f"Consider lowering --reasoning-effort or raising --max-tokens.")
-        except BaseException:
+
+                # A generation that graded nothing valid is a broken evaluator, not a hard problem:
+                # every candidate reached the model and came back, and every one of them failed. The
+                # run used to keep going and record those generations as ordinary — and because they
+                # are structurally perfect (full groups, full complement of children, all invalid),
+                # results.resume verifies such a run as COMPLETE and --resume skips it. So the sweep
+                # hands back a green run holding nothing. Stop, loudly, while the cause is still on
+                # the box to look at.
+                empty_streak = empty_streak + 1 if n_valid == 0 else 0
+                if cfg.max_empty_generations and empty_streak >= cfg.max_empty_generations:
+                    top = sorted(self._failure_mix(gen).items(), key=lambda kv: -kv[1])[:3]
+                    logger.error(
+                        f"gen {gen}: STOPPING — {empty_streak} consecutive generation(s) produced no "
+                        f"valid candidate at all ({n_total} candidates each). This is an evaluator "
+                        f"fault, not a search result: check the sandbox before trusting anything "
+                        f"here. Commonest failure types this generation: "
+                        + (", ".join(f"{k}={v}" for k, v in top) or "none recorded") + ". "
+                        f"A starved cpu_scheduler (leaked CPU groups), a full disk and a Ray head "
+                        f"that lost its workers all look exactly like this. Raise "
+                        f"--max-empty-generations if a barren stretch is genuinely expected here.")
+                    stopped_for_no_yield = True
+                    break
+
+                # Stop ourselves rather than let the batch system decide where to land. Everything
+                # this generation produced is already on disk (sampler.flush + end_generation above),
+                # so --resume has a whole generation to continue from -- which is not true of a kill
+                # that arrives mid-generation.
+                if (cfg.memory_stop_fraction and mem.get("job_rss_pct") is not None
+                        and mem["job_rss_pct"] >= 100 * cfg.memory_stop_fraction):
+                    # job_rss_pct is a JOB-level figure: every run sharing this Ray head sees the
+                    # same one and would otherwise stop in the same breath. Arbitrate so the sweep
+                    # sheds one run and lets the others use the headroom that frees.
+                    shed, why = memwatch.claim_shed(
+                        os.path.dirname(os.path.abspath(cfg.log_path)),
+                        os.path.basename(os.path.abspath(cfg.log_path)))
+                    if not shed:
+                        logger.warning(
+                            f"gen {gen}: over the {100 * cfg.memory_stop_fraction:.0f}% memory "
+                            f"threshold ({memwatch.describe(mem)}) but {why}")
+                    else:
+                        logger.error(
+                            f"gen {gen}: STOPPING — {memwatch.describe(mem)}, at or above the "
+                            f"{100 * cfg.memory_stop_fraction:.0f}% self-stop threshold ({why}). "
+                            f"Generations 0..{gen} are complete on disk; resume this run to "
+                            f"continue. If the job needs more headroom, LSF memory is PER SLOT: "
+                            f"`-M 8192MB -R \"rusage[mem=8192]\"`.")
+                        stopped_for_memory = True
+                        break
+        except BaseException as e:
             if self.tracker is not None:
-                self.tracker.close(status="failed")
+                # "aborted" rather than "failed": the run stopped itself at a generation boundary and
+                # everything before it is intact and resumable. Neither status is trusted by
+                # results.resume, but the distinction is what a post-mortem reads first.
+                self.tracker.close(status="aborted" if isinstance(e, GenerationAborted) else "failed")
             raise
         else:
-            self.tracker.close(status="complete")
+            # Never "complete": the run stopped short of num_generations on purpose, and a summary
+            # claiming otherwise is exactly the lie results.resume was written to stop trusting.
+            self.tracker.close(status="stopped_memory" if stopped_for_memory else
+                               "stopped_no_yield" if stopped_for_no_yield else "complete")
         finally:
             if self._pool_fh is not None:
                 self._pool_fh.close()
-        logger.info("ICL run complete.")
+        if stopped_for_memory:
+            logger.info("ICL run stopped early to stay under the memory ceiling — resume it to continue.")
+        elif stopped_for_no_yield:
+            logger.info("ICL run stopped: the evaluator returned nothing valid. Fix the cause before "
+                        "resuming — resuming into a broken sandbox just reproduces this.")
+        else:
+            logger.info("ICL run complete.")
 
     def dry_run(self) -> str:
         """Build and print one fully-assembled prompt for the first PUCT-selected parent, then stop.

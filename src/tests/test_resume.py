@@ -260,3 +260,50 @@ def test_without_a_target_generation_count_only_the_summary_can_claim_completion
     assert prog.good_generations == 3 and prog.resume_step == 3 and not prog.complete
     # the sweep manifest is where that number comes from in practice
     assert inspect_run(run_dir, num_generations=3).complete
+
+
+def test_snapshot_verdicts_are_cached_per_file_identity(tmp_path):
+    """--status re-inspects every run of a sweep on a timer, and each inspection used to re-parse
+    every buffer snapshot -- the whole PUCT buffer, program code and all. Snapshots are immutable once
+    written, so the re-parse can only ever reach the same verdict."""
+    import results.resume as R
+
+    run_dir = _write_run(tmp_path / "r", 3, want=3, snapshot_steps=[1, 2, 3])
+    R._SNAPSHOT_CACHE.clear()
+    reads = []
+    real_read = R._read_json
+    R._read_json = lambda p: (reads.append(p), real_read(p))[1]
+    try:
+        assert R._snapshot_steps(run_dir) == {1, 2, 3}
+        first = len([p for p in reads if "puct_sampler_step" in p])
+        assert R._snapshot_steps(run_dir) == {1, 2, 3}
+        assert len([p for p in reads if "puct_sampler_step" in p]) == first == 3
+
+        # A file rewritten in place must MISS the cache: a torn snapshot that is later completed has
+        # to be re-read, or a run would be refused a resume point it now has.
+        path = os.path.join(run_dir, "buffer", "puct_sampler_step_000002.json")
+        with open(path, "w") as f:
+            f.write('{"step": 2, "states": []}')            # now empty -> no longer resumable
+        assert R._snapshot_steps(run_dir) == {1, 3}
+    finally:
+        R._read_json = real_read
+
+
+def test_a_run_that_produced_no_valid_solution_is_never_complete(tmp_path):
+    """Every check in this module is structural — full groups, full complement of children,
+    meta.json written — and a broken evaluator passes all of them: its candidates came back and
+    failed, which is what an ordinary generation looks like from the outside. Such a run verified as
+    COMPLETE, so --resume skipped it and --status showed it green."""
+    run_dir = _write_run(tmp_path / "r", 15, want=15, valid_per_gen=0, status="complete",
+                         snapshot_steps=list(range(16)))
+    prog = inspect_run(run_dir, 15)
+
+    assert prog.good_generations == 15          # structurally it really is 15 generations
+    assert not prog.complete                    # ...but it holds nothing, so it is not finished
+    assert any("no result whatever its summary says" in d for d in prog.damage)
+
+
+def test_a_run_with_any_yield_at_all_is_still_judged_normally(tmp_path):
+    run_dir = _write_run(tmp_path / "r", 3, want=3, valid_per_gen=1)
+    prog = inspect_run(run_dir, 3)
+    assert prog.complete and prog.damage == []

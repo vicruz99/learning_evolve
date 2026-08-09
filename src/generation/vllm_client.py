@@ -159,6 +159,20 @@ class VLLMClient:
             logger.debug(f"could not scrape {self._base_url} /metrics: {e}")
             return {}
 
+    async def health(self) -> bool:
+        """Is the server up and serving? Used to wait one out rather than lose a generation to it.
+
+        ``/health`` is the cheap liveness endpoint and needs no model name, so a vLLM that is up but
+        still loading weights answers it only once it is ready to serve — which is exactly the moment
+        a waiting run should retry.
+        """
+        try:
+            url = self._base_url.rstrip("/").removesuffix("/v1") + "/health"
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                return (await http.get(url)).status_code == 200
+        except Exception:                                  # noqa: BLE001 - a probe, never load-bearing
+            return False
+
     async def count_tokens(self, texts: list[str]) -> list[int]:
         """Exact token counts for ``texts``, via the server's ``/tokenize`` (the served model's own
         tokenizer — no local transformers dependency).

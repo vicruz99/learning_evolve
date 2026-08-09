@@ -449,21 +449,58 @@ def plan_head(threads_per_task: int, max_parallel: int, cfg: dict | None = None)
             f"{path}) — the kernel is capping CPU time regardless of core count, so evals will run "
             "slow no matter how the head is sized. Get a real allocation, not a login node.")
 
-    # Leave the supervisor and each concurrent run_icl driver a core: the drivers do the HTTP and
-    # tokenization work that actually paces a generation, and starving them slows the whole sweep
-    # even while every eval core stays busy.
+    # An explicit count is the operator answering "how much of this box may Ray use", which is not
+    # always "all of it": sharing a node with another job, leaving headroom for a server on the same
+    # host, or reproducing a run made on a smaller machine. It is the FINAL --num-cpus, not another
+    # budget to subtract a reserve from -- "let Ray see 16" has to mean 16 or it does not answer the
+    # question. Detection still runs, because its numbers are what the warnings below compare against.
+    want = cfg.get("num_cpus")
     reserve = cfg.get("reserve_cpus")
     reserve = (1 + max_parallel) if reserve is None else int(reserve)
-    usable = budget - reserve
-    # Whole eval slots only: cpu_scheduler drops the trailing partial group, so a num_cpus that is
-    # not a multiple of threads_per_task promises Ray capacity the scheduler cannot back.
-    num_cpus = (usable // threads_per_task) * threads_per_task
-    notes.append(f"reserved {reserve} cpu(s) for the supervisor + {max_parallel} driver(s); "
-                 f"rounded down to a multiple of {threads_per_task}")
-    if num_cpus < threads_per_task:
-        raise ValueError(
-            f"cpu budget {budget} minus {reserve} reserved leaves no room for even one "
-            f"{threads_per_task}-cpu eval. Lower sweep.ray.reserve_cpus or get more cores.")
+    if want is not None:
+        want = int(want)
+        # Whole eval slots only, same as the detected path: cpu_scheduler drops the trailing partial
+        # group, so a num_cpus that is not a multiple of threads_per_task promises Ray capacity the
+        # scheduler cannot back.
+        num_cpus = (want // threads_per_task) * threads_per_task
+        if num_cpus < threads_per_task:
+            raise ValueError(
+                f"sweep.ray.num_cpus={want} is less than one {threads_per_task}-cpu eval slot "
+                f"(num-cpus-per-task={threads_per_task}). Ask for at least {threads_per_task}.")
+        notes.append(
+            f"cpu count OVERRIDDEN to {num_cpus} by sweep.ray.num_cpus={want}"
+            + (f" (rounded down to a multiple of {threads_per_task})" if num_cpus != want else "")
+            + f"; the detected budget ({budget}) and reserve_cpus are NOT applied"
+            + (f", leaving {budget - num_cpus} granted core(s) deliberately idle"
+               if num_cpus < budget else ""))
+        # cpu_scheduler builds its groups from the affinity mask, NOT from --num-cpus, so these two
+        # ceilings fail differently and both are worth naming.
+        if num_cpus > affinity:
+            warnings.append(
+                f"sweep.ray.num_cpus={num_cpus} exceeds the {affinity} logical CPU(s) this process "
+                f"may run on, and cpu_scheduler chops THAT mask into groups — it can only ever hand "
+                f"out {affinity // threads_per_task}. Ray will admit "
+                f"{num_cpus // threads_per_task} concurrent evals, and the surplus will spin in "
+                "get_cpu_group() until they fail as cpu_starvation. Lower it.")
+        elif num_cpus > cores:
+            warnings.append(
+                f"sweep.ray.num_cpus={num_cpus} exceeds the {cores} physical core(s) granted "
+                f"(SMT gives {affinity} logical CPUs). Evals will share cores and run at roughly "
+                "half speed while Ray reports full occupancy — runtimes and timeout rates will not "
+                "be comparable to a run sized to the cores.")
+    else:
+        # Leave the supervisor and each concurrent run_icl driver a core: the drivers do the HTTP and
+        # tokenization work that actually paces a generation, and starving them slows the whole sweep
+        # even while every eval core stays busy.
+        usable = budget - reserve
+        num_cpus = (usable // threads_per_task) * threads_per_task
+        notes.append(f"reserved {reserve} cpu(s) for the supervisor + {max_parallel} driver(s); "
+                     f"rounded down to a multiple of {threads_per_task}")
+        if num_cpus < threads_per_task:
+            raise ValueError(
+                f"cpu budget {budget} minus {reserve} reserved leaves no room for even one "
+                f"{threads_per_task}-cpu eval. Lower sweep.ray.reserve_cpus, set "
+                "sweep.ray.num_cpus explicitly, or get more cores.")
 
     # --- memory ----------------------------------------------------------------------------------
     cg_mem, mem_where = _cgroup_memory_limit()
@@ -511,12 +548,17 @@ def plan_head(threads_per_task: int, max_parallel: int, cfg: dict | None = None)
         # share of RAM that matches the share of CPUs we were allocated.
         # Both sides of this ratio must be physical cores. Dividing our core budget by the LOGICAL
         # cpu count would understate our share by the SMT factor and starve the sweep of memory.
+        # When the operator pinned num_cpus, the fair share is of what they ASKED FOR, not of what
+        # the box granted: taking 16 of 128 cores and still claiming the whole node's RAM is exactly
+        # the co-tenant-hostile case this branch exists to avoid.
+        claim = num_cpus if want is not None else budget
         node = machine_cores()
-        share = min(1.0, budget / node) if node else 1.0
+        share = min(1.0, claim / node) if node else 1.0
         limit = int(total * share)
         notes.append(f"no cgroup memory limit ({mem_where}); claiming {share:.0%} of "
                      f"MemTotal={total / GiB:.0f}G = {limit / GiB:.0f}G, the fair share for "
-                     f"{budget}/{node} physical cores")
+                     f"{claim}/{node} physical cores"
+                     + (" (from sweep.ray.num_cpus)" if want is not None else ""))
 
     # Object store: this workload ships program text and scores — kilobytes. It exists mostly for
     # Ray's own bookkeeping, so a couple of GB is plenty, and every byte of it is taken out of
@@ -713,6 +755,130 @@ def _ancestors(pid: int) -> set[int]:
         except (OSError, IndexError, ValueError):
             break
     return out
+
+
+# Ray's component logs, in rough order of post-mortem value. raylet.* is the one that records worker
+# deaths, OOM-killer decisions and object-store spilling; the rest give the cluster's own view of what
+# it thought it had. Per-worker logs are handled separately because there can be tens of thousands.
+_LOG_KEEP_PREFIXES = ("raylet", "gcs_server", "monitor", "log_monitor", "dashboard", "runtime_env",
+                      "ray_client", "plasma_store", "debug_state")
+
+# Worker logs are one pair per worker, and with MAX_CALLS=1 that is one pair PER EVAL: a multi-day
+# sweep produces tens of thousands. Keep the newest few hundred (the ones near whatever went wrong)
+# rather than all of them or none.
+_MAX_WORKER_LOGS = 400
+
+
+def archive_logs(temp_dir: str, dest_dir: str, compress: bool = True,
+                 tail_bytes: int | None = None) -> tuple[str | None, str]:
+    """Copy this head's session logs out of ``temp_dir`` into ``dest_dir`` as a .tar.gz.
+
+    Ray writes everything under ``<temp_dir>/session_*/logs``, which lives in ``/tmp`` on the compute
+    node. That is the worst possible place for it: ``/tmp`` is node-local, the node is reclaimed when
+    the job ends, and :func:`stop_head` (or a job script's ``rm -rf $RAY_TMPDIR``) removes it on the
+    way out. So the one artifact that could explain a kill is always gone by the time anyone looks.
+
+    ``compress=False`` writes a plain .tar. Use it on the signal path: LSF's TERM_MEMLIMIT sequence
+    is SIGINT, SIGTERM, SIGKILL ten seconds apart, so there is one ~10 s window to get this to disk
+    and gzipping a few hundred MB of worker logs will not finish inside it.
+
+    ``tail_bytes`` keeps only the last N bytes of any file bigger than that. Also for the signal path,
+    and it is the difference between a dump that completes and one that does not: on a real session
+    here ``raylet.out`` was 296 MB and ``gcs_server.out`` 263 MB, so an untruncated emergency archive
+    was 762 MB — too slow to finish in the window, especially to a network filesystem. The tail is
+    also the part worth having: whatever the cluster said as it died is at the end, not the start.
+
+    Returns ``(archive_path_or_None, human_readable_note)``. Never raises: losing the logs is bad,
+    but failing a sweep's teardown over it is worse.
+    """
+    import glob
+    import tarfile
+
+    try:
+        sessions = sorted(glob.glob(os.path.join(temp_dir, "session_*")))
+        # session_latest is a symlink to one of the above; ignore it so nothing is archived twice.
+        sessions = [s for s in sessions if not os.path.islink(s)]
+        if not sessions:
+            return None, f"no session dir under {temp_dir} — nothing to archive"
+        logs_dir = os.path.join(sessions[-1], "logs")
+        if not os.path.isdir(logs_dir):
+            return None, f"{logs_dir} does not exist — nothing to archive"
+
+        component, workers = [], []
+        for name in os.listdir(logs_dir):
+            path = os.path.join(logs_dir, name)
+            if not os.path.isfile(path):
+                continue
+            (component if name.startswith(_LOG_KEEP_PREFIXES) else workers).append(path)
+
+        # Newest last-modified first: after a kill, the interesting workers are the ones that were
+        # still running when it landed.
+        workers.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        dropped = max(0, len(workers) - _MAX_WORKER_LOGS)
+        chosen = component + workers[:_MAX_WORKER_LOGS]
+
+        os.makedirs(dest_dir, exist_ok=True)
+        suffix = "tar.gz" if compress else "tar"
+        archive = os.path.join(dest_dir, f"ray_logs_{os.path.basename(sessions[-1])}.{suffix}")
+        truncated = 0
+        with tarfile.open(archive, "w:gz" if compress else "w") as tar:
+            for path in chosen:
+                try:
+                    full = os.path.getsize(path)
+                    if tail_bytes is None or full <= tail_bytes:
+                        tar.add(path, arcname=os.path.basename(path))
+                        continue
+                    # Seek to the tail and declare the shorter size, so the member is the last
+                    # tail_bytes of the file. Renamed so nobody mistakes it for the whole log.
+                    with open(path, "rb") as fh:
+                        fh.seek(full - tail_bytes)
+                        info = tar.gettarinfo(path, arcname=os.path.basename(path) + ".tail")
+                        info.size = tail_bytes
+                        tar.addfile(info, fh)
+                    truncated += 1
+                except OSError:
+                    continue
+
+        size = os.path.getsize(archive)
+        note = (f"archived {len(chosen)} Ray log file(s) ({size / (1024 ** 2):.1f} MB) to {archive}")
+        if truncated:
+            note += (f"; {truncated} oversized log(s) kept as the last "
+                     f"{tail_bytes / (1024 ** 2):.0f} MB only (*.tail)")
+        if dropped:
+            note += (f"; dropped {dropped} older per-worker log(s) over the {_MAX_WORKER_LOGS} cap "
+                     f"(raise ray_head._MAX_WORKER_LOGS if you need the full history)")
+        return archive, note
+    except Exception as e:
+        return None, f"could not archive Ray logs from {temp_dir}: {e!r}"
+
+
+def remove_temp_dir(temp_dir: str) -> tuple[int, str]:
+    """Delete a temp dir this module created, reporting how much it freed.
+
+    Only ever call this on a dir :func:`plan_head` named (``<base>/ray-<uid>-<host>-<tag>``) and only
+    after :func:`archive_logs`. Refuses anything else -- notably the shared default ``/tmp/ray``,
+    which belongs to whoever ran ``ray start`` by hand and may be in use by a co-tenant.
+
+    Returns ``(bytes_freed, note)``. Never raises.
+    """
+    import shutil
+
+    base = os.path.basename(temp_dir.rstrip("/"))
+    if not base.startswith(f"ray-{os.getuid()}-"):
+        return 0, (f"not removing {temp_dir}: only dirs this module named (ray-<uid>-<host>-<tag>) "
+                   "are ours to delete")
+    try:
+        freed = 0
+        for root, _dirs, files in os.walk(temp_dir):
+            for name in files:
+                try:
+                    freed += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return freed, f"removed {temp_dir} ({freed / GiB:.2f} G of session logs)"
+    except Exception as e:
+        return 0, f"could not remove {temp_dir}: {e!r}"
 
 
 def stop_head(temp_dir: str, grace: float = 10.0) -> int:

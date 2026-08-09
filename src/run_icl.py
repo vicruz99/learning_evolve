@@ -46,6 +46,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "group in one request (grade only after all children arrive). Raise "
                         "--max-gen-concurrency to groups_per_batch*ceil(group_size/chunk) when set.")
 
+    p.add_argument("--llm-max-wait", type=float, default=3600.0, metavar="SECONDS",
+                   help="How long to keep retrying an unreachable model server before stopping the "
+                        "run at its last COMPLETE generation (0 = wait indefinitely). The run never "
+                        "walks past a generation whose groups did not reach the model: those parents "
+                        "produce no children, so every later prompt is conditioned on a different "
+                        "buffer than the configuration being compared.")
+
+    p.add_argument("--max-empty-generations", type=int, default=3, metavar="N",
+                   help="Stop the run after N consecutive generations in which NO candidate graded "
+                        "valid (0 disables). Such generations are structurally perfect and entirely "
+                        "worthless, so a run full of them verifies as complete and --resume skips "
+                        "it; the cause is almost always the evaluator (a starved cpu_scheduler, a "
+                        "full disk, a Ray head that lost its workers), not the problem.")
+
     p.add_argument("--groups-per-batch", type=int, default=8)
     p.add_argument("--group-size", type=int, default=64)
     p.add_argument("--num-generations", type=int, default=50)
@@ -102,7 +116,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--eval-timeout", type=int, default=None)
     p.add_argument("--num-cpus-per-task", type=int, default=None)
+    p.add_argument("--ray-num-cpus", type=int, default=None, metavar="N",
+                   help="Cores for the Ray cluster THIS run starts when no head is up (default: the "
+                        "whole box). Ignored when attaching to an existing head, which cannot be "
+                        "resized — under run_sweep.py use its --ray-num-cpus instead.")
     p.add_argument("--grade-timeout", type=float, default=8000.0)
+    p.add_argument("--memory-stop-fraction", type=float, default=0.85, metavar="F",
+                   help="Stop at the next generation boundary once the job's process-tree RSS "
+                        "reaches this fraction of its detected memory ceiling (LSF MEMLIMIT or "
+                        "cgroup). Landing the stop on a boundary keeps the run resumable, which a "
+                        "TERM_MEMLIMIT kill mid-generation does not. 0 disables the stop; the "
+                        "per-generation memory line is logged either way.")
 
     p.add_argument("--resume-step", default=None, metavar="N|auto",
                    help="Continue an interrupted run in --log-path: N restarts from generation N, "
@@ -185,6 +209,8 @@ def parse_args() -> ICLConfig:
         max_tokens=a.max_tokens,
         max_gen_concurrency=a.max_gen_concurrency,
         grade_chunk_size=a.grade_chunk_size,
+        llm_max_wait=a.llm_max_wait,
+        max_empty_generations=a.max_empty_generations,
         groups_per_batch=a.groups_per_batch,
         group_size=a.group_size,
         num_generations=a.num_generations,
@@ -208,7 +234,9 @@ def parse_args() -> ICLConfig:
         log_level=a.log_level,
         eval_timeout=a.eval_timeout,
         num_cpus_per_task=a.num_cpus_per_task,
+        ray_num_cpus=a.ray_num_cpus,
         grade_timeout=a.grade_timeout,
+        memory_stop_fraction=a.memory_stop_fraction,
         # --dry-run only prints a prompt: never let it rewind a run dir.
         resume_step=None if a.dry_run else _resolve_resume_step(a.resume_step, log_path),
         dry_run=a.dry_run,
