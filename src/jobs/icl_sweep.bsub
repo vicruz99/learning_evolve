@@ -1,0 +1,140 @@
+#!/bin/bash
+# =================================================================================================
+# CPU-only LSF job for the ICL driver (run_sweep.py / run_icl.py).
+#
+# WHY THIS EXISTS
+#   The driver was being run on the LOGIN NODE (rng-dl01-login1). A cgroup there caps the whole user
+#   slice at 5.0 cores of CPU TIME while exposing 64, so Ray happily started 64 one-core evals that
+#   were then throttled ~12x. Measured 2026-07-28: cp26 candidates graded 11.5x slower than on the
+#   INESC box, and 56% of a 1200-candidate run died on the 530s eval_timeout -- including solutions
+#   that scored within 2% of that run's best. This job puts the driver on a real compute node with a
+#   real core reservation.
+#
+#   NOTE: NO GPU is requested here (no `-gpu` line). The vLLM server runs in its own job
+#   (jobs/vllm_server.bsub) and this job talks to it over the network. Queue names at this site look
+#   GPU-ish, but you only get a GPU if you ask for one with `-gpu "num=N"`.
+#
+# SUBMIT
+#   cd ~/projects/phd/learning_evolve/src
+#   mkdir -p jobs/logs
+#   SWEEP=sweeps/ctx_qwen.yaml bsub < jobs/icl_sweep.bsub
+#
+#   Optional environment (bsub inherits the submitting shell's environment):
+#     SWEEP      sweep yaml, relative to src/            (default sweeps/ctx_qwen.yaml)
+#     VLLM_URL   override the yaml's vllm-base-url       (default: read jobs/vllm_host.txt)
+#     MAXPAR     override the sweep's max_parallel       (default: leave the yaml alone)
+#
+#   Override any #BSUB directive on the command line, e.g. a different queue or core count:
+#     SWEEP=sweeps/puct_qwen.yaml bsub -q <queue> -n 48 -W 24:00 < jobs/icl_sweep.bsub
+# =================================================================================================
+
+#BSUB -J icl_sweep
+#BSUB -o jobs/logs/icl_sweep.%J.out
+#BSUB -e jobs/logs/icl_sweep.%J.err
+#BSUB -n 32                                    # CPU cores == concurrent evals (num-cpus-per-task 1)
+#BSUB -R span[hosts=1]                         # ONE host: Ray head is local to this job
+#BSUB -M 65536MB
+#BSUB -W 24:00                                 # check `bqueues -l <queue>` for the real ceiling
+#BSUB -q batch_h200                            # <-- VERIFY: pick a CPU queue if the site has one
+#BSUB -P BH-000557-01
+#BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------------------------
+source /fs/applications/modules/current/init/bash
+module load proxy4server-access/2.0
+sleep 1
+source /fs/applications/p4s-access/2.0/ActivateP4S.sh -a
+
+cd ~/projects/phd/learning_evolve/src || exit 1
+source .venv/bin/activate
+
+SWEEP="${SWEEP:-sweeps/ctx_qwen.yaml}"
+NCPUS="${LSB_DJOB_NUMPROC:-$(nproc)}"
+
+echo "=== allocation ==="
+echo "host          : $(hostname)"
+echo "LSF job       : ${LSB_JOBID:-none}   queue ${LSB_QUEUE:-none}"
+echo "slots (LSF)   : ${LSB_DJOB_NUMPROC:-unset}"
+echo "nproc         : $(nproc)              # node total, NOT your share"
+echo "affinity      : $(python -c 'import os;print(len(os.sched_getaffinity(0)))')"
+echo "cgroup cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo n/a)"
+echo "=================="
+
+# ---------------------------------------------------------------------------------------------
+# vLLM endpoint: the server lives in another job, on another node, reachable by hostname.
+# ---------------------------------------------------------------------------------------------
+if [[ -z "${VLLM_URL:-}" && -f jobs/vllm_host.txt ]]; then
+    VLLM_URL="http://$(cat jobs/vllm_host.txt):8001/v1"
+fi
+
+if [[ -n "${VLLM_URL:-}" ]]; then
+    echo "[job] waiting for vLLM at ${VLLM_URL} ..."
+    for _ in $(seq 1 120); do
+        curl -sf "${VLLM_URL%/v1}/health" >/dev/null && break
+        sleep 15
+    done
+    if ! curl -sf "${VLLM_URL%/v1}/health" >/dev/null; then
+        echo "[job] ERROR: no vLLM at ${VLLM_URL} after 30 min — is jobs/vllm_server.bsub running?" >&2
+        exit 1
+    fi
+    # The yaml pins vllm-base-url, but the server's node changes every time its job is resubmitted.
+    # Rewrite a scratch copy rather than editing the tracked sweep file.
+    SWEEP_RUN="${TMPDIR:-/tmp}/$(basename "$SWEEP")"
+    sed -E "s#^( *vllm-base-url: *).*#\1${VLLM_URL}#" "$SWEEP" > "$SWEEP_RUN"
+    echo "[job] vllm-base-url -> ${VLLM_URL}  (${SWEEP_RUN})"
+    SWEEP="$SWEEP_RUN"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Ray head, SIZED TO THE ALLOCATION.
+#
+# This is the whole point of the job. `ray start --head` with no --num-cpus reads the NODE's core
+# count, not your LSF reservation, and run_sweep.py's ensure_ray_head() does exactly that when it
+# finds no head. On a shared node that recreates the login-node failure: Ray schedules far more
+# concurrent evals than you hold cores for, queue_seconds stays ~0, and every eval silently runs
+# several times slower until it trips eval_timeout.
+#
+# RAY_TMPDIR keeps the head, its address file and its sockets private to this job, so two jobs on
+# one node cannot collide (and `address="auto"` in sandbox/ray_setup.py still resolves correctly).
+# ---------------------------------------------------------------------------------------------
+export RAY_TMPDIR="/tmp/ray_${USER}_${LSB_JOBID:-$$}"
+mkdir -p "$RAY_TMPDIR"
+RAY_PORT=$(( 20000 + (${LSB_JOBID:-$$} % 20000) ))
+
+# The logs under $RAY_TMPDIR are the only record of what the cluster itself saw (raylet.out carries
+# worker deaths and object-store spilling), they live in the compute node's /tmp, and the node is
+# reclaimed when this job ends. Save them into jobs/logs/ before removing anything -- job 12669131
+# was killed on TERM_MEMLIMIT and there was nothing left to read afterwards.
+cleanup() {
+    echo "[job] archiving ray logs"
+    python - "$RAY_TMPDIR" "jobs/logs/ray_${LSB_JOBID:-$$}" <<'PY' || echo "[job] ray log archive failed"
+import sys
+from sandbox.ray_head import archive_logs
+print("[job]", archive_logs(sys.argv[1], sys.argv[2], compress=False)[1])
+PY
+    echo "[job] stopping ray"; ray stop --force >/dev/null 2>&1; rm -rf "$RAY_TMPDIR"
+}
+trap cleanup EXIT
+
+ray start --head --num-cpus="$NCPUS" --port="$RAY_PORT" \
+    --include-dashboard=false --disable-usage-stats || exit 1
+
+echo "=== ray_doctor (confirm the reservation is real) ==="
+python -m sandbox.ray_doctor || echo "[job] ray_doctor reported problems — read the FAIL lines above"
+echo "===================================================="
+
+# ---------------------------------------------------------------------------------------------
+# Run. --ray-head require: fail loudly rather than let run_sweep.py start an unsized head.
+# ---------------------------------------------------------------------------------------------
+ARGS=(--ray-head require)
+[[ -n "${MAXPAR:-}" ]] && ARGS+=(--max-parallel "$MAXPAR")
+
+echo "[job] python run_sweep.py $SWEEP ${ARGS[*]}"
+python run_sweep.py "$SWEEP" "${ARGS[@]}"
+rc=$?
+echo "[job] run_sweep.py exited $rc"
+exit $rc

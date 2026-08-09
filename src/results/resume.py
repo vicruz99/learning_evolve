@@ -71,16 +71,38 @@ def _count_lines(path: str) -> int:
         return 0
 
 
+# Verdict cache for snapshot files, keyed by identity (path, mtime_ns, size) rather than by path, so
+# a rewritten file misses. A snapshot holds the whole buffer -- every state with its full program code
+# -- and `run_sweep --status` re-checks every snapshot of every run of the sweep, on a 60 s timer,
+# inside the same loop that reaps and launches runs. Measured on a synthetic 12-run x 15-generation
+# sweep: 268 MB re-read and re-parsed per render (0.94 s warm on local disk, and these run dirs are
+# routinely on NFS). Snapshots are immutable once written, so the second parse never learns anything.
+_SNAPSHOT_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
+def _snapshot_holds_states(path: str) -> bool:
+    """Does this snapshot parse and hold states? Files are checked, not trusted: a snapshot killed
+    mid-write is a truncated JSON file."""
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    cached = _SNAPSHOT_CACHE.get(key)
+    if cached is None:
+        store = _read_json(path)
+        cached = isinstance(store, dict) and bool(store.get("states"))
+        _SNAPSHOT_CACHE[key] = cached
+    return cached
+
+
 def _snapshot_steps(run_dir: str) -> set[int]:
     """Steps whose PUCT snapshot is present AND holds states — the only steps ``--resume-step`` can
-    load. Files are checked, not trusted: a snapshot killed mid-write is a truncated JSON file."""
+    load."""
     steps = set()
     for path in glob.glob(os.path.join(run_dir, "buffer", "puct_sampler_step_*.json")):
         m = _SNAPSHOT_RE.search(os.path.basename(path))
-        if not m:
-            continue
-        store = _read_json(path)
-        if isinstance(store, dict) and store.get("states"):
+        if m and _snapshot_holds_states(path):
             steps.add(int(m.group(1)))
     return steps
 
@@ -154,6 +176,10 @@ class RunProgress:
     run_dir: str
     num_generations: int | None = None
     good_generations: int = 0
+    # Generation directories present at all, damaged or not. ``good_generations`` is what may be
+    # resumed FROM; this is what a restart actually throws away, and the two diverge exactly when a
+    # generation in the middle is damaged — which is when saying the right number matters most.
+    generations_on_disk: int = 0
     resume_step: int = 0
     complete: bool = False
     damage: list[str] = field(default_factory=list)
@@ -230,6 +256,7 @@ def inspect_run(run_dir: str, num_generations: int | None = None) -> RunProgress
 
     # --- how far the generations themselves are trustworthy ---------------------------------------
     gen_dirs = _generation_dirs(run_dir)
+    prog.generations_on_disk = len(gen_dirs)
     groups, group_size = cfg.get("groups_per_batch"), cfg.get("group_size")
     metas: list[dict] = []
     gen = 0
@@ -266,6 +293,18 @@ def inspect_run(run_dir: str, num_generations: int | None = None) -> RunProgress
                 + ("" if os.path.exists(pool_path) else " (file is missing)"))
             good = covered
 
+    # --- a run that graded nothing valid is not a finished run ---------------------------------
+    # Every check above is structural: full groups, full complement of children, meta.json written.
+    # A run whose evaluator was broken end to end passes all of them — its candidates came back and
+    # failed, which is what an ordinary generation looks like from the outside — so it verified as
+    # COMPLETE and --resume skipped it. `icl.loop` now stops such a run at --max-empty-generations,
+    # but that does not help the run dirs already on disk, and yield is cheap to check here.
+    barren = good > 0 and sum(valid_per_gen[:good]) == 0
+    if barren:
+        prog.damage.append(
+            f"none of the {good} generation(s) on disk produced a single valid candidate — the "
+            f"evaluator was failing, so this run holds no result whatever its summary says")
+
     prog.good_generations = good
 
     # --- the buffer snapshot is what --resume-step actually loads ---------------------------------
@@ -282,7 +321,9 @@ def inspect_run(run_dir: str, num_generations: int | None = None) -> RunProgress
                 f"no usable PUCT snapshot for step {good} (have: {have}) — resuming at "
                 f"{prog.resume_step} instead")
 
-    if want is not None:
+    if barren:
+        prog.complete = False                # never skip a run that holds nothing
+    elif want is not None:
         prog.complete = prog.good_generations >= want
     else:
         # No configured target (no config.json, and the caller did not know either): the only claim

@@ -18,13 +18,17 @@ logger = logging.getLogger("icl.sandbox")
 RAY_NAMESPACE = "icl"
 
 
-def init_ray(num_cpus_per_task: int, num_persistent_workers: int = 0) -> None:
+def init_ray(num_cpus_per_task: int, num_persistent_workers: int = 0, *,
+             ray_num_cpus: int | None = None) -> None:
     """Initialize Ray and ensure the detached ``cpu_scheduler`` actor is running.
 
     Args:
         num_cpus_per_task: CPUs handed to each evaluation task (matches the evaluator's
             ``num_cpus_per_task``). Must be >= 1.
         num_persistent_workers: CPUs to reserve away from the schedulable pool.
+        ray_num_cpus: cores for the cluster this call may have to START. It cannot apply to a shared
+            head — ``--num-cpus`` is fixed at ``ray start`` and a connecting client has no say — so
+            it is deliberately ignored (loudly) on the attach path rather than silently accepted.
     """
     import ray
 
@@ -45,9 +49,17 @@ def init_ray(num_cpus_per_task: int, num_persistent_workers: int = 0) -> None:
         try:
             ray.init(address="auto", **common)
             logger.info("Connected to shared Ray head (address=auto).")
+            if ray_num_cpus is not None:
+                logger.warning(
+                    f"--ray-num-cpus={ray_num_cpus} IGNORED: this run attached to a head that is "
+                    "already running, and its --num-cpus was fixed when it started. Restart the "
+                    f"head with `ray stop && ray start --head --num-cpus={ray_num_cpus}`, or let "
+                    "run_sweep.py own it (--ray-head auto --ray-num-cpus N).")
         except ConnectionError:
-            ray.init(**common)
-            logger.info("No shared Ray head found; started a private Ray cluster for this run.")
+            ray.init(**common, **({} if ray_num_cpus is None else {"num_cpus": ray_num_cpus}))
+            logger.info("No shared Ray head found; started a private Ray cluster for this run"
+                        + (f" with num_cpus={ray_num_cpus}." if ray_num_cpus is not None
+                           else " sized to the whole box."))
 
     # get_if_exists makes this atomic: returns the existing detached actor or creates it, with no
     # get-then-create race. Without it, several runs starting against a shared head at the same instant

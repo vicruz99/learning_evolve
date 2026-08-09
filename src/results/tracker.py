@@ -97,9 +97,10 @@ def _strip_fences(code: str) -> str:
 
 
 def _pctl(values: list[float]) -> dict[str, float]:
-    """Nearest-rank percentiles of a per-candidate cost, in seconds. Same convention as
-    ``icl.loop._percentiles``: the tail is the actionable statistic, because one slow candidate
-    holds its whole parent group (and therefore the generation barrier)."""
+    """Nearest-rank percentiles of a per-candidate cost (seconds, or MB for peak RSS). Same
+    convention as ``icl.loop._percentiles``: the tail is the actionable statistic, because one slow
+    candidate holds its whole parent group (and therefore the generation barrier) -- and one
+    memory-hungry candidate is what sets the per-eval ceiling everything else has to fit under."""
     if not values:
         return {}
     ordered = sorted(values)
@@ -189,6 +190,14 @@ class ExperimentTracker:
             # (measured on an idle box), so read queue_* to tell contention from that floor.
             "eval_p50", "eval_p90", "eval_p99", "eval_max",
             "queue_p50", "queue_max", "grade_p50", "grade_max",
+            # MEMORY. rss_* is per-candidate peak (MB) and says where a per-eval ceiling can sit.
+            # job_rss_gb is the whole job's process-tree total and is the number the batch system
+            # kills on -- with several runs sharing one Ray head every run records the SAME figure,
+            # so do not read it as this run's usage. own_rss_gb is this driver's tree alone and is
+            # the attributable one. A job_rss_gb that climbs while rss_max and own_rss_gb stay flat
+            # is accumulation in the shared eval workers, not a greedy candidate or a heavy driver.
+            "rss_p50", "rss_p90", "rss_p99", "rss_max",
+            "job_rss_gb", "job_rss_pct", "own_rss_gb",
         ]
         if not os.path.exists(self._progress_path):
             with open(self._progress_path, "w", newline="") as f:
@@ -261,7 +270,7 @@ class ExperimentTracker:
             "usage": dict.fromkeys(USAGE_KEYS, 0),
             "parents": {},
             # grading cost of every candidate this generation, valid or not (see _progress_cols)
-            "eval_times": [], "queue_times": [], "grade_times": [],
+            "eval_times": [], "queue_times": [], "grade_times": [], "peak_rss": [],
         }
         for slot, p in enumerate(parents):
             self._cur["parents"][slot] = {
@@ -344,7 +353,7 @@ class ExperimentTracker:
 
             failure_type = "" if res.correctness > 0 else (res.failure_type or "unknown")
             for key, attr in (("eval_times", "eval_seconds"), ("queue_times", "queue_seconds"),
-                              ("grade_times", "grade_seconds")):
+                              ("grade_times", "grade_seconds"), ("peak_rss", "peak_rss_mb")):
                 val = getattr(res, attr, None)
                 if val is not None:
                     self._cur[key].append(val)
@@ -387,6 +396,9 @@ class ExperimentTracker:
                 "eval_seconds": getattr(res, "eval_seconds", None),
                 "queue_seconds": getattr(res, "queue_seconds", None),
                 "grade_seconds": getattr(res, "grade_seconds", None),
+                # Per-candidate peak memory: the distribution that decides where a per-eval RSS
+                # ceiling can sit without rejecting solutions we would have wanted to keep.
+                "peak_rss_mb": getattr(res, "peak_rss_mb", None),
                 "completion_file": self._rel(completion_file) if completion_file else None,
                 "prompt_file": pinfo["prompt_file"],
             }) + "\n")
@@ -428,7 +440,8 @@ class ExperimentTracker:
 
     def end_generation(self, gen: int, sampler, usage: dict | None = None,
                        wall_seconds: float | None = None,
-                       decode_percentiles: dict | None = None) -> None:
+                       decode_percentiles: dict | None = None,
+                       memory: dict | None = None) -> None:
         try:
             stats = sampler.get_sample_stats()
         except Exception:
@@ -467,6 +480,9 @@ class ExperimentTracker:
             "eval_percentiles": _pctl(cur.get("eval_times", [])),
             "queue_percentiles": _pctl(cur.get("queue_times", [])),
             "grade_percentiles": _pctl(cur.get("grade_times", [])),
+            # Per-candidate peak RSS (MB) and the job-wide total at this generation boundary.
+            "rss_percentiles": _pctl(cur.get("peak_rss", [])),
+            "memory": dict(memory or {}),
         }
         meta = {
             "generation": gen,
@@ -489,6 +505,10 @@ class ExperimentTracker:
                 *(gen_stats["eval_percentiles"].get(k) for k in ("p50", "p90", "p99", "max")),
                 *(gen_stats["queue_percentiles"].get(k) for k in ("p50", "max")),
                 *(gen_stats["grade_percentiles"].get(k) for k in ("p50", "max")),
+                *(gen_stats["rss_percentiles"].get(k) for k in ("p50", "p90", "p99", "max")),
+                gen_stats["memory"].get("job_rss_gb"),
+                gen_stats["memory"].get("job_rss_pct"),
+                gen_stats["memory"].get("own_rss_gb"),
             ])
 
         self._per_gen.append(gen_stats)

@@ -83,14 +83,54 @@ def _get_scheduler(num_cpus_per_task: int, num_persistent_workers: int = 0):
     return _SCHEDULER_HANDLE
 
 
+# Retire each eval worker after one task instead of reusing it for the life of the job.
+#
+# WHY: with the Ray default (max_calls=0 = reuse forever) a worker accumulates across every eval it
+# ever runs -- unpickled `result_construction` arrays, numpy/BLAS arenas, glibc malloc
+# fragmentation. None of it is a leak in the ordinary sense and none of it is visible per-eval, but
+# ~120 workers x a multi-day run is a monotonic RSS ramp with no plateau, which is what LSF's
+# process-tree accounting kills on (TERM_MEMLIMIT, job 12669131: AVG MEM 78 G -> MAX MEM 488 G over
+# 14 generations). Recycling bounds a worker's footprint to one candidate.
+#
+# COST: a fresh worker per eval, i.e. one Python interpreter start plus this module's imports
+# (~1-2 s). Negligible here because the thing it is amortised against is a whole sandboxed program
+# run -- eval p50 is tens to hundreds of seconds (see the `eval/candidate` line in the run log). If
+# that ever stops being true, this is the knob to reconsider.
+#
+# NOTE: `peak_rss_mb` in the timing json is only a PER-EVAL number because of this. It comes from
+# RUSAGE_CHILDREN.ru_maxrss, which is a running maximum over every child the worker has reaped, so
+# it means "this eval's peak" only while a worker handles exactly one eval. Raising MAX_CALLS turns
+# it into a high-water mark over the worker's whole history.
+MAX_CALLS = 1
+
+
 def _get_exec_fn(num_cpus_per_task: int, memory: int):
     """Return the memoized ``run_program`` Ray remote function for a given cpu/memory spec."""
     key = (num_cpus_per_task, memory)
     fn = _EXEC_FN_CACHE.get(key)
     if fn is None:
-        fn = ray.remote(num_cpus=num_cpus_per_task, max_calls=0, memory=memory)(run_program)
+        fn = ray.remote(num_cpus=num_cpus_per_task, max_calls=MAX_CALLS, memory=memory)(run_program)
         _EXEC_FN_CACHE[key] = fn
     return fn
+
+
+def _children_peak_rss() -> int | None:
+    """Peak RSS in bytes of the reaped child processes of THIS process, or None if unavailable.
+
+    ``ru_maxrss`` for RUSAGE_CHILDREN is a running MAXIMUM over every child this process has waited
+    for -- not a sum and not a per-call figure. It is therefore only "this eval's peak" because
+    ``MAX_CALLS = 1`` gives each worker exactly one eval; see the note there.
+
+    It is also a max over the sandbox subprocess and its pool workers rather than their sum, so a
+    program that fans out to N ProcessPool workers reports the largest one, not the total. That
+    understates the fan-out case -- fine for its purpose, which is choosing a per-eval ceiling, but
+    do not read it as the eval's total footprint.
+    """
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024   # ru_maxrss is KiB
+    except Exception:
+        return None
 
 
 def run_with_timeout(program_path, function_name: str, timeout_seconds=20, *, cpus: List[int]):
@@ -444,10 +484,17 @@ def run_program(program_code_path, function_name, max_cpus, eval_timeout_seconds
 
     def _write_timing():
         try:
+            # Recorded on the timeout/crash paths too, which is the point: a candidate killed for
+            # running long is also the candidate most likely to have been growing, and the worker
+            # survives its child so the rusage is still there to read.
+            peak = _children_peak_rss()
+            payload = {"queue_seconds": round(queue_seconds, 3),
+                       "eval_seconds": round(time.perf_counter() - _t_exec, 3),
+                       "cpus": len(group)}
+            if peak is not None:
+                payload["peak_rss_mb"] = round(peak / (1024 ** 2), 1)
             with open(timing_path, "w") as tf_:
-                json.dump({"queue_seconds": round(queue_seconds, 3),
-                           "eval_seconds": round(time.perf_counter() - _t_exec, 3),
-                           "cpus": len(group)}, tf_)
+                json.dump(payload, tf_)
         except Exception:
             pass
 

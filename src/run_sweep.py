@@ -21,7 +21,9 @@ Usage
     python run_sweep.py --continue-run runs/.../cp26_cs-best --from-generation 7   # it stopped, or at 7
     python run_sweep.py --resume runs/ctx_strategies --continue-run cp26_cs-best:7   # ...and keep the
                                                                    #   rest of the sweep going too
-    python run_sweep.py --stop   runs/ctx_strategies               # SIGTERM every live run
+    python run_sweep.py --stop   runs/ctx_strategies               # halt: drop the queue, SIGTERM
+                                                                   #   every live run (a supervisor
+                                                                   #   watching it stops launching)
 
 Run it under ``tmux`` for anything long: the supervisor must stay alive to enforce ``max_parallel``,
 but the runs are started in their own process session, so killing the supervisor does NOT kill them
@@ -38,8 +40,11 @@ to learn and nothing to keep in sync; unknown keys are rejected before anything 
       stagger: 120                  # seconds between launches
       server_max_num_seqs: 256      # optional; only used to warn about oversubscription
       ray:                          # optional; every key overrides something auto-detected
+        num_cpus: 16                # cores Ray may use, chosen by hand (--ray-num-cpus overrides).
+                                    #   This IS the final --num-cpus: reserve_cpus is not applied
+                                    #   on top, and the rest of the allocation is left idle.
         reserve_cpus: 3             # cores kept off Ray for the supervisor + drivers
-                                    #   (default 1 + max_parallel)
+                                    #   (default 1 + max_parallel; ignored when num_cpus is set)
         object_store_gb: 2          # carved out of /dev/shm; this workload ships kilobytes
         memory_fraction: 0.85       # of the cgroup's memory limit, minus the object store
         temp_dir_base: /tmp         # set to node-local scratch if /tmp is a network mount
@@ -94,9 +99,18 @@ from sandbox import ray_head
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = "sweep.json"
+# Written by --stop, read by a live supervisor once per pass. A separate file rather than a field in
+# sweep.json on purpose: the supervisor rewrites that manifest on every launch and every reap, so a
+# flag inside it races with its own writer and gets clobbered within the second.
+HALT = ".halted"
 
 # Flags the sweep file must not set: the launcher owns them.
 RESERVED = {"log-path", "resume-step"}
+
+# Every key ray_head.plan_head() honours in the `sweep.ray` block. Kept here so a typo is rejected
+# before anything launches rather than silently ignored by cfg.get().
+RAY_SETTINGS = {"num_cpus", "reserve_cpus", "memory_gb", "memory_fraction", "object_store_gb",
+                "temp_dir", "temp_dir_base", "port"}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -214,6 +228,19 @@ def threads_per_task(entries: list[dict]) -> int:
     return values.pop() if values else 1
 
 
+def _ray_cfg(settings: dict, num_cpus: int | None) -> dict:
+    """The sweep file's ``ray`` block with ``--ray-num-cpus`` layered on top.
+
+    One helper rather than a dict literal at each call site, because the head that ``--print-cmds``
+    describes and the head that actually starts have to be the same head; that is exactly what drifts
+    when two places each build the config themselves.
+    """
+    cfg = dict(settings.get("ray") or {})
+    if num_cpus is not None:
+        cfg["num_cpus"] = num_cpus
+    return cfg
+
+
 class RayHead:
     """The sweep's Ray cluster: started here, sized from the cgroup, torn down here.
 
@@ -233,6 +260,13 @@ class RayHead:
         self.env: dict[str, str] = {}
 
     def ensure(self, mode: str, tpt: int, max_parallel: int, cfg: dict) -> None:
+        # Sizing only happens on the path that STARTS the head. Saying so beats letting someone size
+        # a sweep carefully and never find out the number was dropped on the floor.
+        if cfg.get("num_cpus") is not None and mode != "auto":
+            print(f"[sweep] ray: WARNING — num_cpus={cfg['num_cpus']} was requested but "
+                  f"--ray-head={mode} does not start a head, so nothing is resized. The cluster's "
+                  "own --num-cpus decides how many evals run. Use --ray-head auto to apply it, or "
+                  f"start the head yourself with `ray start --head --num-cpus={cfg['num_cpus']}`.")
         if mode == "skip":
             print("[sweep] ray: --ray-head=skip — each run will boot its own cluster")
             return
@@ -293,11 +327,40 @@ class RayHead:
     def child_env(self) -> dict[str, str]:
         return {**os.environ, **self.env}
 
-    def teardown(self) -> None:
+    # Enough of a big log's tail to cover the kill window, small enough that the whole emergency
+    # archive lands inside LSF's ~10 s SIGINT->SIGKILL gap even on a network filesystem.
+    SIGNAL_TAIL_BYTES = 8 * 1024 ** 2
+
+    def save_logs(self, dest: str, compress: bool = True,
+                  tail_bytes: int | None = None) -> None:
+        """Copy the head's session logs somewhere that outlives the compute node's /tmp.
+
+        Gated on ``temp_dir`` rather than on ``owned``: reading a head's logs is safe whether or not
+        this sweep started it, and an attached head is exactly the case where they are most likely to
+        be lost. Only teardown and deletion require ownership.
+        """
+        if not self.temp_dir:
+            return
+        _, note = ray_head.archive_logs(self.temp_dir, dest, compress=compress,
+                                        tail_bytes=tail_bytes)
+        print(f"[sweep] ray: {note}")
+
+    def teardown(self, log_dest: str | None = None) -> None:
+        # Archive BEFORE the ownership gate. An attached head's logs are the ones most likely to be
+        # lost (a job script's `rm -rf $RAY_TMPDIR`, or the compute node being reclaimed), and reading
+        # them is safe either way — only stopping and deleting need ownership.
+        if log_dest:
+            self.save_logs(log_dest)
         if not (self.owned and self.temp_dir):
             return
         n = ray_head.stop_head(self.temp_dir)
         print(f"[sweep] ray: stopped the head this sweep started ({n} process(es))")
+        # Nothing else reaps these: plan_head gives every sweep its own per-host/per-job temp dir, so
+        # without this they accumulate one session per sweep forever. Ray writes one worker log per
+        # eval worker (~75 KB), which on this project's own boxes had already reached 5.8 GB / 78k
+        # files in /tmp. Safe now: the logs are archived above and stop_head has killed the holders.
+        _, note = ray_head.remove_temp_dir(self.temp_dir)
+        print(f"[sweep] ray: {note}")
 
 
 def _flags_from_cmd(cmd: list[str]) -> dict[str, str]:
@@ -308,6 +371,45 @@ def _flags_from_cmd(cmd: list[str]) -> dict[str, str]:
         if tok.startswith("--") and i + 1 < len(cmd) and not cmd[i + 1].startswith("--"):
             flags[tok[2:]] = cmd[i + 1]
     return flags
+
+
+# Tokens to leave for the parts of the prompt `--max-context-tokens` does NOT bound: the problem
+# intro, the rules/current-solution tail (which renders the parent's whole program), and the chat
+# template. Deliberately generous — the point is to catch a budget with no headroom at all, and the
+# cost of the warning being early is one line of output.
+PROMPT_OVERHEAD_TOKENS = 8000
+
+
+def _check_token_budget(flagsets: list[dict], context_len: dict[str, int | None]) -> None:
+    """Warn when a run's token budget cannot fit the server's context window.
+
+    vLLM rejects a request whose prompt plus ``max_tokens`` exceeds ``--max-model-len``, with a 400 —
+    which ``icl.loop`` treats as permanent (retrying it cannot help) and stops the run on. Two things
+    make this easy to walk into and hard to see coming:
+
+      * ``--max-context-tokens`` bounds only the CONTEXT BLOCK. The intro and the rules/current-
+        solution tail are added on top and are not counted against it.
+      * ``build_context_block`` trims by a chars/4 ESTIMATE, and code tokenises denser than that, so
+        the block can be bigger than the budget it was packed against.
+
+    So a config summing to exactly the window — which is what the cp26/ac1 sweeps do, 94000 + 34000
+    against a 128000 window — has no headroom for either effect.
+    """
+    for f in flagsets:
+        model = f.get("model", "openai/gpt-oss-120b")
+        window = context_len.get(model)
+        ctx, decode = f.get("max-context-tokens"), f.get("max-tokens")
+        if not window or ctx is None or decode is None:
+            continue
+        headroom = int(window) - int(ctx) - int(decode)
+        if headroom >= PROMPT_OVERHEAD_TOKENS:
+            continue
+        print(f"[sweep] WARNING: {model} serves {int(window):,} tokens, but max-context-tokens "
+              f"({int(ctx):,}) + max-tokens ({int(decode):,}) leaves only {headroom:,} for the "
+              f"problem intro, the rules + current-solution tail and the chat template — and the "
+              f"context block is trimmed by a chars/4 estimate, so it can overshoot its own budget. "
+              f"A prompt that crosses the window is a 400, which stops the run. Lower "
+              f"max-context-tokens to <= {int(window) - int(decode) - PROMPT_OVERHEAD_TOKENS:,}.")
 
 
 def check_server(entries: list[dict], max_parallel: int, server_max_num_seqs: int | None) -> None:
@@ -321,15 +423,20 @@ def check_server(entries: list[dict], max_parallel: int, server_max_num_seqs: in
         served: list[str] = []
         try:
             with urllib.request.urlopen(url.rstrip("/") + "/models", timeout=10) as r:
-                served = [m["id"] for m in json.load(r).get("data", [])]
+                cards = json.load(r).get("data", [])
+            served = [m["id"] for m in cards]
+            # vLLM puts the served context length on the model card. Not every build does, so this
+            # stays optional — an absent field just skips the budget check below.
+            context_len = {m["id"]: m.get("max_model_len") for m in cards}
         except Exception as e:
             print(f"[sweep] WARNING: could not reach {url} ({e}) — launching anyway")
             continue
-        wanted = {f.get("model", "openai/gpt-oss-120b") for f in flagsets
-                  if f.get("vllm-base-url") == url}
+        here = [f for f in flagsets if f.get("vllm-base-url") == url]
+        wanted = {f.get("model", "openai/gpt-oss-120b") for f in here}
         for model in sorted(wanted - set(served)):
             print(f"[sweep] WARNING: {url} does not serve {model!r} (serves: {', '.join(served)}) "
                   f"— every request of those runs will fail")
+        _check_token_budget(here, context_len)
 
     # --max-num-seqs counts SEQUENCES, not requests, and each request asks for n=group-size
     # completions. Comparing request counts against it under-reports the load by that factor.
@@ -371,14 +478,68 @@ def _write_manifest(sweep_dir: str, manifest: dict) -> None:
     os.replace(tmp, os.path.join(sweep_dir, MANIFEST))       # atomic: --status may read concurrently
 
 
-def _alive(pid: int | None) -> bool:
+def _proc_start(pid: int) -> int | None:
+    """The kernel's start-time stamp for ``pid`` (field 22 of /proc/<pid>/stat), or None.
+
+    PIDs are recycled, and a sweep's manifest outlives the job that wrote it — on a busy compute node
+    the pid of a long-dead run is very likely to belong to something else by the time anyone reads the
+    manifest. This stamp plus the pid identifies a process uniquely for as long as it lives, which is
+    what ``--stop`` needs before it signals anything and what the live-run guard needs before it
+    believes a run is still going.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _halt_path(sweep_dir: str) -> str:
+    return os.path.join(sweep_dir, HALT)
+
+
+def _set_halt(sweep_dir: str) -> None:
+    os.makedirs(sweep_dir, exist_ok=True)
+    with open(_halt_path(sweep_dir), "w") as f:
+        json.dump({"at": datetime.now().isoformat(timespec="seconds"), "by_pid": os.getpid()}, f)
+
+
+def _clear_halt(sweep_dir: str) -> bool:
+    """Drop a previous --stop's marker. Returns whether there was one (so a deliberate relaunch can
+    say it is overriding it, rather than silently un-stopping a sweep somebody stopped on purpose)."""
+    try:
+        os.remove(_halt_path(sweep_dir))
+        return True
+    except OSError:
+        return False
+
+
+def _alive(pid: int | None, start: int | None = None) -> bool:
+    """Is ``pid`` still the process we started? ``start`` is its recorded ``_proc_start`` stamp.
+
+    Without ``start`` this can only answer "some process holds that pid", which is what it used to
+    do — and what made a recycled pid read as a running run.
+    """
     if not pid:
         return False
+    now = _proc_start(pid)
+    if now is not None:
+        return now == start if start is not None else True
     try:
         os.kill(pid, 0)
         return True
     except (ProcessLookupError, PermissionError) as e:
         return isinstance(e, PermissionError)                # exists but not ours
+
+
+def _entry_alive(entry: dict) -> bool:
+    return _alive(entry.get("pid"), entry.get("pid_start"))
+
+
+def _live_entries(manifest: dict, names: set[str] | None = None) -> list[dict]:
+    """Entries of ``manifest`` whose recorded process is verifiably still running."""
+    return [e for e in manifest["entries"]
+            if (names is None or e["name"] in names) and _entry_alive(e)]
 
 
 def _run_progress(log_path: str, num_generations: int | None = None) -> dict:
@@ -401,7 +562,7 @@ def _state(entry: dict, prog: dict) -> str:
     """Reconcile 'what the manifest says' with 'what is actually true on the box'."""
     if prog.get("complete"):
         return "complete"
-    if _alive(entry.get("pid")):
+    if _entry_alive(entry):
         return "running"
     if entry.get("returncode") not in (None, 0):
         return f"exit {entry['returncode']}"
@@ -518,6 +679,44 @@ def _continue_step(name: str, entry: dict, prog, want: int | None, asked: str) -
     return step
 
 
+def guard_live_runs(sweep_dir: str, names: set[str] | None = None, *, force: bool = False,
+                    action: str = "relaunch") -> None:
+    """Refuse to touch runs that are still going, unless a human says otherwise.
+
+    Everything downstream of here rewinds a run directory and starts a second process writing into
+    it: two run_icl.py appending to one events.jsonl, one rewinding the generations the other is
+    still producing. The manifest already knows which pids were launched, so this is only a question
+    of asking — which nothing did.
+
+    On a terminal, ask. Off one (a batch job, a nohup, a cron) there is nobody to ask, so refuse and
+    say what to do about it: proceeding silently is the failure this exists to prevent, and a job that
+    exits non-zero is cheap next to a corrupted run directory. ``--force`` skips the check entirely.
+    """
+    if force:
+        return
+    try:
+        manifest = _read_manifest(sweep_dir)
+    except SweepError:
+        return                                          # no manifest yet: nothing can be running
+    live = _live_entries(manifest, names)
+    if not live:
+        return
+    listing = ", ".join(f"{e['name']} (pid {e['pid']}, started {e.get('started_at') or '?'})"
+                        for e in live)
+    print(f"\n[sweep] WARNING: {len(live)} run(s) of this sweep are STILL RUNNING: {listing}")
+    print(f"[sweep] A {action} would rewind their run directories under the live processes and start "
+          f"a second writer in each — the two accounts interleave in one events.jsonl and neither is "
+          f"recoverable.")
+    if not sys.stdin.isatty():
+        raise SweepError(
+            f"refusing to {action} {len(live)} live run(s) with no terminal to confirm on. Stop them "
+            f"first (python run_sweep.py --stop {sweep_dir}), wait for them to finish, or pass "
+            f"--force if you are certain those pids are stale.")
+    answer = input(f"[sweep] Go ahead with the {action} anyway? Type 'yes' to continue: ").strip().lower()
+    if answer != "yes":
+        raise SweepError(f"cancelled — the {len(live)} live run(s) were left alone")
+
+
 def plan_runs(manifest: dict, *, continue_at: dict[str, str] | None = None,
               restart_others: bool = True, dry_run: bool = False) -> set[str]:
     """Decide what each run of a sweep does next, make its dir match, and return the names to queue.
@@ -571,8 +770,15 @@ def plan_runs(manifest: dict, *, continue_at: dict[str, str] | None = None,
             continue
         else:
             step = 0
-            had = (f" (discarding {prog.good_generations} verified generation(s))"
-                   if prog.good_generations else "")
+            # Report what is being MOVED, not what verifies. A run damaged at generation 2 of 15 has
+            # 2 verified generations and 15 on disk, and it was the smaller number that got printed —
+            # so "discarding 2 generation(s)" was the caption on throwing away thirteen more.
+            on_disk = prog.generations_on_disk
+            had = ""
+            if on_disk:
+                had = f" (discarding {on_disk} generation(s) of work"
+                had += (f", only {prog.good_generations} of them verified)"
+                        if prog.good_generations != on_disk else ")")
             print(f"[sweep] resume: {name}: restarting from generation 0{had}"
                   + (" — nothing moved: --print-cmds" if dry_run and prog.has_tail else ""))
 
@@ -717,13 +923,17 @@ def _launch(entry: dict, env: dict[str, str] | None = None) -> subprocess.Popen:
     proc = subprocess.Popen(entry["cmd"], cwd=HERE, stdout=out,
                             stderr=subprocess.STDOUT, start_new_session=True, env=env)
     entry["pid"] = proc.pid
+    # Recorded alongside the pid so a later invocation can tell "this run is still going" from "some
+    # unrelated process inherited that pid after the node recycled it". See _alive.
+    entry["pid_start"] = _proc_start(proc.pid)
     entry["started_at"] = datetime.now().isoformat(timespec="seconds")
     entry["returncode"] = None
     return proc
 
 
 def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int, refresh: float,
-              env: dict[str, str] | None = None, only: set[str] | None = None) -> int:
+              env: dict[str, str] | None = None, only: set[str] | None = None,
+              on_signal: Any = None) -> int:
     """Run the queue to completion: at most ``max_parallel`` runs in flight, ``stagger`` seconds
     between launches, a status table every ``refresh`` seconds. Returns the number that failed.
 
@@ -749,12 +959,30 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int,
         print(f"\n[sweep] signal {signum} — leaving {len(live)} run(s) alive "
               f"(stop them with: python run_sweep.py --stop {sweep_dir})")
         _write_manifest(sweep_dir, manifest)
+        # The signal path is the one that matters for a post-mortem: an LSF TERM_MEMLIMIT arrives
+        # here, and if the logs are still in the compute node's /tmp when the node is reclaimed there
+        # is nothing left to read. Uncompressed, because LSF follows up with SIGKILL 10 s later.
+        if on_signal is not None:
+            try:
+                on_signal()
+            except Exception as e:
+                print(f"[sweep] could not save Ray logs on the way out: {e!r}")
         sys.exit(130)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    halted = False
     while pending or live:
+        # --stop's marker. Without this, SIGTERMing a run only frees a slot: the loop below reaps it
+        # and immediately launches the next queued one, so `--stop` on a 12-run sweep at
+        # max_parallel 2 killed two runs and started two more.
+        if pending and not halted and os.path.exists(_halt_path(sweep_dir)):
+            halted = True
+            print(f"[sweep] halted by --stop: dropping {len(pending)} queued run(s) "
+                  + ", ".join(e["name"] for e in pending)
+                  + (f"; waiting for {len(live)} still in flight" if live else ""))
+            pending = []
         for name, proc in list(live.items()):
             rc = proc.poll()
             if rc is None:
@@ -793,16 +1021,32 @@ def supervise(sweep_dir: str, manifest: dict, stagger: float, max_parallel: int,
 
 
 def stop_sweep(sweep_dir: str) -> None:
+    """Halt a sweep: stop what is queued, then signal what is live.
+
+    The marker goes down FIRST. A supervisor reaps an exiting run within a second and fills the slot
+    it freed, so signalling before halting is a race this would usually lose.
+    """
     manifest = _read_manifest(sweep_dir)
+    _set_halt(sweep_dir)
+    print(f"[sweep] halt marker written to {_halt_path(sweep_dir)} — a running supervisor will drop "
+          f"its queue (relaunching this sweep clears it)")
     stopped = 0
     for entry in manifest["entries"]:
-        if _alive(entry.get("pid")):
+        if not _entry_alive(entry):
+            continue
+        pid = entry["pid"]
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)        # the whole run_icl process group
+        except Exception as e:
+            # Fall back to the bare pid, but keep going: one unkillable entry must not leave the rest
+            # of the sweep running, which an unguarded os.kill here used to do.
             try:
-                os.killpg(os.getpgid(entry["pid"]), signal.SIGTERM)   # the whole run_icl process group
-            except Exception:
-                os.kill(entry["pid"], signal.SIGTERM)
-            print(f"[sweep] SIGTERM -> {entry['name']} (pid {entry['pid']})")
-            stopped += 1
+                os.kill(pid, signal.SIGTERM)
+            except Exception as e2:
+                print(f"[sweep] could NOT stop {entry['name']} (pid {pid}): {e!r} / {e2!r}")
+                continue
+        print(f"[sweep] SIGTERM -> {entry['name']} (pid {pid})")
+        stopped += 1
     print(f"[sweep] stopped {stopped} run(s)")
 
 
@@ -821,6 +1065,12 @@ def build_specs(sweep_file: str, sweep_dir_override: str | None) -> tuple[str, d
     unknown = set(settings) - {"name", "max_parallel", "stagger", "server_max_num_seqs", "ray"}
     if unknown:
         raise SweepError(f"unknown key(s) in `sweep`: {sorted(unknown)}")
+    # plan_head reads this block with cfg.get(), so a typo here would otherwise be silently ignored
+    # and the sweep would run at a size nobody chose -- the same failure mode as not setting it at all.
+    unknown = set(settings.get("ray") or {}) - RAY_SETTINGS
+    if unknown:
+        raise SweepError(f"unknown key(s) in `sweep.ray`: {sorted(unknown)}; "
+                         f"expected {sorted(RAY_SETTINGS)}")
     name = settings.get("name") or os.path.splitext(os.path.basename(sweep_file))[0]
     sweep_dir = sweep_dir_override or os.path.join("runs", name)
 
@@ -856,7 +1106,11 @@ def main() -> int:
     p.add_argument("--sweep-dir", default=None,
                    help="Override the output dir (default: runs/<sweep name>).")
     p.add_argument("--status", metavar="SWEEP_DIR", help="Print a sweep's status table and exit.")
-    p.add_argument("--stop", metavar="SWEEP_DIR", help="SIGTERM every live run of a sweep and exit.")
+    p.add_argument("--stop", metavar="SWEEP_DIR",
+                   help="Halt a sweep: drop whatever is still queued and SIGTERM every live run. A "
+                        "supervisor watching this sweep sees the halt marker and stops launching "
+                        "(without it, killing a run only freed a slot and the next queued run "
+                        "started immediately). Relaunching the sweep clears the marker.")
     p.add_argument("--resume", metavar="SWEEP_DIR",
                    help="Restart every run of a sweep that is not complete, from its FIRST generation "
                         "(a partial run is never continued mid-run: one run = one process = one "
@@ -877,6 +1131,10 @@ def main() -> int:
                         "<run>/stale_<timestamp>/.")
     p.add_argument("--print-cmds", action="store_true",
                    help="Expand the sweep and print the exact commands; launch nothing.")
+    p.add_argument("--force", action="store_true",
+                   help="Skip the live-run check. By default a launch/resume that would rewind a run "
+                        "whose process is still alive asks first (and refuses outright when there is "
+                        "no terminal to ask on).")
     p.add_argument("--max-parallel", type=int, default=None,
                    help="Max runs in flight (default: sweep.max_parallel, else 1).")
     p.add_argument("--stagger", type=float, default=None,
@@ -886,6 +1144,11 @@ def main() -> int:
                    help="auto: start a shared Ray head sized from this box's cgroup if none is up, "
                         "and stop it when the sweep drains; require: attach to an existing head, "
                         "fail if none; skip: leave Ray alone (each run boots its own cluster).")
+    p.add_argument("--ray-num-cpus", type=int, default=None, metavar="N",
+                   help="Cores the Ray head may use, instead of detecting them. This is the final "
+                        "--num-cpus: reserve_cpus is not applied on top and the rest of the "
+                        "allocation is left idle. Overrides sweep.ray.num_cpus; only meaningful "
+                        "with --ray-head auto, since an existing head cannot be resized.")
     a = p.parse_args()
 
     if a.status:
@@ -906,6 +1169,12 @@ def main() -> int:
             a.continue_run or [], a.from_generation, a.resume)
         manifest = _read_manifest(sweep_dir)
         settings = manifest.get("settings") or {}
+        if not a.print_cmds:
+            # Before plan_runs, which is what rewinds the run dirs. --print-cmds moves nothing, so it
+            # is free to describe a sweep that is currently running.
+            named = set(continue_at) if not a.resume else None
+            guard_live_runs(sweep_dir, named, force=a.force,
+                            action="continue" if not a.resume else "resume")
         only = plan_runs(manifest, continue_at=continue_at, restart_others=bool(a.resume),
                          dry_run=a.print_cmds)
         if not only:
@@ -917,6 +1186,11 @@ def main() -> int:
         if not a.sweep_file:
             p.error("give a sweep file, or one of --status/--stop/--resume/--continue-run")
         sweep_dir, settings, manifest = build_specs(a.sweep_file, a.sweep_dir)
+        # build_specs writes a manifest with no pids, so the check has to read the one already on
+        # disk — relaunching the same sweep file over a live sweep is the easiest way into this mess
+        # (it is what a resubmitted batch job does) and the one the new manifest cannot see.
+        if not a.print_cmds:
+            guard_live_runs(sweep_dir, force=a.force, action="relaunch")
 
     launching = [e for e in manifest["entries"] if only is None or e["name"] in only]
     single = only is not None and len(only) == 1
@@ -933,7 +1207,7 @@ def main() -> int:
         if stale:
             print(f"\n[sweep] ray: NOTE — {stale}")
         try:
-            plan = ray_head.plan_head(tpt, max_parallel, dict(settings.get("ray") or {}))
+            plan = ray_head.plan_head(tpt, max_parallel, _ray_cfg(settings, a.ray_num_cpus))
             print("\n# ray head that would be started")
             for note in plan.notes:
                 print(f"#   {note}")
@@ -951,16 +1225,23 @@ def main() -> int:
 
     tpt = threads_per_task(launching)
     head = RayHead()
-    head.ensure(a.ray_head, tpt, max_parallel, dict(settings.get("ray") or {}))
+    head.ensure(a.ray_head, tpt, max_parallel, _ray_cfg(settings, a.ray_num_cpus))
 
     _write_manifest(sweep_dir, manifest)
+    # Launching IS the deliberate act that overrides a previous --stop; leaving the marker would halt
+    # this sweep on its first pass.
+    if _clear_halt(sweep_dir):
+        print("[sweep] cleared the halt marker left by a previous --stop")
     print(f"[sweep] {manifest['name']}: {len(launching)} run(s) -> {sweep_dir} "
           f"(max_parallel={max_parallel}, stagger={stagger:g}s)")
     # supervise() exits the process on SIGINT/SIGTERM and deliberately leaves the runs alive, so the
     # head must survive that path — only tear it down when the queue actually drained.
     failed = supervise(sweep_dir, manifest, stagger, max_parallel, a.refresh, head.child_env(),
-                       only=only)
-    head.teardown()
+                       only=only,
+                       on_signal=lambda: head.save_logs(
+                           sweep_dir, compress=False,
+                           tail_bytes=RayHead.SIGNAL_TAIL_BYTES))
+    head.teardown(log_dest=sweep_dir)
     return 1 if failed else 0
 
 

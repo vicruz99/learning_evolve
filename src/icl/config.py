@@ -33,6 +33,29 @@ class ICLConfig:
     # chunking there are groups_per_batch * ceil(group_size/chunk) concurrent requests, so
     # max_gen_concurrency must be raised to that many or vLLM can't co-batch them (a warning fires).
     grade_chunk_size: int | None = None
+    # How long to keep waiting for an unreachable model server before giving up on the RUN.
+    #
+    # A generation whose groups did not reach the model is not a slow generation, it is a different
+    # experiment: those parents produced no children, so the buffer, the context pool and every later
+    # prompt differ from the configuration being compared. The old behaviour — swallow the error,
+    # record an empty group, carry on — spent the rest of the run's budget producing exactly that, and
+    # results.resume then refused to trust anything after it anyway. So: wait the server out (a vLLM
+    # job being requeued is the common case and costs only wall clock), and if it does not come back,
+    # stop at the last COMPLETE generation instead of walking on. 0 = wait indefinitely.
+    llm_max_wait: float = 3600.0
+    # Consecutive generations that may yield NO valid candidate before the run stops itself.
+    #
+    # A generation where all `groups_per_batch * group_size` candidates fail to grade is not a hard
+    # problem, it is a broken evaluator — a starved cpu_scheduler, a full disk, a Ray head that lost
+    # its workers. The run used to carry on to the end and record every one of those generations as
+    # ordinary, which is worse than a crash: the generations are structurally perfect (full groups,
+    # full complement of children, all invalid), so `results.resume` verifies the run as COMPLETE and
+    # `--resume` skips it. A sweep can hand back twelve green runs holding nothing.
+    #
+    # 0 disables the stop. Keep it above 1: an early generation can legitimately come back empty on a
+    # hard problem before the buffer has anything good in it.
+    max_empty_generations: int = 3
+
 
     # --- search shape (matches TTT-Discover: 8 parents x 64 children = 512/generation) ---
     groups_per_batch: int = 8
@@ -48,6 +71,15 @@ class ICLConfig:
     #   "initial" — always the problem's seed solution => Best-of-N. Combined with n_context=0 this is
     #               the no-past-experience baseline: no history via parent selection, none via prompt.
     parent_source: str = "puct"
+
+    # --- memory guard ---
+    # Fraction of the job's detected memory ceiling at which the run stops itself at the next
+    # generation boundary rather than being killed mid-generation. LSF enforces its ceiling by
+    # polling the process tree's total RSS and then sending SIGINT/SIGTERM/SIGKILL 10 s apart, which
+    # lands wherever it lands; stopping ourselves lands on a boundary where the sampler and tracker
+    # have just been flushed, so --resume has a clean generation to continue from. 0 disables the
+    # stop (the per-generation rss line is always logged either way).
+    memory_stop_fraction: float = 0.85
 
     # --- reproducibility ---
     # Seeds the sampler's only stochastic surface (the AC problems' random initial construction) and,
@@ -91,6 +123,10 @@ class ICLConfig:
     # --- evaluation (override registry defaults if set) ---
     eval_timeout: int | None = None                  # sandbox per-candidate timeout, seconds
     num_cpus_per_task: int | None = None
+    # Cores the Ray cluster may use, when THIS run has to start one (no head up). Ignored when a head
+    # is already running -- its size was fixed at `ray start` and a client cannot change it. Under
+    # run_sweep.py the launcher owns the head, so use its --ray-num-cpus instead.
+    ray_num_cpus: int | None = None
     grade_timeout: float = 8000.0                    # async grading wall-clock timeout
 
     # --- resume ---

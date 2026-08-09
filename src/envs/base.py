@@ -75,6 +75,9 @@ class RolloutResult:
     eval_seconds: float | None = None    # the program's own runtime -> the ONLY number --eval-timeout bounds
     queue_seconds: float | None = None   # waiting for a free CPU group; contention, not evaluation
     grade_seconds: float | None = None   # end-to-end (queue + eval + Ray/pickle overhead)
+    # Peak RSS of the sandboxed program, MB. Max over its process tree rather than the sum, and
+    # per-eval only while sandbox_reward_evaluator.MAX_CALLS == 1 -- see _children_peak_rss.
+    peak_rss_mb: float | None = None
 
 
 # Shared ThreadPoolExecutor for all environments (grading runs off the event loop).
@@ -281,4 +284,5 @@ class Environment(ABC):
             eval_seconds=m.get("eval_seconds"),
             queue_seconds=m.get("queue_seconds"),
             grade_seconds=m.get("grade_seconds"),
+            peak_rss_mb=m.get("peak_rss_mb"),
         )

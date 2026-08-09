@@ -641,6 +641,66 @@ only gen-1 data exists for ac2).
 
 ---
 
+## 2026-07-28 — Bosch login-node cgroup throttling: 11.5× slow evals, 56% false timeouts; LSF job scripts
+
+**Problem** — `runs/ctx_qwen/cp26_n10_s1_random` (Bosch, `_meta.host = rng-dl01-login1`) recorded 673
+`eval_timeout`s out of 1200 candidates (56%) against the registry's 530 s cap for `circle_packing_26`.
+
+**Diagnosis** — paired cross-machine re-grade with `python -m sandbox.regrade`: 20 candidates
+(10 SUCCESS + 10 timed-out) re-run on the INESC box `vouga`. **Bosch is ~11.5× slower per candidate**
+(p50; range 5.7–17.7×). Of 8 sampled timeouts, **6 completed on `vouga`**, scoring 2.6197, 2.6113,
+2.5967, 2.5717, 2.2695, 1.9101 — three of them within 2% of the best score the entire 1200-candidate
+run ever found (2.6360). So the cap was discarding near-best candidates, which corrupts the PUCT
+buffer's `Q(s)` and rank prior `P(s)`, not merely wasting compute.
+
+**Root cause (confirmed)** — a cgroup on the login node caps the user slice at **5.0 cores of CPU
+time** while exposing 64. `python -m sandbox.ray_doctor` on Bosch:
+`/sys/fs/cgroup/user.slice/user-120321.slice/cpu.max` = 5 cores, and `cpu.stat` reports
+`nr_throttled=1438673`, 5,148,273 s throttled. The quota predicts up to 12.8× at 64-way concurrency;
+we measured 11.5×. **Nothing upstream reveals it**: a quota is invisible to `sched_getaffinity`
+(still 64), so Ray hands out 64 one-core groups and `queue_seconds` stays ~0. The only symptom is
+that every eval runs slow.
+
+**Ruled out by experiment, do not re-test** — scipy/numpy skew (identical 1.18.0 / 2.5.1 both boxes);
+contention on the grading box (paired re-grade at load 163 vs 63 → median 1.15×, and only on sub-10 s
+evals where process-start and scipy-import dominate); CPU arch / BLAS kernel (Bosch EPYC 7543 →
+OpenBLAS `Haswell`, vouga Xeon 6330 → `SkylakeX`; forcing `OPENBLAS_CORETYPE=Haswell` on vouga gave
+p50 **1.03×**); program nondeterminism (3× repeat, 9/10 with spread exactly 0). `ray_doctor` §6 shows
+the EPYC is **faster** per core than the reference (`slsqp 0.53×`) — the silicon is fine.
+
+**Built** — `src/jobs/` with `icl_sweep.bsub` (CPU-only LSF driver job), `vllm_server.bsub` (GPU
+server job that publishes its node to `jobs/vllm_host.txt`), and `README.md` covering queue
+discovery and login-node → worker port-forwarding. Design notes:
+
+* **No `-gpu` line on the driver job.** The site's queues are GPU-flavoured (`inter_v100`,
+  `batch_h200`) but a queue does not force a GPU on you — `-n 32` with no `-gpu` is a 32-core CPU
+  reservation. The driver reaches the server over the network by hostname, which the runs already
+  did (`vllm_base_url = http://rng-dl01-w26n05:8001/v1`); only the *driver* was on the login node.
+* **The Ray head is started by the job with `--num-cpus=$LSB_DJOB_NUMPROC`.** `run_sweep.py`'s
+  `ensure_ray_head()` runs a bare `ray start --head`, which reads the **node's** core count rather
+  than the LSF reservation — on a shared compute node that reproduces the login-node failure exactly.
+  The job then passes `--ray-head require` so a failed head is loud instead of silently unsized.
+* **`RAY_TMPDIR` is set per job** (`/tmp/ray_$USER_$LSB_JOBID`) with a job-derived GCS port, so two
+  jobs on one node cannot collide. Verified against ray 2.56.1: `get_ray_address_file(None)` resolves
+  under `$RAY_TMPDIR/ray`, so `init_ray`'s `address="auto"` still finds the job's own head.
+* The job rewrites `vllm-base-url` in a **scratch copy** of the sweep yaml from `jobs/vllm_host.txt`,
+  since the server's node changes on every resubmit, and leaves the tracked file alone.
+
+**Interim fix if still on the login node** — `ray stop && ray start --head --num-cpus=5`. Costs
+nothing in throughput (the 5-core quota binds either way: 5×1.0 = 64×1/12.8) but evals then run at
+true speed (~30 s, not 250–540 s) and stop hitting the cap. Also clears the leaked CPU group
+`ray_doctor` flagged.
+
+**Open, unrelated to the quota** — `envs/circle_packing.py:53` rejects on
+`dist < radii[i] + radii[j] - 1e-12`. Optimal packings have *tangent* circles, so the better the
+solution the likelier it trips on float noise. Grading one program 3× on one machine gave
+`['SUCCESS', 'invalid_result', 'SUCCESS']`, the rejection on a **6.6e-12** overlap. Raising the
+tolerance to ~1e-9 would fix it but breaks score comparability with recorded runs — deliberate
+decision not yet made. Relatedly, scores are not bit-portable: 5/10 re-graded candidates differed
+across boxes (one by −10.58%) while being deterministic on each.
+
+---
+
 ## 2026-08-03 — `--resume` verified against the artifacts (it was trusting one field, and that field lies)
 
 **Problem** — a sweep hit LLM request timeouts; the damaged run folders were deleted by hand, and
@@ -734,6 +794,110 @@ generation before it will redo anything. `--resume` + `--continue-run` and `--fr
 Also added `_check_log_path`: both planners now refuse an entry whose manifest `log_path` and command
 `--log-path` disagree, which would otherwise verify one dir and relaunch into another.
 
+---
+
+## 2026-08-04 — TERM_MEMLIMIT post-mortem: bound the eval workers, measure the ceiling, keep the logs
+
+**What happened.** Job 12669131 (interactive, 122 slots on `rng-dl01-w24c02`) was killed by LSF at
+23:31 on Aug 3 after 28h45m and 14 generations. `TERM_MEMLIMIT`, nothing else: run time 28h against a
+7-day limit, CPU efficiency 45%, zero swap. `MAX MEM 488 G` matches `rusage[mem=4096] x 122 slots` to
+the byte, while `AVG MEM 78.4 G` says the memory was never needed — a 6x ramp across the run that
+nobody was watching, reconstructed afterwards from `bhist` because nothing in-process logged it.
+
+Three separate failures, fixed separately.
+
+**1. The eval workers were never recycled.** `_get_exec_fn` built the `run_program` remote with Ray's
+default `max_calls=0`, i.e. reuse a worker for the life of the job. Everything a worker touches
+accumulates — unpickled `result_construction` arrays, numpy/BLAS arenas, glibc fragmentation. None of
+it is a leak per-eval and none of it plateaus; ~120 workers over a multi-day run is a monotonic RSS
+ramp, which is exactly the shape of 78 G -> 488 G. Now `MAX_CALLS = 1`: a worker's footprint is bounded
+to one candidate. Cost is one interpreter start (~1-2 s) per eval, amortised against a whole sandboxed
+program run (eval p50 is tens to hundreds of seconds), so it is noise here — that is the condition to
+re-check if it ever stops holding.
+
+Worth recording what this did *not* turn out to be. The leading external hypothesis was orphaned grader
+subprocesses from `_safe_grade`'s `asyncio.wait_for`. It is the wrong file: `_safe_grade`
+(`envs/base.py`) runs `_run_verification` in a `ThreadPoolExecutor` and spawns no process, its timeout
+is `EnvConfig.timeout = 8000 s` against `eval_timeout = 1000 s` so it fires essentially never, and the
+sandbox path that *does* spawn already sets `start_new_session=True` and does `os.killpg` TERM->KILL
+plus a `pkill -P` sweep (`_kill_process_tree`). Implementing that advice would have been a no-op.
+
+**2. Nothing measured the number LSF kills on.** This site runs `LSB_RESOURCE_ENFORCE="cpu memory gpu"`
+with `LSF_PROCESS_TRACKING=Y`: LSF sums the process tree's RSS itself and kills on the total, and no
+cgroup file carries that figure. So `memory.max` reads `max`, Ray falls back to `/proc/meminfo` and
+sizes for the whole 1.5 T node, and Ray's own memory monitor watches that same wrong denominator and
+can never fire first. New `sandbox/memwatch.py` computes the same sum LSF does and the loop logs it
+every generation (`gen N memory | job rss X across N procs | Y% of the ZG ceiling`), alongside a new
+per-candidate `peak_rss_mb` (from `RUSAGE_CHILDREN.ru_maxrss`, per-eval only because `MAX_CALLS = 1`)
+with `rss_*` percentiles in `progress.csv` and `meta.json`. Reading the pair is the point: job climbing
+while per-eval stays flat is accumulation in the long-lived processes, not a greedy candidate.
+
+`memwatch` deliberately does *not* walk only our descendants. `ray start --head` daemonises, so the
+raylet, GCS and every eval worker are reparented away from the driver — a process-tree walk misses
+precisely the processes under suspicion. Under LSF it matches `LSB_JOBID` in `/proc/*/environ`, which is
+the set LSF accounts; off LSF it falls back to our tree plus Ray components we own. It also sums RSS
+without discounting shared pages, matching LSF's arithmetic rather than the machine's truth, because the
+goal is predicting its kill decision.
+
+At `--memory-stop-fraction` (default 0.85) the run stops at the next generation boundary instead of
+being killed mid-generation: the sampler and tracker have just been flushed there, so the run stays
+resumable, which a `TERM_MEMLIMIT` landing wherever it lands does not. The summary is written
+`stopped_memory`, never `complete`.
+
+**3. The one artifact that could explain a kill was always deleted.** Ray's session logs live under
+`$RAY_TMPDIR` in the compute node's `/tmp`, the node is reclaimed when the job ends, and
+`icl_sweep.bsub`'s cleanup ran `rm -rf "$RAY_TMPDIR"`. `ray_head.archive_logs()` now tars them into the
+sweep dir — component logs (`raylet.*` carries worker deaths and object-store spilling) always, plus
+the newest 400 per-worker logs. Wired into `RayHead.teardown()` *and* into `supervise`'s signal
+handler, which is the path that actually matters: `TERM_MEMLIMIT` arrives as SIGINT, SIGTERM, SIGKILL
+10 s apart, so the signal path writes uncompressed to fit in that window.
+
+**Found while testing, and fixed because `MAX_CALLS = 1` makes it worse.** `/tmp/ray` on guadiana held
+5.8 G across 78,803 worker logs (~75 KB each) from sessions dating to Jul 22, with `/` at 85% — nothing
+reaps them, and `plan_head` gives every sweep its own temp dir. `ray_head.remove_temp_dir()` now cleans
+up after teardown, guarded to refuse anything not named `ray-<uid>-<host>-<tag>` so the shared default
+`/tmp/ray` (which may belong to a co-tenant) is never touched. `max_calls=1` shifts roughly the same
+log bytes into many more files rather than growing the total, but the file count is what the cap and the
+cleanup are for.
+
+**Still open: no per-eval memory ceiling.** `ray.remote(memory=TASK_MEMORY)` is scheduler bookkeeping,
+not enforcement, and the sandbox subprocess has no `RLIMIT_AS`, so one candidate allocating a huge array
+can still take the job down. Deliberately not guessing the limit: `peak_rss_mb` is now recorded so the
+cap can be read off the real distribution (~96 MB for a trivial candidate; the tail is what matters).
+Set it once a real run has reported a few generations of `rss_p99`/`rss_max`.
+
+**Same-day follow-up — the memory guard had to be made shared-head-aware.** The pieces above were
+written as if a run owned its box. It does not: `run_sweep.py` starts one Ray head and every run
+attaches to it, and two of the three changes behaved badly under that.
+
+Measured on guadiana with a head up and two drivers sampling independently: each reported 1.46 G, of
+which **1.39 G (95%) was the shared head and its workers**. Four concurrent runs would log 5.85 G of
+"their" memory for a real 1.68 G. `job_rss_gb` is still the right number for the stop decision — it is
+what the batch system kills on — but it is not per-run, so `sample()` now also reports `own_rss_gb`
+(this driver's tree alone), and the `progress.csv` comment says outright that `job_rss_gb` is identical
+across concurrent runs. Reading the three together localises a ramp: `job` climbing while `own` and
+`rss_max` stay flat is accumulation in the shared eval workers.
+
+The stop was worse than merely mis-attributed. All N runs measure the same total against the same
+ceiling, so they would all cross 85% at the same generation boundary and all stop — losing a whole
+sweep where shedding one run frees enough for the rest. `memwatch.claim_shed()` arbitrates through an
+`O_CREAT | O_EXCL` claim file in the sweep dir: the first run over the threshold stops, siblings see a
+fresh claim and continue (the memory it is about to release is precisely their relief), and after a
+cooldown the next run over the threshold may shed too, so a still-growing job sheds one at a time
+rather than all at once or only ever one. Filesystem rather than a Ray actor because a claim must
+outlive the claiming run and the runs need not share a namespace. Unwritable sweep dir fails toward
+stopping, since one run too few is cheaper than a `TERM_MEMLIMIT`.
+
+Two things left standing as known, pre-existing hazards rather than new ones. `RayHead.teardown()` only
+fires when `self.owned`, so a second sweep that *attaches* to the first sweep's head never tears down —
+and the owning sweep finishing will `stop_head` the cluster the second is still using. That predates
+this work (`af65efd`); `remove_temp_dir` now also deletes the session logs in that window, which is a
+slightly larger blast radius in an already-broken case, not a new one. And `MAX_CALLS = 1` multiplies
+worker *process churn* by the number of concurrent runs: worker startup happens before
+`get_cpu_group()`, so it is unpinned CPU competing with pinned evals. It lands in the `grade_seconds`
+gap rather than in `eval_seconds`, so the headline metric is unaffected, but the 400-worker-log archive
+cap is now shared across all runs in a sweep and gives correspondingly less per-run history.
+
 **Follow-up 2 — the two dials compose.** `--continue-run` on its own touches only the runs it names,
 which is wrong when the rest of the sweep is also unfinished: continuing one run then meant the other
 runs sat idle until a second command. `plan_resume`/`plan_continue_run` are now one planner,
@@ -748,6 +912,32 @@ queued, so nothing else can slip in). `--continue-run` takes a run dir OR — wi
 sweep — a bare run name, with `:N` as the general way to say the generation (`--from-generation` stays
 as sugar for the single-run case, and is an error alongside `:N` or several runs). Cross-sweep paths,
 duplicate names and unknown run names are all refused before anything moves.
+
+**Same-day follow-up 2 — the log capture was dead on the exact configuration it was for.** Decision:
+stop guessing at causes, run again with the instrumentation and let the next crash say what it is. That
+makes the archive the load-bearing piece, so it got checked properly, and two things were wrong.
+
+`RayHead.save_logs()` was gated on `self.owned`. But `jobs/icl_sweep.bsub` starts the head itself and
+passes `--ray-head require`, so `owned` is False there and the sweep archived **nothing** — on precisely
+the job script a Bosch run uses. Archiving is read-only, so it is now gated on `temp_dir` instead, the
+attach branch learns the head's temp dir from `RAY_TMPDIR` (and says so, or warns that it cannot), and
+`teardown()` archives *before* the ownership gate. Stopping and deleting still require ownership.
+
+The emergency dump could not have finished either. Untruncated it was 762 MB, because the valuable
+files are the big ones: `raylet.out` 296 MB, `gcs_server.out` 263 MB, `monitor.log` 89 MB. LSF gives
+~10 s between SIGINT and SIGKILL. `archive_logs(tail_bytes=...)` now keeps only the last N bytes of any
+oversized file, seeking and declaring the shorter size so the member is a genuine tail (verified
+byte-identical on a static file; a first check against a live `raylet.out` "failed" only because the
+running raylet was still appending). The signal path uses 8 MB/file uncompressed: **762 MB -> 87 MB,
+19.2 s -> 1.0 s**. Truncated members are renamed `*.tail` so nobody reads one as a whole log.
+
+What is armed for the next run: per-generation `job`/`own` RSS and per-candidate `rss_*`, a clean
+resumable stop at 85% of the ceiling with sibling arbitration, and a Ray log archive on both the clean
+and the signal path. What is NOT: any per-eval memory *enforcement*. `RLIMIT_DATA` is still unbuilt, the
+watchdog only samples at generation boundaries (~2 h apart at this problem's pace, so a fast
+mid-generation allocation is unguarded), and if `memwatch.ceiling()` returns None inside the job the
+self-stop is silently inert — worth running `python -c "from sandbox.memwatch import ceiling;
+print(ceiling())"` on the compute node once before trusting it.
 
 **Follow-up 3 — a sweep that launches nothing must not report "12 ok".** On Bosch, `--resume
 runs/ac2_qwen_b --continue-run n10_s2_random --from-generation 14` planned all 12 runs correctly, then
@@ -788,3 +978,190 @@ in `supervise` containing the `_launch` and `poll` calls, and `shutdown` must st
 calls has to exist in the COMMITTED `sandbox/ray_head.py` — `teardown` had picked up calls to
 `archive_logs`/`remove_temp_dir`, which live only in the uncommitted stream, so the committed tree would
 have raised AttributeError on teardown.
+
+---
+
+## 2026-08-09 — Stop producing runs that resume cannot trust (and stop lying about them)
+
+Follow-on to the 2026-08-03 entry. That one made `--resume` verify a run against its artifacts; this
+one goes after the thing that *created* untrustworthy artifacts in the first place, plus three
+smaller footguns in the launcher. Audit prompted by "is this actually ready to run on Bosch".
+
+**The audit's finding.** `icl.loop._run_group` caught every exception — LLM *and* grading — recorded
+that parent group with no candidates, and let the loop walk on. So a single transient failure produced
+a run that finished all its generations while every generation after the failure was conditioned on a
+buffer and a context pool missing that group's children: the configured experiment on paper, a
+different one in fact. `results.resume` then (correctly) refused to trust anything past it, so a run
+with 10 generations on disk reported `good_generations = 2`, `complete = False`, and `--resume` threw
+all ten away. Reproduced against synthetic run dirs before changing anything.
+
+**Built**
+- `_generate_waiting` (`icl/loop.py`): a layer above the OpenAI client's own `max_retries`, for the
+  failures those cannot cover — the vLLM job being requeued, a node reboot, a restart to change flags.
+  Backs off 5s → 60s, re-probes `/health` so the log distinguishes a dead server from a sick one, and
+  **the generation does not advance while it waits**. New `--llm-max-wait` (default 3600s, 0 = wait
+  indefinitely).
+- `GenerationAborted` / `LLMUnavailable`: a group that cannot be completed now abandons the
+  generation instead of recording it hollow. Raised only after every group has settled
+  (`asyncio.gather(..., return_exceptions=True)`) so no sibling group is left generating into a
+  directory the process is abandoning, and always **before** `end_generation`, so no `meta.json` is
+  written — which is exactly what makes the stop resumable at the last complete generation.
+- Grading failures are now their own error. A dead Ray worker used to surface as *"the LLM was
+  unreachable for them"*, and retrying it would have paid for the decode twice.
+- `guard_live_runs` (`run_sweep.py`): a launch or resume that would rewind a run whose process is
+  still alive asks first, and **refuses outright with no terminal to ask on** (every batch job).
+  `--force` overrides. Needed because `plan_runs`/`plan_queue` consulted `_alive` nowhere.
+- PID identity: `_alive` now compares `/proc/<pid>/stat` field 22 against a `pid_start` recorded at
+  launch. A manifest outlives the job that wrote it, and on a busy node a dead run's pid belongs to
+  something else by the time anyone reads it — `--stop` would have signalled that stranger's group.
+- `--stop` halts, rather than advancing, the sweep (see below).
+- Snapshot verdicts cached by `(path, mtime_ns, size)` in `results.resume`.
+
+**Design decisions & why**
+- **Abort at the point of damage, not at resume time.** If a compromised generation compromises the
+  run — it does — then the moment to act is that generation, not twelve generations later when someone
+  tries to resume. The old order spent the rest of the run's budget producing data the resume logic
+  had already decided was worthless. As a side effect the strict prefix rule in `results.resume` stops
+  having to adjudicate anything: a run that aborts on damage leaves a short, honest, undamaged prefix.
+- **Wait, don't skip.** A requeued server costs wall clock; a skipped group costs the comparison.
+- **`--stop` writes a marker file, not a manifest field.** It only SIGTERMed the live runs, and the
+  supervisor reaped them and immediately filled the freed slots — so `--stop` on a 12-run sweep at
+  `max_parallel 2` killed two runs and started two more. `<sweep_dir>/.halted` goes down *first*
+  (signalling before halting loses the race), `supervise` drops its queue on it, and a deliberate
+  relaunch clears it. A field inside `sweep.json` would race with the supervisor's own writes.
+- **Report what is discarded, not what verifies.** `--resume` printed `discarding 2 verified
+  generation(s)` while moving ten aside. `RunProgress.generations_on_disk` is the number that
+  belongs in that sentence.
+
+**What bit us / measured**
+- A run that completed 10/10 generations, damaged at gen 2, was reported `2/10` and re-run from
+  scratch by `--resume`; `--continue-run auto` continued at 2 (discarding 8); `--continue-run r:10`
+  was rejected outright. There was no non-manual way to keep it.
+- `--status` re-parsed every buffer snapshot of every run on its 60s timer, inside the same loop that
+  reaps and launches runs: 268 MB re-read per render on a synthetic 12-run × 15-generation sweep
+  (0.94 s warm on local disk, and these run dirs are routinely on NFS). Snapshots are immutable once
+  written, so the re-parse could only ever reach the same verdict — hence the cache.
+- Checked and cleared: PUCT cannot return fewer parents than `groups_per_batch` (the initial states
+  are never evicted — `flush` keeps parentless states, `_finalize_and_save` keeps initials), so the
+  "N groups on disk, M configured" damage check has no false-positive path through normal search.
+  Simulated six generations with a single productive parent to confirm.
+
+**Tests**
+- New `tests/test_llm_loss.py` (5): a transient failure is waited out and leaves no damage; a 404 is
+  not waited on; giving up raises rather than recording an empty group; a lost generation is
+  abandoned and `inspect_run` puts the resume point at the previous one with `status: aborted`; a
+  grading failure reports as grading and is not re-generated.
+- `tests/test_sweep.py` +6: recycled-pid rejection, the live-run refusal and its `--force` escape, a
+  stale pid ignored, `--stop` halting a queue, halt/clear idempotence, honest discard counts.
+- `tests/test_resume.py` +1: snapshot verdicts cached, and a rewritten file misses the cache.
+- 123 pass.
+
+**Not done (deliberately deferred):** the batch-job side. `jobs/icl_sweep.bsub` still has no way to
+pass `--resume` / `--continue-run`, so resubmitting it after a wall-clock kill takes the plain-launch
+path and restarts every partial run from generation 0. That is the next thing to fix for Bosch.
+
+---
+
+## 2026-08-09 (later) — Choosing the head's core count by hand (`sweep.ray.num_cpus` / `--ray-num-cpus`)
+
+`plan_head` detected everything and offered no way to say "use less than that". The cases are real:
+sharing a compute node with another job of your own, leaving headroom for a server on the same host,
+or reproducing a run made on a smaller box. Three spellings, one meaning: `sweep.ray.num_cpus` in the
+sweep file, `run_sweep.py --ray-num-cpus N` (which overrides it, both in `--print-cmds` and in the head
+actually started — one `_ray_cfg()` helper feeds both, so the plan you read is the head you get), and
+`run_icl.py --ray-num-cpus N` for the private cluster a lone run boots when no head is up.
+
+**It is the FINAL `--num-cpus`, not another budget.** `reserve_cpus` is not subtracted on top and the
+detected budget is not consulted: "let Ray see 16" has to mean 16 or it does not answer the question
+being asked. The one adjustment kept is rounding down to a whole multiple of `num-cpus-per-task`,
+because `cpu_scheduler` drops the trailing partial group and a `--num-cpus` it cannot back is capacity
+Ray will admit against and then strand.
+
+**Two different ceilings, two different failures, so both are warned about separately.** Above the
+affinity mask (`num_cpus > logical CPUs`) the run *starves*: `cpu_scheduler` chops the mask, not
+`--num-cpus`, so it can only ever hand out `affinity // tpt` groups and the surplus tasks spin in
+`get_cpu_group()` until they fail as `cpu_starvation`. Between the physical cores and the logical CPUs
+nothing starves — evals just share cores at roughly half speed while Ray reports full occupancy, which
+silently moves runtimes and timeout rates. Neither is refused: an explicit override wins, as
+`memory_gb` already does.
+
+**Memory follows the request, not the grant.** In the no-cgroup-limit branch the heap is a fair share
+of `MemTotal` computed from the core budget; taking 16 of 128 cores and still claiming the whole
+node's RAM is precisely the co-tenant-hostile case that branch exists to prevent, so the share is now
+computed from the override when there is one.
+
+**Where it deliberately does nothing.** `--num-cpus` is fixed at `ray start` and a connecting client
+cannot change it, so on `--ray-head require`/`skip` (and in `init_ray`'s attach path) the value is
+reported as ignored, with the `ray start --head --num-cpus=N` command to use instead. Silently
+accepting it would let someone size a sweep carefully and never learn the number was dropped.
+
+**Found while doing it:** the `sweep.ray` block was never key-validated. `plan_head` reads it with
+`cfg.get()`, so `num_cpu:` or `reserve_cpu:` was accepted and ignored — the sweep then ran at a size
+nobody chose, indistinguishable from not having set it. `build_specs` now rejects unknown keys there
+against `RAY_SETTINGS`, like every other section.
+
+**Tests.** New `tests/test_ray_head.py` (9) — the first tests this module has had — running against a
+faked 64-core/128-thread/256 G box so the assertions mean the same thing on a laptop, on guadiana and
+inside an LSF job: the override is honoured exactly with no reserve applied, it beats `reserve_cpus`,
+it rounds to whole slots, below one slot it raises, each of the two ceilings produces its own warning,
+the memory share follows it, and `memory_gb` still wins. `tests/test_sweep.py` +2 (flag beats yaml
+without mutating the manifest; `sweep.ray` typos rejected). 134 pass.
+
+**Same-day follow-up — the grading-side twin, found by asking "what else can OOM or crash".** The
+change above stops a run when the model is unreachable. The same silence existed one layer down, and
+it was worse, because it survived every check `results.resume` makes.
+
+**A run in which every candidate FAILS TO GRADE verifies as `complete`.** Demonstrated on a synthetic
+run dir: 15 generations, full groups, full complement of children, `correctness: 0` throughout →
+`good_generations 15/15`, `complete: True`, `damage: []`, zero valid solutions ever produced.
+`--resume` skips it and `--status` shows it green. Every check in that module is *structural*, and a
+broken evaluator is structurally indistinguishable from a hard problem: the candidates came back,
+they just all failed.
+
+There is a mechanism that produces exactly this, and it is not hypothetical. `release_cpu_group` sits
+in a `finally` (`sandbox_reward_evaluator.py`), which covers exceptions but **not the worker process
+being killed** — Ray's memory monitor, the OOM killer, node pressure, i.e. precisely the conditions of
+the 2026-08-04 memory ramp. `CpuScheduler` is a *detached* actor holding a fixed deque built once per
+host, with no reaper, so every killed eval permanently removes one CPU group for the life of the Ray
+head — which the sweep owns across all its runs, not per run. With `num-cpus-per-task: 1` on a 32-slot
+job that is 32 losses from total starvation, after which `get_cpu_group` times out for everything and
+every candidate is recorded as a failure. Still open: the scheduler should hand out *leases* with an
+owner and a TTL and reclaim groups whose holder died, instead of trusting the borrower to return one.
+
+**Built**
+- `--max-empty-generations` (default 3, 0 disables): N consecutive generations with no valid candidate
+  stops the run, `status: stopped_no_yield`, with the generation's dominant `failure_type`s in the log
+  line — `cpu_starvation` vs `timeout` vs `invalid_result` is what separates the causes. Above 1 on
+  purpose: an early generation can legitimately come back empty before the buffer has anything good.
+- `results.resume` now refuses `complete` for a run whose whole history produced zero valid solutions,
+  and says so in `damage`. Belt and braces — the loop-side stop cannot help the run dirs already on
+  disk, or a run launched with the stop disabled.
+- `_check_token_budget` in `run_sweep.check_server` (warning only, matching that function's contract).
+
+**Why the token-budget warning.** `max-context-tokens: 94000` + `max-tokens: 34000` = **exactly** the
+`--max-model-len: 128000` the sweeps' own server command uses. Two things then have nowhere to go:
+`max_context_tokens` bounds only the CONTEXT BLOCK — `problem_intro()` and the rules/current-solution
+tail (which renders the parent's whole program) are added on top — and `build_context_block` trims by a
+**chars/4 estimate**, which under-counts code. Overflow is a 400, and since the LLM change classifies
+400 as permanent, a 400 now stops the run. The warning reads `max_model_len` off the model card
+`/v1/models` already returns and fires when under 8000 tokens are left for intro + tail + template.
+
+**Considered and rejected: stripping completion text from `_gen_results`.** It holds every
+completion's full text for a generation purely to feed `_sum_usage`, which only needs the counters —
+~300 MB in the ac1 Best-of-N arms, which are still `75 x 16` in ONE generation (the cp26 files were
+reshaped to `6 x 16 x 25`; `sweeps/ac1_*.yaml` and the three `ac1_gptoss.yaml` copies under the problem
+folders were not). Against a ceiling that was 488 G, 300 MB is noise. The real problem with that shape
+is that `--memory-stop-fraction` is only checked at a generation boundary, so a single-generation run
+has no memory brake at all and no partial recovery — reshaping those arms fixes the brake and the
+buffer together, and is the change to make if it ever matters.
+
+**Also noted, not fixed:** the context pool is unbounded (every valid solution, in RAM and mirrored to
+JSONL, re-read wholly on resume) and AC states carry `result_construction` with
+`construction_length_limits = (1000, 100000)`, so one state can be ~3 MB of Python floats; and the
+sandbox subprocess still has no `RLIMIT_AS` (open since 2026-08-04 — `peak_rss_mb` is being recorded so
+the cap can be read off a real distribution).
+
+**Tests** — `tests/test_llm_loss.py` +3 (the stop fires, it can be disabled, a recovered streak is
+forgiven), `tests/test_resume.py` +2 (a barren run is never complete; a run with any yield is judged
+normally), `tests/test_sweep.py` +3 (the budget warning, its silence with headroom, and its silence
+when the server reports no window). 142 pass.
