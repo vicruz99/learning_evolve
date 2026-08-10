@@ -35,10 +35,23 @@ numbers are junk. Check with `nvidia-smi` first.
 
 Everything below runs the *grader* directly; no LLM, no ICL loop, no Ray.
 
+**Step 0 is not optional, and skipping it produces a misleading error.** `$KPY` must name an
+interpreter that has torch 2.7.1 / triton 3.3.1 (see `coding_agent_evolve/gpumode/requirements.txt`).
+If it is unset, `$KPY evaluate.py ...` collapses to `evaluate.py ...`, bash tries to execute the script
+itself, and you get **`Permission denied`** — see Troubleshooting below. Run this first, in every new
+shell:
+
 ```bash
-# 0. one-time: an env with torch 2.7.1 + triton 3.3.1 (see coding_agent_evolve/gpumode/requirements.txt)
-#    On guadiana that already exists; on Bosch see "Setting this up on Bosch" below.
-KPY=/scratch/vicstorage/learning_evolve/.venv/bin/python
+export KPY=/scratch/vicstorage/learning_evolve/.venv/bin/python   # guadiana
+# export KPY=~/venvs/kernel-eval/bin/python                       # Bosch, once created (see below)
+# triton MUST be 3.3.1; the cu suffix may be cu126 or cu128 (measured identical on this task).
+# guadiana's venv reports 2.7.1+cu126; a fresh cu128 install reports 2.7.1+cu128.
+"$KPY" -c "import torch, triton; print(torch.__version__, triton.__version__)"
+```
+
+Then, from the repo root:
+
+```bash
 
 # 1. correctness only — fastest signal that the card and the stack work at all (~28 s)
 $KPY coding_agent_evolve/gpumode/evaluate.py \
@@ -64,6 +77,24 @@ Add `-v` for stderr tails when something fails.
 
 On a **shared** card, `--max-input-gib 4` drops the largest shapes so the run does not OOM — but the
 score then covers fewer benchmarks and is no longer comparable to the table.
+
+### Troubleshooting: `Permission denied`
+
+```
+bash: coding_agent_evolve/gpumode/evaluate.py: Permission denied
+```
+
+This is never a filesystem-permissions problem. It means the script was **executed directly** instead
+of being handed to an interpreter — either because you typed `./evaluate.py`, or because `$KPY` was
+unset so `$KPY evaluate.py …` collapsed to `evaluate.py …`. Fix: `echo "$KPY"`, re-run the `export`
+above, and always invoke it as `"$KPY" coding_agent_evolve/gpumode/evaluate.py …`.
+
+`evaluate.py` is mode `644` **on purpose**, even though it carries a `#!/usr/bin/env python3` shebang.
+Making it executable would let that shebang pick up whatever `python3` comes first on `PATH` — on Bosch
+the system python, which has no torch — turning a loud, obvious `Permission denied` into either a
+confusing `ModuleNotFoundError` or, far worse, a *successful* run on an unknown torch/triton pair. This
+harness only produces meaningful timings against a known stack, so it should refuse to run rather than
+guess the interpreter. Do not `chmod +x` it.
 
 ### Same check, through the ICL harness's own evaluator
 
@@ -158,8 +189,9 @@ python -c "import torch, triton; print(torch.__version__, triton.__version__, to
 Expect `2.7.1+cu128 3.3.1 NVIDIA A100-SXM4-...`. If `torch.cuda.is_available()` is False the driver is
 older than that build needs — reinstall from the `cu126` index.
 
-Then run step 3 from "Debugging a new GPU" above with `KPY=~/venvs/kernel-eval/bin/python`, and **record
-the number as this machine's baseline.** Do not compare it to guadiana's 2467 µs: Bosch's A100s are
+Then run step 3 from "Debugging a new GPU" above with
+`export KPY=~/venvs/kernel-eval/bin/python` — always naming the interpreter explicitly, never
+`./evaluate.py` — and **record the number as this machine's baseline.** Do not compare it to guadiana's 2467 µs: Bosch's A100s are
 likely SXM, so they may land *closer* to the 2198 µs reference than guadiana does. `--repeats 5` gives
 the noise floor to judge later wins against.
 
