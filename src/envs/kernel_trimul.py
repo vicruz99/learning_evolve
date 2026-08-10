@@ -58,9 +58,12 @@ sweep key / CLI flag    environment fallback       meaning                      
 (env only)              ``TRIMUL_LOCK_DIR``        where the flock files live     ``/tmp``
 ======================  =========================  ============================  ==================
 
-``TRIMUL_LOCK_DIR`` is env-only on purpose: it must be identical for every process sharing a card,
-so pinning it per-run in a sweep file would be a way to defeat the guard rather than configure it.
-Set it once in the job script, and put it on storage shared by every host that grades.
+``TRIMUL_LOCK_DIR`` is env-only on purpose: it must be identical for every process sharing a card, so
+pinning it per-run in a sweep file would be a way to defeat the guard rather than configure it. Set it
+once, in the job script. **Keep it on node-local storage** (the ``/tmp`` default is right): a GPU
+belongs to exactly one host, so every process that can contend for it runs on that host, and ``flock``
+over NFS is not dependable. A shared-filesystem lock dir buys nothing here and can silently fail to
+exclude.
 """
 from __future__ import annotations
 
