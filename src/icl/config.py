@@ -129,6 +129,13 @@ class ICLConfig:
     ray_num_cpus: int | None = None
     grade_timeout: float = 8000.0                    # async grading wall-clock timeout
 
+    # Extra kwargs for the problem's reward evaluator (see envs.base.EnvConfig.evaluator_options).
+    # Only trimul uses it today, for the machine-specific half of grading: which GPU, and which
+    # interpreter runs the kernel harness. It goes through to_dict() into the run's config.json, so a
+    # finished run records the interpreter that produced its timings -- which an environment variable
+    # would not, and kernel timings are only meaningful against a known stack.
+    evaluator_options: dict[str, Any] = field(default_factory=dict)
+
     # --- resume ---
     resume_step: int | None = None
 

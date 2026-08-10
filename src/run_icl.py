@@ -121,6 +121,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "whole box). Ignored when attaching to an existing head, which cannot be "
                         "resized — under run_sweep.py use its --ray-num-cpus instead.")
     p.add_argument("--grade-timeout", type=float, default=8000.0)
+
+    # --- trimul_* only: the machine-specific half of kernel grading -------------------------------
+    # These are properties of the BOX, not of the experiment, but they belong in the sweep file all
+    # the same: they are validated there like every other key, they show up in --print-cmds, and
+    # to_dict() records them in the run's config.json -- so a finished run says which interpreter and
+    # which card produced its timings. The TRIMUL_* environment variables still work and are the
+    # fallback when a flag is not given; a flag always wins.
+    p.add_argument("--trimul-eval-python", default=None, metavar="PATH",
+                   help="Interpreter that runs the kernel harness (needs torch 2.7.1 / triton 3.3.1, "
+                        "which the ICL venv does NOT have). Keep it a separate venv: the pin is a "
+                        "measurement dependency. Env fallback: TRIMUL_EVAL_PYTHON.")
+    p.add_argument("--trimul-eval-gpu", default=None, metavar="IDX",
+                   help="CUDA_VISIBLE_DEVICES value for the eval. Must be a card nothing else is "
+                        "using -- a contended GPU makes every timing meaningless. Env fallback: "
+                        "TRIMUL_EVAL_GPU.")
+    p.add_argument("--trimul-evaluate-py", default=None, metavar="PATH",
+                   help="Path to coding_agent_evolve/gpumode/evaluate.py. Env: TRIMUL_EVALUATE_PY.")
+    p.add_argument("--trimul-eval-mode", default=None, choices=["test", "benchmark", "leaderboard"],
+                   help="Grading mode. `benchmark` (default) scores; `test` is correctness-only so "
+                        "reward becomes binary; `leaderboard` is ~100x slower. Env: TRIMUL_EVAL_MODE.")
     p.add_argument("--memory-stop-fraction", type=float, default=0.85, metavar="F",
                    help="Stop at the next generation boundary once the job's process-tree RSS "
                         "reaches this fraction of its detected memory ceiling (LSF MEMLIMIT or "
@@ -237,6 +257,16 @@ def parse_args() -> ICLConfig:
         ray_num_cpus=a.ray_num_cpus,
         grade_timeout=a.grade_timeout,
         memory_stop_fraction=a.memory_stop_fraction,
+        # Only the flags actually given are forwarded, so an unset flag leaves the evaluator's own
+        # env-var fallback in charge rather than overriding it with None.
+        evaluator_options={
+            k: v for k, v in (
+                ("eval_python", a.trimul_eval_python),
+                ("eval_gpu", a.trimul_eval_gpu),
+                ("evaluate_py", a.trimul_evaluate_py),
+                ("eval_mode", a.trimul_eval_mode),
+            ) if v is not None
+        },
         # --dry-run only prints a prompt: never let it rewind a run dir.
         resume_step=None if a.dry_run else _resolve_resume_step(a.resume_step, log_path),
         dry_run=a.dry_run,

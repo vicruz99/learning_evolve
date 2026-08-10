@@ -46,6 +46,12 @@ class EnvConfig:
     num_cpus_per_task: int = 1
     eval_timeout: int = 1000          # sandbox (per-candidate) execution timeout, seconds
     timeout: float = 8000.0           # async grading wall-clock timeout, seconds
+    # Extra keyword arguments for the problem's reward evaluator, passed straight through by
+    # :meth:`Environment._run_verification`. Empty for every sandbox problem -- it exists so a
+    # problem whose grading depends on the MACHINE (trimul: which GPU, which interpreter runs the
+    # kernel harness) can be configured from the sweep file and recorded in the run's config.json,
+    # instead of living in an environment variable that nothing writes down.
+    evaluator_options: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -186,6 +192,8 @@ class Environment(ABC):
             log_dir=log_path,
             eval_timeout=self.eval_timeout,
             num_cpus_per_task=self.num_cpus_per_task,
+            # Empty for every problem but trimul, so no existing evaluator sees a new argument.
+            **self.config.evaluator_options,
         )
         out = task.get_reward(generation, state=state)
         # Merged here rather than in each problem's get_reward: the evaluator stashes the sandbox

@@ -172,6 +172,7 @@ class ICLRunner:
             num_cpus_per_task=self.num_cpus,
             eval_timeout=self.eval_timeout,
             timeout=cfg.grade_timeout,
+            evaluator_options=cfg.evaluator_options,
         )
         self.llm = VLLMClient(
             base_url=cfg.vllm_base_url,

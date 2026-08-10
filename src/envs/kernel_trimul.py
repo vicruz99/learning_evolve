@@ -40,18 +40,27 @@ Measured on guadiana's idle A100 80GB PCIe (2026-08-10) with TTT-Discover's publ
 that fails to compile fails in ~5 s. See ``gpumode_local/reference/README.md`` for the reference
 numbers to expect on each card.
 
-Configuration is by environment variable, because which card to grade on is a property of the
-machine, not of the experiment:
+CONFIGURATION -- PREFER THE SWEEP FILE
+--------------------------------------
+Where and how to grade is a property of the MACHINE, not of the experiment, but it still belongs in
+the sweep file: keys there are validated against run_icl.py's parser, appear in ``--print-cmds``, and
+land in the run's ``config.json`` -- so a finished run records the interpreter and the card that
+produced its timings, which an environment variable does not. Precedence is flag, then env var,
+then default.
 
-===========================  ==================================================  ==================
-variable                     meaning                                             default
-===========================  ==================================================  ==================
-``TRIMUL_EVAL_GPU``          ``CUDA_VISIBLE_DEVICES`` value for the eval          per problem (below)
-``TRIMUL_EVAL_MODE``         ``test`` | ``benchmark`` | ``leaderboard``           ``benchmark``
-``TRIMUL_EVAL_PYTHON``       interpreter that runs ``evaluate.py``                the scratch venv
-``TRIMUL_EVALUATE_PY``       path to ``evaluate.py``                              repo copy
-``TRIMUL_LOCK_DIR``          where the per-GPU flock files live                   ``/tmp``
-===========================  ==================================================  ==================
+======================  =========================  ============================  ==================
+sweep key / CLI flag    environment fallback       meaning                       default
+======================  =========================  ============================  ==================
+``trimul-eval-python``  ``TRIMUL_EVAL_PYTHON``     interpreter for the harness    the scratch venv
+``trimul-eval-gpu``     ``TRIMUL_EVAL_GPU``        ``CUDA_VISIBLE_DEVICES``       per problem (below)
+``trimul-evaluate-py``  ``TRIMUL_EVALUATE_PY``     path to ``evaluate.py``        repo copy
+``trimul-eval-mode``    ``TRIMUL_EVAL_MODE``       test|benchmark|leaderboard     ``benchmark``
+(env only)              ``TRIMUL_LOCK_DIR``        where the flock files live     ``/tmp``
+======================  =========================  ============================  ==================
+
+``TRIMUL_LOCK_DIR`` is env-only on purpose: it must be identical for every process sharing a card,
+so pinning it per-run in a sweep file would be a way to defeat the guard rather than configure it.
+Set it once in the job script, and put it on storage shared by every host that grades.
 """
 from __future__ import annotations
 
@@ -117,12 +126,21 @@ def _gpu_guard(gpu: str):
             os.close(fd)
 
 
-def _eval_settings(problem_type: str) -> dict:
+def _eval_settings(problem_type: str, overrides: dict | None = None) -> dict:
+    """Resolve where and how to grade, in precedence order: explicit override, env var, default.
+
+    The overrides come from ``--trimul-eval-*`` via ``EnvConfig.evaluator_options``, so a sweep file
+    can pin the interpreter and the card and have both recorded in the run's config.json. The
+    environment variables stay supported for one-off shell use and for the standalone commands in
+    ``gpumode_local/reference/README.md``.
+    """
+    o = overrides or {}
     return {
-        "gpu": os.environ.get("TRIMUL_EVAL_GPU", _DEFAULT_GPU.get(problem_type, "0")),
-        "mode": os.environ.get("TRIMUL_EVAL_MODE", "benchmark"),
-        "python": os.environ.get("TRIMUL_EVAL_PYTHON", DEFAULT_EVAL_PYTHON),
-        "evaluate_py": Path(os.environ.get("TRIMUL_EVALUATE_PY", str(DEFAULT_EVALUATE_PY))),
+        "gpu": o.get("eval_gpu") or os.environ.get("TRIMUL_EVAL_GPU") or _DEFAULT_GPU.get(problem_type, "0"),
+        "mode": o.get("eval_mode") or os.environ.get("TRIMUL_EVAL_MODE") or "benchmark",
+        "python": o.get("eval_python") or os.environ.get("TRIMUL_EVAL_PYTHON") or DEFAULT_EVAL_PYTHON,
+        "evaluate_py": Path(o.get("evaluate_py") or os.environ.get("TRIMUL_EVALUATE_PY")
+                            or DEFAULT_EVALUATE_PY),
     }
 
 
@@ -135,11 +153,16 @@ class TrimulLocalReward(BaseRewardEvaluator):
     than read off the source.
     """
 
-    def __init__(self, problem_type, log_dir, eval_timeout: int = 1200, num_cpus_per_task: int = 1, **kwargs):
-        # Same four kwargs base.Environment._run_verification passes to every evaluator.
+    def __init__(self, problem_type, log_dir, eval_timeout: int = 1200, num_cpus_per_task: int = 1,
+                 eval_python: str | None = None, eval_gpu: str | None = None,
+                 evaluate_py: str | None = None, eval_mode: str | None = None, **kwargs):
+        # The first four are what base.Environment._run_verification passes to every evaluator; the
+        # rest arrive from EnvConfig.evaluator_options, i.e. from --trimul-eval-* in the sweep file.
         self.problem_type = problem_type
         self.log_dir = log_dir
         self.eval_timeout = eval_timeout
+        self._overrides = {"eval_python": eval_python, "eval_gpu": eval_gpu,
+                           "evaluate_py": evaluate_py, "eval_mode": eval_mode}
         self._last_timing: dict = {}
 
     def _fail(self, msg: str, failure_type: str, timing: dict) -> dict:
@@ -155,7 +178,7 @@ class TrimulLocalReward(BaseRewardEvaluator):
         }
 
     def get_reward(self, code: str, state: State) -> dict:
-        cfg = _eval_settings(self.problem_type)
+        cfg = _eval_settings(self.problem_type, self._overrides)
         if not cfg["evaluate_py"].exists():
             # Ours, not the candidate's: surface it as infra so it is not read as a bad kernel.
             return self._fail(

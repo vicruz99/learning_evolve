@@ -273,3 +273,78 @@ def test_guards_on_different_cards_do_not_block_each_other(tmp_path, monkeypatch
         pass
     assert (tmp_path / "learning_evolve-trimul-gpu0.lock").exists()
     assert (tmp_path / "learning_evolve-trimul-gpu1.lock").exists()
+
+
+# ---- configuration precedence: sweep flag > env var > default ------------------------------------
+def test_overrides_beat_env_vars_and_defaults(monkeypatch):
+    """--trimul-eval-* must win, so a sweep file is authoritative over a stale shell export."""
+    from envs.kernel_trimul import _eval_settings
+    monkeypatch.setenv("TRIMUL_EVAL_PYTHON", "/from/env/python")
+    monkeypatch.setenv("TRIMUL_EVAL_GPU", "7")
+    monkeypatch.setenv("TRIMUL_EVAL_MODE", "leaderboard")
+    got = _eval_settings("trimul_a100", {"eval_python": "/from/flag/python", "eval_gpu": "2",
+                                         "eval_mode": "test", "evaluate_py": "/from/flag/ev.py"})
+    assert got["python"] == "/from/flag/python"
+    assert got["gpu"] == "2"
+    assert got["mode"] == "test"
+    assert str(got["evaluate_py"]) == "/from/flag/ev.py"
+
+
+def test_env_vars_still_work_when_no_flag_is_given(monkeypatch):
+    """The standalone commands in gpumode_local/reference/README.md rely on this."""
+    from envs.kernel_trimul import _eval_settings
+    monkeypatch.setenv("TRIMUL_EVAL_PYTHON", "/from/env/python")
+    monkeypatch.setenv("TRIMUL_EVAL_GPU", "7")
+    got = _eval_settings("trimul_a100", {"eval_python": None, "eval_gpu": None})
+    assert got["python"] == "/from/env/python"
+    assert got["gpu"] == "7"
+
+
+def test_the_evaluator_uses_the_configured_interpreter_and_card(monkeypatch):
+    """End of the chain: EnvConfig.evaluator_options -> the argv actually executed."""
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out = cmd[cmd.index("--json") + 1]
+        with open(out, "w") as f:
+            json.dump([OK], f)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.delenv("TRIMUL_EVAL_GPU", raising=False)
+    r = TrimulLocalReward("trimul_h100", "/tmp", eval_timeout=1200,
+                          eval_python="/my/venv/bin/python", eval_gpu="5", eval_mode="test")
+    r.get_reward("code", _state())
+    assert seen["cmd"][0] == "/my/venv/bin/python"
+    assert seen["cmd"][seen["cmd"].index("--gpu") + 1] == "5"
+    assert seen["cmd"][seen["cmd"].index("--mode") + 1] == "test"
+
+
+def test_evaluator_options_reach_the_evaluator_through_envconfig(monkeypatch):
+    """The seam that makes the sweep key work at all: EnvConfig -> _run_verification -> evaluator."""
+    from envs.base import EnvConfig
+    captured = {}
+
+    class Spy(TrimulLocalReward):
+        def __init__(self, *a, **kw):
+            captured.update(kw)
+            super().__init__(*a, **kw)
+
+    class SpyEnv(TrimulH100Env):
+        reward_function = Spy
+
+    monkeypatch.setattr(subprocess, "run", _fake_run(OK))
+    env = SpyEnv(_state(), object(), EnvConfig(
+        problem_type="trimul_h100", log_path="/tmp",
+        evaluator_options={"eval_python": "/cfg/python", "eval_gpu": "4"}))
+    out = env._run_verification("code", "trimul_h100", "/tmp", _state())
+    assert captured["eval_python"] == "/cfg/python"
+    assert captured["eval_gpu"] == "4"
+    assert out.correctness == 1.0
+
+
+def test_other_problems_are_unaffected_by_the_new_field():
+    """evaluator_options defaults empty, so no existing evaluator ever sees an extra argument."""
+    from envs.base import EnvConfig
+    assert EnvConfig(problem_type="ac1", log_path="/tmp").evaluator_options == {}
