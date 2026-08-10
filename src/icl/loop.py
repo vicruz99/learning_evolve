@@ -642,12 +642,20 @@ class ICLRunner:
                 ev = self.tracker._per_gen[-1].get("eval_percentiles") or {}
                 gr = self.tracker._per_gen[-1].get("grade_percentiles") or {}
                 if ev:
+                    # What fills the grade-eval gap depends on the evaluator: the Ray sandbox queues
+                    # for a CPU group and pays pickle/IPC per candidate, while a sandbox-free problem
+                    # (envs with uses_sandbox=False, e.g. trimul) queues for whatever device lock its
+                    # evaluator holds. Naming the wrong one sends you hunting for Ray contention in a
+                    # run that never started Ray.
+                    gap_note = ("CPU-group queueing + ~2s/candidate Ray+pickle overhead"
+                                if spec.env_type.uses_sandbox else
+                                "in-process evaluator queueing (e.g. the GPU lock), not Ray")
                     logger.info(
                         f"gen {gen} eval/candidate | p50 {ev['p50']:.1f}s p90 {ev['p90']:.1f}s "
                         f"p99 {ev['p99']:.1f}s max {ev['max']:.1f}s | eval_timeout="
                         f"{self.eval_timeout}s ({100.0 * ev['max'] / self.eval_timeout:.0f}% used by "
                         f"the slowest) | grade p50 {gr.get('p50', 0):.1f}s max {gr.get('max', 0):.1f}s "
-                        f"(grade-eval gap = CPU-group queueing + ~2s/candidate Ray+pickle overhead)")
+                        f"(grade-eval gap = {gap_note})")
                 rss = self.tracker._per_gen[-1].get("rss_percentiles") or {}
                 logger.info(
                     f"gen {gen} memory | job {memwatch.describe(mem)}"

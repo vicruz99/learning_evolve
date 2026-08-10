@@ -1,0 +1,129 @@
+# =================================================================================================
+# TRIMUL KERNEL CAMPAIGN, FILE 1/4 -- BEST-OF-N (no past experience). guadiana, A100 80GB PCIe.
+# Model: Qwen/Qwen3.6-27B (local vLLM on GPU 0). Grading: GPU 1.
+#
+# The four files together answer, for a KERNEL task, the same question the cp26 campaign asked for a
+# math task -- does putting past experience in the prompt beat TTT-Discover-without-RL, and does the
+# REPRESENTATION of that experience matter:
+#     sweeps/trimul_bon_qwen.yaml       Best-of-N          no past experience at all
+#     sweeps/trimul_puct_qwen.yaml      PUCT, n-context 0  past experience only via parent choice
+#     sweeps/trimul_ctx_qwen.yaml       PUCT + code        LOW-level  representation (§2 of the plan)
+#     sweeps/trimul_strategy_qwen.yaml  PUCT + strategy    HIGH-level representation (§2 of the plan)
+# All four use 160 candidates per run so the arms are directly comparable. The 4th arm is only
+# runnable at all because the trimul prompt now asks for <strategy> (see envs/kernel_trimul.py).
+#
+# ------------------------------------------------------------------------------------------------
+# READ THIS FIRST: THREE WAYS TRIMUL IS NOT LIKE cp26
+# ------------------------------------------------------------------------------------------------
+# 1. GRADING IS SERIAL, ONE CANDIDATE PER GPU, ACROSS PROCESSES.
+#    envs.kernel_trimul._gpu_guard holds a threading lock AND an flock keyed by GPU index, because a
+#    contended card makes every timing meaningless (eval.py's convergence rule, relative error
+#    < 0.1 %, can never be met, so each benchmark also burns its full rep budget). Consequence:
+#    the whole sweep -- every run, in every process -- grades through ONE serial queue per card.
+#      measured: eval p50 9.6 s, max 28.1 s (benchmark mode) => ~20 s/candidate => ~180 candidates/h
+#      grading floor for this campaign: 4 files x 3 seeds x 160 = 1,920 candidates ~= 11 h of GPU
+#    That floor is irreducible on one card. A second free card + TRIMUL_EVAL_GPU halves it.
+#
+# 2. GENERATION, NOT GRADING, IS THE BOTTLENECK -- AND IT IS THE ONE NUMBER WE HAVE NOT MEASURED
+#    AT CAMPAIGN CONCURRENCY. Kernels are long and mostly reasoning:
+#      measured: 13,190 decode tokens/candidate, 83 % of it reasoning, 0 truncations at max-tokens
+#      measured: 87 tok/s AGGREGATE with only 4 sequences in flight  <-- the sole datum
+#    At 87 tok/s a candidate costs 151 s and 1,920 candidates would take ~80 h. That is why this
+#    file is 160 candidates/run rather than cp26's 1200. DO NOT LAUNCH THE OTHER THREE FILES BLIND:
+#    run this one, read `completion_tokens` / `wall_seconds` from progress.csv after generation 0,
+#    and only then choose 3 seeds or 2 for the rest. This is the same discipline sweeps/bon_qwen.yaml
+#    imposed on ac1, for the same reason -- a cost estimate resting on one unmeasured number.
+#
+# 3. THE KV CACHE, NOT --max-num-seqs, CAPS CONCURRENCY.
+#    The server reports 314,418 tokens of KV cache. A trimul sequence needs ~2.4 k prompt + up to
+#    34 k decode, so roughly 15.6 k tokens => only about 20 sequences fit at once. Lowering
+#    --max-model-len does NOT help (KV capacity is set by weights vs GPU memory, not by that flag).
+#    So: group-size 16 with max-gen-concurrency 1 = 16 sequences in flight, comfortably inside that
+#    budget, and max_parallel 1 keeps it there. Two runs would be ~32 -- SAFE for measurement (the
+#    flock still serialises grading) but past the KV budget, so it buys preemption, not throughput.
+#    WATCH FOR: decode tok/s falling in progress.csv, or vLLM logging preemptions. If either shows up
+#    at max_parallel 1, the lever is group-size, not the run count.
+#
+# ------------------------------------------------------------------------------------------------
+# WHY BEST-OF-N IS ONE "GENERATION" OF 10 GROUPS
+#   Same argument as sweeps/bon_qwen.yaml: with `parent-source: initial` parents come from
+#   sample_initial_states() (the buffer is never read) and `n-context 0` empties the context block,
+#   so nothing flows between generations and the generation barrier is pure idle time. One generation
+#   of 10 x 16 = 160 candidates removes it.
+#   >>> progress.csv will have exactly ONE row. For i.i.d. sampling the right x-axis is CANDIDATE
+#   COUNT anyway -- reconstruct best-so-far from events.jsonl / solutions/manifest.jsonl, which are
+#   written in completion order, and compare the arms at k = 32, 64, ... 160.
+#
+# EXPECTED SCORES (lower is better; do not compare across GPU architectures)
+#   TTT-Discover's best kernel: 2198 us on A100, 1161 us on H100.
+#   That same kernel measured on THIS card: 2467 us (mean of 3, spread 1.0 %).
+#   First 8 from-scratch candidates: 1 valid, best 31,335 us. Expect a LOW valid rate and treat it as
+#   genuine -- the smoke run's 7 failures were all real (triton compile errors, the A100 shared-memory
+#   ceiling, a hallucinated tl.* API), zero infra. See gpumode_local/reference/README.md.
+#
+# ------------------------------------------------------------------------------------------------
+# SERVER (one server serves all four files)
+#   CUDA_VISIBLE_DEVICES=0 HF_HOME=/scratch/vicstorage \
+#   XDG_CACHE_HOME=/scratch/vicstorage/cache TRITON_CACHE_DIR=/scratch/vicstorage/cache/triton \
+#   VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_NO_USAGE_STATS=1 \
+#   /scratch/vicstorage/venvs/vllm026/bin/vllm serve /scratch/vicstorage/qwen \
+#       --served-model-name Qwen/Qwen3.6-27B --tensor-parallel-size 1 \
+#       --gpu-memory-utilization 0.95 --max-model-len 130000 --max-num-seqs 256 \
+#       --max-num-batched-tokens 16384 --enable-prefix-caching --reasoning-parser qwen3 --port 8001
+#   (that is R2/LLMs/local/vllm_provider/run_qwen36.sh -- see it for why the +cu129 wheel and the
+#   cache redirects are needed on this box)
+#
+# LAUNCH
+#   NO `ray start` NEEDED: trimul sets uses_sandbox = False, so the loop never initialises Ray.
+#   cd src && tmux new -s trimul_bon
+#   python run_sweep.py sweeps/trimul_bon_qwen.yaml --print-cmds     # inspect first
+#   python run_sweep.py sweeps/trimul_bon_qwen.yaml
+#   python run_sweep.py --status runs/trimul_bon_qwen
+#   To halt: kill the run_sweep.py pid FIRST, then `python run_sweep.py --stop <dir>`.
+#
+# ON THE H100 BOX: change `problem` to trimul_h100 in every run below, point vllm-base-url at that
+#   machine's server, and set TRIMUL_EVAL_GPU / TRIMUL_EVAL_PYTHON / TRIMUL_EVALUATE_PY for it. The
+#   two problems differ ONLY in the rules line naming the card, but that line drives block sizes and
+#   an H100-legal config dies on an A100. Never pool scores across the two.
+# =================================================================================================
+
+sweep:
+  name: trimul_bon_qwen
+  max_parallel: 1                # ONE run at a time, for two independent reasons: grading is a
+                                 # serial per-card queue anyway (note 1), and 2 runs would put ~32
+                                 # sequences in flight against a KV budget that fits ~20 (note 3).
+                                 # The flock makes >1 SAFE, not fast -- it would only add queueing.
+  stagger: 60                    # short: no generation barrier to keep out of phase
+  server_max_num_seqs: 256
+
+common:
+  # --- model / server -------------------------------------------------------------------------
+  model: Qwen/Qwen3.6-27B        # NOT the -FP8 name the cp26 files use; this box serves bf16
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: none         # gpt-oss-only knob; `none` keeps it out of the request
+  thinking-token-budget: 11000   # HARD reasoning cap. Measured: 83 % of decode is reasoning and 0/8
+                                 # candidates truncated, so this is not currently binding.
+
+  # --- token budgets --------------------------------------------------------------------------
+  max-tokens: 34000              # measured decode max 14,853 (44 % used) -- headroom is deliberate
+  max-context-tokens: 40000      # NOT the 94000 the math files use: a single kernel is ~1.4-4.1 k
+                                 # tokens, so 40 k already holds ~10-25 of them, and the KV budget
+                                 # (note 3) is the real constraint.
+  temperature: 1.0
+
+  # --- execution -----------------------------------------------------------------------------
+  save-reasoning: false
+  num-cpus-per-task: 1           # nominal only: no CPU group is taken, grading is the GPU lock
+
+  # --- the Best-of-N shape: ONE generation, no barrier ----------------------------------------
+  parent-source: initial         # THE Best-of-N property: every group restarts from the empty seed
+  n-context: 0                   # and no past solution is injected either
+  groups-per-batch: 10           # 10 independent groups ...
+  group-size: 16                 # ... x 16 children = 160 candidates, matching every other arm
+  num-generations: 1             # nothing flows between generations
+  max-gen-concurrency: 1         # 16 sequences in flight per run; see note 3
+
+runs:
+  - {name: a100_s1, problem: trimul_a100, seed: 1}
+  - {name: a100_s2, problem: trimul_a100, seed: 2}
+  - {name: a100_s3, problem: trimul_a100, seed: 3}

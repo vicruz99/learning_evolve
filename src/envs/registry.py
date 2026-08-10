@@ -11,6 +11,7 @@ from envs.base import Environment
 from envs.erdos_min_overlap import ErdosMinOverlapEnv
 from envs.circle_packing import CirclePackingEnv
 from envs.ac_inequalities import AutoCorrInequalityEnv
+from envs.kernel_trimul import TrimulA100Env, TrimulH100Env
 from envs.toy_ee import ToyEeEnv
 
 
@@ -31,6 +32,17 @@ REGISTRY: dict[str, ProblemSpec] = {
     "circle_packing_32": ProblemSpec(CirclePackingEnv,      "32",  1,  530, "sum of radii", True,  "run_packing"),
     "ac1":               ProblemSpec(AutoCorrInequalityEnv, "ac1", 2, 1100, "upper bound",  False, "propose_candidate"),
     "ac2":               ProblemSpec(AutoCorrInequalityEnv, "ac2", 2, 1100, "lower bound",  True,  "construct_function"),
+    # Kernel optimisation (TTT-Discover's gpu_mode task). Graded by a LOCAL GPU subprocess, not the
+    # Ray sandbox: num_cpus_per_task is nominal (no CPU group is taken) and eval_timeout matches
+    # trimul/task.yml's 1200 s. Only ONE eval runs at a time per card, across threads AND processes --
+    # see envs.kernel_trimul._gpu_guard for why that is not negotiable.
+    #
+    # TWO PROBLEMS, ONE TASK: the prompts differ only in which card they name, but that drives block
+    # sizes and an H100-legal config dies on an A100's smaller shared memory. Scores are comparable
+    # WITHIN an architecture, never across one -- TTT-Discover's best kernel does 2198 us on an A100
+    # and 1161 us on an H100. Pick the one matching the card you are grading on.
+    "trimul_a100":       ProblemSpec(TrimulA100Env, "trimul_a100", 1, 1200, "runtime (us)", False, "custom_kernel"),
+    "trimul_h100":       ProblemSpec(TrimulH100Env, "trimul_h100", 1, 1200, "runtime (us)", False, "custom_kernel"),
     # Synthetic smoke-test problem (in-process grading, no sandbox). metric_name is deliberately
     # generic ("score") so the "ee"-counting mechanism stays hidden from the model. eval_timeout is
     # unused by the in-process evaluator; entrypoint is documentary only (no code is executed).
