@@ -372,7 +372,7 @@ def main() -> int:
     if not args.submission.exists():
         sys.exit(f"no such submission: {args.submission}")
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    #os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     # Triton's JIT cache must live on local disk -- this folder is often on NFS,
     # where cache writes cost more than the compiles they save. Key it on this
     # folder so parallel runs out of different directories never share a cache.
