@@ -360,7 +360,10 @@ def main() -> int:
     ap.add_argument("submission", type=Path, help="path to the candidate .py")
     ap.add_argument("--task", default="trimul", help="task name or path to a task dir")
     ap.add_argument("--mode", default="leaderboard", choices=["test", "benchmark", "leaderboard"])
-    ap.add_argument("--gpu", default="0", help="CUDA_VISIBLE_DEVICES value")
+    ap.add_argument("--gpu", default=None,
+                    help="CUDA_VISIBLE_DEVICES value. OMIT under a scheduler (LSF/Slurm) that has "
+                         "already assigned a card via CUDA_VISIBLE_DEVICES: overriding it here can "
+                         "re-point the eval at a GPU that belongs to someone else's job.")
     ap.add_argument("--repeats", type=int, default=1, help="repeat the whole eval N times")
     ap.add_argument("--max-input-gib", type=float, default=None,
                     help="skip shapes whose input tensor exceeds this")
@@ -372,7 +375,8 @@ def main() -> int:
     if not args.submission.exists():
         sys.exit(f"no such submission: {args.submission}")
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     # Triton's JIT cache must live on local disk -- this folder is often on NFS,
     # where cache writes cost more than the compiles they save. Key it on this
     # folder so parallel runs out of different directories never share a cache.
@@ -388,7 +392,9 @@ def main() -> int:
 
     print(f"task       : {task.name}  ({task.root})")
     print(f"submission : {args.submission}")
-    print(f"mode       : {args.mode}   ranking_by: {task.ranking_by}   GPU: {args.gpu}")
+    gpu_shown = args.gpu if args.gpu is not None else (
+        f"inherited (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset: all cards')})")
+    print(f"mode       : {args.mode}   ranking_by: {task.ranking_by}   GPU: {gpu_shown}")
 
     runs, scores = [], []
     for i in range(args.repeats):

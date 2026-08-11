@@ -82,11 +82,18 @@ then default.
 sweep key / CLI flag    environment fallback       meaning                       default
 ======================  =========================  ============================  ==================
 ``trimul-eval-python``  ``TRIMUL_EVAL_PYTHON``     interpreter for the harness    the scratch venv
-``trimul-eval-gpu``     ``TRIMUL_EVAL_GPU``        ``CUDA_VISIBLE_DEVICES``       per problem (below)
+``trimul-eval-gpu``     ``TRIMUL_EVAL_GPU``        card index, or ``inherit``     per problem (below)
 ``trimul-evaluate-py``  ``TRIMUL_EVALUATE_PY``     path to ``evaluate.py``        repo copy
 ``trimul-eval-mode``    ``TRIMUL_EVAL_MODE``       test|benchmark|leaderboard     ``leaderboard``
 (env only)              ``TRIMUL_LOCK_DIR``        where the flock files live     ``/tmp``
 ======================  =========================  ============================  ==================
+
+``trimul-eval-gpu`` accepts a card index OR the word ``inherit`` (leave ``CUDA_VISIBLE_DEVICES``
+untouched, grade on whatever the environment grants). ``inherit`` is the ONLY correct setting inside
+a scheduler allocation -- an LSF job on Bosch holds one GPU and LSF says which via
+``CUDA_VISIBLE_DEVICES``, so naming an index there overrides the assignment and can land the eval on
+another job's card. It is the default for ``trimul_h100``. Name an index only on an unscheduled box
+like guadiana, where it is how you keep grading off the vLLM server's card.
 
 ``TRIMUL_LOCK_DIR`` is env-only on purpose: it must be identical for every process sharing a card, so
 pinning it per-run in a sweep file would be a way to defeat the guard rather than configure it. Set it
@@ -145,9 +152,18 @@ DEFAULT_EVAL_MODE = "leaderboard"
 _REQUIRED_TOKEN = "@triton.jit"
 _BANNED_TOKEN = "identity"
 
-# Which card each problem grades on unless TRIMUL_EVAL_GPU says otherwise. guadiana's GPU 0 holds a
-# vLLM server, so the A100 default is 1; a fresh H100 box is assumed to have the card at 0.
-_DEFAULT_GPU = {"trimul_a100": "1", "trimul_h100": "0"}
+# "inherit" (or simply not naming a card at all) means: do NOT touch CUDA_VISIBLE_DEVICES, use
+# whatever the environment already grants. This is the ONLY safe setting under a scheduler: an LSF
+# job on Bosch holds exactly one of the node's GPUs and LSF communicates which one via
+# CUDA_VISIBLE_DEVICES -- naming an index here would override that and can re-point grading at a
+# card that belongs to someone else's job.
+INHERIT_GPU = "inherit"
+
+# Which card each problem grades on unless TRIMUL_EVAL_GPU / the sweep key says otherwise.
+# trimul_a100 defaults to guadiana's card 1 (card 0 holds the vLLM server; nothing schedules GPUs
+# there, so naming an index is both safe and necessary). trimul_h100 runs on Bosch under LSF, so its
+# default is to inherit the scheduler's assignment.
+_DEFAULT_GPU = {"trimul_a100": "1", "trimul_h100": INHERIT_GPU}
 
 # Serialises access to the grading GPU WITHIN this process. Module-level on purpose: every
 # environment instance here contends for the same card, so a per-instance lock serialises nothing.
@@ -166,6 +182,11 @@ def _gpu_guard(gpu: str):
     which is the property a lock file with a pid in it would not give us.
     """
     lock_dir = Path(os.environ.get("TRIMUL_LOCK_DIR", tempfile.gettempdir()))
+    if gpu == INHERIT_GPU:
+        # No index of our own to key on -- key on what the scheduler granted this process. Processes
+        # in the same allocation see the same value and correctly share one lock; under LSF's
+        # one-GPU-per-job model there is no cross-job contention for the flock to referee anyway.
+        gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "inherit").replace("/", "_").replace(",", "+")
     lock_path = lock_dir / f"learning_evolve-trimul-gpu{gpu}.lock"
     with _GPU_LOCK:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
@@ -189,7 +210,8 @@ def _eval_settings(problem_type: str, overrides: dict | None = None) -> dict:
     """
     o = overrides or {}
     return {
-        "gpu": o.get("eval_gpu") or os.environ.get("TRIMUL_EVAL_GPU") or _DEFAULT_GPU.get(problem_type, "0"),
+        "gpu": o.get("eval_gpu") or os.environ.get("TRIMUL_EVAL_GPU")
+               or _DEFAULT_GPU.get(problem_type, INHERIT_GPU),
         "mode": o.get("eval_mode") or os.environ.get("TRIMUL_EVAL_MODE") or DEFAULT_EVAL_MODE,
         "python": o.get("eval_python") or os.environ.get("TRIMUL_EVAL_PYTHON") or DEFAULT_EVAL_PYTHON,
         "evaluate_py": Path(o.get("evaluate_py") or os.environ.get("TRIMUL_EVALUATE_PY")
@@ -255,10 +277,14 @@ class TrimulLocalReward(BaseRewardEvaluator):
             cmd = [
                 cfg["python"], str(cfg["evaluate_py"]), str(cand),
                 "--task", "trimul",          # one task file serves both problems
-                "--gpu", cfg["gpu"],
                 "--mode", cfg["mode"],
                 "--json", str(out_json),
             ]
+            if cfg["gpu"] != INHERIT_GPU:
+                # Only name a card when one was actually configured; otherwise evaluate.py leaves
+                # CUDA_VISIBLE_DEVICES alone and the subprocess grades on whatever the scheduler
+                # granted (see INHERIT_GPU above for why overriding it under LSF is dangerous).
+                cmd += ["--gpu", cfg["gpu"]]
 
             t_queue = time.perf_counter()
             with _gpu_guard(cfg["gpu"]):     # <-- the whole point; see the module docstring
