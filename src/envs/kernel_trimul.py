@@ -213,9 +213,13 @@ def _eval_settings(problem_type: str, overrides: dict | None = None) -> dict:
         "gpu": o.get("eval_gpu") or os.environ.get("TRIMUL_EVAL_GPU")
                or _DEFAULT_GPU.get(problem_type, INHERIT_GPU),
         "mode": o.get("eval_mode") or os.environ.get("TRIMUL_EVAL_MODE") or DEFAULT_EVAL_MODE,
-        "python": o.get("eval_python") or os.environ.get("TRIMUL_EVAL_PYTHON") or DEFAULT_EVAL_PYTHON,
+        # expanduser: these paths are handed to subprocess argv, which never sees shell tilde
+        # expansion -- and the Bosch sweep files say ~/venvs/kernel-eval/bin/python on purpose,
+        # since the absolute home prefix differs per user there.
+        "python": os.path.expanduser(o.get("eval_python") or os.environ.get("TRIMUL_EVAL_PYTHON")
+                                     or DEFAULT_EVAL_PYTHON),
         "evaluate_py": Path(o.get("evaluate_py") or os.environ.get("TRIMUL_EVALUATE_PY")
-                            or DEFAULT_EVALUATE_PY),
+                            or DEFAULT_EVALUATE_PY).expanduser(),
     }
 
 

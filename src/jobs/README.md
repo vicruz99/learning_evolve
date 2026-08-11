@@ -71,8 +71,8 @@ no `ray_doctor`). Only `-n 4`: the flock serialises grading to one eval at a tim
 SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
 ```
 
-The tracked `sweeps/trimul_*_qwen.yaml` are written for guadiana — make the Bosch copy first
-("ON ANOTHER MACHINE" in `sweeps/trimul_bon_qwen.yaml`). The job refuses a `problem:` that doesn't
+Use the ready-made Bosch ports `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml` — the
+non-`_bosch` trimul yamls are guadiana's. The job refuses a `problem:` that doesn't
 match the queue's card, and refuses to start unless `$KPY` (default `~/venvs/kernel-eval/bin/python`;
 creation instructions in `gpumode_local/reference/README.md`) carries torch + triton 3.3.1. It
 rewrites `vllm-base-url` and `trimul-eval-python` into the scratch copy of the yaml, and **deletes

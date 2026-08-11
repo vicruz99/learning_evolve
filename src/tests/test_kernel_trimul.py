@@ -391,6 +391,18 @@ def test_overrides_beat_env_vars_and_defaults(monkeypatch):
     assert str(got["evaluate_py"]) == "/from/flag/ev.py"
 
 
+def test_tilde_paths_are_expanded(monkeypatch):
+    """The Bosch sweep files say ~/venvs/kernel-eval/bin/python because the home prefix differs per
+    user there -- and subprocess argv never sees shell tilde expansion, so we must do it."""
+    import os
+    from envs.kernel_trimul import _eval_settings
+    got = _eval_settings("trimul_h100", {"eval_python": "~/venvs/kernel-eval/bin/python",
+                                         "evaluate_py": "~/repo/evaluate.py"})
+    home = os.path.expanduser("~")
+    assert got["python"] == f"{home}/venvs/kernel-eval/bin/python"
+    assert str(got["evaluate_py"]) == f"{home}/repo/evaluate.py"
+
+
 def test_env_vars_still_work_when_no_flag_is_given(monkeypatch):
     """The standalone commands in gpumode_local/reference/README.md rely on this."""
     from envs.kernel_trimul import _eval_settings
