@@ -133,8 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "which the ICL venv does NOT have). Keep it a separate venv: the pin is a "
                         "measurement dependency. Env fallback: TRIMUL_EVAL_PYTHON.")
     p.add_argument("--trimul-eval-gpu", default=None, metavar="IDX",
-                   help="CUDA_VISIBLE_DEVICES value for the eval. Must be a card nothing else is "
-                        "using -- a contended GPU makes every timing meaningless. Env fallback: "
+                   help="Card index for the eval, or 'inherit' to leave CUDA_VISIBLE_DEVICES alone "
+                        "and grade on whatever the environment grants. Under a scheduler (LSF) use "
+                        "inherit -- an index overrides the scheduler's assignment and can grade on "
+                        "another job's GPU. On an unscheduled box name a card nothing else is using "
+                        "-- a contended GPU makes every timing meaningless. Defaults: trimul_a100 "
+                        "-> 1 (guadiana), trimul_h100 -> inherit (Bosch). Env fallback: "
                         "TRIMUL_EVAL_GPU.")
     p.add_argument("--trimul-evaluate-py", default=None, metavar="PATH",
                    help="Path to coding_agent_evolve/gpumode/evaluate.py. Env: TRIMUL_EVALUATE_PY.")

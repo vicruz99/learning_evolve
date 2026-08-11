@@ -271,13 +271,49 @@ def test_the_variants_differ_only_in_the_hardware_rule():
     assert a.replace(_HW_RULE_A100, _HW_RULE_H100) == h
 
 
-def test_each_problem_defaults_to_its_own_card(monkeypatch):
-    from envs.kernel_trimul import _eval_settings
+def test_each_problem_defaults_to_the_right_gpu_policy(monkeypatch):
+    """a100 = guadiana, unscheduled, so an INDEX (and not 0 -- the vLLM server lives there).
+    h100 = Bosch under LSF, so INHERIT: the scheduler names the job's card via CUDA_VISIBLE_DEVICES
+    and there is no guarantee it is index 0 -- a numeric default would override the assignment and
+    could grade on another job's GPU."""
+    from envs.kernel_trimul import INHERIT_GPU, _eval_settings
     monkeypatch.delenv("TRIMUL_EVAL_GPU", raising=False)
     assert _eval_settings("trimul_a100")["gpu"] == "1"   # guadiana: GPU 0 holds the vLLM server
-    assert _eval_settings("trimul_h100")["gpu"] == "0"
+    assert _eval_settings("trimul_h100")["gpu"] == INHERIT_GPU
     monkeypatch.setenv("TRIMUL_EVAL_GPU", "3")
     assert _eval_settings("trimul_a100")["gpu"] == "3"   # the env var always wins
+
+
+def test_inherit_never_touches_cuda_visible_devices(monkeypatch):
+    """The whole point of inherit: --gpu must NOT be passed, so evaluate.py leaves the scheduler's
+    CUDA_VISIBLE_DEVICES exactly as it found it."""
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        out = cmd[cmd.index("--json") + 1]
+        with open(out, "w") as f:
+            json.dump([OK], f)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.delenv("TRIMUL_EVAL_GPU", raising=False)
+    out = _reward("trimul_h100").get_reward(KERNEL, _state())
+    assert out["correctness"] == 1.0
+    assert "--gpu" not in seen["cmd"]
+    # and a named card still passes through, for the unscheduled-box case
+    _reward("trimul_a100").get_reward(KERNEL, _state())
+    assert seen["cmd"][seen["cmd"].index("--gpu") + 1] == "1"
+
+
+def test_inherit_lock_key_follows_the_scheduler_assignment(tmp_path, monkeypatch):
+    """Under inherit the flock is keyed on CUDA_VISIBLE_DEVICES, so two processes in the SAME
+    allocation share one lock, and an allocation on a different card uses a different file."""
+    from envs.kernel_trimul import INHERIT_GPU, _gpu_guard
+    monkeypatch.setenv("TRIMUL_LOCK_DIR", str(tmp_path))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    with _gpu_guard(INHERIT_GPU):
+        assert (tmp_path / "learning_evolve-trimul-gpu3.lock").exists()
 
 
 def test_both_problems_grade_against_the_same_task_file(monkeypatch):

@@ -75,8 +75,10 @@ The tracked `sweeps/trimul_*_qwen.yaml` are written for guadiana — make the Bo
 ("ON ANOTHER MACHINE" in `sweeps/trimul_bon_qwen.yaml`). The job refuses a `problem:` that doesn't
 match the queue's card, and refuses to start unless `$KPY` (default `~/venvs/kernel-eval/bin/python`;
 creation instructions in `gpumode_local/reference/README.md`) carries torch + triton 3.3.1. It
-rewrites `vllm-base-url`, `trimul-eval-python` and `trimul-eval-gpu` into the scratch copy of the
-yaml — inside the job LSF's `CUDA_VISIBLE_DEVICES` makes the allocated card "GPU 0".
+rewrites `vllm-base-url` and `trimul-eval-python` into the scratch copy of the yaml, and **deletes
+`trimul-eval-gpu`** from it: LSF announces the granted card via `CUDA_VISIBLE_DEVICES` with no
+guarantee it is index 0, so grading inherits that assignment instead of naming one — naming an
+index would override LSF and can point the eval at another job's GPU.
 
 ## Interactive instead
 

@@ -55,29 +55,34 @@ export KPY=/scratch/vicstorage/learning_evolve/.venv/bin/python   # guadiana
 "$KPY" -c "import torch, triton; print(torch.__version__, triton.__version__)"
 ```
 
-Then, from the repo root:
+Then, from the repo root. **No `--gpu` flag anywhere below — that is deliberate.** Omitted, the
+grader inherits `CUDA_VISIBLE_DEVICES` untouched, which is the only safe behaviour inside a
+scheduler allocation (an LSF job on Bosch holds one GPU and LSF says which via that variable;
+`--gpu 0` would override it and can land the eval on someone else's card). Pass `--gpu N` only on an
+unscheduled box where you must steer around another workload — e.g. `--gpu 1` on guadiana, whose
+card 0 holds the vLLM server:
 
 ```bash
 
 # 1. correctness only — fastest signal that the card and the stack work at all (~28 s)
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode test
+    src/gpumode_local/reference/trimul_best.py --mode test
 
 # 2. THE ONE THAT MATTERS: the official ranked path, and exactly what the ICL runs grade with
 #    (18 correctness shapes, then 7 timed with correctness re-checked every rep). ~36 s.
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode leaderboard
+    src/gpumode_local/reference/trimul_best.py --mode leaderboard
 
 # 3. establish this machine's baseline + its noise floor before trusting any small win
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode leaderboard \
+    src/gpumode_local/reference/trimul_best.py --mode leaderboard \
     --repeats 5 --json /tmp/trimul_baseline.json
 
 # 4. benchmark mode: timing without the 18-shape correctness gate. ~15 s, and it scores a DIFFERENT
 #    number (2412 vs 2467 us here). Useful for a quick "does this card work", never for a score you
 #    compare against anything graded in leaderboard mode.
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode benchmark
+    src/gpumode_local/reference/trimul_best.py --mode benchmark
 ```
 
 Output ends with `SCORE (geom of 7 benchmarks): <us>`; exit code is 0 only if everything passed.
@@ -223,11 +228,12 @@ cd ~/projects/phd/learning_evolve/src && mkdir -p jobs/logs
 SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
 ```
 
-The sweep copy itself only needs `problem: trimul_h100` (or `_a100`) per run — the job script
-rewrites `vllm-base-url`, `trimul-eval-python` (from `$KPY`, default `~/venvs/kernel-eval/bin/python`)
-and `trimul-eval-gpu` (with `-gpu "num=1"` LSF gives one card, visible as index 0) into a scratch
-copy, and refuses to start if the venv is missing, triton isn't 3.3.1, or the problem doesn't match
-the queue's card. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
+The sweep copy itself only needs `problem: trimul_h100` (or `_a100`) per run. Into a scratch copy,
+the job script rewrites `vllm-base-url` and `trimul-eval-python` (from `$KPY`, default
+`~/venvs/kernel-eval/bin/python`), and **deletes `trimul-eval-gpu`** — LSF grants the job one GPU
+and announces it via `CUDA_VISIBLE_DEVICES`, with no guarantee it is index 0, so grading must
+inherit that assignment rather than name a card. It refuses to start if the venv is missing, triton
+isn't 3.3.1, or the problem doesn't match the queue's card. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
 may not compile, and upgrading torch to fix that breaks comparability with every other number here.
 
 The vLLM server stays in its own job on another node, exactly as it does for the math sweeps; only
