@@ -60,6 +60,24 @@ Check the first minute of `jobs/logs/icl_sweep.<jobid>.out`: `ray_doctor` should
 `slots (LSF)` / `affinity` / `cgroup cpu.max` should agree. If `cpu.max` shows a quota well below
 your slot count, LSF is enforcing by quota rather than cpuset — lower `-n` to match and resubmit.
 
+## Trimul (kernel) sweeps: `jobs/trimul_sweep.bsub`
+
+The kernel task inverts both of `icl_sweep.bsub`'s defining choices, so it has its own script:
+the **driver's job needs a GPU** (`-gpu "num=1"` — grading is a local subprocess on this node's
+card, not a Ray task), and it needs **no Ray at all** (`--ray-head skip`; there is no `ray start`,
+no `ray_doctor`). Only `-n 4`: the flock serialises grading to one eval at a time.
+
+```bash
+SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
+```
+
+The tracked `sweeps/trimul_*_qwen.yaml` are written for guadiana — make the Bosch copy first
+("ON ANOTHER MACHINE" in `sweeps/trimul_bon_qwen.yaml`). The job refuses a `problem:` that doesn't
+match the queue's card, and refuses to start unless `$KPY` (default `~/venvs/kernel-eval/bin/python`;
+creation instructions in `gpumode_local/reference/README.md`) carries torch + triton 3.3.1. It
+rewrites `vllm-base-url`, `trimul-eval-python` and `trimul-eval-gpu` into the scratch copy of the
+yaml — inside the job LSF's `CUDA_VISIBLE_DEVICES` makes the allocated card "GPU 0".
+
 ## Interactive instead
 
 Same allocation, a shell you can watch. Wall-clock limits on interactive queues are short (6h), so

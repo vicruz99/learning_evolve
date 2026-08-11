@@ -1,0 +1,165 @@
+#!/bin/bash
+# =================================================================================================
+# LSF job for a TRIMUL kernel sweep: the ICL driver PLUS the grading GPU, in one job.
+#
+# This is jobs/icl_sweep.bsub inverted on both of its defining choices, because trimul is the
+# opposite of a math sweep on both counts (see the header of sweeps/trimul_bon_qwen.yaml):
+#   * it NEEDS a GPU in the driver's own job -- grading is a local subprocess on this node's card,
+#     not a Ray task on a CPU group. Hence `#BSUB -gpu "num=1"` here and nowhere in icl_sweep.bsub.
+#   * it needs NO Ray at all (uses_sandbox = False), so there is no `ray start`, no ray_doctor, no
+#     log archiving, and run_sweep gets --ray-head skip. `require` would refuse to launch (it wants
+#     a head nobody here starts) and `auto` would start a head nothing uses.
+# The vLLM server stays in its own job (jobs/vllm_server.bsub), reached over the network exactly as
+# icl_sweep.bsub reaches it.
+#
+# SUBMIT
+#   cd ~/projects/phd/learning_evolve/src
+#   mkdir -p jobs/logs
+#   SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub
+#
+#   Optional environment (bsub inherits the submitting shell's environment):
+#     SWEEP      sweep yaml, relative to src/         (REQUIRED in practice -- the default guards)
+#     VLLM_URL   override the yaml's vllm-base-url    (default: read jobs/vllm_host.txt)
+#     KPY        grading interpreter                  (default ~/venvs/kernel-eval/bin/python;
+#                                                      creation: gpumode_local/reference/README.md)
+#     MAXPAR     override the sweep's max_parallel    (default: leave the yaml alone)
+#
+# QUEUE <-> PROBLEM: this script checks them against each other and refuses a mismatch.
+#   batch_a100 -> trimul_a100        batch_h100 / batch_h200 -> trimul_h100
+#   batch_b200 is sm100 Blackwell, which torch 2.7.1 / triton 3.3.1 predates: not without
+#   re-baselining, and never pooled with sm80/sm90 scores.
+#   Override the queue at submit time when needed:  bsub -q batch_h200 < jobs/trimul_sweep.bsub
+#
+# SIZING: -n 4 is deliberate. The driver only talks to vLLM and runs ONE grading subprocess at a
+# time (the per-card flock serialises everything), so cores beyond a handful are pure queue wait.
+# =================================================================================================
+
+#BSUB -J trimul_sweep
+#BSUB -o jobs/logs/trimul_sweep.%J.out
+#BSUB -e jobs/logs/trimul_sweep.%J.err
+#BSUB -n 4
+#BSUB -R span[hosts=1]
+#BSUB -gpu "num=1"
+#BSUB -M 32768MB
+#BSUB -W 24:00                                 # check `bqueues -l <queue>` for the real ceiling
+#BSUB -q batch_h100
+#BSUB -P BH-000557-01
+#BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
+
+set -uo pipefail
+
+# ---------------------------------------------------------------------------------------------
+# Environment (proxy block mandatory on this site -- see docs/BOSCH_CLUSTER.md)
+# ---------------------------------------------------------------------------------------------
+source /fs/applications/modules/current/init/bash
+module load proxy4server-access/2.0
+sleep 1
+source /fs/applications/p4s-access/2.0/ActivateP4S.sh -a
+
+cd ~/projects/phd/learning_evolve/src || exit 1
+source .venv/bin/activate
+
+SWEEP="${SWEEP:-}"
+if [[ -z "$SWEEP" ]]; then
+    echo "[job] ERROR: set SWEEP=<sweeps/trimul_*.yaml>. The tracked trimul yamls are written for" >&2
+    echo "      guadiana (problem: trimul_a100, guadiana paths) -- make the Bosch copy first:"      >&2
+    echo "      see 'ON ANOTHER MACHINE' in sweeps/trimul_bon_qwen.yaml."                           >&2
+    exit 1
+fi
+
+KPY="${KPY:-$HOME/venvs/kernel-eval/bin/python}"
+
+echo "=== allocation ==="
+echo "host          : $(hostname)"
+echo "LSF job       : ${LSB_JOBID:-none}   queue ${LSB_QUEUE:-none}"
+echo "GPU           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+echo "=================="
+
+# ---------------------------------------------------------------------------------------------
+# Guard 1: the grading venv exists and carries the pinned stack. A wrong interpreter here does not
+# fail loudly later -- it grades on an unknown torch/triton pair and poisons every timing.
+# ---------------------------------------------------------------------------------------------
+if ! "$KPY" -c "import torch, triton; print('[job] kernel stack:', torch.__version__, triton.__version__)"; then
+    echo "[job] ERROR: $KPY has no torch/triton. Create the venv per" >&2
+    echo "      gpumode_local/reference/README.md ('Setting this up on the Bosch cluster')." >&2
+    exit 1
+fi
+if ! "$KPY" -c "import triton, sys; sys.exit(triton.__version__ != '3.3.1')"; then
+    echo "[job] ERROR: triton must be exactly 3.3.1 (the prompt names it; the harness pins it)." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Guard 2: the sweep's problem matches this job's queue. An H100-prompted run graded on an A100
+# (or vice versa) produces scores that look fine and compare with nothing.
+# ---------------------------------------------------------------------------------------------
+# Parse, don't grep: the yaml headers DISCUSS other problem names in comments, and a grep happily
+# matches those (caught in a dry run: this file's own porting notes say "problem: trimul_h100").
+PROBLEM=$(python - "$SWEEP" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+probs = {r.get("problem") for r in d.get("runs", [])} | {d.get("common", {}).get("problem")}
+probs.discard(None)
+print(probs.pop() if len(probs) == 1 else f"AMBIGUOUS:{sorted(probs)}")
+PY
+)
+if [[ "$PROBLEM" == AMBIGUOUS:* || -z "$PROBLEM" ]]; then
+    echo "[job] ERROR: could not determine a single 'problem:' from $SWEEP (got: $PROBLEM)" >&2
+    exit 1
+fi
+case "${LSB_QUEUE:-}" in
+    batch_a100)            WANT=trimul_a100 ;;
+    batch_h100|batch_h200) WANT=trimul_h100 ;;
+    *) echo "[job] WARNING: queue '${LSB_QUEUE:-?}' has no trimul mapping -- check the card yourself"; WANT="" ;;
+esac
+if [[ -n "$WANT" && "$PROBLEM" != "$WANT" ]]; then
+    echo "[job] ERROR: $SWEEP says 'problem: ${PROBLEM:-none}' but queue ${LSB_QUEUE} is a $WANT card." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------------------------
+# vLLM endpoint, as in icl_sweep.bsub: the server's node changes every resubmission, so rewrite a
+# scratch copy of the yaml rather than the tracked file. The same copy gets the machine-local
+# grading settings -- LSF has already pinned this job to one card and set CUDA_VISIBLE_DEVICES,
+# so inside this job that card is "GPU 0".
+# ---------------------------------------------------------------------------------------------
+if [[ -z "${VLLM_URL:-}" && -f jobs/vllm_host.txt ]]; then
+    VLLM_URL="http://$(cat jobs/vllm_host.txt):8001/v1"
+fi
+if [[ -n "${VLLM_URL:-}" ]]; then
+    echo "[job] waiting for vLLM at ${VLLM_URL} ..."
+    for _ in $(seq 1 120); do
+        curl -sf "${VLLM_URL%/v1}/health" >/dev/null && break
+        sleep 15
+    done
+    if ! curl -sf "${VLLM_URL%/v1}/health" >/dev/null; then
+        echo "[job] ERROR: no vLLM at ${VLLM_URL} after 30 min — is jobs/vllm_server.bsub running?" >&2
+        exit 1
+    fi
+fi
+
+SWEEP_RUN="${TMPDIR:-/tmp}/$(basename "$SWEEP")"
+sed -E \
+    -e "s#^( *vllm-base-url: *).*#\1${VLLM_URL:-http://localhost:8001/v1}#" \
+    -e "s#^( *trimul-eval-python: *).*#\1${KPY}#" \
+    -e "s#^( *trimul-eval-gpu: *).*#\1\"0\"#" \
+    "$SWEEP" > "$SWEEP_RUN"
+echo "[job] scratch sweep: ${SWEEP_RUN}  (vllm ${VLLM_URL:-yaml default}, kpy ${KPY}, gpu 0)"
+SWEEP="$SWEEP_RUN"
+
+# TRIMUL_LOCK_DIR stays at its /tmp default: node-local is CORRECT (the card belongs to this host,
+# flock over NFS is not dependable), and one setting shared by any process on this node.
+
+# ---------------------------------------------------------------------------------------------
+# Run. --ray-head skip: trimul never touches Ray; `require` would abort, `auto` starts a head
+# nothing uses. Verified against run_sweep.py:308.
+# ---------------------------------------------------------------------------------------------
+ARGS=(--ray-head skip)
+[[ -n "${MAXPAR:-}" ]] && ARGS+=(--max-parallel "$MAXPAR")
+
+echo "[job] python run_sweep.py $SWEEP ${ARGS[*]}"
+python run_sweep.py "$SWEEP" "${ARGS[@]}"
+rc=$?
+echo "[job] run_sweep.py exited $rc"
+exit $rc
