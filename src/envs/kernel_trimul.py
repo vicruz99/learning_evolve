@@ -5,6 +5,34 @@ substitution: TTT-Discover grades through a Modal RPC, we grade on a local card 
 ``coding_agent_evolve/gpumode/evaluate.py``. The prompt body, the initial state and the reward formula
 are unchanged -- see :mod:`envs.kernel_prompt` for the verbatim prompt text.
 
+WHAT "THE SAME EVALUATION" MEANS HERE
+-------------------------------------
+The score that guided their search is reproduced step for step, not just in formula:
+
+  ==========================  ==============================================  ====================
+  step                        TTT-Discover                                    here
+  ==========================  ==============================================  ====================
+  reject non-triton code      ``env.py:123``                                  same, before the eval
+  reject identity kernels     ``env.py:125`` (trimul only)                    same
+  grading mode                ``mode="leaderboard"`` (``env.py:132``)         same (see below)
+  correctness gate            18 ``tests:`` shapes, must all pass             same
+  timed shapes                7 ``benchmarks:`` shapes, ``recheck=True``      same
+  reps per shape              3..100, stop at rel.err < 0.1 % / 30 s / 120 s  same (their eval.py)
+  score                       geometric mean of the 7 means, in us            same
+  reward                      ``1500 / score_us``                             same
+  evals per candidate         exactly ONE, no averaging                       same
+  ==========================  ==============================================  ====================
+
+``leaderboard`` is not one run but two, and that is the whole point of it: ``run_eval.run_evaluation``
+(libkernelbot, line 807-821) runs the ``test`` phase first and only proceeds to the timed phase if
+every shape passed, and the timed phase then re-generates input and re-checks correctness on EVERY
+rep. A kernel cannot buy speed with a wrong answer. Bare ``benchmark`` mode -- which this module used
+until it was made faithful -- skips the 18-shape gate entirely and checks correctness once per shape,
+so it scores kernels their search would have thrown away.
+
+What remains different is the machine, not the procedure: they timed on a Modal H100, we time on a
+local card. That is why ``trimul_a100`` exists and why scores never pool across architectures.
+
 TWO PROBLEMS, ONE TASK: ``trimul_a100`` AND ``trimul_h100``
 -----------------------------------------------------------
 The only difference is the single rules line naming the target card. It matters more than it looks:
@@ -36,9 +64,11 @@ THREE WAYS THIS DIFFERS FROM THE MATH ENVS
    ``__file__``, so this process's working directory is irrelevant.
 
 Measured on guadiana's idle A100 80GB PCIe (2026-08-10) with TTT-Discover's published kernel:
-``--mode benchmark`` takes ~11-23 s wall and scores **2467 us** (mean of 3, spread 1.0 %). A candidate
-that fails to compile fails in ~5 s. See ``gpumode_local/reference/README.md`` for the reference
-numbers to expect on each card.
+``--mode leaderboard`` takes **36 s** wall (13.2 s test + 14.8 s timed + ~8 s startup/compile) and
+scores **2412 us**; the same kernel under the old ``--mode benchmark`` took ~11-23 s and scored
+2467 us. So fidelity costs about 2.5x, and the two modes do NOT agree to within their own noise --
+another reason not to mix scores from the two. A candidate that fails to compile still fails in ~5 s.
+See ``gpumode_local/reference/README.md`` for the reference numbers to expect on each card.
 
 CONFIGURATION -- PREFER THE SWEEP FILE
 --------------------------------------
@@ -54,7 +84,7 @@ sweep key / CLI flag    environment fallback       meaning                      
 ``trimul-eval-python``  ``TRIMUL_EVAL_PYTHON``     interpreter for the harness    the scratch venv
 ``trimul-eval-gpu``     ``TRIMUL_EVAL_GPU``        ``CUDA_VISIBLE_DEVICES``       per problem (below)
 ``trimul-evaluate-py``  ``TRIMUL_EVALUATE_PY``     path to ``evaluate.py``        repo copy
-``trimul-eval-mode``    ``TRIMUL_EVAL_MODE``       test|benchmark|leaderboard     ``benchmark``
+``trimul-eval-mode``    ``TRIMUL_EVAL_MODE``       test|benchmark|leaderboard     ``leaderboard``
 (env only)              ``TRIMUL_LOCK_DIR``        where the flock files live     ``/tmp``
 ======================  =========================  ============================  ==================
 
@@ -94,6 +124,26 @@ DEFAULT_EVAL_PYTHON = "/scratch/vicstorage/learning_evolve/.venv/bin/python"
 # does 2198 us on an A100 and 1161 us on an H100, so 1000 us is out of reach either way.
 SCORE_SCALE = 1500.0
 TARGET_US = 1000
+
+# THE GRADING MODE TTT-DISCOVER'S SEARCH ACTUALLY RAN ON. env.py:129-137 submits every candidate with
+# ``mode="leaderboard"``, and libkernelbot's run_eval.run_evaluation (line 807-821) expands that into
+# TWO runner calls: the 18 ``tests:`` shapes first, then -- only if they all pass -- the 7
+# ``benchmarks:`` shapes with ``recheck=True``. Our evaluate.py:325-326 expands it identically, so the
+# number that reaches the buffer is produced the same way theirs was. Measured cost of the extra
+# fidelity on an idle A100: 36 s vs ~15 s for bare ``benchmark`` mode -- about 2.5x, not the ~100x an
+# earlier version of this file and the reference README both guessed. Nothing rides on that guess now.
+DEFAULT_EVAL_MODE = "leaderboard"
+
+# Two submission gates, applied before the GPU is touched, from env.py:122-126. They are part of the
+# reward function upstream, not a lint: a kernel that never calls into triton, or one that returns its
+# input, can post a fast "score" that means nothing. Rejecting them here also saves the ~36 s eval.
+#
+# Both are blunt substring tests, and that bluntness is INHERITED, not an oversight -- upstream's
+# banned-word check rejects any candidate containing "identity" anywhere, comments and variable names
+# included. Tightening it (say, to a regex on the return statement) would accept candidates their
+# search rejected, which is the one thing this module is not allowed to do. Leave it.
+_REQUIRED_TOKEN = "@triton.jit"
+_BANNED_TOKEN = "identity"
 
 # Which card each problem grades on unless TRIMUL_EVAL_GPU says otherwise. guadiana's GPU 0 holds a
 # vLLM server, so the A100 default is 1; a fresh H100 box is assumed to have the card at 0.
@@ -140,7 +190,7 @@ def _eval_settings(problem_type: str, overrides: dict | None = None) -> dict:
     o = overrides or {}
     return {
         "gpu": o.get("eval_gpu") or os.environ.get("TRIMUL_EVAL_GPU") or _DEFAULT_GPU.get(problem_type, "0"),
-        "mode": o.get("eval_mode") or os.environ.get("TRIMUL_EVAL_MODE") or "benchmark",
+        "mode": o.get("eval_mode") or os.environ.get("TRIMUL_EVAL_MODE") or DEFAULT_EVAL_MODE,
         "python": o.get("eval_python") or os.environ.get("TRIMUL_EVAL_PYTHON") or DEFAULT_EVAL_PYTHON,
         "evaluate_py": Path(o.get("evaluate_py") or os.environ.get("TRIMUL_EVALUATE_PY")
                             or DEFAULT_EVALUATE_PY),
@@ -156,7 +206,7 @@ class TrimulLocalReward(BaseRewardEvaluator):
     than read off the source.
     """
 
-    def __init__(self, problem_type, log_dir, eval_timeout: int = 1200, num_cpus_per_task: int = 1,
+    def __init__(self, problem_type, log_dir, eval_timeout: int = 2700, num_cpus_per_task: int = 1,
                  eval_python: str | None = None, eval_gpu: str | None = None,
                  evaluate_py: str | None = None, eval_mode: str | None = None, **kwargs):
         # The first four are what base.Environment._run_verification passes to every evaluator; the
@@ -182,6 +232,15 @@ class TrimulLocalReward(BaseRewardEvaluator):
 
     def get_reward(self, code: str, state: State) -> dict:
         cfg = _eval_settings(self.problem_type, self._overrides)
+
+        # The upstream gates (env.py:122-126), before anything is written or the card is taken.
+        # Both problems here are trimul, so both gates apply to both.
+        no_timing = {"queue_seconds": 0.0, "eval_seconds": 0.0}
+        if _REQUIRED_TOKEN not in (code or ""):
+            return self._fail("Code must contain @triton.jit.", "invalid_result", no_timing)
+        if _BANNED_TOKEN in (code or ""):
+            return self._fail("Identity kernel is not allowed.", "invalid_result", no_timing)
+
         if not cfg["evaluate_py"].exists():
             # Ours, not the candidate's: surface it as infra so it is not read as a bad kernel.
             return self._fail(
@@ -231,16 +290,34 @@ class TrimulLocalReward(BaseRewardEvaluator):
                 return self._fail(f"unreadable grader output: {e}", "harness_error", timing)
 
         score_us = run.get("score_us")
-        phase = run.get("phases", {}).get(cfg["mode"], {})
+        phases = run.get("phases", {})
+        scoring_phase = phases.get(cfg["mode"], {})
 
-        if score_us is None or not phase.get("passed", False):
+        if score_us is None or not scoring_phase.get("passed", False):
             # A genuine failure of the candidate: wrong output, compile error, OOM, crash.
+            # In leaderboard mode the failure is usually in the TEST phase, in which case there is no
+            # entry under phases["leaderboard"] at all -- read the detail off whichever phase failed,
+            # or this reports an empty error.
+            #
+            # Two ways a phase fails, and they surface differently: a kernel that RAISES leaves a
+            # traceback on stderr, while one that merely returns the wrong numbers exits cleanly and
+            # reports per-shape verdicts through the popcorn protocol -- stderr is empty. Handling
+            # only the first left "FAILED in the 'test' phase" with nothing after it for the
+            # commonest failure of all. (This msg goes to the log, never to the model, so being more
+            # informative than upstream's bare "Failed to pass test cases." costs no fidelity.)
             failed_phase = run.get("failed_phase", cfg["mode"])
-            tail = (phase.get("stderr") or "")[-1500:]
+            entry = phases.get(failed_phase, scoring_phase)
+            detail = (entry.get("stderr") or "")[-1500:]
+            tests = entry.get("tests") or {}
+            if not detail.strip() and tests.get("failed"):
+                shapes = "; ".join(f"[{f['idx']}] {f['spec']}: {f['error']}"
+                                   for f in tests["failed"][:3])
+                detail = (f"{tests['passed']}/{tests['count']} shapes passed. "
+                          f"First failures: {shapes}")[:1500]
             self._last_timing = timing
             return {
                 "reward": 0.0,
-                "msg": f"FAILED in the '{failed_phase}' phase -- no score.\n{tail}",
+                "msg": f"FAILED in the '{failed_phase}' phase -- no score.\n{detail}",
                 "correctness": 0.0,
                 "raw_score": 0.0,
                 "result_construction": [],

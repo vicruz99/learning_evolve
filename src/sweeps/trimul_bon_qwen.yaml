@@ -20,9 +20,18 @@
 #    contended card makes every timing meaningless (eval.py's convergence rule, relative error
 #    < 0.1 %, can never be met, so each benchmark also burns its full rep budget). Consequence:
 #    the whole sweep -- every run, in every process -- grades through ONE serial queue per card.
-#      measured: eval p50 9.6 s, max 28.1 s (benchmark mode) => ~20 s/candidate => ~180 candidates/h
-#      grading floor for this campaign: 4 files x 3 seeds x 160 = 1,920 candidates ~= 11 h of GPU
-#    That floor is irreducible on one card. A second free card + TRIMUL_EVAL_GPU halves it.
+#      measured, leaderboard mode: 36 s for a kernel that passes all 18 correctness shapes and gets
+#      timed; ~5-15 s for one that fails (it never reaches the timed phase). At the smoke run's 1-in-8
+#      valid rate that averages well under 20 s, but plan on 40 s/candidate = 90/h so a high valid
+#      rate cannot surprise us:
+#      grading ceiling for this campaign: 4 files x 3 seeds x 160 = 1,920 candidates ~= 21 h of GPU
+#    That is irreducible on one card. A second free card + trimul-eval-gpu halves it. It stays well
+#    under the generation cost in note 2, which is why fidelity was worth 2.5x here.
+#    The queue is per GROUP, and grade_timeout (default 8000 s) covers queueing + eval for ONE
+#    candidate: 16 children x 36 s means the last one waits ~10 min, comfortably inside that. If
+#    `grade_timeout` ever shows up in the failure counts, it is the queue backing up, not a slow
+#    kernel -- a slow kernel hits eval.py's own 1200 s-per-phase cap first and returns a clean
+#    failure. Raise --grade-timeout, or cut group-size, rather than reading it as a bad candidate.
 #
 # 2. GENERATION, NOT GRADING, IS THE BOTTLENECK -- AND IT IS THE ONE NUMBER WE HAVE NOT MEASURED
 #    AT CAMPAIGN CONCURRENCY. Kernels are long and mostly reasoning:
@@ -56,7 +65,8 @@
 #
 # EXPECTED SCORES (lower is better; do not compare across GPU architectures)
 #   TTT-Discover's best kernel: 2198 us on A100, 1161 us on H100.
-#   That same kernel measured on THIS card: 2467 us (mean of 3, spread 1.0 %).
+#   That same kernel measured on THIS card, in the leaderboard mode these runs grade with:
+#   2412-2417 us (the older 2467 figure was benchmark mode -- not comparable, do not mix).
 #   First 8 from-scratch candidates: 1 valid, best 31,335 us. Expect a LOW valid rate and treat it as
 #   genuine -- the smoke run's 7 failures were all real (triton compile errors, the A100 shared-memory
 #   ceiling, a hallucinated tl.* API), zero infra. See gpumode_local/reference/README.md.
@@ -73,38 +83,46 @@
 #   (that is R2/LLMs/local/vllm_provider/run_qwen36.sh -- see it for why the +cu129 wheel and the
 #   cache redirects are needed on this box)
 #
-# LAUNCH
-#   NO `ray start` NEEDED: trimul sets uses_sandbox = False, so the loop never initialises Ray.
+# LAUNCH -- note the --ray-head skip, ON EVERY MACHINE, guadiana included.
+#   trimul sets uses_sandbox = False, so no run ever touches Ray. But run_sweep's DEFAULT is
+#   --ray-head auto, which would start (and hold for the whole sweep) a head sized to every core on
+#   the box that nothing then uses. skip's help-text caveat "each run boots its own cluster" cannot
+#   happen here for the same uses_sandbox reason.
 #   cd src && tmux new -s trimul_bon
 #   python run_sweep.py sweeps/trimul_bon_qwen.yaml --print-cmds     # inspect first
-#   python run_sweep.py sweeps/trimul_bon_qwen.yaml
+#   python run_sweep.py sweeps/trimul_bon_qwen.yaml --ray-head skip
 #   python run_sweep.py --status runs/trimul_bon_qwen
 #   To halt: kill the run_sweep.py pid FIRST, then `python run_sweep.py --stop <dir>`.
 #
-# ON ANOTHER MACHINE (Bosch, the H100 box): copy this file and change four things --
-#   `problem: trimul_h100` in every run, `vllm-base-url`, `trimul-eval-python` (that box needs its own
-#   torch 2.7.1 / triton 3.3.1 venv; the ICL venv has no torch at all), and `trimul-eval-gpu`. Add
-#   `trimul-evaluate-py` if the repo lives elsewhere. Those four are the whole port.
-#   Everything except TRIMUL_LOCK_DIR is a sweep key, so it is validated, printed by --print-cmds and
-#   recorded in each run's config.json -- kernel timings only mean something against a known stack, so
-#   the run should say which one produced it. TRIMUL_LOCK_DIR stays an env var (set it once in the job
-#   script): it must be the SAME for all processes sharing a card, so per-run values would defeat the
-#   guard rather than configure it. Leave it NODE-LOCAL (the /tmp default): a GPU belongs to one host,
-#   so all contenders are on that host, and flock over NFS is not dependable.
+# ON ANOTHER MACHINE (Bosch, the H100 box): USE jobs/trimul_sweep.bsub -- it exists now, so the port
+#   is smaller than it used to be. Copy this file, change `problem: trimul_h100` in every run (and
+#   the run names), and submit:
+#       SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub
+#   The job script handles the machine-local half itself: it rewrites `vllm-base-url` (from
+#   jobs/vllm_host.txt), `trimul-eval-python` (from $KPY, default ~/venvs/kernel-eval/bin/python --
+#   that box needs its own torch 2.7.1 / triton 3.3.1 venv, the ICL venv has no torch; creation
+#   instructions in gpumode_local/reference/README.md) and `trimul-eval-gpu` (LSF's
+#   CUDA_VISIBLE_DEVICES makes the allocated card "0") into a scratch copy, refuses to start if the
+#   grading venv is missing or triton is not 3.3.1, and refuses a problem/queue mismatch:
+#   batch_a100 -> trimul_a100, batch_h100/batch_h200 -> trimul_h100. batch_b200 is sm100 Blackwell,
+#   which torch 2.7.1 / triton 3.3.1 predates -- do not grade there without re-baselining, and never
+#   pool scores across architectures (2198 vs 1161 us is the size of the effect). Add
+#   `trimul-evaluate-py` to the copy only if the gpumode harness lives outside the repo clone.
+#   These stay sweep keys (not env vars) on purpose: validated, printed by --print-cmds, recorded in
+#   each run's config.json -- kernel timings only mean something against a known stack, so the run
+#   should say which one produced it.
 #
-# ON BOSCH, THE DRIVER JOB NEEDS A GPU -- jobs/icl_sweep.bsub DOES NOT REQUEST ONE.
-#   Every math sweep grades on CPU, so that script deliberately has no `-gpu` line and builds a Ray
-#   head. trimul is the opposite on both counts: it needs a card in the DRIVER's job (grading is a
-#   local subprocess, not a Ray task) and it needs no Ray at all (uses_sandbox = False). Copy
-#   icl_sweep.bsub, add `#BSUB -gpu "num=1"`, match the queue to the problem, drop the ray start /
-#   ray_doctor block, and pass `--ray-head skip` instead of `require`. Verified in run_sweep.py:308,
-#   `require` raises SweepError("no Ray head reachable") and nothing there consults uses_sandbox, so a
-#   trimul sweep would refuse to launch over a head it never wanted; `auto` would instead start a head
-#   nobody uses. The vLLM server can stay in its own job on another node.
-#   Match the problem to the queue: batch_a100 -> trimul_a100, batch_h100/batch_h200 -> trimul_h100.
-#   batch_b200 is sm100 Blackwell, which torch 2.7.1 / triton 3.3.1 predates -- do not grade there
-#   without re-baselining, and never pool scores across architectures (2198 vs 1161 us is the size of
-#   the effect).
+# WHY THAT JOB SCRIPT IS NOT icl_sweep.bsub: every math sweep grades on CPU, so icl_sweep.bsub has no
+#   `-gpu` line and builds a Ray head. trimul is the opposite on both counts: it needs a card in the
+#   DRIVER's job (grading is a local subprocess, not a Ray task) and it needs no Ray at all
+#   (uses_sandbox = False). Hence trimul_sweep.bsub: `#BSUB -gpu "num=1"`, no ray start / ray_doctor,
+#   and `--ray-head skip`. Verified in run_sweep.py:308, `require` raises SweepError("no Ray head
+#   reachable") and nothing there consults uses_sandbox, so a trimul sweep would refuse to launch over
+#   a head it never wanted; `auto` would instead start a head nobody uses. The vLLM server stays in
+#   its own job on another node.
+#   TRIMUL_LOCK_DIR stays an env var at its /tmp default: it must be the SAME for all processes
+#   sharing a card (per-run values would defeat the guard), and NODE-LOCAL is correct -- a GPU belongs
+#   to one host, so all contenders are on that host, and flock over NFS is not dependable.
 # =================================================================================================
 
 sweep:
@@ -138,8 +156,22 @@ common:
   # --- where kernels are graded (machine-specific, but declared here so config.json records it) ---
   trimul-eval-python: /scratch/vicstorage/learning_evolve/.venv/bin/python
   trimul-eval-gpu: "1"           # MUST be a card nothing else uses; GPU 0 holds the vLLM server
-  trimul-eval-mode: benchmark    # scores. "test" would make reward binary; "leaderboard" is
-                                 # the official ranked path and ~100x slower.
+  trimul-eval-mode: leaderboard  # EXACTLY WHAT GUIDED TTT-DISCOVER'S SEARCH (env.py:132). One
+                                 # evaluate.py subprocess per candidate, and that one run IS the
+                                 # score -- we never pass --repeats, so nothing is re-graded or
+                                 # averaged above eval.py. That subprocess runs two phases: the 18
+                                 # `tests:` shapes must ALL pass, then the 7 `benchmarks:` shapes are
+                                 # timed 3-100 reps each with correctness re-checked on every rep,
+                                 # stopping at rel. error < 0.1 % (or 30 s GPU / 120 s wall). Score =
+                                 # geometric mean of the 7 means; reward = 1500/us.
+                                 # Measured on an idle A100: 36 s (13.2 test + 14.8 timed + startup),
+                                 # scoring 2412 us. Bare `benchmark` mode is ~15 s and scores 2467 --
+                                 # it skips the 18-shape correctness gate, so it rewards kernels this
+                                 # search would discard. DO NOT MIX SCORES FROM THE TWO MODES.
+  # trimul-evaluate-py:          # THE GRADER ITSELF -- deliberately not set. It defaults to
+                                 # <repo>/coding_agent_evolve/gpumode/evaluate.py, resolved from
+                                 # envs/kernel_trimul.py's own path, so any clone works unedited.
+                                 # Set it only if the gpumode harness lives outside this repo.
 
   # --- the Best-of-N shape: ONE generation, no barrier ----------------------------------------
   parent-source: initial         # THE Best-of-N property: every group restarts from the empty seed

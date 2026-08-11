@@ -41,14 +41,19 @@ def _fake_run(payload, *, delay: float = 0.0, write: bool = True):
     return run
 
 
-OK = {"task": "trimul", "mode": "benchmark", "score_us": 2500.0,
-      "phases": {"benchmark": {"passed": True, "stderr": ""}}}
+# Anything handed to get_reward has to clear TTT-Discover's two submission gates first
+# (env.py:122-126), so the fixtures use a candidate that does.
+KERNEL = "import triton\n\n@triton.jit\ndef k():\n    pass\n"
+
+OK = {"task": "trimul", "mode": "leaderboard", "score_us": 2500.0,
+      "phases": {"test": {"passed": True, "stderr": ""},
+                 "leaderboard": {"passed": True, "stderr": ""}}}
 
 
 # ---- the score path ------------------------------------------------------------------------------
 def test_reward_is_score_scale_over_microseconds(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _fake_run(OK))
-    out = _reward().get_reward("code", _state())
+    out = _reward().get_reward(KERNEL, _state())
     assert out["correctness"] == 1.0
     assert out["raw_score"] == 2500.0
     assert out["reward"] == pytest.approx(SCORE_SCALE / 2500.0)
@@ -58,26 +63,27 @@ def test_faster_kernel_earns_more_reward(monkeypatch):
     """Sanity on the direction: this is a MINIMISE problem behind a maximise-shaped reward."""
     fast = dict(OK, score_us=1000.0)
     monkeypatch.setattr(subprocess, "run", _fake_run(fast))
-    quick = _reward().get_reward("code", _state())["reward"]
+    quick = _reward().get_reward(KERNEL, _state())["reward"]
     monkeypatch.setattr(subprocess, "run", _fake_run(OK))
-    slow = _reward().get_reward("code", _state())["reward"]
+    slow = _reward().get_reward(KERNEL, _state())["reward"]
     assert quick > slow
 
 
 def test_timings_are_recorded_for_progress_csv(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _fake_run(OK, delay=0.05))
     r = _reward()
-    r.get_reward("code", _state())
+    r.get_reward(KERNEL, _state())
     assert r._last_timing["eval_seconds"] >= 0.05
     assert "queue_seconds" in r._last_timing
 
 
 # ---- genuine candidate failures ------------------------------------------------------------------
 def test_failed_phase_is_a_crash_not_a_score(monkeypatch):
-    bad = {"task": "trimul", "mode": "benchmark", "score_us": None, "failed_phase": "benchmark",
-           "phases": {"benchmark": {"passed": False, "stderr": "SyntaxError: invalid syntax"}}}
+    bad = {"task": "trimul", "mode": "leaderboard", "score_us": None, "failed_phase": "leaderboard",
+           "phases": {"test": {"passed": True, "stderr": ""},
+                      "leaderboard": {"passed": False, "stderr": "SyntaxError: invalid syntax"}}}
     monkeypatch.setattr(subprocess, "run", _fake_run(bad))
-    out = _reward().get_reward("nonsense", _state())
+    out = _reward().get_reward(KERNEL, _state())
     assert out["correctness"] == 0.0
     assert out["reward"] == 0.0
     assert out["failure_type"] == "process_crash"
@@ -87,31 +93,90 @@ def test_failed_phase_is_a_crash_not_a_score(monkeypatch):
 
 def test_passed_false_beats_a_present_score(monkeypatch):
     """Defensive: never trust score_us if the phase did not pass."""
-    weird = dict(OK, score_us=10.0, phases={"benchmark": {"passed": False, "stderr": "boom"}})
+    weird = dict(OK, score_us=10.0, phases={"leaderboard": {"passed": False, "stderr": "boom"}})
     monkeypatch.setattr(subprocess, "run", _fake_run(weird))
-    assert _reward().get_reward("code", _state())["correctness"] == 0.0
+    assert _reward().get_reward(KERNEL, _state())["correctness"] == 0.0
 
 
 def test_timeout_is_reported_as_eval_timeout(monkeypatch):
     def boom(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 1200)
     monkeypatch.setattr(subprocess, "run", boom)
-    out = _reward(eval_timeout=1200).get_reward("code", _state())
+    out = _reward(eval_timeout=1200).get_reward(KERNEL, _state())
     assert out["failure_type"] == "eval_timeout"
     assert out["correctness"] == 0.0
+
+
+def test_a_failure_in_the_test_phase_still_reports_its_stderr(monkeypatch):
+    """leaderboard mode is TWO phases, and a candidate usually dies in the FIRST one -- in which case
+    there is no phases["leaderboard"] entry to read stderr from. Reading it off the scoring phase
+    (the obvious way) silently produced an empty error message for the commonest failure there is."""
+    bad = {"task": "trimul", "mode": "leaderboard", "score_us": None, "failed_phase": "test",
+           "phases": {"test": {"passed": False, "stderr": "triton.OutOfResources: shared memory"}}}
+    monkeypatch.setattr(subprocess, "run", _fake_run(bad))
+    out = _reward().get_reward(KERNEL, _state())
+    assert out["correctness"] == 0.0
+    assert out["failure_type"] == "process_crash"
+    assert "OutOfResources" in out["msg"]
+    assert "'test' phase" in out["msg"]
+
+
+def test_a_wrong_answer_reports_which_shapes_failed(monkeypatch):
+    """The commonest failure of all: the kernel runs fine and returns wrong numbers. eval.py exits 0
+    with an EMPTY stderr and puts the verdicts in the result protocol, so a stderr-only error message
+    said nothing at all. Verified against a real deliberately-wrong kernel, not just this fixture."""
+    bad = {"task": "trimul", "mode": "leaderboard", "score_us": None, "failed_phase": "test",
+           "phases": {"test": {"passed": False, "stderr": "",
+                               "tests": {"count": 18, "passed": 2, "incomplete": [],
+                                         "failed": [{"idx": 2, "spec": "seqlen: 64",
+                                                     "error": "mismatch at 0: 0.0 vs 1.5"}]}}}}
+    monkeypatch.setattr(subprocess, "run", _fake_run(bad))
+    out = _reward().get_reward(KERNEL, _state())
+    assert out["correctness"] == 0.0
+    assert "2/18 shapes passed" in out["msg"]
+    assert "mismatch at 0" in out["msg"]
+
+
+# ---- the submission gates TTT-Discover applies before grading (env.py:122-126) --------------------
+def test_grading_defaults_to_the_mode_that_guided_their_search(monkeypatch):
+    """`leaderboard`, not `benchmark`: the 18-shape correctness gate is part of their score, and a
+    kernel that skips it can post a fast number their search would have discarded."""
+    from envs.kernel_trimul import _eval_settings
+    monkeypatch.delenv("TRIMUL_EVAL_MODE", raising=False)
+    assert _eval_settings("trimul_a100")["mode"] == "leaderboard"
+    assert _eval_settings("trimul_h100")["mode"] == "leaderboard"
+
+
+def test_code_without_a_triton_kernel_is_rejected_before_the_gpu(monkeypatch):
+    def never(cmd, **kwargs):
+        raise AssertionError("the GPU must not be touched for a submission that cannot qualify")
+    monkeypatch.setattr(subprocess, "run", never)
+    out = _reward().get_reward("import torch\ndef custom_kernel(d):\n    return d\n", _state())
+    assert out["correctness"] == 0.0
+    assert "@triton.jit" in out["msg"]
+
+
+def test_identity_kernels_are_rejected(monkeypatch):
+    """Upstream's guard against the degenerate 'return the input' submission (trimul only)."""
+    def never(cmd, **kwargs):
+        raise AssertionError("the GPU must not be touched for a banned submission")
+    monkeypatch.setattr(subprocess, "run", never)
+    out = _reward().get_reward(KERNEL + "\n# identity\n", _state())
+    assert out["correctness"] == 0.0
+    assert "Identity" in out["msg"]
 
 
 # ---- our failures, which must not look like the candidate's --------------------------------------
 def test_missing_grader_is_infra_not_a_bad_kernel(monkeypatch):
     monkeypatch.setenv("TRIMUL_EVALUATE_PY", "/nonexistent/evaluate.py")
-    out = _reward().get_reward("code", _state())
+    out = _reward().get_reward(KERNEL, _state())
     assert out["failure_type"] == "harness_error"
     assert out["correctness"] == 0.0
 
 
 def test_grader_writing_no_results_is_infra(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _fake_run(OK, write=False))
-    out = _reward().get_reward("code", _state())
+    out = _reward().get_reward(KERNEL, _state())
     assert out["failure_type"] == "harness_error"
 
 
@@ -133,7 +198,7 @@ def test_concurrent_evals_are_serialised_on_the_gpu(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    threads = [threading.Thread(target=lambda: _reward().get_reward("code", _state()))
+    threads = [threading.Thread(target=lambda: _reward().get_reward(KERNEL, _state()))
                for _ in range(4)]
     for t in threads:
         t.start()
@@ -227,8 +292,8 @@ def test_both_problems_grade_against_the_same_task_file(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    _reward("trimul_a100").get_reward("code", _state())
-    _reward("trimul_h100").get_reward("code", _state())
+    _reward("trimul_a100").get_reward(KERNEL, _state())
+    _reward("trimul_h100").get_reward(KERNEL, _state())
     assert seen == ["trimul", "trimul"]
 
 
@@ -315,7 +380,7 @@ def test_the_evaluator_uses_the_configured_interpreter_and_card(monkeypatch):
     monkeypatch.delenv("TRIMUL_EVAL_GPU", raising=False)
     r = TrimulLocalReward("trimul_h100", "/tmp", eval_timeout=1200,
                           eval_python="/my/venv/bin/python", eval_gpu="5", eval_mode="test")
-    r.get_reward("code", _state())
+    r.get_reward(KERNEL, _state())
     assert seen["cmd"][0] == "/my/venv/bin/python"
     assert seen["cmd"][seen["cmd"].index("--gpu") + 1] == "5"
     assert seen["cmd"][seen["cmd"].index("--mode") + 1] == "test"
@@ -338,7 +403,7 @@ def test_evaluator_options_reach_the_evaluator_through_envconfig(monkeypatch):
     env = SpyEnv(_state(), object(), EnvConfig(
         problem_type="trimul_h100", log_path="/tmp",
         evaluator_options={"eval_python": "/cfg/python", "eval_gpu": "4"}))
-    out = env._run_verification("code", "trimul_h100", "/tmp", _state())
+    out = env._run_verification(KERNEL, "trimul_h100", "/tmp", _state())
     assert captured["eval_python"] == "/cfg/python"
     assert captured["eval_gpu"] == "4"
     assert out.correctness == 1.0

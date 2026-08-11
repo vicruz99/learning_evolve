@@ -16,7 +16,13 @@ diff src/gpumode_local/reference/trimul_best.py discover/results/kernel-engineer
 |---|---:|---|
 | A100 | **2198 µs** | TTT-Discover's reported best |
 | H100 | **1161 µs** | TTT-Discover's reported best |
-| A100 80GB **PCIe** (guadiana, GPU 1) | **2467 µs** | measured here 2026-08-10, mean of 3, spread 1.0 % |
+| A100 80GB **PCIe** (guadiana, GPU 1) | **2412 µs** | measured here 2026-08-10, `--mode leaderboard` |
+| A100 80GB **PCIe** (guadiana, GPU 1) | **2467 µs** | same card, `--mode benchmark`, mean of 3, spread 1.0 % |
+
+**The mode is part of the number.** `leaderboard` is what TTT-Discover's search ran on and what the
+`trimul_a100` / `trimul_h100` environments now grade with; `benchmark` skips the 18-shape correctness
+gate and gives its per-shape timing loop a smaller budget, so it lands ~2 % elsewhere. Compare like
+with like, and prefer the leaderboard row.
 
 ⚠️ **Read the third row before using the first as a pass/fail gate.** On guadiana we measure
 2467 µs, i.e. **12 % above** the 2198 µs reference, reproducibly (2457.4 / 2482.5 / 2461.2, and
@@ -57,19 +63,21 @@ Then, from the repo root:
 $KPY coding_agent_evolve/gpumode/evaluate.py \
     src/gpumode_local/reference/trimul_best.py --gpu 0 --mode test
 
-# 2. the score, and the number to compare against the table above (~11-23 s)
+# 2. THE ONE THAT MATTERS: the official ranked path, and exactly what the ICL runs grade with
+#    (18 correctness shapes, then 7 timed with correctness re-checked every rep). ~36 s.
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode benchmark
+    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode leaderboard
 
 # 3. establish this machine's baseline + its noise floor before trusting any small win
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode benchmark \
+    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode leaderboard \
     --repeats 5 --json /tmp/trimul_baseline.json
 
-# 4. the official ranked path (correctness re-checked every rep). ~100x slower — only for a final
-#    number you intend to quote, never in a loop.
+# 4. benchmark mode: timing without the 18-shape correctness gate. ~15 s, and it scores a DIFFERENT
+#    number (2412 vs 2467 us here). Useful for a quick "does this card work", never for a score you
+#    compare against anything graded in leaderboard mode.
 $KPY coding_agent_evolve/gpumode/evaluate.py \
-    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode leaderboard
+    src/gpumode_local/reference/trimul_best.py --gpu 0 --mode benchmark
 ```
 
 Output ends with `SCORE (geom of 7 benchmarks): <us>`; exit code is 0 only if everything passed.
@@ -99,19 +107,24 @@ guess the interpreter. Do not `chmod +x` it.
 ### Same check, through the ICL harness's own evaluator
 
 Use this to confirm the *reward path* (not just the grader) works on a new box — it is what a real run
-calls, `flock` and all:
+calls, `flock` and all, and it grades in `leaderboard` mode because that is now the default:
 
 ```bash
 cd src && TRIMUL_EVAL_GPU=0 .venv/bin/python -c "
 from envs.kernel_trimul import TrimulLocalReward
 from puct import State
 code = open('gpumode_local/reference/trimul_best.py').read()
-r = TrimulLocalReward('trimul_h100', '/tmp', eval_timeout=1200)   # or trimul_a100
+r = TrimulLocalReward('trimul_h100', '/tmp', eval_timeout=2700)   # or trimul_a100
 o = r.get_reward(code, State(timestep=-1, construction=None, code='', value=-1_000_000))
 print('correctness', o['correctness'], 'score_us', o['raw_score'], 'reward', o['reward'])
 print('timing', r._last_timing)
 "
 ```
+
+On guadiana's GPU 1 this prints `correctness 1.0 score_us 2417.5 reward 0.6205`, `eval_seconds ~35`.
+`reward` is `1500 / score_us`, so it is small and *higher is better* even though the metric is a
+runtime — that inversion is TTT-Discover's, and it is why `is_maximize()` is False while the reward
+still grows as the kernel gets faster.
 
 On a machine that is not guadiana, also set:
 
@@ -191,33 +204,34 @@ older than that build needs — reinstall from the `cu126` index.
 
 Then run step 3 from "Debugging a new GPU" above with
 `export KPY=~/venvs/kernel-eval/bin/python` — always naming the interpreter explicitly, never
-`./evaluate.py` — and **record the number as this machine's baseline.** Do not compare it to guadiana's 2467 µs: Bosch's A100s are
-likely SXM, so they may land *closer* to the 2198 µs reference than guadiana does. `--repeats 5` gives
-the noise floor to judge later wins against.
+`./evaluate.py` — and **record the number as this machine's baseline.** Do not compare it to
+guadiana's 2412 µs (leaderboard mode): Bosch's A100s are likely SXM, so they may land *closer* to the
+2198 µs reference than guadiana does. `--repeats 5` gives the noise floor to judge later wins against.
 
-### The driver job needs a GPU — `jobs/icl_sweep.bsub` does not request one
+### Running a sweep on Bosch — `jobs/trimul_sweep.bsub`
 
-Every math problem grades on CPU through Ray, so that script has **no `-gpu` line by design**, starts a
-Ray head, and passes `--ray-head require`. trimul is the opposite on both counts: the card must be in
-the **driver's** job (grading is a local subprocess, not a Ray task) and Ray is never initialised at all
-(`uses_sandbox = False`). To adapt it:
+Use `jobs/trimul_sweep.bsub`, not `jobs/icl_sweep.bsub`. Every math problem grades on CPU through
+Ray, so `icl_sweep.bsub` has **no `-gpu` line by design**, starts a Ray head, and passes
+`--ray-head require`. trimul is the opposite on both counts: the card must be in the **driver's**
+job (grading is a local subprocess, not a Ray task) and Ray is never initialised at all
+(`uses_sandbox = False`) — so `trimul_sweep.bsub` requests `-gpu "num=1"`, starts no Ray, and passes
+`--ray-head skip` (`require` would abort at `run_sweep.py:308`; `auto` would start a head nobody
+uses).
 
-1. add `#BSUB -gpu "num=1"`;
-2. match the queue to the problem — `batch_a100` → `trimul_a100`, `batch_h100` / `batch_h200` →
-   `trimul_h100`. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
-   may not compile, and upgrading torch to fix that breaks comparability with every other number here;
-3. drop the `ray start` / `ray_doctor` / cleanup block;
-4. pass **`--ray-head skip`**, not `require`. `run_sweep.py:308` raises
-   `SweepError("no Ray head reachable")` under `require`, and nothing in `run_sweep` consults
-   `uses_sandbox` — so the sweep would refuse to launch over a head trimul never wanted. `auto` would
-   instead start a head nobody uses.
+```bash
+cd ~/projects/phd/learning_evolve/src && mkdir -p jobs/logs
+SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
+```
 
-The vLLM server can stay in its own job on another node, exactly as it does for the math sweeps; only
+The sweep copy itself only needs `problem: trimul_h100` (or `_a100`) per run — the job script
+rewrites `vllm-base-url`, `trimul-eval-python` (from `$KPY`, default `~/venvs/kernel-eval/bin/python`)
+and `trimul-eval-gpu` (with `-gpu "num=1"` LSF gives one card, visible as index 0) into a scratch
+copy, and refuses to start if the venv is missing, triton isn't 3.3.1, or the problem doesn't match
+the queue's card. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
+may not compile, and upgrading torch to fix that breaks comparability with every other number here.
+
+The vLLM server stays in its own job on another node, exactly as it does for the math sweeps; only
 grading has to be local to the card.
-
-Then the sweep file needs three changes: `problem: trimul_a100` (or `_h100`) per run,
-`trimul-eval-python: ~/venvs/kernel-eval/bin/python`, and `trimul-eval-gpu: "0"` — with `-gpu "num=1"`
-LSF gives you a single card, visible as index 0.
 
 Leave `TRIMUL_LOCK_DIR` alone. The `/tmp` default is correct **because** it is node-local: a GPU
 belongs to one host, so every process that can contend for it runs on that host, and `flock` over NFS
