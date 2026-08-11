@@ -228,12 +228,14 @@ cd ~/projects/phd/learning_evolve/src && mkdir -p jobs/logs
 SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
 ```
 
-The sweep copy itself only needs `problem: trimul_h100` (or `_a100`) per run. Into a scratch copy,
-the job script rewrites `vllm-base-url` and `trimul-eval-python` (from `$KPY`, default
-`~/venvs/kernel-eval/bin/python`), and **deletes `trimul-eval-gpu`** — LSF grants the job one GPU
-and announces it via `CUDA_VISIBLE_DEVICES`, with no guarantee it is index 0, so grading must
-inherit that assignment rather than name a card. It refuses to start if the venv is missing, triton
-isn't 3.3.1, or the problem doesn't match the queue's card. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
+The four Bosch sweep files already exist — `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml`
+(`trimul_h100`, the FP8 model the server job serves, no `trimul-eval-gpu`); the non-`_bosch` trimul
+yamls are guadiana's. Into a scratch copy, the job script rewrites `vllm-base-url` and
+`trimul-eval-python` (from `$KPY`, default `~/venvs/kernel-eval/bin/python`), and **deletes any
+`trimul-eval-gpu`** — LSF grants the job one GPU and announces it via `CUDA_VISIBLE_DEVICES`, with
+no guarantee it is index 0, so grading must inherit that assignment rather than name a card. It
+refuses to start if the venv is missing, triton isn't 3.3.1, or the problem doesn't match the
+queue's card. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
 may not compile, and upgrading torch to fix that breaks comparability with every other number here.
 
 The vLLM server stays in its own job on another node, exactly as it does for the math sweeps; only
