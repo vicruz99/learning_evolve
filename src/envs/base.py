@@ -35,6 +35,22 @@ def parse_strategy_block(completion_text: str) -> str:
     return matches[-1].strip() if matches else ""
 
 
+def objective_only_prompt(target, metric_name: str = "value", maximize: bool = True) -> str:
+    """The stand-in for ``State.to_prompt`` when a run shows the model NO current solution
+    (``--parent-source none``).
+
+    Keeps the two things that define the *task* — which quantity is being optimised, in which
+    direction, and what the target is — and drops everything that constitutes a *solution to improve
+    upon*: the parent's code, its before/after values, and its stdout. Without this the arm would
+    differ from the others in two ways at once (no parent AND no target), which is not the comparison
+    anyone wants.
+    """
+    direction = "higher" if maximize else "lower"
+    return (f"You are optimizing {metric_name} ({direction} is better).\n"
+            f"Target: {target}. Reaching or passing it will be generously rewarded.\n"
+            f"You are NOT given a current solution to continue from — write one from scratch.")
+
+
 @dataclass
 class EnvConfig:
     """Everything the grading path needs from a run's config.
@@ -46,6 +62,15 @@ class EnvConfig:
     num_cpus_per_task: int = 1
     eval_timeout: int = 1000          # sandbox (per-candidate) execution timeout, seconds
     timeout: float = 8000.0           # async grading wall-clock timeout, seconds
+    # Whether ``improvement_task`` renders the parent as "the current solution to improve upon".
+    #
+    # False (``--parent-source none``) removes that whole framing from the prompt: no parent code, no
+    # parent value, no "improve upon this" sentence — only the problem, the target, and whatever the
+    # ICL context block carries. It is a PROMPT knob, not a search knob: the loop still needs a state
+    # to attribute children to (it uses the seed, as Best-of-N does), and the evaluator still receives
+    # that state, so problems that hand their construction to the sandbox (ac1/ac2's
+    # ``height_sequence_1``, erdos' ``initial_h_values``) are unaffected.
+    show_parent_solution: bool = True
     # Extra keyword arguments for the problem's reward evaluator, passed straight through by
     # :meth:`Environment._run_verification`. Empty for every sandbox problem -- it exists so a
     # problem whose grading depends on the MACHINE (trimul: which GPU, which interpreter runs the
@@ -117,6 +142,7 @@ class Environment(ABC):
         self.sampler = sampler
         self.state = initial_state
         self.problem_type = config.problem_type
+        self.show_parent_solution = config.show_parent_solution
 
     @abstractmethod
     def problem_intro(self) -> str:
@@ -137,6 +163,11 @@ class Environment(ABC):
         varies between parents, so it MUST be rendered LAST here. Everything above it — the intro,
         the ICL context block the loop inserts, and these rules — then forms a shared prefix across
         a generation's parents, so only the trailing current-solution differs.
+
+        When ``self.show_parent_solution`` is False the trailing solution — and the wording that
+        introduces it — must be replaced by :func:`objective_only_prompt`, so the prompt never refers
+        to a "current solution" that is not there. The tail is then constant across parents too, which
+        makes the WHOLE prompt a shared prefix.
         """
 
     def get_question(self) -> str:

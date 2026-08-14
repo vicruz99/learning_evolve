@@ -1,7 +1,7 @@
 import inspect
 import numpy as np
 
-from envs.base import Environment
+from envs.base import Environment, objective_only_prompt
 from sandbox import SandboxRewardEvaluator
 from puct import State
 
@@ -122,10 +122,16 @@ We will run the below validation function (read-only, do not modify this):
     def improvement_task(self) -> str:
         assert self.problem_type in {"26", "32"}
         target = 2.636 if self.problem_type == "26" else 2.940
-        state_ctx = self.initial_state.to_prompt(target, metric_name="sum of radii")
+        if self.show_parent_solution:
+            opening = "Reason about how you could further improve the current packing (shown at the end of this prompt)."
+            current = ("--- Current packing solution to improve upon ---\n"
+                       + self.initial_state.to_prompt(target, metric_name="sum of radii"))
+        else:
+            opening = "Reason about how to pack the circles as tightly as you can."
+            current = objective_only_prompt(target, metric_name="sum of radii")
 
         return f"""
-Reason about how you could further improve the current packing (shown at the end of this prompt). Consider:
+{opening} Consider:
 - Are circles placed optimally near boundaries and corners?
 - Could a different arrangement (hexagonal, nested, hybrid) yield better results?
 - Are there gaps that could be filled with repositioned or resized circles?
@@ -141,8 +147,7 @@ Rules:
 - No filesystem or network IO.
 - You need to get really creative and think from first principles.
 
---- Current packing solution to improve upon ---
-{state_ctx}
+{current}
 
 Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 """

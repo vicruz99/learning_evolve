@@ -1,6 +1,6 @@
 import numpy as np
 
-from envs.base import Environment
+from envs.base import Environment, objective_only_prompt
 from sandbox import SandboxRewardEvaluator
 from puct import State
 
@@ -163,16 +163,28 @@ Current record: C₅ ≤ 0.38092. Our goal is to find a construction that shows 
     def improvement_task(self) -> str:
         state = self.initial_state
         state_ctx = state.to_prompt(0.3808, metric_name="C₅ bound", maximize=False)
+        has_construction = (hasattr(state, 'construction') and state.construction is not None
+                            and len(state.construction) > 0)
 
-        # Construct construction section (mentions n, which varies per parent)
+        # Construct construction section (mentions n, which varies per parent). Kept even when no
+        # parent solution is shown: `initial_h_values` is handed to the sandbox by the evaluator
+        # either way, so the prompt would otherwise hide a global the code can actually use.
         construction_section = ""
-        if hasattr(state, 'construction') and state.construction is not None and len(state.construction) > 0:
+        if has_construction and not self.show_parent_solution:
+            construction_section = f"""An initial construction is available through the `initial_h_values` global variable (n={len(state.construction)} samples). You may start your search from it or from anywhere else.
+"""
+        elif has_construction:
             construction_section = f"""You may want to start your search from the current construction, which you can access through the `initial_h_values` global variable (n={len(state.construction)} samples).
 You are encouraged to explore solutions that use other starting points to prevent getting stuck in a local optimum.
 """
 
         # Construct code section (improvement guidance; constant once we have a prior solution)
-        if state.code and state.code.strip():
+        if not self.show_parent_solution:
+            code_section = f'''Write code that searches for the best construction you can find.
+
+{objective_only_prompt(0.3808, metric_name="C₅ bound", maximize=False)}
+'''
+        elif state.code and state.code.strip():
             code_section = f'''Your task is to reason about how you could further improve the current construction and propose an improvement to the current solution. You may want to consider different algorithmic ideas, adjusting your heuristics, or sweeping your hyperparameters.
 Unless you make a meaningful improvement, you will not be rewarded.
 

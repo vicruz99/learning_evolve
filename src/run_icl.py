@@ -67,10 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--puct-c", type=float, default=1.0)
     p.add_argument("--max-buffer-size", type=int, default=1000)
     p.add_argument("--topk-children", type=int, default=2)
-    p.add_argument("--parent-source", default="puct", choices=["puct", "initial"],
-                   help="Where each generation's parents come from. 'puct': select from the buffer "
-                        "(TTT-Discover's search). 'initial': always the problem's seed solution => "
-                        "Best-of-N; with --n-context 0 that is the no-past-experience baseline.")
+    p.add_argument("--parent-source", default="puct", choices=["puct", "initial", "best", "none"],
+                   help="Which solution the prompt hands the model as 'the current solution to "
+                        "improve upon'. 'puct': PUCT-selected from the buffer (TTT-Discover's "
+                        "search). 'initial': always the problem's seed => Best-of-N; with "
+                        "--n-context 0 that is the no-past-experience baseline. 'best': always the "
+                        "buffer's best-so-far => greedy hill-climbing (same prompt shape as puct, so "
+                        "the gap between them is what PUCT's exploration term buys). 'none': no "
+                        "current solution in the prompt at all — the improve-upon framing is removed "
+                        "and only the objective and target remain, so past experience reaches the "
+                        "model through the context block and nothing else (with --n-context 0, a "
+                        "from-scratch zero-shot arm).")
     p.add_argument("--seed", type=int, default=None,
                    help="Replicate seed. Seeds the sampler's random initial construction (ac1/ac2) and "
                         "the 'random' context strategy unless --context-seed is given. Recorded in "
@@ -215,7 +222,14 @@ def parse_args() -> ICLConfig:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         # A Best-of-N run has no context strategy in play; label it as such rather than inheriting the
         # (unused) --context-strategy default, which would read as an ICL run in the runs/ listing.
-        tag = "bon" if a.parent_source == "initial" else a.context_strategy
+        # 'best' and 'none' DO use the strategy, so they keep its name and get a parent-source prefix
+        # -- a bare strategy name in runs/ has always meant PUCT parents, and still should.
+        if a.parent_source == "initial":
+            tag = "bon"
+        elif a.parent_source == "puct":
+            tag = a.context_strategy
+        else:
+            tag = f"{a.parent_source}_{a.context_strategy}"
         seed = f"_s{a.seed}" if a.seed is not None else ""
         auto = (f"{a.problem}_{tag}_n{a.n_context}_g{a.group_size}x{a.groups_per_batch}{seed}_{ts}")
         log_path = os.path.join("runs", auto)

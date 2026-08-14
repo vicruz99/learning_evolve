@@ -66,10 +66,24 @@ class ICLConfig:
     puct_c: float = 1.0
     max_buffer_size: int = 1000
     topk_children: int = 2
-    # Where each generation's parents come from:
+    # Where each generation's parents come from, i.e. WHICH solution the prompt hands the model as
+    # "the current solution to improve upon":
     #   "puct"    — PUCT-select from the buffer (TTT-Discover's search; the default)
     #   "initial" — always the problem's seed solution => Best-of-N. Combined with n_context=0 this is
     #               the no-past-experience baseline: no history via parent selection, none via prompt.
+    #   "best"    — always the buffer's best-so-far solution => greedy hill-climbing. Same prompt
+    #               shape as "puct", so the difference between the two is exactly what PUCT's
+    #               exploration term (under-visited states, lineage spreading) is worth.
+    #   "none"    — NO current solution in the prompt at all: the "improve upon this" framing is
+    #               removed and the tail states only the objective and the target
+    #               (envs.base.objective_only_prompt). Past experience then reaches the model through
+    #               the ICL context block and nothing else, so this is the parent source that
+    #               measures a context strategy on its own. With n_context=0 it is a from-scratch
+    #               zero-shot arm.
+    #
+    # "none" is still a search-neutral choice, not a search variant: children are attributed to the
+    # seed (as in "initial"), and the evaluator still receives that state — so the constructions the
+    # sandbox pre-imports (ac1/ac2's height_sequence_1, erdos' initial_h_values) are unchanged.
     parent_source: str = "puct"
 
     # --- memory guard ---

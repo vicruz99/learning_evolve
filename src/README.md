@@ -225,7 +225,18 @@ was previously invisible. Overrides: `--max-parallel`, `--stagger`, `--refresh`,
 - `--puct-c` (1.0) — exploration coefficient `c` in the PUCT score `Q + c·scale·P·√(1+T)/(1+n)`; higher = more exploration of under-visited states.
 - `--max-buffer-size` (1000) — max states kept in the search buffer.
 - `--topk-children` (2) — children per parent retained in the buffer on flush.
-- `--parent-source` (`puct`) — where a generation's parents come from. `puct` selects from the buffer. `initial` always returns the problem's seed solution, i.e. **Best-of-N**: combined with `--n-context 0` no past experience reaches the model at all (none in the prompt, none through parent selection). The buffer is still written — best-so-far, the context pool and `events.jsonl` stay correct — it is just never read to pick a parent.
+- `--parent-source` (`puct`) — **which solution the prompt hands the model as "the current solution to improve upon"**. The buffer is written in every mode — best-so-far, the context pool and `events.jsonl` stay correct — the modes differ only in what is *read* out of it and what reaches the prompt.
+
+  | value | parent given to the model | what it isolates |
+  |---|---|---|
+  | `puct` | PUCT-selected from the buffer | TTT-Discover's search (the default) |
+  | `initial` | always the problem's seed | **Best-of-N**; with `--n-context 0`, the no-past-experience baseline |
+  | `best` | always the buffer's best-so-far | **greedy hill-climbing** — same prompt shape as `puct`, so the gap between them is exactly what PUCT's exploration term (under-visited states, lineage spreading) buys |
+  | `none` | **no solution at all** | the prompt's "improve upon this" framing is removed and only the objective + target remain, so past experience reaches the model **through the context block and nothing else** — the mode for measuring a context strategy on its own. With `--n-context 0` it is a from-scratch zero-shot arm. |
+
+  `none` is a prompt setting, not a search variant: children are attributed to the seed (as in `initial`), and the evaluator still receives that state, so the constructions the sandbox pre-imports (`height_sequence_1`, `initial_h_values`) are unchanged. With `best`, every slot of a generation gets the same parent, so a generation adds `topk_children` states to the buffer rather than `groups_per_batch × topk_children` (best-so-far always survives; the context pool is unaffected).
+
+  Run-directory naming follows: `initial` → `bon`, `puct` → the bare strategy name, `best`/`none` → `<source>_<strategy>`.
 
 **Reproducibility**
 - `--seed N` — replicate seed, recorded in `config.json`. Seeds the sampler's only stochastic surface (the random initial construction of `ac1`/`ac2`) and, unless `--context-seed` is given, the `random` context strategy. It does **not** make a run bit-reproducible: PUCT selection is a deterministic score sort, and replicate-to-replicate variation comes from vLLM sampling at `temperature 1.0`, which is deliberately left unseeded (a fixed request seed would make Best-of-N's identical per-parent prompts return identical children).

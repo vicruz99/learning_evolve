@@ -100,7 +100,7 @@ to produce a sentence that scores as high as possible.
         # the model actually sees the specific sentence it is meant to improve on. At gen 0 the parent
         # is the empty seed, so we ask for a fresh sentence instead.
         st = self.initial_state
-        parent_sentence = _clean_sentence(getattr(st, "code", ""))
+        parent_sentence = _clean_sentence(getattr(st, "code", "")) if self.show_parent_solution else ""
         if parent_sentence:
             score = st.value if self.is_maximize() else -st.value
             current_block = (

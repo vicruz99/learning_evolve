@@ -173,6 +173,10 @@ class ICLRunner:
             eval_timeout=self.eval_timeout,
             timeout=cfg.grade_timeout,
             evaluator_options=cfg.evaluator_options,
+            # --parent-source none is a PROMPT setting, so it is the env that has to honour it: it
+            # drops the trailing "current solution to improve upon" and the wording that introduces
+            # it. Grading is untouched -- the env still gets a state.
+            show_parent_solution=cfg.parent_source != "none",
         )
         self.llm = VLLMClient(
             base_url=cfg.vllm_base_url,
@@ -216,9 +220,18 @@ class ICLRunner:
         )
 
     def _sample_parents(self, n: int) -> list[State]:
-        """This generation's parents: PUCT-selected from the buffer, or always the seed (Best-of-N)."""
-        if self.cfg.parent_source == "initial":
+        """This generation's parents — see ``ICLConfig.parent_source`` for what each source means.
+
+        ``none`` shares ``initial``'s bookkeeping deliberately: the prompt shows no parent, so the
+        children belong to no particular solution, and attributing them to the seed is the only
+        choice that leaves the PUCT statistics meaning what they say. What makes ``none`` different
+        is on the prompt side (``EnvConfig.show_parent_solution``), not here.
+        """
+        source = self.cfg.parent_source
+        if source in ("initial", "none"):
             return self.sampler.sample_initial_states(n)
+        if source == "best":
+            return self.sampler.sample_best_states(n)
         return self.sampler.sample_states(n)
 
     def _build_prompt(self, env, parent: State):
@@ -496,20 +509,39 @@ class ICLRunner:
         gen_par = min(cfg.groups_per_batch, cfg.max_gen_concurrency)
         logger.info(f"ICL run: problem={cfg.problem} model={cfg.model_name} strategy={cfg.context_strategy} "
                     f"n_context={cfg.n_context} seed={cfg.seed}")
+        no_ctx = not cfg.n_context
         if cfg.parent_source == "initial":
             logger.info("parents: ALWAYS the seed solution (--parent-source initial) -> Best-of-N; the "
                         "buffer is still recorded but never read to pick a parent"
-                        + ("" if cfg.n_context else " and no context is injected: no past experience "
-                                                    "reaches the model at all"))
+                        + (" and no context is injected: no past experience reaches the model at all"
+                           if no_ctx else ""))
+        elif cfg.parent_source == "best":
+            logger.info("parents: ALWAYS the buffer's best-so-far solution (--parent-source best) -> "
+                        "greedy hill-climbing; every slot of a generation gets the SAME parent, so "
+                        "PUCT's exploration term is switched off, not the buffer"
+                        + (" and no context is injected: past experience reaches the model only as "
+                           "that one best parent" if no_ctx else ""))
+        elif cfg.parent_source == "none":
+            logger.info("parents: NONE (--parent-source none) -> the prompt shows no current solution "
+                        "to improve upon, only the objective and the target; children are attributed "
+                        "to the seed"
+                        + (" and no context is injected: the model gets NOTHING but the problem "
+                           "statement (from-scratch zero-shot arm)" if no_ctx else
+                           " -> past experience reaches the model through the context block and "
+                           "nothing else"))
         else:
             logger.info("parents: PUCT-selected from the buffer"
-                        + ("" if cfg.n_context else " (no context injected: past experience reaches the "
-                                                    "model only through which parent it is given)"))
+                        + (" (no context injected: past experience reaches the model only through "
+                           "which parent it is given)" if no_ctx else ""))
         # Whether a generation's parents share one context block decides whether vLLM prefills that
         # block once per generation or once per parent -- worth seeing at a glance, since at n_context=20
         # the block is ~16k of a ~17k prompt.
         if cfg.n_context:
-            if cfg.exclude_parent_from_context:
+            # Self-exclusion is what usually makes each parent's block different. It cannot, when
+            # every slot of a generation gets the same parent (best) or a fresh seed that is not in
+            # the context pool at all (initial / none) -- then every parent drops the same id, or
+            # none, and the block is shared whatever --exclude-parent says.
+            if cfg.exclude_parent_from_context and cfg.parent_source == "puct":
                 logger.info("context block: per-parent (each parent excludes itself) -> no cross-parent "
                             "prefix reuse; pass --no-exclude-parent --context-seed N to share it")
             elif cfg.context_seed is None:
@@ -762,6 +794,9 @@ class ICLRunner:
         print(bar)
         print(f"strategy                   : {cfg.context_strategy}  "
               f"(include_code={cfg.include_code}, include_strategy={cfg.include_strategy})")
+        print(f"parent source              : {cfg.parent_source}  "
+              f"(current solution shown in the prompt: "
+              f"{'no' if cfg.parent_source == 'none' else 'yes'})")
         print(f"context solutions injected : {len(ctx_states)}  "
               f"(positives={len(selection.positives)}, negatives={len(selection.negatives)}, "
               f"n_context={cfg.n_context})")
@@ -771,7 +806,9 @@ class ICLRunner:
         print(f"total prompt chars         : {len(prompt)}  (~{approx_tokens} tokens @ 4 chars/tok)")
         if not ctx_states:
             print("\nNOTE: no context solutions yet — this is generation 0, so the buffer holds only")
-            print("the seed (which is the parent already shown above). Below is an ILLUSTRATIVE render")
+            print("the seed" + ("" if cfg.parent_source == "none" else
+                                " (which is the parent already shown above)")
+                  + ". Below is an ILLUSTRATIVE render")
             print("of what the context block will look like once the buffer has solutions:")
             print(build_context_block([parent], metric_name=spec.metric_name, maximize=spec.maximize,
                                       include_code=cfg.include_code, include_strategy=cfg.include_strategy))

@@ -115,7 +115,7 @@ import threading
 import time
 from pathlib import Path
 
-from envs.base import Environment
+from envs.base import Environment, objective_only_prompt
 from envs.kernel_prompt import TRIMUL_PROMPT
 from puct import State
 from sandbox.base_reward_evaluator import BaseRewardEvaluator
@@ -407,9 +407,13 @@ class _TrimulEnvBase(Environment):
 
     # --- Prompt zone 3: rules, then the parent to improve on (rendered LAST) ---
     def improvement_task(self) -> str:
-        state_ctx = self.initial_state.to_prompt(
-            TARGET_US, metric_name="runtime (microseconds)", maximize=False, language="python",
-        )
+        if self.show_parent_solution:
+            current = "--- Current kernel to improve upon ---\n" + self.initial_state.to_prompt(
+                TARGET_US, metric_name="runtime (microseconds)", maximize=False, language="python",
+            )
+        else:
+            current = objective_only_prompt(
+                TARGET_US, metric_name="runtime (microseconds)", maximize=False)
         # Rules copied from env.py:199-206, unchanged in wording apart from the hardware line. THREE
         # deliberate deviations from upstream, all matching what this project does elsewhere:
         #
@@ -433,8 +437,7 @@ Rules:
 - You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
 
---- Current kernel to improve upon ---
-{state_ctx}
+{current}
 
 Make sure to /think step by step, first give your strategy between <strategy> and </strategy> tags, then finally return the final program between ```python and ```.
 """

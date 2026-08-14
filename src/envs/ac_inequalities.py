@@ -2,7 +2,7 @@ import numpy as np
 from types import SimpleNamespace
 from typing import Any, Tuple
 
-from envs.base import Environment
+from envs.base import Environment, objective_only_prompt
 from sandbox import SandboxRewardEvaluator
 from puct import State
 
@@ -270,23 +270,42 @@ Your task is to generate the sequence of non-negative heights of a step function
         if state.construction:
             state_ctx += f"\nLength of the construction: {len(state.construction)}"
 
-        if self.problem_type == "ac1":
-            return f'''
-Your task is to write a search function, propose_candidate(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+        # `height_sequence_1` reaches the sandbox from the STATE, not from this text, so the note
+        # about it survives a no-parent run — only its "one of the constructions we have found so
+        # far" framing, which would be a lie when nothing has been found, is dropped.
+        if self.show_parent_solution:
+            start_note = ("You may want to start your search from one of the constructions we have "
+                          "found so far, which you can access through the 'height_sequence_1' global "
+                          "variable.\nHowever, you are encouraged to explore solutions that use other "
+                          "starting points to prevent getting stuck in a local minimum.")
+        else:
+            start_note = ("An initial sequence is available through the 'height_sequence_1' global "
+                          "variable. You may start your search from it or from any other starting "
+                          "point you like.")
 
-You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
-
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable.
-However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
-
-This is the current solution/search algorithm you should improve upon.
+        # The whole "here is the algorithm you should improve upon" framing, or its no-parent
+        # replacement.
+        if self.show_parent_solution:
+            current = f'''This is the current solution/search algorithm you should improve upon.
 
 --- Current solution to improve upon ---
 {state_ctx}
 
 
 Ideally, try to propose something different than the current solution. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc.
-Unless you make a meaningful improvement, you will not be rewarded.
+Unless you make a meaningful improvement, you will not be rewarded.'''
+        else:
+            current = objective_only_prompt(target, metric_name=metric_name, maximize=is_maximize)
+
+        if self.problem_type == "ac1":
+            return f'''
+Your task is to write a search function, propose_candidate(), that searches for the best sequence of coefficients. Your function will have {budget_s} seconds to run, and after that it has to have returned the best sequence it found. If after {budget_s} seconds it has not returned anything, it will be terminated with negative infinity points. All numbers in your sequence have to be positive or zero. Larger sequences with {budget_s}s of items often have better attack surface, but too large sequences with 100s of thousands of items may be too slow to search.
+
+You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
+
+{start_note}
+
+{current}
 
 Rules:
 - You must define the `propose_candidate` function as this is what will be invoked.
@@ -307,17 +326,9 @@ Your task is to write a search function, construct_function(), that searches for
 
 You may code up any search method you want, and you are allowed to call the evaluate_sequence() function as many times as you want. You have access to it, you don't need to code up the evaluate_sequence() function.
 
-You may want to start your search from one of the constructions we have found so far, which you can access through the 'height_sequence_1' global variable.
-However, you are encouraged to explore solutions that use other starting points to prevent getting stuck in a local minimum.
+{start_note}
 
-This is the current solution/search algorithm you should improve upon.
-
---- Current solution to improve upon ---
-{state_ctx}
-
-
-Ideally, try to propose something different than the current solution. Could be using different algorithmic ideas, adjusting your heuristics, adjusting / sweeping your hyperparemeters, etc.
-Unless you make a meaningful improvement, you will not be rewarded.
+{current}
 
 Rules:
 - You must define the `construct_function` function as this is what will be invoked.

@@ -246,6 +246,42 @@ class PUCTSampler(StateSampler):
         self._last_puct_stats = [(0, 0.0, 0.0, 0.0, 0.0) for _ in picked]
         return picked
 
+    def sample_best_states(self, num_states: int) -> list[State]:
+        """Return the buffer's single highest-value state, ``num_states`` times.
+
+        The **greedy** parent source: no exploration term, no lineage spreading, no visit counts —
+        every parent of every generation is best-so-far. It isolates the one thing PUCT adds over
+        hill-climbing (keeping under-visited and lower-scoring states alive), which ``puct`` vs
+        ``initial`` alone cannot separate: Best-of-N changes the parent AND removes all search.
+
+        The same object is returned for every slot on purpose. It IS one state, so its PUCT
+        bookkeeping (``_n`` / ``_m`` / ``_T``) should accumulate over all ``num_states`` groups, and
+        the tracker records the same ``parent_state_id`` for each — which is the truth of what was
+        prompted. Ties are broken by buffer order, i.e. the earliest solution to reach the value.
+
+        Consequence worth knowing: ``topk_children`` is applied PER PARENT, so a generation whose
+        parents are all one state contributes ``topk_children`` states to the buffer rather than
+        ``groups_per_batch * topk_children``. Best-so-far cannot be lost to that (the global best is
+        by definition the top child of its own parent, so it always survives the filter) and the
+        context pool is untouched — it takes every valid solution regardless of the buffer.
+        """
+        candidates = list(self._states)
+        if not candidates:
+            return self.sample_initial_states(num_states)
+        best = max(candidates, key=lambda s: (s.value if s.value is not None else float("-inf")))
+        picked = [best] * num_states
+        state_id_to_idx = {s.id: i for i, s in enumerate(self._states)}
+        self._last_sampled_states = picked
+        self._last_sampled_indices = [state_id_to_idx.get(best.id, -1)] * num_states
+        n = self._n.get(best.id, 0)
+        v = float(best.value) if best.value is not None else 0.0
+        # (n, Q, P, bonus, score): no PUCT score was computed, so the prior and the exploration bonus
+        # are 0 and score == Q. Recorded rather than left empty so events.jsonl keeps one shape.
+        self._last_puct_stats = [(n, self._m.get(best.id, v), 0.0, 0.0, self._m.get(best.id, v))] * num_states
+        if best.id in {s.id for s in self._initial_states}:
+            self._refresh_random_construction(best)
+        return picked
+
     def sample_states(self, num_states: int) -> list[State]:
         initial_ids = {s.id for s in self._initial_states}
         candidates = list(self._states)
