@@ -18,6 +18,8 @@ diff src/gpumode_local/reference/trimul_best.py discover/results/kernel-engineer
 | H100 | **1161 µs** | TTT-Discover's reported best |
 | A100 80GB **PCIe** (guadiana, GPU 1) | **2412 µs** | measured here 2026-08-10, `--mode leaderboard` |
 | A100 80GB **PCIe** (guadiana, GPU 1) | **2467 µs** | same card, `--mode benchmark`, mean of 3, spread 1.0 % |
+| H100 (Bosch, `batch_h100`) | *not yet measured* | run step 3 below before the first H100 sweep |
+| B200 (Bosch, `batch_b200`) | *not yet measured* | **no published number exists for this card** — step 3 below IS the yardstick for `trimul_b200` |
 
 **The mode is part of the number.** `leaderboard` is what TTT-Discover's search ran on and what the
 `trimul_a100` / `trimul_h100` environments now grade with; `benchmark` skips the 18-shape correctness
@@ -191,21 +193,42 @@ pip install "torch==2.7.1" --index-url https://download.pytorch.org/whl/cu128
 pip install pyyaml numpy
 ```
 
-- **`cu126` works identically** — `coding_agent_evolve/gpumode/requirements.txt` records that both
-  builds of torch 2.7.1 were *measured* to give the same timings on this task. cu128 matches the
-  official GPU-mode harness image, so prefer it. torch bundles its own CUDA runtime, so it does not
-  have to match `module load cuda/12.6.0`.
+- **`cu126` works identically on sm80/sm90 — but NOT on a B200.** `coding_agent_evolve/gpumode/
+  requirements.txt` records that both builds of torch 2.7.1 were *measured* to give the same timings
+  on this task, so on A100/H100/H200 the choice is free. Blackwell is different: `sm_100` gencode is
+  only emitted from CUDA 12.8, so the cu126 wheel's arch list stops at `sm_90` and cannot run on a
+  B200 at all. **Install cu128** — it also matches the official GPU-mode harness image. torch bundles
+  its own CUDA runtime, so it does not have to match `module load cuda/12.6.0`; conversely, do not put
+  a 12.6 toolkit on `PATH` for a B200 job and expect its `ptxas` to know `sm_100` (triton uses the one
+  inside the wheel, which is why the cu128 venv is self-sufficient).
 - **Do not install triton separately.** It ships with torch, and 2.7.1 provides exactly the 3.3.1 the
   harness pins. Installing it by hand is how you end up with a mismatched pair.
 
 ### Verify, still on the GPU node
 
 ```bash
-python -c "import torch, triton; print(torch.__version__, triton.__version__, torch.cuda.get_device_name(0))"
+python -c "import torch, triton; p = torch.cuda.get_device_properties(0); \
+print(torch.__version__, triton.__version__, torch.cuda.get_arch_list(), p.name, \
+p.shared_memory_per_block_optin)"
 ```
 
-Expect `2.7.1+cu128 3.3.1 NVIDIA A100-SXM4-...`. If `torch.cuda.is_available()` is False the driver is
-older than that build needs — reinstall from the `cu126` index.
+Expect `2.7.1+cu128 3.3.1 ['sm_75' ... 'sm_100', 'sm_120'] NVIDIA A100-SXM4-...`. If
+`torch.cuda.is_available()` is False the driver is older than that build needs — reinstall from the
+`cu126` index (only an option on sm80/sm90; see above).
+
+**The arch list is the part to read, not just the version.** The card's compute capability must appear
+in it — `sm_80` for an A100, `sm_90` for H100/H200, `sm_100` for a B200. `jobs/trimul_sweep.bsub`
+asserts exactly this against the card LSF granted (guard 1b), because a cu126 venv on a Blackwell node
+does not fail cleanly: it produces a wall of ptxas errors that read like bad candidates. Measured on a
+Bosch b200 node, 2026-08-17:
+
+```
+2.7.1+cu128 3.3.1 ['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120','compute_120'] NVIDIA B200 232448
+```
+
+That last number is `shared_memory_per_block_optin` — 232448 bytes, **identical to the H100's**, which
+is why `trimul_b200`'s rules line has no A100-style block-size cliff to warn about. `_HW_RULE_B200` in
+`envs/kernel_trimul.py` quotes it; re-measure before changing it.
 
 Then run step 3 from "Debugging a new GPU" above with
 `export KPY=~/venvs/kernel-eval/bin/python` — always naming the interpreter explicitly, never
@@ -228,15 +251,26 @@ cd ~/projects/phd/learning_evolve/src && mkdir -p jobs/logs
 SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
 ```
 
-The four Bosch sweep files already exist — `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml`
-(`trimul_h100`, the FP8 model the server job serves, no `trimul-eval-gpu`); the non-`_bosch` trimul
-yamls are guadiana's. Into a scratch copy, the job script rewrites `vllm-base-url` and
-`trimul-eval-python` (from `$KPY`, default `~/venvs/kernel-eval/bin/python`), and **deletes any
-`trimul-eval-gpu`** — LSF grants the job one GPU and announces it via `CUDA_VISIBLE_DEVICES`, with
-no guarantee it is index 0, so grading must inherit that assignment rather than name a card. It
-refuses to start if the venv is missing, triton isn't 3.3.1, or the problem doesn't match the
-queue's card. **Avoid `batch_b200`**: sm100 Blackwell predates torch 2.7.1 / triton 3.3.1, so it
-may not compile, and upgrading torch to fix that breaks comparability with every other number here.
+Eight Bosch sweep files exist, four per card:
+
+| files | problem | queue |
+|---|---|---|
+| `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml` | `trimul_h100` | `-q batch_h100` (the job's default) or `batch_h200` |
+| `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_b200.yaml` | `trimul_b200` | `-q batch_b200` — **must be passed explicitly** |
+
+The non-`_bosch` trimul yamls are guadiana's. Into a scratch copy, the job script rewrites
+`vllm-base-url` and `trimul-eval-python` (from `$KPY`, default `~/venvs/kernel-eval/bin/python`), and
+**deletes any `trimul-eval-gpu`** — LSF grants the job one GPU and announces it via
+`CUDA_VISIBLE_DEVICES`, with no guarantee it is index 0, so grading must inherit that assignment
+rather than name a card. It refuses to start if the venv is missing, triton isn't 3.3.1, the
+interpreter has no kernels for the granted card, or the problem doesn't match the queue.
+
+**On `batch_b200`, two things to know.** The pinned stack *does* run there (cu128 wheel — see above;
+an earlier version of this file wrongly said sm100 predates torch 2.7.1), and it is where GPUs are
+actually free: 20 hosts vs `batch_h100`'s 5. But triton 3.3.1's Blackwell support is
+first-generation — it compiles for sm100 without exposing tcgen05 MMA or the newer TMA descriptors, so
+the card will be understated — and B200 scores pool with **nothing**: `trimul_h100` is the arm that
+compares to TTT-Discover's 1161 µs. Use B200 for availability, not for fidelity.
 
 The vLLM server stays in its own job on another node, exactly as it does for the math sweeps; only
 grading has to be local to the card.
@@ -247,8 +281,14 @@ is not dependable. Pointing it at home would buy nothing and could silently fail
 
 ## Which problem to run on which card
 
-`trimul_a100` and `trimul_h100` differ **only** in the rules line naming the target GPU, but that line
-steers the model's block sizes: an H100-legal `BLOCK_H=128, BLOCK_K=64` wants 180 KB of shared memory
-and dies on the A100's 166912-byte limit. The first smoke run lost a candidate to exactly that. So
-match the problem to the card, and **never compare scores across architectures** — 2198 vs 1161 µs for
-the same kernel is the size of the effect.
+`trimul_a100`, `trimul_h100` and `trimul_b200` differ **only** in the rules line naming the target GPU,
+but that line steers the model's block sizes: an H100-legal `BLOCK_H=128, BLOCK_K=64` wants 180 KB of
+shared memory and dies on the A100's 166912-byte limit. The first smoke run lost a candidate to exactly
+that. So match the problem to the card, and **never compare scores across architectures** — 2198 vs
+1161 µs for the same kernel is the size of the effect.
+
+| card | problem | shared mem / block | notes |
+|---|---|---:|---|
+| A100 80GB | `trimul_a100` | 166912 | guadiana; the ceiling that makes this variant necessary |
+| H100 / H200 | `trimul_h100` | 232448 | TTT-Discover's verbatim line — the faithful baseline |
+| B200 | `trimul_b200` | 232448 | same ceiling as H100, so no block-size cliff; needs cu128 |

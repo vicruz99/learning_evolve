@@ -31,10 +31,11 @@ until it was made faithful -- skips the 18-shape gate entirely and checks correc
 so it scores kernels their search would have thrown away.
 
 What remains different is the machine, not the procedure: they timed on a Modal H100, we time on a
-local card. That is why ``trimul_a100`` exists and why scores never pool across architectures.
+local card. That is why ``trimul_a100`` and ``trimul_b200`` exist and why scores never pool across
+architectures.
 
-TWO PROBLEMS, ONE TASK: ``trimul_a100`` AND ``trimul_h100``
------------------------------------------------------------
+THREE PROBLEMS, ONE TASK: ``trimul_a100``, ``trimul_h100`` AND ``trimul_b200``
+-----------------------------------------------------------------------------
 The only difference is the single rules line naming the target card. It matters more than it looks:
 the prompt drives the model's block-size choices, and a config that is legal on an H100 (228 KB of
 shared memory) dies on an A100 (166 KB) with ``OutOfResources`` -- observed in the very first smoke
@@ -42,6 +43,28 @@ run. So ``trimul_h100`` keeps TTT-Discover's line verbatim (the faithful baselin
 ``trimul_a100`` names the A100 and its shared-memory ceiling instead. Everything else -- prompt body,
 target, reward scale, grader, task file -- is identical, so scores are comparable within an
 architecture and NOT across one.
+
+``trimul_b200`` is the third card, added because Bosch's ``batch_b200`` is where GPUs are actually
+free (20 hosts, vs 5 h100 hosts) -- see ``docs/BOSCH_CLUSTER.md`` §3-4. Two things are worth knowing
+before using it:
+
+* **The pinned stack does run on sm100, but only from the cu128 wheel.** ``torch==2.7.1`` was the
+  first release with Blackwell wheels and it bundles the triton 3.3.1 the prompt names, so NO version
+  change is needed -- but sm100 gencode is only emitted from CUDA 12.8. Measured 2026-08-17 on a
+  Bosch b200 node: ``~/venvs/kernel-eval`` reports ``2.7.1+cu128 3.3.1`` with arch list
+  ``[sm_75 ... sm_90, sm_100, sm_120]``. guadiana's grading venv is the **cu126** build, whose arch
+  list stops at ``sm_90``; that venv cannot grade on a B200 at all. ``jobs/trimul_sweep.bsub`` checks
+  the granted card's capability against the interpreter's arch list for exactly this reason.
+* **The shared-memory ceiling is the H100's, to the byte.** ``shared_memory_per_block_optin`` is
+  232448 on both, so unlike the A100 there is no block-size cliff between the two prompts. The rules
+  line still names it (see :data:`_HW_RULE_B200`): the model is told a different card, and a measured
+  number is cheaper than letting it guess an A100-like limit.
+
+Triton 3.3.1's Blackwell support is first-generation -- it compiles for sm100 but exposes none of the
+architecture's new machinery (tcgen05 MMA, the newer TMA descriptors). Expect B200 timings under this
+stack to understate the card, and watch the first generation's failures for ``unsupported`` /
+``target`` errors out of ptxas rather than ordinary wrong-answer rejections. Upgrading triton to fix
+that would break comparability with every other number in this project, so do not.
 
 THREE WAYS THIS DIFFERS FROM THE MATH ENVS
 ------------------------------------------
@@ -92,8 +115,8 @@ sweep key / CLI flag    environment fallback       meaning                      
 untouched, grade on whatever the environment grants). ``inherit`` is the ONLY correct setting inside
 a scheduler allocation -- an LSF job on Bosch holds one GPU and LSF says which via
 ``CUDA_VISIBLE_DEVICES``, so naming an index there overrides the assignment and can land the eval on
-another job's card. It is the default for ``trimul_h100``. Name an index only on an unscheduled box
-like guadiana, where it is how you keep grading off the vLLM server's card.
+another job's card. It is the default for ``trimul_h100`` and ``trimul_b200``. Name an index only on
+an unscheduled box like guadiana, where it is how you keep grading off the vLLM server's card.
 
 ``TRIMUL_LOCK_DIR`` is env-only on purpose: it must be identical for every process sharing a card, so
 pinning it per-run in a sweep file would be a way to defeat the guard rather than configure it. Set it
@@ -128,8 +151,10 @@ DEFAULT_EVALUATE_PY = REPO_ROOT / "coding_agent_evolve" / "gpumode" / "evaluate.
 DEFAULT_EVAL_PYTHON = "/scratch/vicstorage/learning_evolve/.venv/bin/python"
 
 # Reward scale and prompt target, straight from TTT-Discover (env.py:106-108, 191). The target is
-# aspirational and deliberately left at the upstream value on BOTH cards: the best published kernel
-# does 2198 us on an A100 and 1161 us on an H100, so 1000 us is out of reach either way.
+# aspirational and deliberately left at the upstream value on EVERY card: the best published kernel
+# does 2198 us on an A100 and 1161 us on an H100, so 1000 us is out of reach on both. A B200 might
+# get closer -- it is still left alone, because the reward (SCORE_SCALE / score_us) is unbounded and
+# nothing in the loop treats TARGET_US as a stopping condition; it is prompt text only.
 SCORE_SCALE = 1500.0
 TARGET_US = 1000
 
@@ -162,9 +187,9 @@ INHERIT_GPU = "inherit"
 
 # Which card each problem grades on unless TRIMUL_EVAL_GPU / the sweep key says otherwise.
 # trimul_a100 defaults to guadiana's card 1 (card 0 holds the vLLM server; nothing schedules GPUs
-# there, so naming an index is both safe and necessary). trimul_h100 runs on Bosch under LSF, so its
-# default is to inherit the scheduler's assignment.
-_DEFAULT_GPU = {"trimul_a100": "1", "trimul_h100": INHERIT_GPU}
+# there, so naming an index is both safe and necessary). trimul_h100 and trimul_b200 run on Bosch
+# under LSF, so their default is to inherit the scheduler's assignment.
+_DEFAULT_GPU = {"trimul_a100": "1", "trimul_h100": INHERIT_GPU, "trimul_b200": INHERIT_GPU}
 
 # Serialises access to the grading GPU WITHIN this process. Module-level on purpose: every
 # environment instance here contends for the same card, so a per-instance lock serialises nothing.
@@ -559,6 +584,19 @@ _HW_RULE_A100 = (
     "- The A100 allows at most 166912 bytes of shared memory per kernel launch, so block sizes or\n"
     "  num_stages needing more than that will fail to launch. There are no fp8 tensor cores."
 )
+# The B200 rewrite. Note what it does NOT say: the shared-memory ceiling is 232448 bytes, the SAME as
+# the H100's (measured 2026-08-17, `get_device_properties(0).shared_memory_per_block_optin` on a Bosch
+# b200 node), so there is no A100-style cliff between this prompt and _HW_RULE_H100 -- an H100-legal
+# block size is B200-legal. It is named anyway because the model is being told a different card and a
+# measured number beats letting it assume an A100-like limit. fp8 is mentioned because sm100 has the
+# tensor cores for it and the A100 rule's last sentence would otherwise carry over by analogy; no
+# claim is made about triton 3.3.1's sm100-specific instruction support, which is minimal (see the
+# module docstring) and not something a prompt line should assert.
+_HW_RULE_B200 = (
+    "- You must use trition 3.3.1 and these kernels will be run on an NVIDIA B200 (sm100, Blackwell).\n"
+    "- The B200 allows at most 232448 bytes of shared memory per kernel launch, so block sizes or\n"
+    "  num_stages needing more than that will fail to launch. It has fp8 tensor cores."
+)
 
 
 class _TrimulEnvBase(Environment):
@@ -631,3 +669,8 @@ class TrimulH100Env(_TrimulEnvBase):
 class TrimulA100Env(_TrimulEnvBase):
     """Same task, prompt retargeted at an A100 so candidates are not handicapped by the wrong card."""
     hardware_rule = _HW_RULE_A100
+
+
+class TrimulB200Env(_TrimulEnvBase):
+    """Same task, prompt retargeted at a B200 (sm100). Grade only on a cu128 interpreter."""
+    hardware_rule = _HW_RULE_B200

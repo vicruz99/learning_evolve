@@ -23,12 +23,32 @@
 #     KPY        grading interpreter                  (default ~/venvs/kernel-eval/bin/python;
 #                                                      creation: gpumode_local/reference/README.md)
 #     MAXPAR     override the sweep's max_parallel    (default: leave the yaml alone)
+#     RESUME=1   restart only what did not finish     (for the SECOND submission of a sweep too big
+#                                                      for one wall clock -- e.g.
+#                                                      sweeps/trimul_arms_qwen_b200.yaml. Complete
+#                                                      runs are skipped, partial ones restart from
+#                                                      generation 0 with the old dir kept as
+#                                                      stale_<ts>/. See docs/SWEEPS.md.)
 #
 # QUEUE <-> PROBLEM: this script checks them against each other and refuses a mismatch.
 #   batch_a100 -> trimul_a100        batch_h100 / batch_h200 -> trimul_h100
-#   batch_b200 is sm100 Blackwell, which torch 2.7.1 / triton 3.3.1 predates: not without
-#   re-baselining, and never pooled with sm80/sm90 scores.
-#   Override the queue at submit time when needed:  bsub -q batch_h200 < jobs/trimul_sweep.bsub
+#   batch_b200 -> trimul_b200        (sm100; needs the cu128 build of torch 2.7.1 -- guard 1b below
+#                                     proves it, and guadiana's cu126 venv would fail there)
+#   Scores are NEVER pooled across these three. Each card needs its own reference baseline first.
+#   Override the queue at submit time when needed:  bsub -q batch_b200 < jobs/trimul_sweep.bsub
+#
+# EXCLUSIVITY IS WORTH CHECKING ONCE, especially on batch_b200 (the busiest queue on the site).
+# `-gpu "num=1"` below does not by itself promise nobody else gets this card -- the effective
+# j_exclusive comes from the site's lsb.params. A shared card is the one failure that leaves no trace
+# in the logs: eval.py's convergence rule (rel. err < 0.1 %) can never be met, so every benchmark
+# burns its full rep budget and the timings are junk. The per-card flock cannot help, since it only
+# serialises processes that see the same CUDA_VISIBLE_DEVICES, not another job on the same physical
+# GPU. Check the "Combined" GPU requirement on a live job:
+#     bjobs -l <jobid> | tr -d '\n ' | grep -o 'gpu[^>]*'
+# and if it does not say j_exclusive=yes, submit with:
+#     bsub -gpu "num=1:j_exclusive=yes" < jobs/trimul_sweep.bsub
+# (left off the #BSUB line on purpose: it is a scheduling change that can lengthen pend time, and it
+#  should be a decision you make knowing what the site's default already is.)
 #
 # SIZING: -n 4 is deliberate. The driver only talks to vLLM and runs ONE grading subprocess at a
 # time (the per-card flock serialises everything), so cores beyond a handful are pure queue wait.
@@ -62,7 +82,8 @@ source .venv/bin/activate
 SWEEP="${SWEEP:-}"
 if [[ -z "$SWEEP" ]]; then
     echo "[job] ERROR: set SWEEP=<file>. On this cluster use the ready-made Bosch ports:"           >&2
-    echo "      sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml"                              >&2
+    echo "      sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml   (H100, -q batch_h100)"      >&2
+    echo "      sweeps/trimul_{bon,puct,ctx,strategy}_qwen_b200.yaml    (B200, -q batch_b200)"      >&2
     echo "      (the non-_bosch trimul yamls are guadiana's: trimul_a100, guadiana paths)."         >&2
     exit 1
 fi
@@ -91,6 +112,33 @@ if ! "$KPY" -c "import triton, sys; sys.exit(triton.__version__ != '3.3.1')"; th
 fi
 
 # ---------------------------------------------------------------------------------------------
+# Guard 1b: the interpreter can actually generate code for THIS node's card. The version check
+# above does not cover it -- torch 2.7.1 exists as a cu126 build (arch list stops at sm_90) and a
+# cu128 build (adds sm_100/sm_120), and only the second can run on a B200. Getting this wrong on a
+# Blackwell node does not produce a clean "unsupported card" message; it produces a wall of ptxas
+# failures that read like bad candidates. Cheap, general, and it also catches the reverse mistake.
+# ---------------------------------------------------------------------------------------------
+if ! "$KPY" - <<'PY'
+import sys, torch
+if not torch.cuda.is_available():
+    print("[job] ERROR: the grading interpreter sees no GPU (CUDA_VISIBLE_DEVICES="
+          f"{__import__('os').environ.get('CUDA_VISIBLE_DEVICES', 'unset')})", file=sys.stderr)
+    sys.exit(1)
+major, minor = torch.cuda.get_device_capability(0)
+want, archs = f"sm_{major}{minor}", torch.cuda.get_arch_list()
+print(f"[job] card: {torch.cuda.get_device_name(0)} ({want}), "
+      f"shared-mem/block {torch.cuda.get_device_properties(0).shared_memory_per_block_optin} B")
+if want not in archs:
+    print(f"[job] ERROR: {torch.__version__} has no {want} kernels (arch list: {archs}). "
+          "Reinstall the grading venv from the cu128 index -- see "
+          "gpumode_local/reference/README.md.", file=sys.stderr)
+    sys.exit(1)
+PY
+then
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------------------------
 # Guard 2: the sweep's problem matches this job's queue. An H100-prompted run graded on an A100
 # (or vice versa) produces scores that look fine and compare with nothing.
 # ---------------------------------------------------------------------------------------------
@@ -111,6 +159,7 @@ fi
 case "${LSB_QUEUE:-}" in
     batch_a100)            WANT=trimul_a100 ;;
     batch_h100|batch_h200) WANT=trimul_h100 ;;
+    batch_b200)            WANT=trimul_b200 ;;
     *) echo "[job] WARNING: queue '${LSB_QUEUE:-?}' has no trimul mapping -- check the card yourself"; WANT="" ;;
 esac
 if [[ -n "$WANT" && "$PROBLEM" != "$WANT" ]]; then
@@ -160,6 +209,23 @@ SWEEP="$SWEEP_RUN"
 # ---------------------------------------------------------------------------------------------
 ARGS=(--ray-head skip)
 [[ -n "${MAXPAR:-}" ]] && ARGS+=(--max-parallel "$MAXPAR")
+
+# RESUME=1: continue a sweep a previous job did not finish. --resume takes the SWEEP DIRECTORY, which
+# run_sweep derives from `sweep.name` in the yaml (runs/<name>), so read the name rather than making
+# the caller repeat it. Parsed, not grepped, for the same reason the problem is (comments discuss
+# other names). Refuses if the dir is absent: without it --resume has nothing to resume and the
+# mistake -- a typo, or a --sweep-dir used on the first submission -- is better caught here than as a
+# fresh 30 h sweep silently starting from zero.
+if [[ -n "${RESUME:-}" ]]; then
+    SWEEP_NAME=$(python -c "import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))['sweep']['name'])" "$SWEEP")
+    if [[ -z "$SWEEP_NAME" || ! -d "runs/$SWEEP_NAME" ]]; then
+        echo "[job] ERROR: RESUME=1 but runs/${SWEEP_NAME:-?} does not exist. Nothing to resume." >&2
+        echo "      Drop RESUME to start it fresh, or pass --sweep-dir by hand if it lives elsewhere." >&2
+        exit 1
+    fi
+    ARGS+=(--resume "runs/$SWEEP_NAME")
+    echo "[job] RESUME: only runs that did not complete in runs/$SWEEP_NAME will be relaunched"
+fi
 
 echo "[job] python run_sweep.py $SWEEP ${ARGS[*]}"
 python run_sweep.py "$SWEEP" "${ARGS[@]}"

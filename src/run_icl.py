@@ -138,15 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trimul-eval-python", default=None, metavar="PATH",
                    help="Interpreter that runs the kernel harness (needs torch 2.7.1 / triton 3.3.1, "
                         "which the ICL venv does NOT have). Keep it a separate venv: the pin is a "
-                        "measurement dependency. Env fallback: TRIMUL_EVAL_PYTHON.")
+                        "measurement dependency. For trimul_b200 it must be the cu128 build of that "
+                        "same torch -- cu126 emits no sm100 code. Env fallback: TRIMUL_EVAL_PYTHON.")
     p.add_argument("--trimul-eval-gpu", default=None, metavar="IDX",
                    help="Card index for the eval, or 'inherit' to leave CUDA_VISIBLE_DEVICES alone "
                         "and grade on whatever the environment grants. Under a scheduler (LSF) use "
                         "inherit -- an index overrides the scheduler's assignment and can grade on "
                         "another job's GPU. On an unscheduled box name a card nothing else is using "
                         "-- a contended GPU makes every timing meaningless. Defaults: trimul_a100 "
-                        "-> 1 (guadiana), trimul_h100 -> inherit (Bosch). Env fallback: "
-                        "TRIMUL_EVAL_GPU.")
+                        "-> 1 (guadiana), trimul_h100 / trimul_b200 -> inherit (Bosch). Env "
+                        "fallback: TRIMUL_EVAL_GPU.")
     p.add_argument("--trimul-evaluate-py", default=None, metavar="PATH",
                    help="Path to coding_agent_evolve/gpumode/evaluate.py. Env: TRIMUL_EVALUATE_PY.")
     p.add_argument("--trimul-eval-mode", default=None, choices=["test", "benchmark", "leaderboard"],

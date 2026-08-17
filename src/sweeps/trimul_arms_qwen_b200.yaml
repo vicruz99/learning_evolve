@@ -1,0 +1,130 @@
+# =================================================================================================
+# TRIMUL ON B200 -- FIVE ARMS x 2 SEEDS IN ONE FILE. Bosch, batch_b200, via LSF.
+#
+# Self-contained version of the four-file campaign (sweeps/trimul_{bon,puct,ctx,strategy}_qwen_*.yaml)
+# on the card that actually has free hosts. Every arm is 160 candidates, so all ten runs are directly
+# comparable; the ONLY thing that varies is how past experience reaches the model:
+#
+#   bon         parent-source initial, n-context 0   NO past experience at all (the floor)
+#   puct        parent-source puct,    n-context 0   past experience ONLY via parent choice
+#   n05_best    + n-context 5,  strategy best        the 5 fastest kernels' source in the prompt
+#   n05_random  + n-context 5,  strategy random      CONTROL for the line above -- see below
+#   n10_best    + n-context 10, strategy best        does doubling the examples buy anything?
+#
+# n05_random IS NOT OPTIONAL. It separates "having examples" from "choosing well": if n05_best beats
+# puct but n05_random beats it too, the win is example-count, not selection. Dropping it makes the
+# best/random contrast uninterpretable, so if something has to go, drop n10_best (which is why the
+# run order below ends each seed with it).
+#
+# THE CARD: problem trimul_b200 on every run.
+#   * Prompt names the B200 and its 232448-byte shared-memory ceiling (measured; same as the H100's,
+#     so no A100-style block-size cliff). See envs/kernel_trimul.py.
+#   * REQUIRES the cu128 build of torch 2.7.1 -- version pin unchanged (2.7.1 / triton 3.3.1), but
+#     sm100 gencode only comes from CUDA 12.8. ~/venvs/kernel-eval is verified cu128; guard 1b in
+#     jobs/trimul_sweep.bsub re-checks it against the granted card every launch.
+#   * These scores pool with NOTHING -- not the H100 runs (trimul_h100 is the arm that compares to
+#     TTT-Discover's 1161 us), not the A100 ones. Record the reference kernel's B200 baseline first
+#     (gpumode_local/reference/README.md step 3, --repeats 5): on this card that measurement IS the
+#     yardstick, since no published B200 number exists.
+#   * Triton 3.3.1's Blackwell support is first-generation (no tcgen05 MMA, no newer TMA), so the card
+#     will be understated. In generation 0, check failures are ordinary wrong-answer/compile
+#     rejections and not ptxas 'unsupported'/'target' errors -- the latter would mean the stack.
+#
+# WHY n-context 10 IS SAFE HERE (it is NOT safe on the math problems, and the guadiana file says so)
+#   `build_context_block` SILENTLY TRIMS the block to fit max-context-tokens, keeping >= 1 solution --
+#   so if it fires, "n-context 10" is a fiction and the n05-vs-n10 axis measures nothing. Measured on
+#   the Bosch H100 pilot (runs/trimul/h100_s1_{bon,puct}, 307 valid kernels): p50 5.7 kB, p90 7.7 kB,
+#   max 22.6 kB per kernel, and the top-10-by-score block is 55-65 kB = ~14-22 k tokens. Against
+#   max-context-tokens 40000 that is ~2x headroom, so 40000 is kept (same budget as every other
+#   trimul file, so the packing budget is not a confound). The guadiana file's warning that n10 "can
+#   reach 41 k" was scaled from TTT-Discover's published 16.4 kB kernel -- 3x our measured median.
+#   >>> STILL VERIFY, do not assume: icl.log prints `context=k/N` per parent. If k < N in the later
+#       generations, trimming is happening and n05_best/n10_best are no longer a clean pair.
+#   >>> ALSO EXPECT k << N EARLY. The pool is built from previous generations' VALID candidates and
+#       trimul's valid rate is low -- the pilot ran 3-16 valid per 32 (~10-50 %) -- so generation 0 has
+#       an empty pool and the ctx arms only become themselves after a few generations.
+#
+# COST -- READ BEFORE SUBMITTING: THIS FILE DOES NOT FIT ONE 24 h JOB.
+#   Pilot wall per 32 candidates: median ~23 min, range 14-52 (Bosch H100, 4x8 shape, leaderboard
+#   grading). 160 candidates/run is therefore ~2 h at the median and ~3-4 h for the ctx arms, whose
+#   prompts carry 14-22 k extra tokens of prefill. Ten runs, one at a time:
+#
+#       seed 1 (5 runs)   ~10-15 h        <- fits, and is a complete 5-arm comparison on its own
+#       both seeds        ~20-30 h        <- against the job's -W 24:00 (and the queue's RUNLIMIT)
+#
+#   So runs are SEED-MAJOR: a wall-clock kill leaves seed 1 whole rather than five half-finished arms.
+#   Plan on two submissions -- the second with RESUME=1, which restarts only what did not complete
+#   (docs/SWEEPS.md). Eval cost itself is small and NOT the constraint: pilot eval_p50 was 8-11 s
+#   (dominated by fast failures) with eval_p90 18-30 s; decode is the bulk of the wall.
+#
+# SUBMIT (never from the login node -- docs/BOSCH_CLUSTER.md)
+#   cd ~/projects/phd/learning_evolve/src && mkdir -p jobs/logs
+#   bsub < jobs/vllm_server.bsub                       # once, if not already up
+#   SWEEP=sweeps/trimul_arms_qwen_b200.yaml bsub -q batch_b200 < jobs/trimul_sweep.bsub
+#                                                ^^^^^^^^^^^^ REQUIRED: the job defaults to
+#                                                batch_h100 and refuses trimul_b200 there.
+#   # after a wall-clock kill, same line plus:
+#   SWEEP=... RESUME=1 bsub -q batch_b200 < jobs/trimul_sweep.bsub
+#   python run_sweep.py --status runs/trimul_arms_qwen_b200      # from an interactive shell
+# =================================================================================================
+
+sweep:
+  name: trimul_arms_qwen_b200
+  max_parallel: 1                # matches every other trimul file: grading is a serial per-card
+                                 # queue, so a second run only adds contention for the flock. Raising
+                                 # it to 2 WOULD overlap one run's decode with another's grading (the
+                                 # flock keeps the timings themselves valid either way) and could cut
+                                 # the wall meaningfully -- but re-derive the KV budget from the
+                                 # server's own report first, per note 3 of trimul_bon_qwen.yaml.
+  stagger: 180                   # keeps generation barriers out of phase across runs
+  server_max_num_seqs: 256
+
+common:
+  # --- model / server (URL is rewritten by jobs/trimul_sweep.bsub from jobs/vllm_host.txt) --------
+  model: Qwen/Qwen3.6-27B-FP8
+  vllm-base-url: http://localhost:8001/v1
+  reasoning-effort: none
+  thinking-token-budget: 11000
+
+  # --- token budgets (identical across arms: the comparison is representation, not budget) --------
+  max-tokens: 34000
+  max-context-tokens: 40000      # see "WHY n-context 10 IS SAFE HERE" above -- measured, not assumed
+  temperature: 1.0
+
+  # --- execution ---------------------------------------------------------------------------------
+  save-reasoning: false
+  num-cpus-per-task: 1           # nominal only: no CPU group is taken, grading is the GPU lock
+
+  # --- grading (no trimul-eval-gpu ON PURPOSE: LSF grants one card and names it via ----------------
+  #     CUDA_VISIBLE_DEVICES with no guarantee it is index 0, so trimul_b200's "inherit" default is
+  #     the only safe setting. Naming an index here can grade on another job's GPU.)
+  trimul-eval-python: ~/venvs/kernel-eval/bin/python     # MUST be the cu128 build -- see header
+  trimul-eval-mode: leaderboard  # the mode that guided TTT-Discover's search; part of the number
+
+  # --- search shape: the PUCT default. The two bon runs override it below ------------------------
+  parent-source: puct
+  n-context: 0                   # the ctx arms override this; bon/puct keep it
+  groups-per-batch: 2
+  group-size: 16                 # 2 x 16 = 32 candidates/generation
+  num-generations: 5             # 160 candidates/run -- equal across ALL ten runs
+  max-gen-concurrency: 1
+
+runs:
+  # SEED-MAJOR (see COST above). Within a seed: floor, parent-choice-only, then the context arms with
+  # the best/random pair BEFORE n10 -- so a run lost to the wall clock costs the 5-vs-10 axis, not the
+  # selection contrast.
+  #
+  # bon overrides the shape, not the budget: 10 x 16 x 1 generation = the same 160 candidates, drawn
+  # from the initial state with no barrier (there is nothing to select between, so generations would
+  # only serialise it).
+  - {name: b200_s1_bon,        problem: trimul_b200, seed: 1, parent-source: initial, groups-per-batch: 10, num-generations: 1}
+  - {name: b200_s1_puct,       problem: trimul_b200, seed: 1}
+  - {name: b200_s1_n05_best,   problem: trimul_b200, seed: 1, n-context: 5,  context-strategy: best,   include-code: true}
+  - {name: b200_s1_n05_random, problem: trimul_b200, seed: 1, n-context: 5,  context-strategy: random, include-code: true}
+  - {name: b200_s1_n10_best,   problem: trimul_b200, seed: 1, n-context: 10, context-strategy: best,   include-code: true}
+
+  - {name: b200_s2_bon,        problem: trimul_b200, seed: 2, parent-source: initial, groups-per-batch: 10, num-generations: 1}
+  - {name: b200_s2_puct,       problem: trimul_b200, seed: 2}
+  - {name: b200_s2_n05_best,   problem: trimul_b200, seed: 2, n-context: 5,  context-strategy: best,   include-code: true}
+  - {name: b200_s2_n05_random, problem: trimul_b200, seed: 2, n-context: 5,  context-strategy: random, include-code: true}
+  - {name: b200_s2_n10_best,   problem: trimul_b200, seed: 2, n-context: 10, context-strategy: best,   include-code: true}

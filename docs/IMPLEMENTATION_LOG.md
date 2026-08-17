@@ -1165,3 +1165,353 @@ the cap can be read off a real distribution).
 forgiven), `tests/test_resume.py` +2 (a barren run is never complete; a run with any yield is judged
 normally), `tests/test_sweep.py` +3 (the budget warning, its silence with headroom, and its silence
 when the server reports no window). 142 pass.
+
+---
+
+## 2026-08-10 — ShinkaEvolve baseline: budget-matched AC1/AC2/Erdős runs on local qwen
+
+The "parallel task" from EXPERIMENT_PLAN §1: run ShinkaEvolve on the same problems, same initial
+solutions, same model, at a comparable budget to the ICL runs. The task ports already existed —
+`ShinkaEvolve/examples/ttt_discover_math/` (untracked, 2026-07-20) holds faithful ports of all five
+TTT-Discover problems — so this session was about parity gaps, run configs, and the launch story.
+
+**Budget mapping.** Shinka is steady-state: one generation = one parent (+ ~2 in-prompt
+inspirations) → ONE new candidate, evaluated and inserted before the next selection. There is no
+6×16 fan-out; its only batching is `max_proposal_jobs` in-flight steps against a slightly stale DB.
+So "same number of tried solutions" = `num_generations: 2400` (= ICL's 6 parents × 16 children × 25
+generations), with every search knob left at Shinka's own defaults (decision with Vic). New per-problem
+configs: `examples/ttt_discover_math/{ac1,ac2,erdos_min_overlap}/shinka_qwen.yaml` — single model
+`local/Qwen/Qwen3.6-27B-FP8@<the problem's ICL vLLM server>`, temp 1.0, `max_tokens` 34000,
+`thinking_token_budget` 12000, bandit/embeddings/novelty-judge/meta-scratchpad/prompt-evolution all
+off → mutation calls are the ONLY LLM traffic (ground truth per call in
+`gen_*/attempts/**/metadata.json`). `max_api_costs: null` because local models price at 0.0 — the
+cost cap can never fire; generations are the only stop rule.
+
+**Patches to the Shinka clone (user-approved).** (1) The local-OpenAI provider only ever sent
+`temperature` + `max_tokens` — no path for vLLM's `thinking_token_budget`, which the ICL runs rely
+on. `llm_kwargs` now accepts `extra_body`, threaded `LLMClient`/`AsyncLLMClient` →
+`sample_model_kwargs` → `chat.completions.create` (7 call sites; merges over the deepseek branch's
+own extra_body). (2) `local_openai.py` reads `reasoning` as a fallback for `reasoning_content` —
+vLLM ≥0.26 renamed the field (same fix `vllm_client._reasoning_of` already has; confirmed live:
+0.26 enforces budget=64 → 69 completion tokens, but serves the trace under the new name).
+(3) erdos port seeded `initial_h_values` with 0 while `src/envs/erdos_min_overlap.py` pins 12345 —
+now 12345; verified byte-identical 81-point construction, C₅ = 0.4939862931508411 both sides.
+
+**Env.** New `ShinkaEvolve/.venv` (same uv 3.12.12 base as `src/.venv`), shinka editable +
+scipy/cvxpy/tqdm. `src/.venv` deliberately untouched. Needs `LOCAL_OPENAI_API_KEY=local` and
+`SHINKA_PRICING_MODE=offline`.
+
+**Verified on guadiana** against a live Qwen3.6-27B vLLM (port 8001): all three evaluators validate
+their seed programs (`correct: true`); a 2-generation AC1 run end-to-end (proposal → diff patch →
+eval → DB, first-attempt patch success); config objects construct for all three problems; and
+**resume works** — rerunning with the same `--results_dir` logged `RESUMING PREVIOUS` and continued
+at gen 2. One artifact: each resume re-inserts the initial program (duplicate gen-0 DB row);
+harmless for search, but don't double-count it in analysis.
+
+**Launch story (Bosch).** `src/jobs/shinka_run.bsub`, one job per problem × replicate
+(`PROBLEM=ac1|ac2|erdos_min_overlap REP=r1..r3 bsub < jobs/shinka_run.bsub`), 3 replicates each,
+same servers as the ICL sweeps. At Shinka-default `max_evaluation_jobs: 5` a run sustains ~410
+generations/24h (evals bound it: 5 × 86400 / ~1050s), so a 2400-gen run spans ~6 wall-clock windows —
+resubmit the same job to resume. If one-window runs are wanted, `max_evaluation_jobs` ~30 is the
+infra knob (with `-n` ≈ 2×that + 4); it is not a search-behavior knob, though it does increase eval
+staleness. `run_evo.py` gained `--results_dir` for per-replicate dirs. Also documented in
+`examples/ttt_discover_math/README.md`.
+
+**Before first launch on Bosch:** run the sweep-header curl check against each server to confirm
+the thinking cap is live there too (`ac1_qwen.yaml` header has it) — a silent no-op is the failure
+mode, and the guadiana check does not vouch for the Bosch builds.
+
+**Follow-up (same day) — parity audit + embeddings + meta variant.** Four asks: timeout parity,
+prompt parity, "is 2400 generations right?", and turning embeddings + a meta-scratchpad arm on.
+(1) *Timeouts*: the yamls' `job_time: "00:20:00"` (1200s) did NOT match the ICL sandbox's 1100s
+hard kill (`src/envs/registry.py`: ac1/ac2/erdos all 1100) — now `"00:18:20"`; `eval_budget_s`
+stays 1000 (= the budget both prompts promise). (2) *Prompts*: re-diffed all three
+`search_task_sys_msg` against `src/envs/{ac_inequalities,erdos_min_overlap}.py` — domain content
+(opening line, verbatim eval function, literature paragraph, ~1000s budget, target, seed-global
+hint, 2-CPU guidance) matches; only TTT harness-mechanics (entrypoint-name rule, no-lambdas/IO,
+return fences) are swapped for Shinka's own patch-format instructions, which is inherent to the
+baseline. Structural (unavoidable) difference: ICL sends ONE user message with the full context
+block; Shinka splits task→system msg, parent+inspirations+diff instructions→user msg.
+(3) *Generation semantics re-confirmed*: `async_runner.py::_generate_evolved_proposal` samples
+1 parent + inspirations → ONE proposal → one eval per generation; Shinka's own examples run
+10–200 gens, so 2400 is ~12× their largest — that is the equal-candidates choice, not a
+misreading. (4) *Embeddings*: Shinka's default gate (`text-embedding-3-small`, sim 0.99,
+`max_novelty_attempts: 3` restored) needs an OpenAI key we don't have → serve
+`Qwen/Qwen3-Embedding-0.6B` locally (`jobs/vllm_embed.bsub`, port 8003, publishes
+`jobs/vllm_embed_host.txt`); `run_evo.py` gained `--embedding_model` and `shinka_run.bsub` wires
+the host in automatically (fails early if the host file is missing). Embed failures degrade
+gracefully (`get_code_embedding_async` catches everything, logs "Error generating code
+embedding", returns None) — verified with a 2-gen smoke against a dead port. (5) *Meta arm*:
+`shinka_qwen_meta.yaml` per problem = base + `meta_rec_interval: 10` (Shinka default cadence) +
+same local model/sampling for `meta_llm_models`/`meta_llm_kwargs` (extra_body reaches it via the
+same patch). Launch matrix: r1–r3 base + meta_r1 per problem = 12 jobs + 1 embed server.
+
+**2026-08-11 — Shinka baseline: seed programs made byte-identical to the ICL prompts.** Audit of
+"is the initial program the same?": the constructions already matched exactly (ac1/ac2
+`height_sequence_1`: 6520 entries, numerically identical to `create_initial_state("ac1")`; erdos
+81 points, seed 12345). The seed *code* did not: the ac2 EVOLVE-BLOCK was a cleaned-up copy of
+`thetaevolve_initial_program_prev_init` (explanatory comments/docstrings stripped, `tqdm`/`typing`
+imports dropped, `×`→`x`, PEP8 spacing) — information the ICL model sees in its first prompt —
+and ac1 had `except:`→`except Exception:` plus imports hoisted out of the block. Both
+EVOLVE-BLOCKs are now spliced byte-identical to the exact text the ICL first prompt shows
+(verified `block == seed`); ac1 seed re-evaluated valid (upper_bound 2.0 at 20s budget), ac2
+module imports (tqdm is in ShinkaEvolve/.venv). Remaining inherent differences: erdos has NO seed
+program in ICL (construction only) while Shinka needs a gen-0 program (minimal `run` returning the
+construction, scoring its C5); and Shinka's program file exposes the fixed evaluator source next
+to the seed — same text the ac1/ac2 prompts already contain, but for erdos it reveals verifier
+internals (atol 1e-4) the ICL prompt doesn't. Same day, runtime knobs: `code_embed_sim_threshold
+0.96` (nomic-embed scores near-identical code ~0.93, so Shinka's 0.99 never fires) and
+`numeric_threads_per_job: 2` (Shinka local evals are NOT thread-capped by default — each eval's
+BLAS would take all 96 cores) in all six yamls; embeddings now via the user's CPU ollama
+(`local/nomic-embed-text:latest@http://localhost:11434/v1`, verified through shinka's embed
+client); concurrency guidance: ≤6 runs at once (RUNS.md).
+
+**2026-08-12 — Shinka meta runs launched; first-hour health check found two faults.** The three
+meta_r1 runs (ac1/ac2/erdos, attached tee launches) came up healthy on the LLM side: proposals
+flowing, diffs applying, evals launching under the 2-thread cap, meta scratchpad dir created,
+~20 gens/hour → ~5 days to 2400. Fault 1: ac1 had TWO run_evo processes on the SAME results dir
+— a leftover detached nohup launch (22:52, orphaned to init) plus the real attached one (22:55).
+Each numbers generations independently, so both write the same gen_N paths (dirs reached gen_50
+while the attached DB said gen 42): ac1_qwen_meta_r1 is contaminated and must be killed, wiped,
+and relaunched. RUNS.md launch templates are now attached-only (tee, no nohup/&) with a warning.
+Fault 2: the duplicate-gate embeddings were failing on virtually every proposal — ollama
+nomic-embed-text hard-rejects inputs past its 2048-token GGUF context (400 "input length exceeds
+the context length"; measured: 5500 chars OK, 6000 fails) while Shinka truncates code to 10000
+chars before embedding and proposals run 10-25k chars. Since embed failures silently skip the
+gate, the gate was effectively OFF. Patched shinka/edit/async_apply.py::get_code_embedding_async
+max_chars 10000→5000 (gate now compares 5k-char prefixes); running processes keep the old code
+until restarted — restart-fresh recommended while runs are young (<40 gens).
+
+**2026-08-12 (later) — Shinka premature-timeout bug: eval kill clock started at proposal time.**
+Failure triage of the first-hour meta runs (user asked: our fault or bad solutions?). Genuine
+bad proposals dominate: ac2 11/35 died on program bugs (NameError time/construct_function, shape
+mismatches, list.astype), erdos 17/35 (same churn plus verifier rejections: reported-C5 mismatch,
+h(x) leaving [0,1] — two by 1e-5/1e-16 float near-misses, same knife-edge as the TTT verifier).
+But ac2 also had 10 and erdos 5 no-verdict deaths: scheduler killed evals claiming "exceeded
+00:18:20" after only 0-730s of eval. Root cause: async_runner.py built AsyncRunningJob with
+start_time=proposal_started_at, and scheduler.check_job_status measures the 1100s job_time from
+start_time — so LLM proposal latency (5-18+ min with 5 concurrent proposals on the shared GPU)
+was charged against the eval budget; some evals died seconds after launch (ac2 gen8 ~0s, erdos
+gen13/16/21 <10s). This both under-scores the arm vs ICL (which gives programs the full 1000s
+from eval start) and selects for fast-returning programs. Patched: start_time now
+evaluation_started_at or evaluation_submitted_at (shinka/core/async_runner.py:2916, syntax-
+checked). All four processes (incl. the ac1 orphan) killed; all three results dirs must be
+wiped before relaunch so runs restart on patched code with working embeddings.
+
+---
+
+## 2026-08-12 (later) — `baselines_analysis.ipynb`: live Shinka + coding-agent compilation
+
+New `src/notebooks/baselines_analysis.ipynb`, built to be **re-run as the Shinka runs advance**:
+every loader re-parses from disk (SQLite opened `file:...?mode=ro` — URI read-only is WAL-aware,
+which matters because the runs are live and ~50 MB sits uncommitted in the `-wal`). Sections:
+Shinka status/curves, eval-fidelity audit, coding-agent erdos runs, an erdos cross-method panel,
+and a stub that auto-loads the ICL runs from `src/runs/` via `results.analysis` once they are
+copied over from the other server.
+
+**Loader facts worth keeping.** Shinka's `combined_score` is maximize-everywhere: `1/upper_bound`
+(ac1), `lower_bound` (ac2), `1/c5_bound` (erdos); the raw metric is in `public_metrics`. Every
+resume re-inserts a duplicate gen-0 row (drop it). Per-eval timing lives in the `metadata` blob
+(`evaluation_seconds` = wall) and `gen_N/results/metrics.json` (`execution_time_mean` = the
+program's own timer, ≤ its 1000s budget). Hard kills are only in `evolution_run.log`
+(`"exceeded timeout ... => Gen. N"`); `generation_event_log`/`attempt_log` tables are empty.
+`best_raw` needs `.ffill()` after `cummin/cummax` — invalid rows otherwise leave NaN.
+
+**Eval-fidelity answer (the "did evals get their time?" question), at ~150-190/2400 gens:** the
+premature-timeout bug is confirmed gone (no killed eval died early). 9-12 hard kills per run
+(5-8% of gens), but **most killed programs had already written metrics.json** after their
+self-budgeted ~1000s — true losses are 1 (ac1), 2 (ac2), 1 (erdos); starved evals (hit the 1100s
+wall with <90% of the promised budget self-reported, i.e. CPU-overhead inflation) are 5/3/3 —
+**~2-3% of evals**. Median wall-vs-self-timer overhead is small. Verdict: timeouts/overhead are
+NOT materially distorting these Shinka runs so far.
+
+**Coding-agent audit.** Erdos: analyzable. run3 is the only clean series (`results/ledger.jsonl`,
+356 timestamped attempts, nothing downloaded, 0.3816 → 0.3808795 in 6h). run1/run2 warm-started
+from published vectors (einsteinarena API / seeds/), so their 0.3808586/0.3808585 finals are not
+method results; loaders exclude direct downloads but descendants are still contaminated. run1/2
+timestamps are file **mtimes** — the loader snapshots them to `_mtime_snapshot.json` in each run
+dir on first execution (done), so a future non-preserving copy can't destroy the series.
+**TriMul: dead** — the agent run folders (`/scratch/vicstorage/kernel_runs/{run1,run2}`) were
+deleted and never committed; only the harness + 5 untimed variants survive. Needs a re-run.
+
+---
+
+## 2026-08-12 (evening) — `icl_results.ipynb`: the ICL campaign compiled for the supervisor meeting
+
+The ICL runs arrived in `src/runs/{ac1,ac2,erdos}/` (44 runs, 101,440 candidates; 1-3 seeds per
+arm, some still `running`/`aborted` — `runs_compilation.md` is Vic's own inventory). New
+`src/notebooks/icl_results.ipynb`, re-runnable like `baselines_analysis.ipynb`: run matrix,
+per-problem final-best dot plots (incomplete runs faded/open + generation count), evolution
+panels (best-so-far vs k + per-generation median valid-proposal score), paired n5-vs-n10 slope
+chart, overlay vs Shinka (same model/budget unit) + coding-agent run3 line on erdos, and a
+per-run health table. Exports `icl_*.png` next to the notebook.
+
+**Gotchas encoded in the loaders:** `analysis._arm_of` cannot tell BoN from PUCT (both
+`n_context=0`) — arms are parsed from run names; the failure-type string is `eval_timeout`,
+NOT `timeout` (first health table silently counted zeros); per-generation proposal quality
+beats a candidate-level rolling median, which shows square-wave mode-collapse artifacts.
+
+**Snapshot findings (2026-08-12):** history helps everywhere except ac1 — ac2: BoN 0.930-0.937
+vs everything else 0.945-0.960 with `n5 best` on top (0.9603) above PUCT (0.951-0.954); erdos:
+BoN 0.38092-94 vs PUCT 0.380863 / `n5 best` 0.380866-92; ac1 is mud (all arms 1.505-1.515,
+within-arm spread ≈ between-arm gaps). `best` > `random` context consistently; per-generation
+medians show `random` context is *unstable* (ac2 n10_random collapses to ~0.72 for whole
+generations while `best` holds ~0.95). n5-vs-n10: too few pairs, no direction. Eval health:
+eval_timeout 2.7/2.8/4.8% by problem (worst three runs 12-13.5%, all erdos on rb-hpc nodes),
+cpu_starvation only on ac1, crashes 14-21% dominate — infra noise second-order at this snapshot.
+
+**Same-day additions to `icl_results.ipynb`:** §4b Shinka-shaped ICL (`*_qwen_like_shinka{,_2}`:
+1 parent x 5 children x 400 gens, ~100-130 cands in) vs Shinka at equal k — both 1x5 arms lead
+Shinka on ac2 AND erdos at equal candidates, and on ac2 the 1x5 shape even leads the 6x16 PUCT
+mean at small k (fresher buffer, more selection steps). §4c TriMul pilot (`runs/trimul`, H100,
+geomean us): BoN 9347 (640 cands, 17% compile), PUCT 6919 (512 cands, 38% compile), n5 best
+3/16 gens; TTT-Discover RL reference 1161 at 25.6k cands — 6x headroom left, and history arms
+triple BoN's compile rate (parents give the model working Triton to edit).
+
+---
+
+## 2026-08-14 — Two more parent sources: `best` (greedy) and `none` (no solution in the prompt)
+
+**Built** — `--parent-source` grew from `{puct, initial}` to `{puct, initial, best, none}`.
+
+- **`best`** — every slot of every generation gets the buffer's single best-so-far state
+  (`PUCTSampler.sample_best_states`). Same prompt shape as `puct`, so the gap between the two is
+  exactly what PUCT's exploration term (under-visited states, lineage spreading) is worth. The same
+  State *object* is returned for all slots on purpose: it is one state, so `_n`/`_m`/`_T` should
+  accumulate on it and the tracker should record one `parent_state_id`.
+- **`none`** — the prompt shows **no current solution at all**. The "improve upon this" framing, the
+  parent's code, its value history and its stdout all go; `envs.base.objective_only_prompt` puts back
+  the two things that define the *task* (which quantity, which direction, what target), so the arm
+  differs from the others in one thing only. Past experience then reaches the model through the ICL
+  context block and nothing else — which is what makes it the mode for measuring a context strategy
+  on its own. With `--n-context 0` it is a from-scratch zero-shot arm.
+
+**Design decisions & why**
+
+- **Folded into `--parent-source` rather than a separate `--no-parent-solution` flag.** The two axes
+  are not independent: "PUCT-select a parent, then don't show it" is nonsense, and an orthogonal flag
+  would make three of its four combinations meaningless. One enum, four coherent arms.
+- **`none` is a PROMPT knob, not a search knob** (`EnvConfig.show_parent_solution`, read by each
+  env's `improvement_task`). The loop still needs a state to attribute children to and the evaluator
+  still needs one to hand the sandbox, so `none` reuses `initial`'s bookkeeping: children belong to
+  the seed. That keeps the PUCT statistics meaning what they say, and leaves the constructions the
+  sandbox pre-imports (`height_sequence_1`, `initial_h_values`) exactly as they are in every other
+  arm — only their surrounding *wording* changes, since "one of the constructions we have found so
+  far" is a lie when nothing has been found.
+- **Every env rewords, not just deletes.** Dropping `{state_ctx}` alone would leave circle_packing
+  saying "improve the current packing (shown at the end of this prompt)" with nothing at the end.
+  Each `improvement_task` now branches on `self.show_parent_solution` for both the trailing block and
+  the sentence that introduces it.
+- **Run-dir naming:** `initial` → `bon` (unchanged), `puct` → the bare strategy name (unchanged, so a
+  bare name still means PUCT parents), `best`/`none` → `<source>_<strategy>`.
+
+**Verified** — dry-run prompts for all 8 registry problems are **byte-identical to HEAD** under
+`--parent-source puct` (the AC constructions differ only because they are random when unseeded), so
+no existing arm's prompt moved. `tests/test_baselines.py` grew 10 tests (greedy selection, empty-buffer
+fallback, greedy-vs-PUCT divergence after repeated expansion, the prompt drops the solution but keeps
+the target, the no-parent tail is identical across parents, loop dispatch per source); 186 tests pass.
+Sweeps need no change — `run_sweep.py` introspects `build_parser()`, so `parent-source: best` in a
+grid already expands.
+
+**Noticed, not fixed:** `State.to_prompt` hardcodes "(higher is better)" in its no-parent-values
+branch, so minimise problems (erdos, ac1, trimul) render "Current C₅ bound (higher is better)". Every
+run to date carries it; changing it would move every existing prompt, so it is left alone here.
+`objective_only_prompt` states the direction correctly.
+
+## 2026-08-17 — Shinka baseline made portable for Bosch replicates (commit 566f1d4)
+
+The outer repo gitignores `ShinkaEvolve/` (nested clone), so nothing that defines the Shinka
+baseline runs was committed anywhere. Now tracked under `src/shinka_baseline/`: the three
+problem ports (ac1/ac2/erdos: run_evo.py, evaluate.py, initial.py, yamls), `shinka_local.patch`
+(the 5 shinka-package fixes against upstream `b67a073`), and `setup_shinka.sh` (clone upstream
+pinned → apply patch → symlink `examples/ttt_discover_math` back to the tracked dir). Also
+finally committed `src/jobs/shinka_run.bsub` and `src/jobs/vllm_embed.bsub`.
+
+Purpose: repeat the runs on Bosch as extra replicates. Shinka has no RNG-seed knob — replicates
+differ only through temperature-1.0 LLM sampling — so a fresh `REP` label (use `bosch_*`) IS a
+new seed. Caveats noted in `src/shinka_baseline/README.md`: the yamls pin
+`localhost:8001` and must be sed-ed to the `vllm_host.txt` node on Bosch; the Bosch embed job
+serves Qwen3-Embedding-0.6B while `code_embed_sim_threshold: 0.96` was tuned on nomic — worth a
+quick similarity sanity-check before trusting the duplicate gate there. On guadiana the live
+`ShinkaEvolve/examples/ttt_discover_math` remains the original; keep the tracked copy in sync.
+
+## 2026-08-17 — `trimul_b200`: the kernel task on Blackwell, and a wrong note corrected
+
+**Why.** Availability, not fidelity. `batch_b200` has 20 hosts to `batch_h100`'s 5
+(`BOSCH_CLUSTER.md` §3-4) and the vLLM server already lands there, so the trimul campaign was
+queue-starved on the wrong card. `trimul_h100` stays the faithful-baseline arm (TTT-Discover's
+verbatim hardware line, comparable to their 1161 µs); `trimul_b200` is a third card whose scores
+pool with nothing.
+
+**The blocker in the docs was wrong.** Three places said sm100 "predates torch 2.7.1 / triton 3.3.1"
+and told us to avoid `batch_b200`. Half true: 2.7.1 was the *first* release with Blackwell wheels and
+bundles exactly the triton 3.3.1 the prompt pins — but sm100 gencode is only emitted from CUDA 12.8,
+so the distinction is the **wheel index, not the version**. Measured on a Bosch b200 node:
+`~/venvs/kernel-eval` is `2.7.1+cu128 3.3.1`, arch list `[sm_75 … sm_90, sm_100, sm_120]`, card
+`NVIDIA B200`. So **no version change, no re-pinning, no comparability loss** — the existing grading
+venv already works there. guadiana's venv is the cu126 build (arch list stops at `sm_90`) and cannot
+grade on a B200 at all, which is why this could not be tested locally.
+
+**Built** — the pattern set by `trimul_a100`, nothing structural:
+- `envs/kernel_trimul.py`: `_HW_RULE_B200`, `TrimulB200Env`, `_DEFAULT_GPU["trimul_b200"] = inherit`.
+- `envs/registry.py`: `trimul_b200`. `run_icl.py` help text for the two `--trimul-eval-*` flags.
+- `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_b200.yaml` — the `_bosch` four with the card swapped;
+  all four verified to expand under `run_sweep.py --print-cmds`.
+- `jobs/trimul_sweep.bsub`: `batch_b200 -> trimul_b200`, plus **guard 1b** (below).
+- Tests: prompt/ceiling assertions for the third variant, `_eval_settings` default, and the
+  differ-only-in-the-hardware-rule invariant extended to it. 187 pass.
+
+**Design decisions**
+- **The rules line names 232448 bytes even though that equals the H100's.** `shared_memory_per_block_optin`
+  is byte-identical on both cards, so unlike the A100 there is no block-size cliff between the two
+  prompts — an H100-legal config is B200-legal. The number is stated anyway because the model is being
+  told a different card and a measured figure beats an assumed A100-like limit. No claim is made in the
+  prompt about triton's sm100 instruction support.
+- **Guard 1b: check the granted card's capability against `torch.cuda.get_arch_list()`.** The existing
+  guard only pinned the triton *version*, which cannot distinguish cu126 from cu128 — and a cu126 venv
+  on a Blackwell node fails as a wall of ptxas errors that read like bad candidates, i.e. it would have
+  produced a plausible-looking run of all-zero rewards. Verified against guadiana's A100 (prints
+  `sm_80`, 166912 B — which independently confirms the number hardcoded in `_HW_RULE_A100`).
+
+**What bit / what to watch**
+- **Triton 3.3.1's Blackwell support is first-generation**: it compiles for sm100 but exposes none of
+  the architecture's new machinery (tcgen05 MMA, newer TMA descriptors). Expect B200 timings to
+  understate the card, and read generation 0's failures for ptxas `unsupported`/`target` errors —
+  those would mean the stack, not the candidates. Upgrading triton would break every existing number.
+- **GPU exclusivity is unverified on this site.** `-gpu "num=1"` does not by itself promise the card;
+  the effective `j_exclusive` comes from `lsb.params`. A shared card is the failure with no log
+  signature — `eval.py`'s convergence rule (rel. err < 0.1 %) can never be met, so every benchmark
+  burns its full rep budget and the timings are junk, and the per-card flock cannot help because it
+  only serialises processes sharing a `CUDA_VISIBLE_DEVICES`. Documented in the job header with the
+  `bjobs -l` check and the `j_exclusive=yes` submit line; **not** applied to the `#BSUB` line, since
+  it lengthens pend time and should be a knowing choice. This exposure is not new — it applies to the
+  H100 arm too.
+- **No B200 reference number exists anywhere**, published or measured. `gpumode_local/reference/README.md`
+  now carries a placeholder row: run step 3 (`--repeats 5`) before the first sweep, because on this
+  card that measurement *is* the yardstick.
+
+**Follow-on the same day — `sweeps/trimul_arms_qwen_b200.yaml`**, five arms x 2 seeds in ONE file
+(bon, puct, n05_best, n05_random, n10_best; 160 candidates each, 1600 total). Three things it
+settles that the four-file campaign left open:
+
+- **n-context 10 is safe on trimul, measured not assumed.** The guadiana ctx file warned that 10
+  kernels "can reach 41 k tokens" and capped the arm at 5. That figure was scaled from
+  TTT-Discover's published 16.4 kB kernel. Against the 307 valid kernels in the Bosch H100 pilot
+  (`runs/trimul/h100_s1_{bon,puct}`): p50 **5.7 kB**, p90 7.7 kB, max 22.6 kB, and a top-10-by-score
+  block is 55-65 kB ≈ 14-22 k tokens — ~2x headroom under `max-context-tokens: 40000`, which is
+  therefore kept unchanged (so the packing budget is not a confound against the other trimul files).
+  The n05-vs-n10 axis is only meaningful while `context=k/N` shows k == N, so that check is written
+  into the header.
+- **It does not fit one 24 h job, and the file says so.** Pilot wall was ~23 min median per 32
+  candidates (range 14-52), i.e. ~2 h/run and 3-4 h for the ctx arms → ~20-30 h for ten runs at
+  `max_parallel: 1`. Runs are therefore **seed-major**: a wall-clock kill leaves seed 1 a complete
+  five-arm comparison instead of five half-runs. Within a seed the order ends with n10_best, so the
+  run most likely to be lost costs the 5-vs-10 axis rather than the best-vs-random control.
+- **`RESUME=1` added to `jobs/trimul_sweep.bsub`** for the second submission: it reads `sweep.name`
+  from the yaml, passes `--resume runs/<name>`, and refuses if that dir is absent — a first-submission
+  typo silently starting a fresh 30 h sweep is exactly the failure worth catching at launch.
+
+Not changed: `max_parallel` stays 1, matching every other trimul file. Raising it to 2 would overlap
+one run's decode with another's grading (the flock keeps the timings valid regardless) and could cut
+the wall substantially — but the KV budget has to be re-derived from this server's own report first,
+per note 3 of `trimul_bon_qwen.yaml`. Noted in the file rather than done.
