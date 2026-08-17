@@ -1,0 +1,72 @@
+#!/bin/bash
+# =================================================================================================
+# CPU-only LSF job for one ShinkaEvolve baseline run (examples/ttt_discover_math, local qwen).
+#
+# WHY THIS EXISTS
+#   The ShinkaEvolve baseline runs (AC1 / AC2 / Erdos, budget-matched at 2400 generations to one
+#   ICL run) evaluate candidates as LOCAL subprocesses with a ~1000s internal search budget each.
+#   Like the ICL driver, that work must not land on the login node (5-core cgroup cap, see
+#   docs/BOSCH_CLUSTER.md) - so each run gets its own compute-node job. The LLM is the same vLLM
+#   server the ICL sweeps use (per-problem host/port pinned in each problem's shinka_qwen.yaml).
+#
+# THROUGHPUT / RESUBMISSION
+#   shinka_qwen.yaml keeps Shinka's usual parallelism (max_evaluation_jobs 5), which sustains
+#   ~410 generations per 24h (evals are the bottleneck: 5 x 86400s / ~1050s). A 2400-generation
+#   run therefore spans ~6 wall-clock windows. Shinka resumes from its own database: RESUBMITTING
+#   THE SAME JOB (same PROBLEM/REP, hence same results dir) CONTINUES THE RUN where it stopped
+#   (shinka/core/async_runner.py::_restore_resume_progress). If you would rather finish in one
+#   window, raise max_evaluation_jobs (~30 on 64 cores at 2 CPUs/eval) - infra parallelism, not a
+#   search-behavior knob - and bump `-n` below to 2*max_evaluation_jobs + 4.
+#
+# SUBMIT (embedding server FIRST, then one job per problem x replicate; the extra meta_r1
+# submission is the with-meta-scratchpad arm - see shinka_qwen_meta.yaml)
+#   cd ~/work/projects/phd/learning_evolve/src
+#   mkdir -p jobs/logs
+#   bsub < jobs/vllm_embed.bsub   # wait until jobs/vllm_embed_host.txt exists
+#   for p in ac1 ac2 erdos_min_overlap; do
+#     for r in r1 r2 r3; do PROBLEM=$p REP=$r bsub < jobs/shinka_run.bsub; done
+#     PROBLEM=$p REP=meta_r1 CONFIG=shinka_qwen_meta.yaml bsub < jobs/shinka_run.bsub
+#   done
+#
+#   Environment (bsub inherits the submitting shell's environment):
+#     PROBLEM   ac1 | ac2 | erdos_min_overlap            (required)
+#     REP       replicate label, names the results dir    (default r1)
+#     CONFIG    config yaml inside the problem dir        (default shinka_qwen.yaml)
+# =================================================================================================
+
+#BSUB -J shinka_run
+#BSUB -o jobs/logs/shinka_run.%J.out
+#BSUB -e jobs/logs/shinka_run.%J.err
+#BSUB -n 12                                    # 5 evals x 2 CPUs + driver/proposals headroom
+#BSUB -R span[hosts=1]
+#BSUB -M 32768MB
+#BSUB -W 24:00                                 # resubmit with the same PROBLEM/REP to resume
+#BSUB -q batch_h200                            # no -gpu line: CPU-only, LLM is a remote server
+#BSUB -P BH-000557-01
+#BSUB -G rb_bd_dlp_rng-dl01_cr_AIQ_employees
+
+set -euo pipefail
+
+PROBLEM="${PROBLEM:?set PROBLEM to ac1, ac2 or erdos_min_overlap}"
+REP="${REP:-r1}"
+CONFIG="${CONFIG:-shinka_qwen.yaml}"
+
+ROOT="$HOME/work/projects/phd/learning_evolve"
+TASK_DIR="$ROOT/ShinkaEvolve/examples/ttt_discover_math/$PROBLEM"
+[ -d "$TASK_DIR" ] || { echo "no such task dir: $TASK_DIR" >&2; exit 1; }
+
+source "$ROOT/ShinkaEvolve/.venv/bin/activate"
+export LOCAL_OPENAI_API_KEY=local              # vLLM ignores the key; shinka requires one
+export SHINKA_PRICING_MODE=offline             # no models.dev catalog fetch on compute nodes
+
+# The embedding server (jobs/vllm_embed.bsub) publishes its node here; Shinka's duplicate
+# gate needs it. Fail early rather than run the whole campaign with the gate silently off.
+EMBED_HOST_FILE="$ROOT/src/jobs/vllm_embed_host.txt"
+[ -s "$EMBED_HOST_FILE" ] || { echo "no embedding server: submit jobs/vllm_embed.bsub first ($EMBED_HOST_FILE missing)" >&2; exit 1; }
+EMBED_MODEL="local/Qwen/Qwen3-Embedding-0.6B@http://$(cat "$EMBED_HOST_FILE"):8003/v1"
+
+cd "$TASK_DIR"
+echo "shinka_run: problem=$PROBLEM rep=$REP config=$CONFIG host=$(hostname) embed=$EMBED_MODEL"
+exec python run_evo.py --config_path "$CONFIG" \
+    --results_dir "results/${PROBLEM}_qwen_${REP}" \
+    --embedding_model "$EMBED_MODEL"
