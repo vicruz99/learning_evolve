@@ -11,7 +11,7 @@ from envs.base import Environment
 from envs.erdos_min_overlap import ErdosMinOverlapEnv
 from envs.circle_packing import CirclePackingEnv
 from envs.ac_inequalities import AutoCorrInequalityEnv
-from envs.kernel_trimul import TrimulA100Env, TrimulH100Env
+from envs.kernel_trimul import TrimulA100Env, TrimulB200Env, TrimulH100Env
 from envs.toy_ee import ToyEeEnv
 
 
@@ -44,12 +44,14 @@ REGISTRY: dict[str, ProblemSpec] = {
     # logs always means "the grader hung", never "a slow kernel used its allowance". A healthy eval
     # is 36 s.
     #
-    # TWO PROBLEMS, ONE TASK: the prompts differ only in which card they name, but that drives block
+    # THREE PROBLEMS, ONE TASK: the prompts differ only in which card they name, but that drives block
     # sizes and an H100-legal config dies on an A100's smaller shared memory. Scores are comparable
     # WITHIN an architecture, never across one -- TTT-Discover's best kernel does 2198 us on an A100
-    # and 1161 us on an H100. Pick the one matching the card you are grading on.
+    # and 1161 us on an H100. Pick the one matching the card you are grading on. trimul_b200 needs a
+    # cu128 grading interpreter (guadiana's is cu126 and has no sm100); see envs/kernel_trimul.py.
     "trimul_a100":       ProblemSpec(TrimulA100Env, "trimul_a100", 1, 2700, "runtime (us)", False, "custom_kernel"),
     "trimul_h100":       ProblemSpec(TrimulH100Env, "trimul_h100", 1, 2700, "runtime (us)", False, "custom_kernel"),
+    "trimul_b200":       ProblemSpec(TrimulB200Env, "trimul_b200", 1, 2700, "runtime (us)", False, "custom_kernel"),
     # Synthetic smoke-test problem (in-process grading, no sandbox). metric_name is deliberately
     # generic ("score") so the "ee"-counting mechanism stays hidden from the model. eval_timeout is
     # unused by the in-process evaluator; entrypoint is documentary only (no code is executed).

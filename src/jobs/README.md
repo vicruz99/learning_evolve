@@ -69,12 +69,16 @@ no `ray_doctor`). Only `-n 4`: the flock serialises grading to one eval at a tim
 
 ```bash
 SWEEP=sweeps/trimul_bon_qwen_bosch.yaml bsub < jobs/trimul_sweep.bsub    # default queue batch_h100
+SWEEP=sweeps/trimul_bon_qwen_b200.yaml  bsub -q batch_b200 < jobs/trimul_sweep.bsub
 ```
 
-Use the ready-made Bosch ports `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml` — the
-non-`_bosch` trimul yamls are guadiana's. The job refuses a `problem:` that doesn't
-match the queue's card, and refuses to start unless `$KPY` (default `~/venvs/kernel-eval/bin/python`;
-creation instructions in `gpumode_local/reference/README.md`) carries torch + triton 3.3.1. It
+Use the ready-made Bosch ports — `sweeps/trimul_{bon,puct,ctx,strategy}_qwen_bosch.yaml` for the H100
+(`trimul_h100`, the faithful baseline) and `..._qwen_b200.yaml` for the B200 (`trimul_b200`, its own
+problem and its own reference baseline; scores never pool across the two). The non-`_bosch` trimul
+yamls are guadiana's. The job refuses a `problem:` that doesn't match the queue's card, and refuses to
+start unless `$KPY` (default `~/venvs/kernel-eval/bin/python`; creation instructions in
+`gpumode_local/reference/README.md`) carries torch + triton 3.3.1 **and has kernels for the card LSF
+granted** — the B200 needs the cu128 build, whose arch list includes `sm_100`. It
 rewrites `vllm-base-url` and `trimul-eval-python` into the scratch copy of the yaml, and **deletes
 `trimul-eval-gpu`** from it: LSF announces the granted card via `CUDA_VISIBLE_DEVICES` with no
 guarantee it is index 0, so grading inherits that assignment instead of naming one — naming an

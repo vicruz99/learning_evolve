@@ -15,8 +15,8 @@ import time
 
 import pytest
 
-from envs.kernel_trimul import (SCORE_SCALE, TrimulA100Env, TrimulH100Env,
-                                TrimulLocalReward, _HW_RULE_A100, _HW_RULE_H100)
+from envs.kernel_trimul import (SCORE_SCALE, TrimulA100Env, TrimulB200Env, TrimulH100Env,
+                                TrimulLocalReward, _HW_RULE_A100, _HW_RULE_B200, _HW_RULE_H100)
 from puct import State
 
 
@@ -250,7 +250,7 @@ def test_prompt_asks_for_a_strategy_block():
     assert "<strategy>" in q and "</strategy>" in q
 
 
-# ---- the two hardware variants -------------------------------------------------------------------
+# ---- the three hardware variants -----------------------------------------------------------------
 def test_a100_prompt_names_the_a100_and_its_shared_memory_ceiling():
     """The A100 variant exists because of one observed failure mode: an H100-legal block size asking
     for 393216 bytes of shared memory against the A100's 166912. Naming the number is the fix."""
@@ -266,20 +266,34 @@ def test_h100_prompt_is_the_verbatim_upstream_line():
     assert "166912" not in q
 
 
+def test_b200_prompt_names_the_b200_and_the_h100s_shared_memory_ceiling():
+    """232448 is MEASURED, not copied from the H100 line by analogy: shared_memory_per_block_optin on
+    a Bosch b200 node (2026-08-17) is the same 232448 the H100 reports, which is exactly why this
+    variant has no A100-style block-size cliff. If this number is ever changed, change it because a
+    card was measured -- not because a datasheet was read."""
+    q = _prompt(TrimulB200Env)
+    assert "B200 (sm100, Blackwell)" in q
+    assert "232448" in q
+    assert "run on an H100" not in q
+    assert "166912" not in q                    # the A100's ceiling has no business here
+
+
 def test_the_variants_differ_only_in_the_hardware_rule():
-    a, h = _prompt(TrimulA100Env), _prompt(TrimulH100Env)
+    a, h, b = _prompt(TrimulA100Env), _prompt(TrimulH100Env), _prompt(TrimulB200Env)
     assert a.replace(_HW_RULE_A100, _HW_RULE_H100) == h
+    assert b.replace(_HW_RULE_B200, _HW_RULE_H100) == h
 
 
 def test_each_problem_defaults_to_the_right_gpu_policy(monkeypatch):
     """a100 = guadiana, unscheduled, so an INDEX (and not 0 -- the vLLM server lives there).
-    h100 = Bosch under LSF, so INHERIT: the scheduler names the job's card via CUDA_VISIBLE_DEVICES
-    and there is no guarantee it is index 0 -- a numeric default would override the assignment and
-    could grade on another job's GPU."""
+    h100/b200 = Bosch under LSF, so INHERIT: the scheduler names the job's card via
+    CUDA_VISIBLE_DEVICES and there is no guarantee it is index 0 -- a numeric default would override
+    the assignment and could grade on another job's GPU."""
     from envs.kernel_trimul import INHERIT_GPU, _eval_settings
     monkeypatch.delenv("TRIMUL_EVAL_GPU", raising=False)
     assert _eval_settings("trimul_a100")["gpu"] == "1"   # guadiana: GPU 0 holds the vLLM server
     assert _eval_settings("trimul_h100")["gpu"] == INHERIT_GPU
+    assert _eval_settings("trimul_b200")["gpu"] == INHERIT_GPU
     monkeypatch.setenv("TRIMUL_EVAL_GPU", "3")
     assert _eval_settings("trimul_a100")["gpu"] == "3"   # the env var always wins
 
