@@ -19,12 +19,13 @@ MODE="${2:-}"
 
 VLLM_URL=${VLLM_URL:-http://127.0.0.1:8001}
 PROXY_PORT=${PROXY_PORT:-4000}
-# The proxy lives in the project venv by default -- litellm only ADDS packages there
-# (verified: 62 additions, one aiohttp patch bump, no downgrades), so it does not need one
-# of its own. Override with LITELLM= if you keep it separate.
-_REPO="$(cd "$HERE/../.." && pwd)"
-LITELLM=${LITELLM:-$_REPO/src/.venv/bin/litellm}
-[ -x "$LITELLM" ] || LITELLM=$HOME/venvs/ccproxy/bin/litellm
+# The proxy gets its own venv, deliberately kept out of src/.venv. litellm drags in 62
+# packages (boto3, azure-*, polars, redis, mcp) and pins fastapi tightly; sharing a venv
+# would make a future resolver conflict in the agent stack break the ICL sweeps too.
+# ~/venvs/ccproxy on Bosch (no scratch filesystem there), /scratch on guadiana.
+LITELLM=${LITELLM:-$HOME/venvs/ccproxy/bin/litellm}
+[ -x "$LITELLM" ] || LITELLM=/scratch/vicstorage/venvs/ccproxy/bin/litellm
+[ -x "$LITELLM" ] || { echo "no litellm found; see README step 1" >&2; exit 1; }
 PROXY_LOG=${PROXY_LOG:-/tmp/litellm_qwen.log}
 
 [ -d "$RUN_DIR" ] || { echo "no such run dir: $RUN_DIR" >&2; exit 1; }
