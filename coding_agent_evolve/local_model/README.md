@@ -5,6 +5,9 @@ but with **Claude Code as the harness** and **Qwen3.6-27B as the model behind it
 so the agent scaffold is held fixed and only the model changes, the same way the ICL
 sweeps hold the search fixed and vary the prompt.
 
+**If you just want to run it, go to [The runbook](#the-runbook).** Everything before it is
+reference: what each piece is and why it is configured the way it is.
+
 Claude Code never learns it is not talking to Anthropic: it speaks the Anthropic Messages
 API to a LiteLLM proxy, which translates to the OpenAI API your vLLM server already serves.
 
@@ -16,7 +19,7 @@ claude  --(Anthropic Messages, /v1/messages)-->  LiteLLM :4000
                                             vLLM :8001  (Qwen3.6-27B)
 ```
 
-## One-time setup
+## Reference: one-time setup
 
 ```bash
 python3 -m venv /scratch/vicstorage/venvs/ccproxy
@@ -35,7 +38,7 @@ self-contained binary — not npm). To put it on another machine, copy that dire
 run `curl -fsSL https://claude.ai/install.sh | bash`. **Pin the version** so the model
 arm does not silently change harness mid-study.
 
-## 1. The server, with tool calling on
+## Reference: the server, and why tool calling is the whole game
 
 This is the one non-obvious requirement. Claude Code does everything through tools —
 Read, Bash, Edit, Task — so a server that emits tool calls as plain text gives you an
@@ -82,7 +85,7 @@ Keep `--enable-prefix-caching`. Claude Code resends a long, stable prefix (syste
 tool schemas, measured at ~3k here) on every single turn; without prefix caching you pay to
 prefill it hundreds of times per run.
 
-## 2. The proxy
+## Reference: the proxy
 
 ```bash
 /scratch/vicstorage/venvs/ccproxy/bin/litellm --config litellm_qwen.yaml --port 4000
@@ -99,7 +102,7 @@ right, from the gateway protocol contract:
   error *wording*; a proxy that wraps errors in its own envelope breaks the recovery path
   even with the status code preserved.
 
-## 3. Run
+## Reference: the run folder and its guard
 
 ```bash
 ./run_agent.sh /scratch/vicstorage/agent_runs/erdos_qwen1        # interactive
@@ -309,27 +312,72 @@ grades on a local GPU. Sharing one card makes every timing meaningless (`gpumode
 §Measurement caveats). Give vLLM its own cards with `GPUS=0,1 ./serve_qwen.sh` and leave
 one free for grading. The Erdős task grades on CPU, so one GPU is enough there.
 
-## The command workflow
+## The runbook
 
-Two shells (or tmux panes) on the node that holds the cards. Nothing here uses `bsub`.
+Nothing here uses `bsub` for the run itself — only to get the interactive allocation. Three
+tmux panes on one node. Everything below assumes `cd` into this directory.
 
-**Once per machine** — the proxy venv, the fixed template, the grading venv:
+### Step 0 — get a node (Bosch only)
+
+Never on a login node: a cgroup caps the user slice at 5 cores while exposing 64, invisibly
+to every tool, and evals run ~12x slower (`docs/BOSCH_CLUSTER.md` §1).
 
 ```bash
-python3 -m venv /scratch/vicstorage/venvs/ccproxy          # on Bosch: ~/venvs/ccproxy
-/scratch/vicstorage/venvs/ccproxy/bin/pip install 'litellm[proxy]' \
-    'fastapi==0.115.12' 'sse-starlette==2.1.3'
-./fetch_chat_template.sh                                   # needs the p4s proxy on Bosch
+bsub -Is -q batch_b200 -gpu "num=2" -J ccagent -P BH-000557-01 \
+     -G rb_bd_dlp_rng-dl01_cr_AIQ_employees \
+     -n 32 -R "span[hosts=1] rusage[mem=65536]" -M 65536MB -W 24:00 /bin/bash
 ```
 
-**Pane 1 — the server.** Two cards: vLLM takes one, the grader needs the other free.
+**Two GPUs, not one.** vLLM holds one for the whole run and the grader needs a clean card;
+sharing makes every TriMul timing meaningless. Pass `-M` explicitly — LSF's default memory
+limit is 1 GB and will kill the server.
+
+Then, on the compute node, turn on outbound network. Needed for the one-time installs, and
+for the proxy's first start (it downloads Qwen's tokenizer):
+
+```bash
+source /fs/applications/modules/current/init/bash
+module load proxy4server-access/2.0 && sleep 1
+source /fs/applications/p4s-access/2.0/ActivateP4S.sh -a
+```
+
+On guadiana, skip this step entirely — the cards are already there and `GPUS=1` steers vLLM
+off card 0.
+
+### Step 1 — one-time, per machine
+
+```bash
+# the proxy. The pins are not optional: litellm 1.97.0 does not import against current
+# fastapi, and the real error (get_flat_dependant) is masked as "No module named proxy_server".
+python3 -m venv ~/venvs/ccproxy
+~/venvs/ccproxy/bin/pip install 'litellm[proxy]' 'fastapi==0.115.12' 'sse-starlette==2.1.3'
+
+# the fixed chat template (v19 — the 3.6 line; the repo root file is Qwen3.8)
+./fetch_chat_template.sh
+python compare_templates.py /scratch/vicstorage/qwen/chat_template.jinja \
+                            qwen3.6_chat_template-v19.jinja
+
+# the grading interpreter, for the TriMul task only. MUST be the cu128 build: sm_100
+# gencode comes only from CUDA 12.8, and a cu126 venv on a B200 fails as a wall of ptxas
+# errors that read like bad candidates. Full steps in gpumode_local/reference/README.md.
+python3 -m venv ~/venvs/kernel-eval
+~/venvs/kernel-eval/bin/pip install "torch==2.7.1" --index-url https://download.pytorch.org/whl/cu128
+~/venvs/kernel-eval/bin/pip install pyyaml numpy
+```
+
+Also install the `claude` CLI once (`curl -fsSL https://claude.ai/install.sh | bash`, or
+copy `~/.local/share/claude/versions/<v>` across) and **pin the version** — the set of
+capabilities Claude Code sends to a gateway grows with each release, so an upgrade can
+reintroduce a body field Qwen's endpoint rejects, and it changes the harness mid-study.
+
+### Step 2 — pane 1: the model server
 
 ```bash
 GPUS=0 CHAT_TEMPLATE=$PWD/qwen3.6_chat_template-v19.jinja ./serve_qwen.sh
 ```
 
-Wait for it to serve, then confirm tool calling is live — this is the one thing that
-silently produces a useless agent if it is wrong:
+When it is serving, **check tool calling from another shell**. This is the one failure that
+produces a plausible-looking agent that narrates what it would do and never acts:
 
 ```bash
 curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -340,27 +388,79 @@ curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -
   "tool_choice":"auto"}' | python -m json.tool | grep -A5 tool_calls
 ```
 
-**Pane 2 — the run.**
+A `tool_calls` array is what you want. A `<tool_call>` string sitting in `content`, or a 400
+saying `"auto" tool choice requires --enable-auto-tool-choice`, means the flags did not take.
+
+### Step 3 — pane 2: the B200 baseline, once per machine
+
+**Do this before the first agent run.** No published B200 number for this kernel exists, so
+the reference kernel's own score on this card is the only yardstick you will have to judge
+an agent result against. Run it from the repo — it grades the published TTT-Discover
+kernel, which the agent must never see:
 
 ```bash
-export KPY=~/venvs/kernel-eval/bin/python                  # the cu128 grading interpreter
+cd ~/projects/phd/learning_evolve
+export KPY=~/venvs/kernel-eval/bin/python
+"$KPY" -c "import torch,triton;print(torch.__version__,triton.__version__,torch.cuda.get_arch_list())"
+#   must print 2.7.1+cu128 3.3.1 and the arch list MUST contain sm_100
+
+"$KPY" coding_agent_evolve/gpumode/evaluate.py \
+    src/gpumode_local/reference/trimul_best.py --mode leaderboard --repeats 5
+```
+
+No `--gpu` flag, ever: the grader inherits `CUDA_VISIBLE_DEVICES`, which is the card LSF
+granted. Naming an index overrides that and can time another job's GPU. Record the score
+and the spread in `gpumode_local/reference/README.md`.
+
+### Step 4 — pane 3: the run
+
+```bash
+cd ~/projects/phd/learning_evolve/coding_agent_evolve/local_model
+export KPY=~/venvs/kernel-eval/bin/python
+
 ../gpumode/b200_task/make_run.sh ~/agent_runs/trimul_b200_qwen1
-./run_agent.sh ~/agent_runs/trimul_b200_qwen1              # interactive; add -p for headless
+./run_agent.sh ~/agent_runs/trimul_b200_qwen1          # interactive
+./run_agent.sh ~/agent_runs/trimul_b200_qwen1 -p       # headless -> agent.jsonl
 ```
 
-`run_agent.sh` health-checks vLLM, starts LiteLLM on :4000 if it is not up, verifies `$KPY`
-has kernels for the granted card, and launches the agent in the run folder with
-`run_guard.json`. On Bosch, get the allocation first:
+`run_agent.sh` health-checks vLLM, starts LiteLLM on :4000 if it is not already up, checks
+that `$KPY` has kernels for the granted card, sources `env.sh`, gives the run its own
+`CLAUDE_CONFIG_DIR`, and launches the agent under `run_guard.json` from outside the run
+folder.
+
+For the Erdős task instead, build the folder by hand — it needs no harness:
 
 ```bash
-bsub -Is -q batch_b200 -gpu "num=2" -J ccagent -P BH-000557-01 \
-     -G rb_bd_dlp_rng-dl01_cr_AIQ_employees \
-     -n 32 -R "span[hosts=1] rusage[mem=65536]" -M 65536MB -W 24:00 /bin/bash
+mkdir -p ~/agent_runs/erdos_qwen1 && cd ~/agent_runs/erdos_qwen1
+cp ~/projects/phd/learning_evolve/coding_agent_evolve/erdos/erdos_prompt_noweb.md INITIAL_PROMPT.md
+cp ~/projects/phd/learning_evolve/coding_agent_evolve/erdos/eval.py .
+python3 -m venv .claude_venv                      # the prompt tells the agent this exists
 ```
 
-Then run everything above on the compute node. Never on a login node: a cgroup caps the
-user slice at 5 cores while showing 64, which is invisible to every tool and makes evals
-~12x slower (`docs/BOSCH_CLUSTER.md`).
+### Checks worth running once, in the first session
+
+```bash
+claude -p "/context"      # expect `Tokens: ~3k / 88k`. A different denominator means
+                          # CLAUDE_CODE_MAX_CONTEXT_TOKENS did not take.
+```
+
+And confirm the token counter is the real one — with tiktoken behind it, the 88k ceiling can
+be 131k real tokens and overrun the server (see *Can the context overrun `--max-model-len`?*):
+
+```bash
+curl -s http://127.0.0.1:4000/v1/messages/count_tokens \
+  -H 'x-api-key: sk-local' -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' \
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"1234567890 9876543210"}]}'
+```
+
+If the proxy could not reach HuggingFace on its first start it silently falls back to
+tiktoken. The fallback is not announced, so check rather than assume; if it happened, either
+give it network and restart, or raise `--max-model-len` to 200000 and rely on headroom.
+
+### Shutting down
+
+`Ctrl-C` pane 1 for vLLM. The proxy is backgrounded by `run_agent.sh`; find it with
+`pgrep -f "litellm.*4000"` and kill that PID. Both die with the LSF job anyway.
 
 ## Files
 
