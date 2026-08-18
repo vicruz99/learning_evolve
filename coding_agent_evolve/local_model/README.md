@@ -157,33 +157,74 @@ mid-sentence and the "answer" is just the rest of its reasoning with the tags go
 `chat_template_kwargs: {"enable_thinking": false}` is the cheaper way to get zero, though
 this checkpoint implements that by injecting an empty `<think></think>` block.
 
-### How often Claude Code compacts
+### How often Claude Code compacts, and what the 100k floor is
 
-The target is a hard ceiling on context per run. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` cannot
-express one below 100k — that is its floor, and it is capped at the model's window besides.
+The 100k floor is **the smallest value the variable accepts**, not a compaction period.
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` takes 100,000-1,000,000 and Claude Code caps it at the
+model's window. It is a *window size*, so it cannot express a ceiling below 100k at all —
+which is why `env.sh` does not use it.
 
 The variable that can is `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which declares the window Claude
 Code should assume for a model ID it does not recognise. It applies directly here because
-`qwen3.6-27b` neither starts with `claude-` nor contains `[1m]`, and compaction then happens
-against that number. `env.sh` sets **88000**, with `CLAUDE_CODE_AUTO_COMPACT_WINDOW` left
-unset.
+`qwen3.6-27b` neither starts with `claude-` nor contains `[1m]`. `env.sh` sets **88000**.
 
-Measured at that setting with `claude -p "/context"`:
+Compaction then fires at **window minus a fixed 29.4k buffer**. Measured with
+`claude -p "/context"` at three settings — the buffer does not scale:
 
-```
-Tokens: 3k / 88k (3%)
-System prompt 1.6k | Skills 1.4k | Free space 55.6k | Autocompact buffer 29.4k (33.4%)
-```
+| declared window | free space | autocompact buffer | messages compact at |
+|---|---|---|---|
+| 88k | 55.6k | 29.4k (33.4%) | ~58k |
+| 130k | 97.6k | 29.4k (22.6%) | ~100k |
+| 200k | 167.6k | 29.4k (14.7%) | ~170k |
 
-So messages compact around 58k and the total sent to the server never passes 88k. Note the
-system prompt is **~3k, not the 20-25k** an earlier version of this file guessed — the
-budget is much less encumbered than expected.
+At 88k the session reported `Tokens: 3k / 88k`, with the system prompt at ~1.6k and skills
+at ~1.4k — **~3k, not the 20-25k** an earlier version of this file guessed.
 
 To turn compaction off entirely, set `DISABLE_COMPACT`. Do not: the session will hit
 `Prompt is too long` and stop instead.
 
 For the study, compaction is not plumbing — it is the harness's own context-truncation
 strategy, doing the same job as `src/context/` in the ICL loop. Log how often it fires.
+
+### Can the context overrun `--max-model-len`?
+
+It could, badly, and the fix is not a compaction setting — it is the **tokenizer**.
+
+Claude Code enforces its ceiling against whatever the proxy's `/v1/messages/count_tokens`
+returns. LiteLLM defaults to tiktoken for a non-Anthropic model, and tiktoken is not
+Qwen's tokenizer. Measured drift on the same text:
+
+| content | tiktoken (what Claude Code believed) | Qwen actual | undercount |
+|---|---:|---:|---:|
+| Triton code + prose | 12,128 | 13,329 | 10% |
+| benchmark tables, digit-heavy | 34,206 | 51,099 | **49%** |
+
+The second row is not a contrived case — it is what a TriMul agent's context actually fills
+with, since `eval.py` emits per-shape `mean / std / err / best / worst` in nanoseconds. An
+88k ceiling counted 49% low is **131k real tokens**, past the server's 130k
+`--max-model-len`, before a single output token.
+
+`model_info.custom_tokenizer` in `litellm_qwen.yaml` points the counter at the real
+tokenizer and closes the gap: the same two texts now count 13,328 and 51,096 against vLLM's
+13,329 and 51,099. With that in place 88k means 88k, and 88k + the 16k output cap leaves
+~26k of headroom under 130k.
+
+It needs network the first time (HuggingFace hub) and caches to `~/.cache/huggingface`, so
+on Bosch start the proxy once with the p4s proxy module loaded. **If you cannot give it
+network, raise `--max-model-len` instead** — this checkpoint is documented at ~260k, and
+200k would absorb even the 49% case. Do not simply trust the ceiling with a tiktoken
+counter behind it.
+
+Do not count on Claude Code recovering if it does overrun. Its retry path matches on the
+*upstream's* error wording, and LiteLLM wraps vLLM's error in its own envelope:
+
+```
+litellm.BadRequestError: Hosted_vllmException - {"error":{"message":"max_tokens=200000
+cannot be greater than max_model_len=max_total_tokens=130000 ..."}}
+```
+
+That may well defeat the matcher, in which case the overrun surfaces as a hard API error
+mid-run rather than as a compaction. The proactive window is the protection.
 
 ## The chat template
 
