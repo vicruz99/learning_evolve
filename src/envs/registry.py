@@ -37,21 +37,25 @@ REGISTRY: dict[str, ProblemSpec] = {
     # per card, across threads AND processes -- see envs.kernel_trimul._gpu_guard for why that is not
     # negotiable.
     #
-    # eval_timeout 2700 is a BACKSTOP, not a budget. Grading runs in TTT-Discover's `leaderboard`
+    # eval_timeout 1500 is a BACKSTOP, not a budget. Grading runs in TTT-Discover's `leaderboard`
     # mode, which is two eval.py invocations (18 correctness shapes, then 7 timed ones), and
     # task.yml caps each at 1200 s -- evaluate.py enforces those itself and reports a clean failure.
-    # This outer subprocess timeout only has to sit above their sum, so that a `eval_timeout` in the
-    # logs always means "the grader hung", never "a slow kernel used its allowance". A healthy eval
-    # is 36 s.
+    # The outer timeout sits above one phase cap (a hung phase fails cleanly at 1200 s and, since a
+    # failed test phase skips the benchmark phase, no clean path reaches ~1300 s), so `eval_timeout`
+    # in the logs always means "the grader hung", never "a slow kernel used its allowance". It was
+    # 2700 (above the 2400 sum of both caps), but the 2026-08-14 w093 incident showed a single hang
+    # stalls its whole parent group for the full allowance, so it now sits as low as that semantic
+    # permits; the real hang protection is the process-group reaping in kernel_trimul. A healthy
+    # eval is 36 s; the slowest PASSING eval over 2400 h100 candidates was 1127 s.
     #
     # THREE PROBLEMS, ONE TASK: the prompts differ only in which card they name, but that drives block
     # sizes and an H100-legal config dies on an A100's smaller shared memory. Scores are comparable
     # WITHIN an architecture, never across one -- TTT-Discover's best kernel does 2198 us on an A100
     # and 1161 us on an H100. Pick the one matching the card you are grading on. trimul_b200 needs a
     # cu128 grading interpreter (guadiana's is cu126 and has no sm100); see envs/kernel_trimul.py.
-    "trimul_a100":       ProblemSpec(TrimulA100Env, "trimul_a100", 1, 2700, "runtime (us)", False, "custom_kernel"),
-    "trimul_h100":       ProblemSpec(TrimulH100Env, "trimul_h100", 1, 2700, "runtime (us)", False, "custom_kernel"),
-    "trimul_b200":       ProblemSpec(TrimulB200Env, "trimul_b200", 1, 2700, "runtime (us)", False, "custom_kernel"),
+    "trimul_a100":       ProblemSpec(TrimulA100Env, "trimul_a100", 1, 1500, "runtime (us)", False, "custom_kernel"),
+    "trimul_h100":       ProblemSpec(TrimulH100Env, "trimul_h100", 1, 1500, "runtime (us)", False, "custom_kernel"),
+    "trimul_b200":       ProblemSpec(TrimulB200Env, "trimul_b200", 1, 1500, "runtime (us)", False, "custom_kernel"),
     # Synthetic smoke-test problem (in-process grading, no sandbox). metric_name is deliberately
     # generic ("score") so the "ee"-counting mechanism stays hidden from the model. eval_timeout is
     # unused by the in-process evaluator; entrypoint is documentary only (no code is executed).

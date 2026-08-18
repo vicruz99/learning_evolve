@@ -132,6 +132,7 @@ import fcntl
 import json
 import logging
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -195,6 +196,16 @@ _DEFAULT_GPU = {"trimul_a100": "1", "trimul_h100": INHERIT_GPU, "trimul_b200": I
 _GPU_LOCK = threading.Lock()
 
 
+def _gpu_key(gpu: str) -> str:
+    """The per-card key the lock file and the dead-GPU marker are both named by."""
+    if gpu == INHERIT_GPU:
+        # No index of our own to key on -- key on what the scheduler granted this process. Processes
+        # in the same allocation see the same value and correctly share one lock; under LSF's
+        # one-GPU-per-job model there is no cross-job contention for the flock to referee anyway.
+        gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "inherit").replace("/", "_").replace(",", "+")
+    return gpu
+
+
 @contextlib.contextmanager
 def _gpu_guard(gpu: str):
     """Hold exclusive use of one GPU across every thread AND every process on this machine.
@@ -207,12 +218,7 @@ def _gpu_guard(gpu: str):
     which is the property a lock file with a pid in it would not give us.
     """
     lock_dir = Path(os.environ.get("TRIMUL_LOCK_DIR", tempfile.gettempdir()))
-    if gpu == INHERIT_GPU:
-        # No index of our own to key on -- key on what the scheduler granted this process. Processes
-        # in the same allocation see the same value and correctly share one lock; under LSF's
-        # one-GPU-per-job model there is no cross-job contention for the flock to referee anyway.
-        gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "inherit").replace("/", "_").replace(",", "+")
-    lock_path = lock_dir / f"learning_evolve-trimul-gpu{gpu}.lock"
+    lock_path = lock_dir / f"learning_evolve-trimul-gpu{_gpu_key(gpu)}.lock"
     with _GPU_LOCK:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
         try:
@@ -223,6 +229,108 @@ def _gpu_guard(gpu: str):
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+# On Exclusive_Process cards (every LSF GPU here) one leaked CUDA context bricks the card for
+# everyone after it: each later eval dies at context creation with "device busy or unavailable"
+# in ~7 s, which reads exactly like 500 bad kernels in a row. Verified on rng-dl01-w093
+# 2026-08-14: a candidate hung at 14:10 (Xid 31), its pool worker outlived evaluate.py with the
+# context held, and three sub-runs graded 0/~510 until the wedged kernel MMU-faulted at 16:29.
+_INFRA_SIGNATURES = (
+    "CUDA-capable device(s) is/are busy or unavailable",
+    "all CUDA-capable devices are busy or unavailable",
+    "CUDA error: initialization error",
+    "CUDA driver initialization failed",
+)
+
+# How long after SIGKILL to keep polling for the eval process group to disappear. A kernel wedged
+# on the GPU can sit unkillable in D-state until the driver faults it out (2h19m in the incident
+# above), so this is a heartbeat interval for logging, not a promise.
+_REAP_GRACE_SECONDS = 60.0
+_UNKILLABLE_WAIT_SECONDS = 1800.0
+
+
+def _reap_group(pgid: int, grace: float = _REAP_GRACE_SECONDS) -> bool:
+    """SIGKILL an eval's entire process group and wait until it is actually gone.
+
+    ``subprocess``'s own timeout handling kills the DIRECT child only -- but the CUDA context
+    lives two forks down (evaluate.py -> eval.py -> multiprocessing spawn worker), so anything
+    short of the whole group leaves an orphan holding the card. Killing the group on the SUCCESS
+    path too is deliberate: the incident orphan was created by a normal-looking evaluate.py exit,
+    not by a timeout.
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True                          # nothing left of the group
+    except PermissionError:                  # a pid was recycled into someone else's group
+        logger.warning("reap: pgid %d no longer ours; leaving it alone", pgid)
+        return True
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.25)
+    return False                             # unkillable: kernel still resident on the card
+
+
+# When an eval group survives SIGKILL past _UNKILLABLE_WAIT_SECONDS, the card is not merely busy --
+# the driver itself is wedged (observed twice: rng-dl01-w093 GPU7 and w092, both spinning in
+# uvm_va_space_destroy with SIGKILL pending for 14h+). Every process that subsequently touches the
+# card goes straight to D-state at CUDA init, so continuing costs a full
+# timeout+grace+unkillable-wait cycle (~56 min) AND leaks one more unkillable process PER CANDIDATE
+# -- w092 accumulated 46 of them over two days. The marker below makes the wedge sticky and
+# machine-wide: it sits next to the flock file (node-local /tmp, shared by every run process on the
+# host), and once it exists no eval on that card spawns anything at all. The failure is then instant,
+# so the run-level empty-generation stop halts the run within one generation instead of never.
+def _dead_marker_path(gpu: str) -> Path:
+    lock_dir = Path(os.environ.get("TRIMUL_LOCK_DIR", tempfile.gettempdir()))
+    return lock_dir / f"learning_evolve-trimul-gpu{_gpu_key(gpu)}.dead"
+
+
+def _mark_gpu_dead(gpu: str, pgid: int) -> Path:
+    marker = _dead_marker_path(gpu)
+    with contextlib.suppress(OSError):
+        marker.write_text(json.dumps({
+            "pgid": pgid,
+            "host": os.uname().nodename,
+            "marked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "why": f"eval process group survived SIGKILL for {_UNKILLABLE_WAIT_SECONDS:.0f}s; "
+                   "GPU driver wedged (see dmesg for nvidia_uvm / Xid). Needs admin reset/reboot. "
+                   "This file auto-clears when the wedged group is gone; delete it to retry sooner.",
+        }, indent=2))
+    return marker
+
+
+def _gpu_dead_reason(gpu: str) -> str | None:
+    """If this card was declared dead, say why; self-heal the marker when the wedge has cleared.
+
+    The wedged process group outliving SIGKILL is what MADE the card dead, so its disappearance
+    (driver finally faulted it out, or the node rebooted -- which also empties /tmp) is the one
+    user-space observable that the card may be usable again. A recycled pgid shows up as
+    ProcessLookupError or PermissionError all the same: either way the group we recorded is gone.
+    """
+    marker = _dead_marker_path(gpu)
+    try:
+        info = json.loads(marker.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        info = {}
+    pgid = info.get("pgid")
+    if isinstance(pgid, int):
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            logger.warning("dead-GPU marker %s cleared: wedged group %d is gone", marker, pgid)
+            return None
+    return (f"GPU marked dead at {info.get('marked_at', '?')} on {info.get('host', '?')} "
+            f"(wedged pgid {pgid}, marker {marker}). "
+            f"{info.get('why', '')} -- infra failure, not the candidate.")
 
 
 def _eval_settings(problem_type: str, overrides: dict | None = None) -> dict:
@@ -257,7 +365,10 @@ class TrimulLocalReward(BaseRewardEvaluator):
     than read off the source.
     """
 
-    def __init__(self, problem_type, log_dir, eval_timeout: int = 2700, num_cpus_per_task: int = 1,
+    # In practice base.Environment always passes eval_timeout from the problem spec (registry.py)
+    # or --eval-timeout, so this default is a fallback for direct construction only. Keep it equal
+    # to the registry value; the sizing rationale lives on the registry entry.
+    def __init__(self, problem_type, log_dir, eval_timeout: int = 1500, num_cpus_per_task: int = 1,
                  eval_python: str | None = None, eval_gpu: str | None = None,
                  evaluate_py: str | None = None, eval_mode: str | None = None, **kwargs):
         # The first four are what base.Environment._run_verification passes to every evaluator; the
@@ -299,6 +410,12 @@ class TrimulLocalReward(BaseRewardEvaluator):
                 {"queue_seconds": 0.0, "eval_seconds": 0.0},
             )
 
+        # Fail BEFORE spawning anything if an earlier eval declared this card dead: a process that
+        # touches a wedged card joins it in unkillable D-state and costs ~56 min to give up on.
+        dead = _gpu_dead_reason(cfg["gpu"])
+        if dead:
+            return self._fail(dead, "harness_error", no_timing)
+
         with tempfile.TemporaryDirectory(prefix="trimul-cand-") as tmp:
             cand = Path(tmp) / "candidate.py"
             cand.write_text(code or "")
@@ -319,24 +436,77 @@ class TrimulLocalReward(BaseRewardEvaluator):
             with _gpu_guard(cfg["gpu"]):     # <-- the whole point; see the module docstring
                 queue_seconds = time.perf_counter() - t_queue
                 t_eval = time.perf_counter()
+                # Re-check under the lock: when the wedge is first detected, a generation's worth of
+                # sibling threads is already queued on the flock behind the discoverer, and each
+                # would otherwise spawn one more process into the dead driver as it gets the lock.
+                dead = _gpu_dead_reason(cfg["gpu"])
+                if dead:
+                    return self._fail(dead, "harness_error",
+                                      {"queue_seconds": round(queue_seconds, 3),
+                                       "eval_seconds": 0.0})
+                # start_new_session=True makes proc.pid the pgid, so _reap_group below can take
+                # out evaluate.py, eval.py AND the spawn worker that owns the CUDA context. The
+                # flock must not be released until that whole group is provably dead -- otherwise
+                # the "free" card is handed to the next candidate with a context still on it.
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    start_new_session=True,
+                )
+                timed_out = False
                 try:
-                    proc = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=self.eval_timeout,
-                    )
+                    proc_stdout, proc_stderr = proc.communicate(timeout=self.eval_timeout)
                 except subprocess.TimeoutExpired:
-                    return self._fail(
-                        f"Process timed out after {self.eval_timeout}s", "eval_timeout",
-                        {"queue_seconds": round(queue_seconds, 3),
-                         "eval_seconds": round(time.perf_counter() - t_eval, 3)},
-                    )
+                    timed_out = True
+                    proc_stdout, proc_stderr = "", ""
+                finally:
+                    reaped = _reap_group(proc.pid)
+                    if timed_out:
+                        # The group is dead (or being killed); collect the direct child so it
+                        # does not linger as a zombie. Output is best-effort at this point.
+                        with contextlib.suppress(Exception):
+                            proc_stdout, proc_stderr = proc.communicate(timeout=10)
+                    if not reaped:
+                        # SIGKILL did not land: a kernel is wedged on the card and the worker sits
+                        # in D-state until the driver faults it out. Hold the flock and wait --
+                        # a stalled run is recoverable, a run grinding into a bricked card is not.
+                        logger.critical(
+                            "eval process group %d survived SIGKILL; kernel likely wedged on the "
+                            "GPU. Holding the GPU lock up to %.0fs while polling.",
+                            proc.pid, _UNKILLABLE_WAIT_SECONDS)
+                        wait_deadline = time.monotonic() + _UNKILLABLE_WAIT_SECONDS
+                        while time.monotonic() < wait_deadline:
+                            if _reap_group(proc.pid):
+                                reaped = True
+                                break
+                            logger.warning("still waiting on unkillable eval group %d", proc.pid)
                 eval_seconds = time.perf_counter() - t_eval
-
-            timing = {"queue_seconds": round(queue_seconds, 3),
-                      "eval_seconds": round(eval_seconds, 3)}
+                timing = {"queue_seconds": round(queue_seconds, 3),
+                          "eval_seconds": round(eval_seconds, 3)}
+                if not reaped:
+                    # Give up loudly AND declare the card dead machine-wide. Returning a plain
+                    # harness_error here was not enough (rng-dl01-w092, 2026-08-15..17): the run
+                    # kept feeding candidates to the wedged driver at one unkillable D-state
+                    # process per ~56 min cycle, 46 of them over two days. With the marker, every
+                    # later candidate on this card -- this run or any sibling process -- fails in
+                    # microseconds without spawning, so the empty-generation stop actually fires.
+                    marker = _mark_gpu_dead(cfg["gpu"], proc.pid)
+                    logger.critical(
+                        "declaring GPU dead: eval group %d survived SIGKILL for %.0fs "
+                        "(driver wedge; see dmesg). Marker: %s. Needs admin GPU reset/reboot.",
+                        proc.pid, _UNKILLABLE_WAIT_SECONDS, marker)
+                    return self._fail(
+                        f"GPU still held by unkillable eval process group {proc.pid} after "
+                        f"{_UNKILLABLE_WAIT_SECONDS:.0f}s -- driver wedged; card declared dead "
+                        f"({marker}). Infra failure, not the candidate.",
+                        "harness_error", timing)
+                if timed_out:
+                    return self._fail(
+                        f"Process timed out after {self.eval_timeout}s (process group killed)",
+                        "eval_timeout", timing)
 
             if not out_json.exists():
                 # The grader itself did not get far enough to write results.
-                tail = (proc.stderr or proc.stdout or "")[-1500:]
+                tail = (proc_stderr or proc_stdout or "")[-1500:]
                 return self._fail(f"grader wrote no results:\n{tail}", "harness_error", timing)
             try:
                 runs = json.loads(out_json.read_text())
@@ -362,7 +532,8 @@ class TrimulLocalReward(BaseRewardEvaluator):
             # informative than upstream's bare "Failed to pass test cases." costs no fidelity.)
             failed_phase = run.get("failed_phase", cfg["mode"])
             entry = phases.get(failed_phase, scoring_phase)
-            detail = (entry.get("stderr") or "")[-1500:]
+            full_stderr = entry.get("stderr") or ""
+            detail = full_stderr[-1500:]
             tests = entry.get("tests") or {}
             if not detail.strip() and tests.get("failed"):
                 shapes = "; ".join(f"[{f['idx']}] {f['spec']}: {f['error']}"
@@ -370,6 +541,15 @@ class TrimulLocalReward(BaseRewardEvaluator):
                 detail = (f"{tests['passed']}/{tests['count']} shapes passed. "
                           f"First failures: {shapes}")[:1500]
             self._last_timing = timing
+            # A context-creation failure is OURS (a leaked context bricked the Exclusive_Process
+            # card -- see _INFRA_SIGNATURES), not the candidate's. Scoring it as process_crash
+            # burns the candidate and, at 96/generation, trips the empty-generation stop with a
+            # message blaming the kernels. Match against the FULL stderr, not the 1500-char tail:
+            # the signature sits mid-traceback and can be truncated out of the tail.
+            if any(sig in full_stderr for sig in _INFRA_SIGNATURES):
+                return self._fail(
+                    f"GPU unavailable (infra, not the candidate) in the '{failed_phase}' "
+                    f"phase:\n{detail}", "harness_error", timing)
             return {
                 "reward": 0.0,
                 "msg": f"FAILED in the '{failed_phase}' phase -- no score.\n{detail}",
