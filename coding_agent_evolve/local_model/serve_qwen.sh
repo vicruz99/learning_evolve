@@ -19,6 +19,11 @@ SERVED_NAME=${SERVED_NAME:-Qwen/Qwen3.6-27B}
 VLLM=${VLLM:-/scratch/vicstorage/venvs/vllm026/bin/vllm}
 PORT=${PORT:-8001}
 TP=${TP:-2}
+# 127.0.0.1 is right for an agent run: server, proxy and agent share a node. The ICL sweeps
+# are the opposite -- jobs/vllm_server.bsub binds 0.0.0.0 because the driver job can be on
+# another node, and bound to localhost the server is invisible to it. Set HOST=0.0.0.0 if
+# this server also has to serve a sweep.
+HOST=${HOST:-127.0.0.1}
 
 # On a box where the agent also grades on a GPU (the TriMul task), pin vLLM to a
 # subset of cards and leave one free -- a shared card makes every timing garbage.
@@ -33,7 +38,7 @@ TEMPLATE_ARGS=()
 exec "$VLLM" serve "$MODEL" \
     "${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"}" \
     --served-model-name "$SERVED_NAME" \
-    --host 127.0.0.1 --port "$PORT" \
+    --host "$HOST" --port "$PORT" \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization 0.95 \
     --max-model-len 130000 \

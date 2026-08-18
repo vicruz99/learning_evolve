@@ -329,6 +329,42 @@ It stops incidental contamination, not a determined search.
 Each run gets its own `CLAUDE_CONFIG_DIR` (`<run_dir>/.cc`), so no history, memory or
 config leaks between runs.
 
+## Adding the flags to the server the ICL sweeps use
+
+The two flags are additive, and on the shape of request the ICL loop sends they change
+nothing. Checked at the source rather than assumed:
+
+**`src/generation/vllm_client.py` sends one user turn with no `tools` and no `tool_choice`**
+(`messages=[{"role": "user", ...}]`, `extra_body` carrying only `thinking_token_budget` /
+`reasoning_effort` / `chat_template_kwargs`). In vLLM 0.26's chat serving path the tool
+parser is gated on exactly that: with `tool_choice` unset, the branch that fires is
+`elif not request.tool_choice or request.tool_choice == "none"`, which returns plain
+`ChatMessage(role, reasoning, content)` — the same object the no-flags path produces. The
+parser is also constructed with `request.tools`, so with no tools it has nothing to extract.
+A `--reasoning-parser` is already attached today, so this is not even a new code path.
+
+**The template swap is also invisible to the sweeps, but only because they never set
+`enable_thinking`.** Rendering the exact ICL message shape through both templates:
+
+| `chat_template_kwargs` | official vs v19 |
+|---|---|
+| *(unset — what every sweep does)* | **byte-identical** |
+| `enable_thinking: true` | **byte-identical** |
+| `enable_thinking: false` | **differs** (`<think>\n\n</think>\n\n` vs `<think>\n</think>\n`) |
+
+`icl/config.py` has an `enable_thinking` key but no sweep sets it, so today the swap is
+free. If you ever set it to `false`, that arm's prompts change under the new template and
+its numbers stop being comparable with runs made before it.
+
+**What restarting does cost**, regardless of flags: in-flight requests die and the prefix
+cache is empty afterwards. Check nothing is running (`bjobs -w`) before you bounce it.
+
+**Do not swap the server command wholesale.** `serve_qwen.sh` is written for an agent run on
+one node and defaults to `--host 127.0.0.1`; `jobs/vllm_server.bsub` binds `0.0.0.0` because
+the sweep driver can be on a different node, and it also carries `--async-scheduling`,
+`--kv-cache-dtype fp8` and the FP8 checkpoint. To serve both, add the two flags to *that*
+file rather than replacing it — or run `serve_qwen.sh` with `HOST=0.0.0.0`.
+
 ## What does not work behind a local model
 
 * **WebSearch** is an Anthropic server-side tool: it is executed by the API, not the
