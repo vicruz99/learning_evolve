@@ -40,17 +40,19 @@ export MAX_THINKING_TOKENS=0
 
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384
 
-# Declare the real context window. Claude Code does not recognise the model ID `qwen3.6-27b`
-# and would otherwise assume one; because the ID neither starts with `claude-` nor contains
-# `[1m]`, this variable applies directly. Keep it equal to the server's --max-model-len.
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=130000
-
-# Compact at 100k of that 130k. 100000 is the FLOOR the variable accepts -- Claude Code
-# cannot be made to compact earlier than that, so if you want more headroom between
-# compactions, raise --max-model-len on the server rather than lowering this.
-# Plain integers only: `100k` reads as 100 and clamps. While this is set it overrides the
-# /autocompact command, the --autocompact flag and the autoCompactWindow setting.
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000
+# THE context knob. Claude Code does not recognise the ID `qwen3.6-27b`, so it assumes a
+# window for it; this declares the one to assume, and applies directly because the ID
+# neither starts with `claude-` nor contains `[1m]`. Compaction then happens against this
+# number, so the session never sends more than this many tokens to the server.
+#
+# Deliberately NOT the server's 130k --max-model-len: 88k is the ceiling we want per run.
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW is not the way to do this -- it has a hard floor of
+# 100000 and is capped at the model's window anyway, so it cannot express a sub-100k
+# budget. Leave it unset.
+#
+# Measured with `claude -p "/context"` at this setting: `Tokens: 3k / 88k`, with a 29.4k
+# autocompact buffer, i.e. messages compact around 58k and total context never passes 88k.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=88000
 
 # Keep config, history and memory out of ~/.claude so one run cannot inherit another's
 # state. run_agent.sh overrides this per run directory.

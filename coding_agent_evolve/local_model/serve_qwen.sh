@@ -24,7 +24,14 @@ TP=${TP:-2}
 # subset of cards and leave one free -- a shared card makes every timing garbage.
 [ -n "${GPUS:-}" ] && export CUDA_VISIBLE_DEVICES="$GPUS"
 
+# Optional replacement chat template (see fetch_chat_template.sh and the README). Passed as
+# a flag rather than written into tokenizer_config.json so the checkpoint stays pristine and
+# the template is a logged, switchable part of the run config.
+TEMPLATE_ARGS=()
+[ -n "${CHAT_TEMPLATE:-}" ] && TEMPLATE_ARGS=(--chat-template "$CHAT_TEMPLATE")
+
 exec "$VLLM" serve "$MODEL" \
+    "${TEMPLATE_ARGS[@]+"${TEMPLATE_ARGS[@]}"}" \
     --served-model-name "$SERVED_NAME" \
     --host 127.0.0.1 --port "$PORT" \
     --tensor-parallel-size "$TP" \

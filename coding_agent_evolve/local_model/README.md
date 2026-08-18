@@ -79,7 +79,7 @@ API Error: 400 litellm.BadRequestError: Hosted_vllmException -
 Code does not know `qwen3.6-27b`; that is the point.)
 
 Keep `--enable-prefix-caching`. Claude Code resends a long, stable prefix (system prompt +
-tool schemas ≈ 20-25k tokens) on every single turn; without prefix caching you pay to
+tool schemas, measured at ~3k here) on every single turn; without prefix caching you pay to
 prefill it hundreds of times per run.
 
 ## 2. The proxy
@@ -140,58 +140,49 @@ config leaks between runs.
 
 ### How much Qwen is allowed to think
 
-`MAX_THINKING_TOKENS` does **not** do this. It controls what Claude Code *asks* for, and
-`drop_params: true` discards the ask before it reaches vLLM. Qwen thinks as much as it likes
-regardless.
+**Currently unconstrained, on purpose.** The model is agentic and decides for itself when
+to stop reasoning; the ICL arm caps it (`thinking-token-budget: 11000` in the trimul
+sweeps) because a single-shot generation has no other way to bound cost, which is not the
+situation here.
 
-The real control is vLLM's per-request `thinking_token_budget`, pinned in
-`litellm_qwen.yaml` under `extra_body` because Claude Code has no knob to send it:
+`MAX_THINKING_TOKENS` is not the knob either way. It controls what Claude Code *asks* for,
+and `drop_params: true` discards the ask before it reaches vLLM.
 
-```yaml
-extra_body:
-  thinking_token_budget: 2048     # 0 = no thinking at all
-```
-
-vLLM tracks the `<think>` section and forces the end token once the budget is spent. It
-needs `--reasoning-parser` on the server, which `serve_qwen.sh` sets. Verified through the
-full chain (Anthropic `/v1/messages` -> LiteLLM -> vLLM): a budget of 24 cut reasoning at
-89 characters and handed control back to visible output.
-
-Two things to know before you turn it down:
-
-* **The cut is hard, not graceful.** At 24 tokens the model was mid-sentence in step 1 of
-  its plan, and the "answer" that followed was just the rest of the reasoning with the
-  `<think>` tags gone. Budget enough for a complete thought (1-4k) or set 0 for none.
-  Values in between mostly buy you incoherence.
-* **The other lever is the template.** `chat_template_kwargs: {"enable_thinking": false}`
-  turns thinking off through the template instead, which costs nothing at sample time.
-  Confirmed working on this checkpoint. But this template implements it by injecting an
-  empty `<think>\n\n</think>` block, which is exactly the construction the fixed-template
-  project below blames for premature turn aborts. `thinking_token_budget: 0` gets you the
-  same place without the empty block.
+The real knob, if you ever want it, is vLLM's per-request `thinking_token_budget`,
+commented out in `litellm_qwen.yaml` under `extra_body` because Claude Code has no way to
+send it. vLLM tracks the `<think>` section and forces the end token once the budget is
+spent; verified through the full chain, a budget of 24 cut reasoning at 89 characters.
+Two things before you turn it on: the cut is **hard**, so a small budget leaves the model
+mid-sentence and the "answer" is just the rest of its reasoning with the tags gone; and
+`chat_template_kwargs: {"enable_thinking": false}` is the cheaper way to get zero, though
+this checkpoint implements that by injecting an empty `<think></think>` block.
 
 ### How often Claude Code compacts
 
-`CLAUDE_CODE_AUTO_COMPACT_WINDOW` is how full the context may get before compaction. Three
-constraints matter here:
+The target is a hard ceiling on context per run. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` cannot
+express one below 100k — that is its floor, and it is capped at the model's window besides.
 
-* **100,000 is the floor.** You cannot make Claude Code compact earlier. With a 130k
-  server window and ~20-25k of system prompt and tool schemas, 100k is nearly the whole
-  usable window. If you want more headroom between compactions, raise `--max-model-len`
-  (this checkpoint is documented at ~260k) rather than lowering this.
-* **Plain integers only** in the environment variable: `100k` reads as `100` and clamps to
-  the floor. The `/autocompact 500k` command and the `--autocompact 500k` flag do accept
-  suffixes; the environment variable overrides both while it is set.
-* **Declare the real window too.** Claude Code does not recognise the ID `qwen3.6-27b` and
-  assumes a context window for it. `CLAUDE_CODE_MAX_CONTEXT_TOKENS=130000` corrects that,
-  and applies directly here because the ID neither starts with `claude-` nor contains
-  `[1m]`. Without it the status line percentage is measured against a window that does not
-  exist.
+The variable that can is `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, which declares the window Claude
+Code should assume for a model ID it does not recognise. It applies directly here because
+`qwen3.6-27b` neither starts with `claude-` nor contains `[1m]`, and compaction then happens
+against that number. `env.sh` sets **88000**, with `CLAUDE_CODE_AUTO_COMPACT_WINDOW` left
+unset.
 
-To turn compaction off entirely, set `DISABLE_COMPACT`. Do not, on a 130k window: the
-session will hit `Prompt is too long` and stop instead.
+Measured at that setting with `claude -p "/context"`:
 
-For the study, compaction is not plumbing -- it is the harness's own context-truncation
+```
+Tokens: 3k / 88k (3%)
+System prompt 1.6k | Skills 1.4k | Free space 55.6k | Autocompact buffer 29.4k (33.4%)
+```
+
+So messages compact around 58k and the total sent to the server never passes 88k. Note the
+system prompt is **~3k, not the 20-25k** an earlier version of this file guessed — the
+budget is much less encumbered than expected.
+
+To turn compaction off entirely, set `DISABLE_COMPACT`. Do not: the session will hit
+`Prompt is too long` and stop instead.
+
+For the study, compaction is not plumbing — it is the harness's own context-truncation
 strategy, doing the same job as `src/context/` in the ICL loop. Log how often it fires.
 
 ## The chat template
@@ -207,20 +198,50 @@ checkpoint, though only one of them currently bites on this stack:
 | empty `<think></think>` causes premature aborts | **Construction confirmed, effect not measured.** `enable_thinking: false` does inject exactly that block here. A single-turn probe answered fine; the claim is about rate over many turns, which we have not tested. |
 | graded reasoning effort (`<\|think_low\|>` … `<\|think_xhigh\|>`) | **Genuinely absent here.** This template has only the binary `enable_thinking` switch — no effort tags at all, and no `xhigh` default to fix. The fixed templates would *add* per-prompt effort steering, which is a real gain for an agent loop where some turns deserve more thought than others. |
 
-If you swap it in, point `--chat-template <file>` at it in `serve_qwen.sh` rather than
-editing `tokenizer_config.json` in `/scratch/vicstorage/qwen` — the checkpoint stays
-pristine and the template becomes a logged, switchable part of the run config. Treat it as
-a variable to hold fixed across arms, not a fix to apply once and forget: it changes the
-rendered prompt, so runs before and after are not comparable.
+### Which file, and what it actually changes
+
+**Take the version from `archive/qwen3.6/`, not the repo root.** The root
+`chat_template.jinja` is `qwen3.8-froggeric-v22.1` — the Qwen3.8 template, wrong model. The
+3.6 line stops at **v19**, and v19 does *not* carry the `<|think_low|>`…`<|think_xhigh|>`
+inline tags; those are a v21/v22 (3.8) feature. So the effort-steering upside is **not**
+available to this checkpoint. What v19 does fix is real, measured with
+`compare_templates.py`:
+
+```
+============ /scratch/vicstorage/qwen/chat_template.jinja          (official)
+  stringified tool args : FAILS -> TypeError: Can only get item pairs from a mapping.
+  prefix stability      : 52/127 chars of the turn-1 render survive
+  old reasoning kept    : False
+============ qwen3.6_chat_template-v19.jinja                       (fixed)
+  stringified tool args : RENDERS
+  prefix stability      : 108/126 chars of the turn-1 render survive
+  old reasoning kept    : True
+```
+
+Read the last line as a trade, not a free win: v19 keeps every historical reasoning block
+in the prompt. That is what makes the prefix stable, and with reasoning unconstrained it
+also means the 88k window fills faster and compaction fires sooner. Pass
+`chat_template_kwargs: {"preserve_thinking": false}` to get the old stripping behaviour
+back if the window turns out to be the binding constraint.
+
+```bash
+./fetch_chat_template.sh                                   # writes qwen3.6_chat_template-v19.jinja
+python compare_templates.py /scratch/vicstorage/qwen/chat_template.jinja \
+                            qwen3.6_chat_template-v19.jinja
+CHAT_TEMPLATE=$PWD/qwen3.6_chat_template-v19.jinja ./serve_qwen.sh
+```
+
+`serve_qwen.sh` passes it as `--chat-template` rather than editing `tokenizer_config.json`
+in the checkpoint, so the model stays pristine and the template is a logged, switchable
+part of the run config. Treat it as a variable held fixed across arms, not a fix applied
+once and forgotten: it changes every rendered prompt, so runs before and after are not
+comparable.
 
 ## Things that will bite
 
-**Context.** The server window is 130k. Claude Code's system prompt and tool schemas
-already cost ~20-25k of it before the task prompt, and tool results (file reads, script
-output) accumulate fast. `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000` compacts before the
-ceiling; without it a long run dies mid-tool-call. Compaction is itself an ICL-relevant
-variable — it is the harness's own truncation strategy, and it is doing the same job as
-`src/context/` in the ICL loop. Worth logging how often it fires.
+**Context.** Handled by `CLAUDE_CODE_MAX_CONTEXT_TOKENS=88000`; see *How often Claude Code
+compacts* above. The server's `--max-model-len` is 130k, so the 88k ceiling leaves headroom
+rather than racing it.
 
 **Betas.** Claude Code sends its full Anthropic capability set to any `ANTHROPIC_BASE_URL`
 gateway, including body fields (`context_management`, `output_config`, `strict` /
@@ -247,6 +268,59 @@ grades on a local GPU. Sharing one card makes every timing meaningless (`gpumode
 §Measurement caveats). Give vLLM its own cards with `GPUS=0,1 ./serve_qwen.sh` and leave
 one free for grading. The Erdős task grades on CPU, so one GPU is enough there.
 
+## The command workflow
+
+Two shells (or tmux panes) on the node that holds the cards. Nothing here uses `bsub`.
+
+**Once per machine** — the proxy venv, the fixed template, the grading venv:
+
+```bash
+python3 -m venv /scratch/vicstorage/venvs/ccproxy          # on Bosch: ~/venvs/ccproxy
+/scratch/vicstorage/venvs/ccproxy/bin/pip install 'litellm[proxy]' \
+    'fastapi==0.115.12' 'sse-starlette==2.1.3'
+./fetch_chat_template.sh                                   # needs the p4s proxy on Bosch
+```
+
+**Pane 1 — the server.** Two cards: vLLM takes one, the grader needs the other free.
+
+```bash
+GPUS=0 CHAT_TEMPLATE=$PWD/qwen3.6_chat_template-v19.jinja ./serve_qwen.sh
+```
+
+Wait for it to serve, then confirm tool calling is live — this is the one thing that
+silently produces a useless agent if it is wrong:
+
+```bash
+curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"Qwen/Qwen3.6-27B",
+  "messages":[{"role":"user","content":"List files in /tmp"}],
+  "tools":[{"type":"function","function":{"name":"bash","description":"run a shell command",
+    "parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}}],
+  "tool_choice":"auto"}' | python -m json.tool | grep -A5 tool_calls
+```
+
+**Pane 2 — the run.**
+
+```bash
+export KPY=~/venvs/kernel-eval/bin/python                  # the cu128 grading interpreter
+../gpumode/b200_task/make_run.sh ~/agent_runs/trimul_b200_qwen1
+./run_agent.sh ~/agent_runs/trimul_b200_qwen1              # interactive; add -p for headless
+```
+
+`run_agent.sh` health-checks vLLM, starts LiteLLM on :4000 if it is not up, verifies `$KPY`
+has kernels for the granted card, and launches the agent in the run folder with
+`run_guard.json`. On Bosch, get the allocation first:
+
+```bash
+bsub -Is -q batch_b200 -gpu "num=2" -J ccagent -P BH-000557-01 \
+     -G rb_bd_dlp_rng-dl01_cr_AIQ_employees \
+     -n 32 -R "span[hosts=1] rusage[mem=65536]" -M 65536MB -W 24:00 /bin/bash
+```
+
+Then run everything above on the compute node. Never on a login node: a cgroup caps the
+user slice at 5 cores while showing 64, which is invisible to every tool and makes evals
+~12x slower (`docs/BOSCH_CLUSTER.md`).
+
 ## Files
 
 | file | what it is |
@@ -256,3 +330,8 @@ one free for grading. The Erdős task grades on CPU, so one GPU is enough there.
 | `env.sh` | the environment that points `claude` at the proxy |
 | `run_agent.sh` | health-checks the server, starts the proxy, launches the agent in a run dir |
 | `run_guard.json` | `--settings` guard: denies web tools, the docs, and auto-memory |
+| `fetch_chat_template.sh` | pulls the fixed Qwen3.6 chat template (v19) from HuggingFace |
+| `compare_templates.py` | renders two templates side by side on the three things that break agent loops |
+
+The task folders live next door: `../gpumode/b200_task/` (TriMul on a B200) and
+`../erdos/` (the Erdős prompt plus `eval.py`).

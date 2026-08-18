@@ -49,6 +49,25 @@ source "$HERE/env.sh"
 export CLAUDE_CONFIG_DIR="$RUN_DIR/.cc"        # per-run config: no shared history or memory
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
+# The kernel tasks grade through a specific interpreter. Export it so the agent's Bash tool
+# inherits it, and refuse to start without it -- an unset $KPY makes `$KPY evaluate.py ...`
+# collapse to `evaluate.py ...`, which fails as a confusing `Permission denied`.
+if [ -d "$RUN_DIR/trimul" ]; then
+    KPY=${KPY:-$HOME/venvs/kernel-eval/bin/python}
+    [ -x "$KPY" ] || { echo "KPY=$KPY is not executable; see gpumode_local/reference/README.md" >&2; exit 1; }
+    "$KPY" - <<'PYCHK' || exit 1
+import sys, torch, triton
+archs = torch.cuda.get_arch_list()
+name = torch.cuda.get_device_properties(0).name
+print(f"[run_agent] grading stack: torch {torch.__version__}, triton {triton.__version__}")
+print(f"[run_agent] card: {name} | arch list: {archs}")
+cc = torch.cuda.get_device_capability(0)
+if f"sm_{cc[0]}{cc[1]}" not in archs:
+    sys.exit(f"[run_agent] FATAL: this interpreter has no kernels for sm_{cc[0]}{cc[1]}")
+PYCHK
+    export KPY
+fi
+
 cd "$RUN_DIR"
 if [ "$MODE" = "-p" ]; then
     claude --settings "$HERE/run_guard.json" \
