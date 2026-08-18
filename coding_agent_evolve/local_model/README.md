@@ -68,13 +68,24 @@ python3 -m venv ~/venvs/ccproxy          # /scratch/vicstorage/venvs/ccproxy on 
 ~/venvs/ccproxy/bin/python compare_templates.py \
     /scratch/vicstorage/qwen/chat_template.jinja qwen3.6_chat_template-v19.jinja
 
-# the grading interpreter, for the TriMul task only. MUST be the cu128 build: sm_100
-# gencode comes only from CUDA 12.8, and a cu126 venv on a B200 fails as a wall of ptxas
-# errors that read like bad candidates. Full steps in gpumode_local/reference/README.md.
+# the grading interpreter, for the TriMul task only. ON BOSCH THIS ALREADY EXISTS -- it was
+# built and measured 2026-08-17 -- so check before creating anything:
+KPY=~/venvs/kernel-eval/bin/python ./check_gpu.sh
+
+# only if it is missing. Full steps in gpumode_local/reference/README.md.
 python3 -m venv ~/venvs/kernel-eval
 ~/venvs/kernel-eval/bin/pip install "torch==2.7.1" --index-url https://download.pytorch.org/whl/cu128
 ~/venvs/kernel-eval/bin/pip install pyyaml numpy
 ```
+
+**The cu128 part is a wheel index, not a CUDA upgrade.** Nothing about the system CUDA
+changes and no version gets re-pinned: `torch==2.7.1` and `triton 3.3.1` are the same
+versions every other arm in this project uses, and 2.7.1 was already the first release with
+Blackwell wheels. It ships in two builds — cu126, whose arch list stops at `sm_90`, and
+cu128, which adds `sm_100`/`sm_120` — and only the second can run on a B200. torch bundles
+its own CUDA runtime, so the `module load cuda/12.6.0` in the `jobs/*.bsub` files is
+unrelated and stays as it is. (`IMPLEMENTATION_LOG.md`, 2026-08-17: *"the distinction is the
+wheel index, not the version — no version change, no re-pinning, no comparability loss"*.)
 
 **Both pins are load-bearing, in opposite directions.** `fastapi` must be `<0.141`:
 `get_flat_dependant` was removed in 0.141, and litellm 1.97.0 still imports it, so it dies
