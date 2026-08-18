@@ -24,13 +24,13 @@ claude  --(Anthropic Messages, /v1/messages)-->  LiteLLM :4000
 ```bash
 python3 -m venv /scratch/vicstorage/venvs/ccproxy
 /scratch/vicstorage/venvs/ccproxy/bin/pip install 'litellm[proxy]'
-# litellm 1.97.0 (the newest on our index) does not import against current fastapi --
+# litellm 1.97.0 (the newest on our index) does not import against fastapi 0.141+ --
 # `ImportError: cannot import name 'get_flat_dependant'`, which surfaces confusingly as
 # `ModuleNotFoundError: No module named 'proxy_server'`. Pin both back:
-/scratch/vicstorage/venvs/ccproxy/bin/pip install 'fastapi==0.115.12' 'sse-starlette==2.1.3'
+/scratch/vicstorage/venvs/ccproxy/bin/pip install 'fastapi==0.140.0' 'sse-starlette==2.1.3'
 ```
 
-Verified working on guadiana 2026-08-18 with litellm 1.97.0 + fastapi 0.115.12 +
+Verified working on guadiana 2026-08-18 with litellm 1.97.0 + fastapi 0.140.0 +
 sse-starlette 2.1.3 on Python 3.13.
 
 The `claude` CLI is the native install (`~/.local/share/claude/versions/<v>`, a
@@ -347,10 +347,11 @@ off card 0.
 ### Step 1 — one-time, per machine
 
 ```bash
-# the proxy. The pins are not optional: litellm 1.97.0 does not import against current
-# fastapi, and the real error (get_flat_dependant) is masked as "No module named proxy_server".
-python3 -m venv ~/venvs/ccproxy
-~/venvs/ccproxy/bin/pip install 'litellm[proxy]' 'fastapi==0.115.12' 'sse-starlette==2.1.3'
+# The proxy goes in the PROJECT venv -- it does not need one of its own. Verified with a
+# dry run against src/.venv: 62 pure additions, aiohttp 3.14.1 -> 3.14.3 (ray needs
+# >=3.13.3, so it is fine), and nothing downgraded or removed.
+uv pip install --python src/.venv/bin/python \
+    'litellm[proxy]==1.97.0' 'fastapi==0.140.0' 'sse-starlette==2.1.3'
 
 # the fixed chat template (v19 — the 3.6 line; the repo root file is Qwen3.8)
 ./fetch_chat_template.sh
@@ -364,6 +365,34 @@ python3 -m venv ~/venvs/kernel-eval
 ~/venvs/kernel-eval/bin/pip install "torch==2.7.1" --index-url https://download.pytorch.org/whl/cu128
 ~/venvs/kernel-eval/bin/pip install pyyaml numpy
 ```
+
+**Both pins are load-bearing, in opposite directions.** `fastapi` must be `<0.141`:
+`get_flat_dependant` was removed in 0.141, and litellm 1.97.0 still imports it, so it dies
+with a `ModuleNotFoundError: No module named 'proxy_server'` that names the wrong thing
+entirely. It must also be `>=0.136.3`, because that is litellm's own declared floor and uv
+refuses to resolve below it. 0.140.0 is the version that satisfies both — an earlier version
+of this file said 0.115.12, which works but violates litellm's constraint and makes the
+resolver reject the whole install.
+
+Then verify the grading stack on the card the scheduler gave you:
+
+```bash
+KPY=~/venvs/kernel-eval/bin/python ./check_gpu.sh
+```
+
+It prints torch/triton/card/arch-list/shared-memory, fails loudly if the interpreter has no
+kernels for this capability, and then **compiles and runs a real Triton kernel** — because
+the arch list alone is not proof, and this is what the grader actually does. Expect on a
+Bosch B200 node (measured 2026-08-17, recorded in `gpumode_local/reference/README.md`):
+
+```
+torch 2.7.1+cu128 | triton 3.3.1 | NVIDIA B200 | sm_100
+['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120','compute_120'] | shared mem 232448
+```
+
+A `BUSY` result means the card has no free memory — something else owns it — and says
+nothing about the toolchain. Inside an LSF job the scheduler sets `CUDA_VISIBLE_DEVICES` to
+your card, so this only comes up on an unscheduled box.
 
 Also install the `claude` CLI once (`curl -fsSL https://claude.ai/install.sh | bash`, or
 copy `~/.local/share/claude/versions/<v>` across) and **pin the version** — the set of
@@ -401,8 +430,6 @@ kernel, which the agent must never see:
 ```bash
 cd ~/projects/phd/learning_evolve
 export KPY=~/venvs/kernel-eval/bin/python
-"$KPY" -c "import torch,triton;print(torch.__version__,triton.__version__,torch.cuda.get_arch_list())"
-#   must print 2.7.1+cu128 3.3.1 and the arch list MUST contain sm_100
 
 "$KPY" coding_agent_evolve/gpumode/evaluate.py \
     src/gpumode_local/reference/trimul_best.py --mode leaderboard --repeats 5
@@ -423,10 +450,18 @@ export KPY=~/venvs/kernel-eval/bin/python
 ./run_agent.sh ~/agent_runs/trimul_b200_qwen1 -p       # headless -> agent.jsonl
 ```
 
-`run_agent.sh` health-checks vLLM, starts LiteLLM on :4000 if it is not already up, checks
-that `$KPY` has kernels for the granted card, sources `env.sh`, gives the run its own
-`CLAUDE_CONFIG_DIR`, and launches the agent under `run_guard.json` from outside the run
-folder.
+**Interactive is the default and it is a real Claude Code session** — the normal UI opens
+in the run folder and `INITIAL_PROMPT.md` is submitted for you, so the run starts on the
+task and you watch it work, interrupt it, and steer it like any other session. Drop the
+positional argument in `run_agent.sh` if you would rather land in an empty prompt and type.
+
+`-p` is headless: no UI at all, the transcript streams to `agent.jsonl`. Use it for a run
+you are not sitting with. Nothing can answer a permission prompt in that mode, which is why
+`run_guard.json` sets `defaultMode: acceptEdits`.
+
+Either way `run_agent.sh` health-checks vLLM, starts LiteLLM on :4000 if it is not already
+up, runs `check_gpu.sh` for kernel tasks, sources `env.sh`, gives the run its own
+`CLAUDE_CONFIG_DIR`, and launches under `run_guard.json` from outside the run folder.
 
 For the Erdős task instead, build the folder by hand — it needs no harness:
 
@@ -473,6 +508,7 @@ give it network and restart, or raise `--max-model-len` to 200000 and rely on he
 | `run_guard.json` | `--settings` guard: denies web tools, the docs, and auto-memory |
 | `fetch_chat_template.sh` | pulls the fixed Qwen3.6 chat template (v19) from HuggingFace |
 | `compare_templates.py` | renders two templates side by side on the three things that break agent loops |
+| `check_gpu.sh` | proves the grading interpreter can compile Triton for the granted card |
 
 The task folders live next door: `../gpumode/b200_task/` (TriMul on a B200) and
 `../erdos/` (the Erdős prompt plus `eval.py`).

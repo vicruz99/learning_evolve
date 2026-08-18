@@ -19,7 +19,12 @@ MODE="${2:-}"
 
 VLLM_URL=${VLLM_URL:-http://127.0.0.1:8001}
 PROXY_PORT=${PROXY_PORT:-4000}
-LITELLM=${LITELLM:-/scratch/vicstorage/venvs/ccproxy/bin/litellm}
+# The proxy lives in the project venv by default -- litellm only ADDS packages there
+# (verified: 62 additions, one aiohttp patch bump, no downgrades), so it does not need one
+# of its own. Override with LITELLM= if you keep it separate.
+_REPO="$(cd "$HERE/../.." && pwd)"
+LITELLM=${LITELLM:-$_REPO/src/.venv/bin/litellm}
+[ -x "$LITELLM" ] || LITELLM=$HOME/venvs/ccproxy/bin/litellm
 PROXY_LOG=${PROXY_LOG:-/tmp/litellm_qwen.log}
 
 [ -d "$RUN_DIR" ] || { echo "no such run dir: $RUN_DIR" >&2; exit 1; }
@@ -49,30 +54,24 @@ source "$HERE/env.sh"
 export CLAUDE_CONFIG_DIR="$RUN_DIR/.cc"        # per-run config: no shared history or memory
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
-# The kernel tasks grade through a specific interpreter. Export it so the agent's Bash tool
-# inherits it, and refuse to start without it -- an unset $KPY makes `$KPY evaluate.py ...`
-# collapse to `evaluate.py ...`, which fails as a confusing `Permission denied`.
+# The kernel tasks grade through a specific interpreter, and a stack without kernels for
+# this card fails as a wall of ptxas errors that read like bad candidates. check_gpu.sh
+# compiles a real Triton kernel rather than trusting the arch list.
 if [ -d "$RUN_DIR/trimul" ]; then
-    KPY=${KPY:-$HOME/venvs/kernel-eval/bin/python}
-    [ -x "$KPY" ] || { echo "KPY=$KPY is not executable; see gpumode_local/reference/README.md" >&2; exit 1; }
-    "$KPY" - <<'PYCHK' || exit 1
-import sys, torch, triton
-archs = torch.cuda.get_arch_list()
-name = torch.cuda.get_device_properties(0).name
-print(f"[run_agent] grading stack: torch {torch.__version__}, triton {triton.__version__}")
-print(f"[run_agent] card: {name} | arch list: {archs}")
-cc = torch.cuda.get_device_capability(0)
-if f"sm_{cc[0]}{cc[1]}" not in archs:
-    sys.exit(f"[run_agent] FATAL: this interpreter has no kernels for sm_{cc[0]}{cc[1]}")
-PYCHK
-    export KPY
+    export KPY=${KPY:-$HOME/venvs/kernel-eval/bin/python}
+    "$HERE/check_gpu.sh" || exit 1
 fi
 
 cd "$RUN_DIR"
 if [ "$MODE" = "-p" ]; then
+    # Headless: no UI, the transcript lands in agent.jsonl. Nothing can answer a permission
+    # prompt, which is why run_guard.json sets defaultMode acceptEdits.
     claude --settings "$HERE/run_guard.json" \
            --output-format stream-json --verbose \
            -p "$(cat INITIAL_PROMPT.md)" 2>&1 | tee -a agent.jsonl
 else
-    claude --settings "$HERE/run_guard.json"
+    # Interactive: the normal Claude Code UI opens and the initial prompt is submitted for
+    # you, so the run starts on the task and you can watch, interrupt and steer it. Drop the
+    # positional argument if you would rather type into an empty session.
+    claude --settings "$HERE/run_guard.json" "$(cat INITIAL_PROMPT.md)"
 fi
