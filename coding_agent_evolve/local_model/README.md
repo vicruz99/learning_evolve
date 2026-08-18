@@ -136,6 +136,83 @@ config leaks between runs.
   on a network without egress. Harmless.
 * Subagents, skills and hooks all work — they are client-side.
 
+## The two budgets you will actually want to tune
+
+### How much Qwen is allowed to think
+
+`MAX_THINKING_TOKENS` does **not** do this. It controls what Claude Code *asks* for, and
+`drop_params: true` discards the ask before it reaches vLLM. Qwen thinks as much as it likes
+regardless.
+
+The real control is vLLM's per-request `thinking_token_budget`, pinned in
+`litellm_qwen.yaml` under `extra_body` because Claude Code has no knob to send it:
+
+```yaml
+extra_body:
+  thinking_token_budget: 2048     # 0 = no thinking at all
+```
+
+vLLM tracks the `<think>` section and forces the end token once the budget is spent. It
+needs `--reasoning-parser` on the server, which `serve_qwen.sh` sets. Verified through the
+full chain (Anthropic `/v1/messages` -> LiteLLM -> vLLM): a budget of 24 cut reasoning at
+89 characters and handed control back to visible output.
+
+Two things to know before you turn it down:
+
+* **The cut is hard, not graceful.** At 24 tokens the model was mid-sentence in step 1 of
+  its plan, and the "answer" that followed was just the rest of the reasoning with the
+  `<think>` tags gone. Budget enough for a complete thought (1-4k) or set 0 for none.
+  Values in between mostly buy you incoherence.
+* **The other lever is the template.** `chat_template_kwargs: {"enable_thinking": false}`
+  turns thinking off through the template instead, which costs nothing at sample time.
+  Confirmed working on this checkpoint. But this template implements it by injecting an
+  empty `<think>\n\n</think>` block, which is exactly the construction the fixed-template
+  project below blames for premature turn aborts. `thinking_token_budget: 0` gets you the
+  same place without the empty block.
+
+### How often Claude Code compacts
+
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` is how full the context may get before compaction. Three
+constraints matter here:
+
+* **100,000 is the floor.** You cannot make Claude Code compact earlier. With a 130k
+  server window and ~20-25k of system prompt and tool schemas, 100k is nearly the whole
+  usable window. If you want more headroom between compactions, raise `--max-model-len`
+  (this checkpoint is documented at ~260k) rather than lowering this.
+* **Plain integers only** in the environment variable: `100k` reads as `100` and clamps to
+  the floor. The `/autocompact 500k` command and the `--autocompact 500k` flag do accept
+  suffixes; the environment variable overrides both while it is set.
+* **Declare the real window too.** Claude Code does not recognise the ID `qwen3.6-27b` and
+  assumes a context window for it. `CLAUDE_CODE_MAX_CONTEXT_TOKENS=130000` corrects that,
+  and applies directly here because the ID neither starts with `claude-` nor contains
+  `[1m]`. Without it the status line percentage is measured against a window that does not
+  exist.
+
+To turn compaction off entirely, set `DISABLE_COMPACT`. Do not, on a 130k window: the
+session will hit `Prompt is too long` and stop instead.
+
+For the study, compaction is not plumbing -- it is the harness's own context-truncation
+strategy, doing the same job as `src/context/` in the ICL loop. Log how often it fires.
+
+## The chat template
+
+`froggeric/Qwen-Fixed-Chat-Templates` (covers Qwen 3.5 / 3.6 / 3.8) is worth taking
+seriously. Three of its claims check out against the official template shipped with this
+checkpoint, though only one of them currently bites on this stack:
+
+| claim | verdict here |
+|---|---|
+| tool-call args as a JSON string crash the template | **Real, but masked.** Rendering `arguments` as the JSON string the OpenAI spec sends fails with `TypeError: Can only get item pairs from a mapping` — the template does `arguments\|items` with no string handling. vLLM 0.26.0 parses the string to a dict before templating, so it never surfaces. It would surface on llama.cpp, LM Studio, or a vLLM that stops normalising. |
+| historical mutation destroys prefix caching | **Real.** The template strips `<think>` from any assistant message older than the last user query. So each new turn retroactively deletes the previous turn's reasoning, and the render diverges from that point on — a per-turn cache miss on the tail, proportional to the reasoning block dropped. Capping `thinking_token_budget` bounds the damage; `chat_template_kwargs: {"preserve_thinking": true}` removes it entirely, at the cost of keeping every reasoning block in a 130k window forever. |
+| empty `<think></think>` causes premature aborts | **Construction confirmed, effect not measured.** `enable_thinking: false` does inject exactly that block here. A single-turn probe answered fine; the claim is about rate over many turns, which we have not tested. |
+| graded reasoning effort (`<\|think_low\|>` … `<\|think_xhigh\|>`) | **Genuinely absent here.** This template has only the binary `enable_thinking` switch — no effort tags at all, and no `xhigh` default to fix. The fixed templates would *add* per-prompt effort steering, which is a real gain for an agent loop where some turns deserve more thought than others. |
+
+If you swap it in, point `--chat-template <file>` at it in `serve_qwen.sh` rather than
+editing `tokenizer_config.json` in `/scratch/vicstorage/qwen` — the checkpoint stays
+pristine and the template becomes a logged, switchable part of the run config. Treat it as
+a variable to hold fixed across arms, not a fix to apply once and forget: it changes the
+rendered prompt, so runs before and after are not comparable.
+
 ## Things that will bite
 
 **Context.** The server window is 130k. Claude Code's system prompt and tool schemas

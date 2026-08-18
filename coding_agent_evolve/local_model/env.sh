@@ -31,12 +31,25 @@ export DISABLE_AUTOUPDATER=1
 # Claude Code treats an unrecognised model name as a current model and sends
 # thinking:{"type":"adaptive"}. It auto-retries without it after the first rejection, so
 # it self-heals -- but that costs a request per conversation and interacts badly with
-# --reasoning-parser qwen3. Get a run working with 0, then try raising it.
+# --reasoning-parser qwen3.
+#
+# This does NOT limit how much Qwen thinks. It only controls what Claude Code *asks* for,
+# and drop_params discards the ask before it reaches vLLM. Qwen's actual thinking budget is
+# `extra_body.thinking_token_budget` in litellm_qwen.yaml -- see the README.
 export MAX_THINKING_TOKENS=0
 
-# The server's window is 130k. Claude Code's system prompt + tool schemas already cost
-# ~20-25k of it, so compact well before the ceiling or a long run dies mid-tool-call.
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384
+
+# Declare the real context window. Claude Code does not recognise the model ID `qwen3.6-27b`
+# and would otherwise assume one; because the ID neither starts with `claude-` nor contains
+# `[1m]`, this variable applies directly. Keep it equal to the server's --max-model-len.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=130000
+
+# Compact at 100k of that 130k. 100000 is the FLOOR the variable accepts -- Claude Code
+# cannot be made to compact earlier than that, so if you want more headroom between
+# compactions, raise --max-model-len on the server rather than lowering this.
+# Plain integers only: `100k` reads as 100 and clamps. While this is set it overrides the
+# /autocompact command, the --autocompact flag and the autoCompactWindow setting.
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000
 
 # Keep config, history and memory out of ~/.claude so one run cannot inherit another's
