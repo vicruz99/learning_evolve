@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# runcell <cell_dir> <bnb|cc> <hours>
+#
+# Runs one cell to completion or to its time budget, whichever comes first, and leaves
+# everything an analysis needs behind. Both arms are UNAIDED: nothing here restarts,
+# nudges, or blocks a stop. The run ending IS the measurement.
+#
+# Two things happen around the agent, and both matter:
+#   * a process sampler, because a transcript cannot tell a genuine stop from an agent
+#     legitimately waiting on a candidate evaluation -- see analysis/stopclass.py
+#   * a turn-cache pass at the end, because bnbcode's session store may not be reachable
+#     from wherever the analysis eventually runs
+set -u
+
+DIR=${1:?usage: runcell <cell_dir> <bnb|cc> <hours>}
+HARNESS=${2:?}
+HOURS=${3:?}
+
+KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIR="$(cd "$DIR" && pwd)"
+SECS=$(python3 -c "print(int(float('$HOURS')*3600))")
+
+log () { echo "[runcell $(date +%H:%M:%S)] $*"; }
+
+: "${KIMI_API_KEY:?set KIMI_API_KEY before running}"
+
+# --- the process sampler ------------------------------------------------------
+setsid nohup "$KIT/bin/procsample" "$DIR" 15 >> "$DIR/run/procsample.err" 2>&1 < /dev/null &
+SAMPLER=$!
+log "sampler pid $SAMPLER"
+trap 'kill "$SAMPLER" 2>/dev/null || true' EXIT
+
+cd "$DIR"
+
+case "$HARNESS" in
+  bnb)
+    # Continual work is left at its default. Nothing else is armed.
+    MODEL=${BNB_MODEL:-kimi/kimi-k2-thinking}
+    log "bnbcode, model=$MODEL, budget ${HOURS}h"
+    timeout "$SECS" bnbcode run --agent build -m "$MODEL" --format json \
+        "$(cat INITIAL_PROMPT.md)" > events.json 2>> stderr.txt
+    log "bnbcode exited rc=$? after ${SECONDS}s"
+    ;;
+
+  cc)
+    # Moonshot exposes an Anthropic-compatible endpoint, so Claude Code talks to Kimi
+    # directly -- no LiteLLM shim, unlike the vLLM arm this kit was derived from.
+    # VERIFY the host against your key's region (api.moonshot.ai vs api.moonshot.cn).
+    export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.moonshot.ai/anthropic}"
+    export ANTHROPIC_AUTH_TOKEN="$KIMI_API_KEY"
+    CC_MODEL=${CC_MODEL:-kimi-k2-thinking}
+    export ANTHROPIC_MODEL="$CC_MODEL"
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="$CC_MODEL"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="$CC_MODEL"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$CC_MODEL"
+    export ANTHROPIC_SMALL_FAST_MODEL="$CC_MODEL"
+
+    # Match the bnbcode arm: 32000 output, and compaction at 160k so the two harnesses
+    # are compared at the same context budget rather than at their own defaults.
+    export CLAUDE_CODE_MAX_OUTPUT_TOKENS=${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-32000}
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS=${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-224000}
+    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1
+    export DISABLE_ERROR_REPORTING=1 DISABLE_AUTOUPDATER=1
+
+    # Keep the transcript inside the run folder: it is the primary artefact, and a
+    # shared ~/.claude would interleave concurrent cells.
+    export CLAUDE_CONFIG_DIR="$DIR/.cc"
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+
+    log "Claude Code stock, model=$CC_MODEL, budget ${HOURS}h"
+    timeout "$SECS" claude --settings "$KIT/config/claude_settings.json" \
+        --autocompact 160k --permission-mode acceptEdits \
+        -p "$(cat INITIAL_PROMPT.md)" > cc_out.txt 2>> stderr.txt
+    log "claude exited rc=$?"
+    ;;
+
+  *) echo "unknown harness: $HARNESS" >&2; exit 1 ;;
+esac
+
+# Cache the turns now, while the session store is still reachable from here.
+python3 "$KIT/analysis/stopclass.py" "$DIR" || true
+log "cell finished: $DIR"
