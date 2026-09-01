@@ -137,7 +137,14 @@ python3 analysis/score.py     $RUNS_ROOT/ac2_evo_kimi_bnb_s1     # re-graded bes
 
 Run `stopclass.py` **on the machine that executed the cell**, before archiving: it caches
 turns to `run/turns.json`, and bnbcode's session store may not be reachable from wherever
-the analysis eventually happens.
+the analysis eventually happens. Do not delete that cache to force a rebuild unless you are
+on that machine — off-node the rebuild silently returns nothing.
+
+A second reason it matters: bnbcode keys its session store by run **directory**, and the
+store outlives the process. Re-running a cell in the same folder therefore reads back the
+previous attempt's turns interleaved with the new ones. `stopclass.py` dates each attempt
+from the sampler's first sample and drops anything older; a restarted cell here came back
+with 79 turns, 71 of them from the attempt killed an hour earlier.
 
 `score.py` re-grades every `.npy` the run produced using the run's own `eval.py`. Do not
 take the agent's word for its score — pilot runs had ledger entries claiming improvements

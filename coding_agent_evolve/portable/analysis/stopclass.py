@@ -156,7 +156,7 @@ def cc_turns(run):
 ORDER = ("mid-thought", "waiting", "abandoned", "signoff-idle", "truncation", "empty")
 
 
-def load_turns(run, is_cc):
+def load_turns(run, is_cc, t0=None):
     """Turns for a run, cached to run/turns.json.
 
     bnbcode session state lives in a PER-NODE postgres (bnbcode-pg-node keeps a node-local
@@ -169,11 +169,14 @@ def load_turns(run, is_cc):
         try:
             with open(cache, encoding="utf-8") as f:
                 cached = json.load(f)
-            if cached:
+            # a cache written by an EARLIER attempt in this same folder is stale
+            if cached and not (t0 and min(x["t"] for x in cached) < t0):
                 return cached
         except (OSError, ValueError):
             pass
     turns = cc_turns(run) if is_cc else bnb_turns(run)
+    if t0:
+        turns = [x for x in turns if x["t"] >= t0]
     if turns and not is_cc:
         try:
             os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -184,11 +187,32 @@ def load_turns(run, is_cc):
     return turns
 
 
+def run_start(run, sam):
+    """Epoch at which THIS attempt of the cell began.
+
+    bnbcode keys its session store by run DIRECTORY, and the store outlives the process.
+    So a cell that is re-run in the same folder -- after a restart, a crash, or a config
+    fix -- reads back the OLD attempt's turns interleaved with the new ones, and every
+    per-run rate silently mixes two different conditions. Seen for real: a restarted cell
+    came back with 79 turns, 71 of them from the attempt that had been killed an hour
+    earlier.
+
+    The sampler is started immediately before the agent and its file is reset with the
+    cell, so its first sample dates the attempt with no extra bookkeeping. Fall back to
+    accepting everything when there is no sampler data, rather than silently dropping a
+    whole run.
+    """
+    if not sam:
+        return None
+    return min(r.get("t", 0) for r in sam) - 60
+
+
 def classify(run):
     is_cc = os.path.isdir(os.path.join(run, ".cc"))
-    turns = load_turns(run, is_cc)
-    trunc_word = "max_tokens" if is_cc else "length"
     sam = samples(run)
+    t0 = run_start(run, sam)
+    turns = load_turns(run, is_cc, t0)
+    trunc_word = "max_tokens" if is_cc else "length"
 
     real = [t for t in turns if t["finish"] and t["out"] > 0]
     counts = dict((k, 0) for k in ORDER)
