@@ -57,6 +57,123 @@ def load_solutions(runs_dir: str, run: str) -> pd.DataFrame:
     return pd.DataFrame([json.loads(line) for line in open(p)])
 
 
+# ------------------------------------------------------------------ nested campaign loaders
+# The loaders above assume a flat ``runs/<run>/``. Sweeps launched with `run_sweep.py` nest one
+# level deeper -- ``runs/<group>/<run>/`` -- so these three read that layout instead. They are
+# additive; nothing above changed.
+
+def _arm_of(group: str, run: str, cfg: dict) -> str:
+    """Short arm label: the campaign plus, for ICL runs, the context strategy and size.
+
+    ``bon_gptoss/cp26_s1`` -> ``bon_gptoss``;
+    ``ctx_gptoss/cp26_n10_s1_best`` -> ``ctx_gptoss:best``;
+    ``ac1_gptoss_rest/n05_s1_random`` -> ``ac1_gptoss_rest:random``.
+    """
+    if cfg.get("n_context"):
+        return f"{group}:{cfg.get('context_strategy')}"
+    return group
+
+
+def _seed_of(cfg: dict) -> int | None:
+    return cfg.get("seed")
+
+
+def load_grouped_index(runs_dir: str = "runs", groups: list[str] | None = None) -> pd.DataFrame:
+    """One row per run across every ``runs/<group>/<run>/summary.json``.
+
+    Joins in the knobs and the host from ``config.json`` -- ``host`` matters because these
+    campaigns were spread over several machines, and eval-time comparisons are only valid within
+    one host (see ``docs/BOSCH_CLUSTER.md``).
+    """
+    rows = []
+    for s in sorted(glob.glob(os.path.join(runs_dir, "*", "*", "summary.json"))):
+        run_dir = os.path.dirname(s)
+        group, run = os.path.basename(os.path.dirname(run_dir)), os.path.basename(run_dir)
+        if groups and group not in groups:
+            continue
+        d = json.load(open(s))
+        cfg_path = os.path.join(run_dir, "config.json")
+        cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+        meta = cfg.get("_meta", {})
+        n_events = sum(1 for _ in open(os.path.join(run_dir, "events.jsonl"))) \
+            if os.path.exists(os.path.join(run_dir, "events.jsonl")) else 0
+        rows.append({
+            "group": group, "run": run, "arm": _arm_of(group, run, cfg),
+            "problem": d.get("problem"), "model": cfg.get("model_name"),
+            "host": (meta.get("host") or "").split(".")[0],
+            "strategy": d.get("strategy"), "n_context": d.get("n_context"),
+            "seed": _seed_of(cfg), "group_size": d.get("group_size"),
+            "groups_per_batch": d.get("groups_per_batch"),
+            "num_generations": d.get("num_generations"),
+            "generations_done": len(d.get("per_generation") or []),
+            "candidates": n_events,
+            "best_score": (d.get("best") or {}).get("score"),
+            "metric_name": d.get("metric_name"), "maximize": d.get("maximize"),
+            "status": d.get("status"),
+            "started_at": d.get("started_at"), "updated_at": d.get("updated_at"),
+            "wall_hours": sum(g.get("wall_seconds") or 0
+                              for g in (d.get("per_generation") or [])) / 3600.0,
+            "path": run_dir,
+        })
+    return pd.DataFrame(rows)
+
+
+def load_events(runs_dir: str, group: str, run: str) -> pd.DataFrame:
+    """Every candidate of one run, in completion order, from ``events.jsonl``.
+
+    Adds two derived columns the raw file does not have: ``valid`` (the definition used everywhere
+    -- ``correctness == 1.0`` *and* a non-null ``raw_score``; note ``failure_type`` is ``''`` rather
+    than null for a success) and ``k``, the 1-based candidate index used as the budget axis.
+    """
+    p = os.path.join(runs_dir, group, run, "events.jsonl")
+    if not os.path.exists(p):
+        return pd.DataFrame()
+    df = pd.DataFrame([json.loads(line) for line in open(p)])
+    if df.empty:
+        return df
+    df["valid"] = (df["correctness"] == 1.0) & df["raw_score"].notna()
+    df["failure_type"] = df["failure_type"].replace("", None)
+    df["k"] = range(1, len(df) + 1)
+    return df
+
+
+def load_grouped_progress(runs_dir: str = "runs", groups: list[str] | None = None) -> pd.DataFrame:
+    """Per-generation rows from every ``summary.json``'s ``per_generation`` list.
+
+    Richer than ``progress.csv``: keeps the ``failure_types`` breakdown (flattened to
+    ``fail_<type>`` columns) and all four latency percentile blocks (``eval_p50`` ...).
+    """
+    rows = []
+    for s in sorted(glob.glob(os.path.join(runs_dir, "*", "*", "summary.json"))):
+        run_dir = os.path.dirname(s)
+        group, run = os.path.basename(os.path.dirname(run_dir)), os.path.basename(run_dir)
+        if groups and group not in groups:
+            continue
+        d = json.load(open(s))
+        cfg_path = os.path.join(run_dir, "config.json")
+        cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+        for g in d.get("per_generation") or []:
+            row = {"group": group, "run": run, "arm": _arm_of(group, run, cfg),
+                   "problem": d.get("problem"), "seed": _seed_of(cfg),
+                   "host": (cfg.get("_meta", {}).get("host") or "").split(".")[0]}
+            row.update({k: v for k, v in g.items()
+                        if k not in ("failure_types", "usage", "decode_percentiles",
+                                     "eval_percentiles", "queue_percentiles", "grade_percentiles")})
+            for ftype, n in (g.get("failure_types") or {}).items():
+                row[f"fail_{ftype}"] = n
+            for block, prefix in (("eval_percentiles", "eval"), ("grade_percentiles", "grade"),
+                                  ("queue_percentiles", "queue"), ("decode_percentiles", "decode")):
+                for pct, v in (g.get(block) or {}).items():
+                    row[f"{prefix}_{pct}"] = v
+            for key in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "truncated"):
+                row[key] = (g.get("usage") or {}).get(key)
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    for c in [c for c in df.columns if c.startswith("fail_")]:
+        df[c] = df[c].fillna(0).astype(int)
+    return df
+
+
 RunSelection = list[str] | dict[str, str] | None
 
 
