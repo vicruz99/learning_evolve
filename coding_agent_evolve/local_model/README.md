@@ -66,7 +66,8 @@ python3 -m venv ~/venvs/ccproxy          # /scratch/vicstorage/venvs/ccproxy on 
 # the fixed chat template (v19 — the 3.6 line; the repo root file is Qwen3.8)
 ./fetch_chat_template.sh
 ~/venvs/ccproxy/bin/python compare_templates.py \
-    /scratch/vicstorage/qwen/chat_template.jinja qwen3.6_chat_template-v19.jinja
+    /home/crv1pi/work/learning_evolve/coding_agent_evolve/local_model/qwen3.6_chat_template-v19.jinja qwen3.6_chat_template-v19.jinja
+
 
 # the grading interpreter, for the TriMul task only. ON BOSCH THIS ALREADY EXISTS -- it was
 # built and measured 2026-08-17 -- so check before creating anything:
@@ -149,7 +150,7 @@ an agent result against. Run it from the repo — it grades the published TTT-Di
 kernel, which the agent must never see:
 
 ```bash
-cd ~/projects/phd/learning_evolve
+cd ~/work/learning_evolve/coding_agent_evolve/local_model
 export KPY=~/venvs/kernel-eval/bin/python
 
 "$KPY" coding_agent_evolve/gpumode/evaluate.py \

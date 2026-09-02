@@ -34,6 +34,7 @@ git -C "$ROOT/ShinkaEvolve" checkout "$PIN"
 git -C "$ROOT/ShinkaEvolve" apply --stat --check "$HERE/shinka_local.patch"
 git -C "$ROOT/ShinkaEvolve" apply "$HERE/shinka_local.patch"
 ln -s "$HERE/ttt_discover_math" "$ROOT/ShinkaEvolve/examples/ttt_discover_math"
+ln -s "$HERE/ttt_discover_kernel" "$ROOT/ShinkaEvolve/examples/ttt_discover_kernel"
 
 echo
 echo "ShinkaEvolve checkout ready at $ROOT/ShinkaEvolve (upstream $PIN + local patches)."

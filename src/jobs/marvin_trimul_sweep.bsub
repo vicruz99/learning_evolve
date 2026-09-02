@@ -1,0 +1,129 @@
+#!/bin/bash
+# =================================================================================================
+# LSF job for a TriMul ICL sweep on a Marvin (rb-hpc) H100: the ICL driver PLUS its grading card,
+# in one job. Marvin counterpart of jobs/trimul_sweep.bsub (rng-dl01).
+#
+#   cd ~/work/learning_evolve/src
+#   SWEEP=sweeps/kernel_trimul/marvin/icl_s1.yaml bsub < jobs/marvin_trimul_sweep.bsub
+#
+# Environment (bsub inherits the submitting shell):
+#   SWEEP      sweep yaml, relative to src/                       (required)
+#   VLLM_URL   override the LLM endpoint                          (default: $HOME/bin/llmtun url $LLM_NAME)
+#   LLM_NAME   llmtun model name                                  (default: gpu1)
+#   KPY        grading interpreter                                (default: ~/venvs/kernel-eval/bin/python)
+#   RESUME=1   relaunch only the runs that did not finish         (same SWEEP; sweep dir = runs/<sweep.name>)
+#   MAXPAR     override the sweep's max_parallel
+#
+# Differences from the rng-dl01 script, all forced by this cluster:
+#   * queue `gpu`, one H100 per job, 7-day walltime, no accounting/-P/-G lines, no proxy modules.
+#   * the LLM lives on rng-dl01 and is reached through the llmtun relay on a Marvin LOGIN node. Compute
+#     nodes cannot route to 10.124.x themselves. The relay IP must be in no_proxy LITERALLY: httpx (the
+#     openai SDK) ignores the 10.* glob and would send the request to the corporate proxy (-> 504 HTML).
+#   * no external network is needed here at all, so the proxy variables are simply unset.
+# =================================================================================================
+#BSUB -q gpu
+#BSUB -m gpu
+#BSUB -J trimul_icl
+#BSUB -n 8
+#BSUB -R "span[hosts=1] rusage[mem=6144] affinity[core]"
+#BSUB -M 6144
+#BSUB -gpu "num=1:mode=exclusive_process:j_exclusive=yes"
+#BSUB -W 168:00
+#BSUB -o jobs/logs/marvin_icl.%J.out
+#BSUB -e jobs/logs/marvin_icl.%J.err
+#BSUB -app shell
+
+set -uo pipefail
+cd "$LS_SUBCWD" || exit 1
+source "$HOME/venvs/icl/bin/activate"
+
+SWEEP="${SWEEP:?set SWEEP=<sweep yaml>}"
+KPY="${KPY:-$HOME/venvs/kernel-eval/bin/python}"
+LLM_NAME="${LLM_NAME:-gpu1}"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+# One job = one card, but several jobs can share a node and LSF shows each of them its card as
+# CUDA_VISIBLE_DEVICES=0. The grader keys its flock on that value inside a node-shared /tmp, so two
+# jobs on one node would serialise grading with each other. A per-job lock dir keeps the lock
+# (and the dead-card marker next to it) private to this job's card.
+export TRIMUL_LOCK_DIR="/tmp/trimul-lock-${LSB_JOBID}"
+mkdir -p "$TRIMUL_LOCK_DIR"
+
+echo "=== job $LSB_JOBID on $(hostname)  GPU=${CUDA_VISIBLE_DEVICES:-unset}  sweep=$SWEEP  $(date)"
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+
+# ---- Guard 1: grading stack is the pinned one and can run on this card ------------------------
+if ! "$KPY" -c 'import torch, triton, sys; print("[job] kernel stack:", torch.__version__, triton.__version__); sys.exit(triton.__version__ != "3.3.1")'; then
+    echo "[job] ERROR: $KPY is not the pinned torch 2.7.1 / triton 3.3.1 venv" >&2
+    exit 1
+fi
+if ! "$KPY" - <<'PY'
+import sys, torch
+if not torch.cuda.is_available():
+    print("[job] ERROR: grading interpreter sees no GPU", file=sys.stderr); sys.exit(1)
+m, n = torch.cuda.get_device_capability(0)
+want = f"sm_{m}{n}"
+print(f"[job] card: {torch.cuda.get_device_name(0)} ({want})")
+sys.exit(0 if want in torch.cuda.get_arch_list() else 1)
+PY
+then
+    exit 1
+fi
+
+# ---- Guard 2: Marvin cards are H100s -> the sweep must say trimul_h100 -------------------------
+PROBLEM=$(python - "$SWEEP" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+p = {r.get("problem") for r in d.get("runs", [])} | {d.get("common", {}).get("problem")}
+p.discard(None)
+print(p.pop() if len(p) == 1 else f"AMBIGUOUS:{sorted(p)}")
+PY
+)
+if [[ "$PROBLEM" != "trimul_h100" ]]; then
+    echo "[job] ERROR: $SWEEP has problem '$PROBLEM'; this cluster's cards are H100 -> trimul_h100" >&2
+    exit 1
+fi
+
+# ---- LLM endpoint: llmtun manifest lives on GPFS, so this works on a compute node --------------
+if [[ -z "${VLLM_URL:-}" ]]; then
+    VLLM_URL=$("$HOME/bin/llmtun" url "$LLM_NAME") || { echo "[job] ERROR: llmtun url $LLM_NAME failed" >&2; exit 1; }
+fi
+RELAY_IP=$(printf '%s' "$VLLM_URL" | sed -E 's#^https?://([^:/]+).*#\1#')
+export no_proxy="${no_proxy:+$no_proxy,}$RELAY_IP"
+export NO_PROXY="${NO_PROXY:+$NO_PROXY,}$RELAY_IP"
+
+echo "[job] waiting for vLLM at $VLLM_URL ..."
+for _ in $(seq 1 120); do
+    curl -sf -m 10 "${VLLM_URL%/v1}/health" >/dev/null && break
+    sleep 15
+done
+if ! curl -sf -m 10 "${VLLM_URL%/v1}/health" >/dev/null; then
+    echo "[job] ERROR: no vLLM at $VLLM_URL after 30 min. Run 'llmtun sync' on a Marvin login node." >&2
+    exit 1
+fi
+
+# ---- scratch copy of the yaml with the machine-local settings ---------------------------------
+SWEEP_RUN="${TMPDIR:-/tmp}/$(basename "$SWEEP")"
+sed -E \
+    -e "s#^( *vllm-base-url: *).*#\1${VLLM_URL}#" \
+    -e "s#^( *trimul-eval-python: *).*#\1${KPY}#" \
+    -e "/^ *trimul-eval-gpu:/d" \
+    "$SWEEP" > "$SWEEP_RUN"
+echo "[job] scratch sweep: $SWEEP_RUN  (vllm $VLLM_URL, kpy $KPY, gpu inherited)"
+
+ARGS=(--ray-head skip)
+[[ -n "${MAXPAR:-}" ]] && ARGS+=(--max-parallel "$MAXPAR")
+if [[ -n "${RESUME:-}" ]]; then
+    NAME=$(python -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["sweep"]["name"])' "$SWEEP_RUN")
+    if [[ ! -d "runs/$NAME" ]]; then
+        echo "[job] ERROR: RESUME=1 but runs/$NAME does not exist" >&2
+        exit 1
+    fi
+    ARGS+=(--resume "runs/$NAME")
+    echo "[job] RESUME: relaunching unfinished runs in runs/$NAME"
+fi
+
+echo "[job] python run_sweep.py $SWEEP_RUN ${ARGS[*]}"
+python run_sweep.py "$SWEEP_RUN" "${ARGS[@]}"
+rc=$?
+echo "[job] run_sweep.py exited $rc  $(date)"
+exit $rc

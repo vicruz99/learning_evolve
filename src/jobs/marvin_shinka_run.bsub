@@ -1,0 +1,128 @@
+#!/bin/bash
+# =================================================================================================
+# LSF job: one ShinkaEvolve run on the GPU-mode TriMul task, on a Marvin (rb-hpc) H100.
+#
+#   cd ~/work/learning_evolve/src && mkdir -p jobs/logs
+#   REP=r1 bsub < jobs/marvin_shinka_run.bsub
+#   REP=r1 SHINKA_SMOKE=1 bsub -W 00:30 < jobs/marvin_shinka_run.bsub   # grader + 3 generations
+#
+# Environment (bsub inherits the submitting shell):
+#   REP        replicate label, names the results dir              (default r1)
+#   CONFIG     config yaml inside the task dir                       (default shinka_qwen.yaml)
+#   LLM_NAME   llmtun model name                                     (default gpu2)
+#   VLLM_URL   override the LLM endpoint instead of asking llmtun
+#   KPY        grading interpreter                                   (default ~/venvs/kernel-eval/bin/python)
+#   SHINKA_SMOKE=1  grade the reference kernel, then run only 3 generations, then exit
+#
+# RESUBMITTING WITH THE SAME REP CONTINUES THE RUN: Shinka resumes from its own database
+# (shinka/core/async_runner.py::_restore_resume_progress), as with the math baselines.
+#
+# Layout on this machine: ~/work/learning_evolve/ShinkaEvolve (pinned clone + shinka_local.patch,
+# venv ~/venvs/shinka), examples/ttt_discover_kernel -> src/shinka_baseline/ttt_discover_kernel.
+# The embedder runs on CPU inside this job (src/shinka_baseline/embed_server.py, venv ~/venvs/embed)
+# because the job's single card is exclusive-process and belongs to the grader.
+# =================================================================================================
+#BSUB -q gpu
+#BSUB -m gpu
+#BSUB -J shinka_trimul
+#BSUB -n 8
+#BSUB -R "span[hosts=1] rusage[mem=8192] affinity[core]"
+#BSUB -M 8192
+#BSUB -gpu "num=1:mode=exclusive_process:j_exclusive=yes"
+#BSUB -W 168:00
+#BSUB -o jobs/logs/marvin_shinka.%J.out
+#BSUB -e jobs/logs/marvin_shinka.%J.err
+#BSUB -app shell
+
+set -uo pipefail
+cd "$LS_SUBCWD" || exit 1                    # src/
+# Several of these jobs can share a node (one card each), so every local port must be picked
+# per job, not hard-coded: a second job on the node would otherwise fail to bind and silently
+# talk to the first job's servers (seen 2026-08-27: r2 and the agent both rode r1's relay).
+pick_port() { /usr/bin/python3.12 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+alive_or_die() {  # alive_or_die <pid> <what> <log>
+    sleep 2; if ! kill -0 "$1" 2>/dev/null; then echo "[job] ERROR: $2 died at startup; log:" >&2; tail -5 "$3" >&2; exit 1; fi
+}
+ROOT="$(cd .. && pwd)"                       # learning_evolve/
+REP="${REP:-r1}"
+CONFIG="${CONFIG:-shinka_qwen.yaml}"
+LLM_NAME="${LLM_NAME:-gpu2}"
+export KPY="${KPY:-$HOME/venvs/kernel-eval/bin/python}"
+export TRIMUL_EVALUATE_PY="$ROOT/coding_agent_evolve/gpumode/evaluate.py"
+export TRIMUL_EVAL_TIMEOUT="${TRIMUL_EVAL_TIMEOUT:-1500}"
+TASK_DIR="$ROOT/ShinkaEvolve/examples/ttt_discover_kernel/trimul"
+SHINKA_PY="$HOME/venvs/shinka/bin/python"
+EMBED_PY="$HOME/venvs/embed/bin/python"
+EMBED_MODEL_DIR="$HOME/models/qwen3-embedding-0.6b"
+EMBED_PORT="${EMBED_PORT:-$(pick_port)}"
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+export HF_HOME="$HOME/models/hf" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export LOCAL_OPENAI_API_KEY=local SHINKA_PRICING_MODE=offline
+export no_proxy="${no_proxy:+$no_proxy,}127.0.0.1,localhost" NO_PROXY="${NO_PROXY:+$NO_PROXY,}127.0.0.1,localhost"
+
+echo "=== job $LSB_JOBID on $(hostname)  GPU=${CUDA_VISIBLE_DEVICES:-unset}  rep=$REP  config=$CONFIG  $(date)"
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+[[ -d "$TASK_DIR" ]] || { echo "[job] ERROR: $TASK_DIR missing (setup_shinka.sh symlink)" >&2; exit 1; }
+[[ -x "$SHINKA_PY" ]] || { echo "[job] ERROR: $SHINKA_PY missing" >&2; exit 1; }
+
+# ---- grading stack on the granted card --------------------------------------------------------
+"$KPY" - <<'PY' || exit 1
+import sys, torch, triton
+assert torch.cuda.is_available(), "grading interpreter sees no GPU"
+assert triton.__version__ == "3.3.1", triton.__version__
+m, n = torch.cuda.get_device_capability(0)
+print(f"[job] card: {torch.cuda.get_device_name(0)} (sm_{m}{n})  torch {torch.__version__} triton {triton.__version__}")
+PY
+
+# ---- LLM: in-job relay that follows the llmtun tunnel if it moves ------------------------------
+# The tunnel's PORT is sticky per LSF job name but its IP is whichever login node hosts it, and a
+# rebuilt tunnel can land elsewhere. Shinka caches its base URL for the whole run, so on 2026-08-26
+# a moved tunnel cost r1 its run (267 connection failures, then Shinka gave up). llm_relay.py
+# re-reads ~/.llmtun/endpoints on every failure, so Shinka only ever sees 127.0.0.1.
+RELAY_PORT="${RELAY_PORT:-$(pick_port)}"
+if [[ -z "${VLLM_URL:-}" ]]; then
+    "$HOME/bin/llmtun" url "$LLM_NAME" >/dev/null || { echo "[job] ERROR: llmtun has no entry for $LLM_NAME (llmtun sync on a login node)" >&2; exit 1; }
+    /usr/bin/python3.12 "$ROOT/src/jobs/llm_relay.py" --name "$LLM_NAME" --port "$RELAY_PORT" \
+        >"jobs/logs/relay_${LSB_JOBID}.log" 2>&1 &
+    RELAY_PID=$!
+    alive_or_die "$RELAY_PID" "llm_relay" "jobs/logs/relay_${LSB_JOBID}.log"
+    VLLM_URL="http://127.0.0.1:$RELAY_PORT/v1"
+fi
+for _ in $(seq 1 120); do curl -sf -m 10 "${VLLM_URL%/v1}/health" >/dev/null && break; sleep 15; done
+curl -sf -m 10 "${VLLM_URL%/v1}/health" >/dev/null || { echo "[job] ERROR: no vLLM through $VLLM_URL (llmtun $LLM_NAME)" >&2; exit 1; }
+echo "[job] LLM: $VLLM_URL  (relay -> llmtun '$LLM_NAME': $($HOME/bin/llmtun url $LLM_NAME))"
+
+# ---- CPU embedding server (duplicate gate) --------------------------------------------------------
+EMBED_URL="http://127.0.0.1:$EMBED_PORT/v1"
+"$EMBED_PY" "$ROOT/src/shinka_baseline/embed_server.py" --model "$EMBED_MODEL_DIR" --port "$EMBED_PORT" \
+    >"jobs/logs/embed_${LSB_JOBID}.log" 2>&1 &
+EMBED_PID=$!
+alive_or_die "$EMBED_PID" "embed_server" "jobs/logs/embed_${LSB_JOBID}.log"
+trap 'kill $EMBED_PID ${RELAY_PID:-} 2>/dev/null' EXIT
+for _ in $(seq 90); do curl -sf -m 2 "http://127.0.0.1:$EMBED_PORT/health" >/dev/null 2>&1 && break; sleep 2; done
+curl -sf -m 2 "http://127.0.0.1:$EMBED_PORT/health" >/dev/null 2>&1 \
+    || { echo "[job] ERROR: embed server never came up; see jobs/logs/embed_${LSB_JOBID}.log" >&2; exit 1; }
+echo "[job] embeddings: $EMBED_URL"
+
+# ---- scratch config with the live endpoint -----------------------------------------------------
+cd "$TASK_DIR" || exit 1
+CFG_RUN="${TMPDIR:-/tmp}/shinka_trimul_${LSB_JOBID}.yaml"
+sed -E "s#@http://localhost:8001/v1#@${VLLM_URL}#" "$CONFIG" > "$CFG_RUN"
+if [[ -n "${SHINKA_SMOKE:-}" ]]; then
+    echo "[job] SMOKE: grading the reference kernel through evaluate.py"
+    "$SHINKA_PY" evaluate.py --program_path "$ROOT/src/gpumode_local/reference/trimul_best.py" \
+        --results_dir "/tmp/shinka_smoke_${LSB_JOBID}" && cat "/tmp/shinka_smoke_${LSB_JOBID}/correct.json"; echo
+    echo "[job] SMOKE: the stub seed must fail the gate"
+    "$SHINKA_PY" evaluate.py --program_path initial.py --results_dir "/tmp/shinka_smoke_${LSB_JOBID}_seed"; cat "/tmp/shinka_smoke_${LSB_JOBID}_seed/correct.json"; echo
+    sed -i -E "s/^( *num_generations: *).*/\13/" "$CFG_RUN"
+    REP="smoke_${LSB_JOBID}"
+fi
+
+echo "[job] python run_evo.py --config_path $CFG_RUN --results_dir results/trimul_qwen_${REP} --embedding_model local/Qwen/Qwen3-Embedding-0.6B@$EMBED_URL"
+"$SHINKA_PY" run_evo.py --config_path "$CFG_RUN" \
+    --results_dir "results/trimul_qwen_${REP}" \
+    --embedding_model "local/Qwen/Qwen3-Embedding-0.6B@$EMBED_URL"
+rc=$?
+echo "[job] run_evo.py exited $rc  $(date)"
+exit $rc
