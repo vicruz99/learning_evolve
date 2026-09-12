@@ -37,6 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "Needs the server launched with --reasoning-parser qwen3.")
     p.add_argument("--no-thinking", dest="enable_thinking", action="store_false", default=None,
                    help="Qwen3: disable thinking entirely (chat_template_kwargs enable_thinking=false).")
+    # Not redundant with the default. Leaving enable_thinking None omits chat_template_kwargs and
+    # lets the template decide -- and the Qwen templates disagree about what the default is:
+    #   Qwen3.6-27B  `if enable_thinking is false -> <think>\n\n</think>` else `<think>\n`  => ON
+    #   Qwen3.5-2B   `if enable_thinking is true  -> <think>\n` else `<think>\n\n</think>`  => OFF
+    # So a run that relies on the default silently produces no chain of thought on some models.
+    # Pass --thinking whenever the traces matter (SFT/RL data collection).
+    p.add_argument("--thinking", dest="enable_thinking", action="store_true", default=None,
+                   help="Qwen3: force thinking ON (chat_template_kwargs enable_thinking=true). "
+                        "Required on models whose template defaults it off, e.g. Qwen3.5-2B.")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--max-tokens", type=int, default=26000)
     p.add_argument("--max-gen-concurrency", type=int, default=8)
