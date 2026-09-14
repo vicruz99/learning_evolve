@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""render_transcripts [CAMPAIGN ...] [--out DIR] [--runs DIR]
+
+Render every cell of the given campaigns (default: every campaign under runs root that has
+cells) into readable text files, plus an INDEX.md overview. Safe to run while cells are
+running: each file is written to .tmp and renamed, so a reader never sees a half file.
+
+  <out>/<campaign>/<cell>.txt            model text, tool calls, host nudges, decisions
+  <out>/<campaign>/<cell>.thinking.txt   the same, with the model's reasoning included
+  <out>/INDEX.md                         one row per cell: state, evals, best, last activity
+"""
+import argparse, importlib.util, io, json, os, shutil, subprocess, sys, time
+from contextlib import redirect_stdout
+from pathlib import Path
+
+V2 = Path(__file__).resolve().parent.parent
+RUNS = Path.home() / "agent_runs" / "v2"
+
+
+def load_module(name, fname):
+    """Load one of the sibling scripts (they have no .py suffix) as a module."""
+    src = (V2 / "bin" / fname).read_text()
+    spec = importlib.util.spec_from_loader(name, loader=None)
+    mod = importlib.util.module_from_spec(spec)
+    mod.__dict__["__file__"] = str(V2 / "bin" / fname)
+    exec(compile(src.replace('if __name__ == "__main__":\n    main()', ""), fname, "exec"), mod.__dict__)
+    return mod
+
+
+def load_renderer():
+    spec = importlib.util.spec_from_loader("t_render", loader=None)
+    src = (V2 / "bin" / "transcript").read_text()
+    mod = importlib.util.module_from_spec(spec)
+    exec(compile(src.replace('if __name__ == "__main__":\n    main()', ""), "transcript", "exec"), mod.__dict__)
+    return mod.R
+
+
+def read_json(p, default=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except Exception:
+        return default
+
+
+def iterations(cell):
+    rows = []
+    try:
+        with open(cell / "iterations.jsonl") as fh:
+            for ln in fh:
+                try:
+                    rows.append(json.loads(ln))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return rows
+
+
+def lsf_states():
+    out = {}
+    try:
+        txt = subprocess.run(["bjobs", "-w", "-noheader"], capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return out
+    for ln in txt.splitlines():
+        f = ln.split()
+        if len(f) > 6 and f[1] == os.environ.get("USER", ""):
+            out[f[6]] = (f[2], f[5])
+    return out
+
+
+def render_both(R, cell, want_thoughts):
+    """One pass over events.jsonl, feeding a plain and (optionally) a thinking renderer."""
+    outs = [io.StringIO(), io.StringIO()] if want_thoughts else [io.StringIO()]
+    rs = [R(False)] + ([R(True)] if want_thoughts else [])
+    try:
+        with open(cell / "events.jsonl") as fh:
+            for ln in fh:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                for r, buf in zip(rs, outs):
+                    with redirect_stdout(buf):
+                        r.line(e)
+            for r, buf in zip(rs, outs):
+                with redirect_stdout(buf):
+                    r.flush()
+    except OSError as e:
+        for buf in outs:
+            buf.write("\n[render] events.jsonl unreadable: %s\n" % e)
+    return [b.getvalue() for b in outs]
+
+
+def header(camp, cell, source, rows, state):
+    c = read_json(cell / "cell.json", {}) or {}
+    clock = read_json(cell / "clock.json", {}) or {}
+    best = read_json(cell / "best.json", {}) or {}
+    scored = [r["score"] for r in rows if r.get("score") is not None]
+    ev = cell / "events.jsonl"
+    age = int(time.time() - ev.stat().st_mtime) if ev.exists() else -1
+    L = [
+        "=" * 100,
+        "cell        : %s / %s" % (camp, cell.name),
+        "harness     : %-10s problem: %-6s prompt: %-6s seed: %-3s reasoning: %s"
+        % (c.get("harness"), c.get("problem"), c.get("prompt"), c.get("seed"), c.get("reasoning")),
+        "lsf         : %s  %s" % (state[0] if state else "-", state[1] if state else ""),
+        "budget      : %.2f h active of %.0f h, launches %s"
+        % (clock.get("active_s", 0) / 3600, clock.get("budget_s", 0) / 3600, clock.get("launches", "?")),
+        "evaluations : %d official (%d scored)   best: %s" % (len(rows), len(scored), best.get("score")),
+        "last event  : %d s ago        rendered: %s" % (age, time.strftime("%Y-%m-%d %H:%M:%S")),
+        "source      : %s" % source,
+        "=" * 100,
+        "",
+    ]
+    return "\n".join(L)
+
+
+def write_atomic(path, text):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("campaigns", nargs="*")
+    ap.add_argument("--runs", type=Path, default=RUNS)
+    ap.add_argument("--out", type=Path, default=RUNS / "_transcripts")
+    ap.add_argument("--no-thoughts", action="store_true", help="skip the .thinking.txt files")
+    ap.add_argument("--no-db", action="store_true", help="do not query the bnbcode session databases")
+    a = ap.parse_args()
+
+    camps = a.campaigns or sorted(
+        p.name for p in a.runs.iterdir() if p.is_dir() and not p.name.startswith("_") and any(q.joinpath("events.jsonl").exists() for q in p.iterdir() if q.is_dir())
+    )
+    R = load_renderer()
+    db = load_module("db_transcript", "db_transcript")
+    states = lsf_states()
+    a.out.mkdir(parents=True, exist_ok=True)
+    index = ["# v2 transcripts", "", "rendered %s" % time.strftime("%Y-%m-%d %H:%M:%S %Z"), ""]
+    total = 0
+    for camp in camps:
+        cdir = a.runs / camp
+        if not cdir.is_dir():
+            print("skip %s (not a directory)" % camp, file=sys.stderr)
+            continue
+        odir = a.out / camp
+        odir.mkdir(parents=True, exist_ok=True)
+        index += ["## %s" % camp, "", "| cell | lsf | evals | best | last event | transcript |", "|---|---|---|---|---|---|"]
+        for cell in sorted(p for p in cdir.iterdir() if p.is_dir()):
+            if not (cell / "events.jsonl").exists():
+                continue
+            rows = iterations(cell)
+            st = states.get("%s.%s" % (camp, cell.name))
+            texts = render_both(R, cell, not a.no_thoughts)
+            source = "events.jsonl (the harness stream)"
+            harness = (read_json(cell / "cell.json", {}) or {}).get("harness")
+            if harness == "bnbcode" and not a.no_db:
+                # events.jsonl stops at the first compaction; the session database has the rest.
+                try:
+                    parts, host = db.cell_rows(cell)
+                    if parts:
+                        write_atomic(odir / (cell.name + ".acp.txt"), texts[0])
+                        texts = [db.render(parts, False), db.render(parts, True) if not a.no_thoughts else ""]
+                        source = "session database on %s (%d parts); .acp.txt is the harness stream" % (host, len(parts))
+                except Exception as e:
+                    source = "events.jsonl -- session database unavailable: %s" % str(e)[:200]
+            head = header(camp, cell, source, rows, st)
+            # A finished cell's node-local postgres is reaped with its LSF job, so the render
+            # falls back to events.jsonl -- which goes silent at the first compaction.  Never
+            # let that thin version overwrite a database-sourced transcript: park it beside the
+            # good one instead.  (2026-09-09: four finished cells were downgraded this way.)
+            main = odir / (cell.name + ".txt")
+            if source.startswith("events.jsonl") and main.exists():
+                prev = main.read_text(errors="replace")[:2000]
+                if "source      : session database" in prev:
+                    write_atomic(odir / (cell.name + ".events.txt"), head + texts[0])
+                    index.append("- %s/%s -- kept the earlier session-database render; this run "
+                                 "could not reach the database (%s)" % (camp, cell.name, source))
+                    continue
+            write_atomic(main, head + texts[0])
+            if not a.no_thoughts:
+                write_atomic(odir / (cell.name + ".thinking.txt"), head + texts[1])
+            total += 1
+            best = (read_json(cell / "best.json", {}) or {}).get("score")
+            age = int(time.time() - (cell / "events.jsonl").stat().st_mtime)
+            index.append(
+                "| %s | %s | %d | %s | %s | [txt](%s/%s.txt) |"
+                % (cell.name, st[0] if st else "-", len(rows), best, "%d s" % age if age < 3600 else "%.1f h" % (age / 3600), camp, cell.name)
+            )
+        index.append("")
+    write_atomic(a.out / "INDEX.md", "\n".join(index) + "\n")
+    print("rendered %d cell(s) into %s" % (total, a.out))
+
+
+if __name__ == "__main__":
+    main()

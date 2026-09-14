@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""health <campaign>... [--resubmit-dead] [--gpu host:port ...]
+
+One-screen health check for running v2 campaigns: LSF states, per running cell (age of the last
+event, turns, evals, best, live candidate processes, warnings), cells that vanished from LSF
+before finishing (resubmitted with --resubmit-dead), GPU server load, host memory."""
+import argparse, json, os, subprocess, sys, time, urllib.request
+from pathlib import Path
+
+ROOT = Path.home() / "agent_runs/v2"
+V2 = Path(__file__).resolve().parents[1]
+NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def sh(cmd, timeout=60):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+def lsf():
+    # plain `bjobs -w`: `-o job_name` truncates names to 10 characters
+    out = sh("bjobs -w -noheader 2>/dev/null")
+    d = {}
+    for l in out.splitlines():
+        f = l.split()
+        if len(f) >= 7 and "." in f[6]:
+            d[f[6]] = (f[2], f[5].split("*")[-1])
+    return d
+
+def count(p):
+    try:
+        return sum(1 for _ in open(p))
+    except OSError:
+        return 0
+
+def db_age(camp, cell, host):
+    """Seconds since the newest message part in this bnbcode cell's node-local session DB.
+
+    events.jsonl goes quiet at the first cliff-compaction (the agent moves to a successor
+    session our ACP client is not listening to), so event age alone cannot tell a working
+    cell from a stalled one. The database can."""
+    import base64
+    sql = "select coalesce(max(time_created),0) from part"
+    script = ("export BNBCODE_PGDATA=/tmp/v2pg/%s.%s\n" % (camp, cell)
+              + "exec %s/bin/bnbcode-pg-node psql -t -A -c %s\n" % (V2, json.dumps(sql)))
+    b64 = base64.b64encode(script.encode()).decode()
+    out = sh("ssh -o BatchMode=yes -o ConnectTimeout=15 %s 'echo %s | base64 -d | bash'" % (host, b64), timeout=90)
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if ln.isdigit() and len(ln) > 10:
+            return int(time.time() - int(ln) / 1000)
+    return -1
+
+def ws_active(d, minutes=45):
+    """Did anything under the agent's run/ change recently?
+
+    The db= column has a blind spot: while the agent sits inside one long bash tool call
+    (a batch of optimizers, a sleep-and-poll loop) nothing is written to the session
+    database, so a perfectly busy cell looks quiet. Its files do not. -print -quit stops
+    at the first hit, so this stays cheap on GPFS."""
+    out = sh(f"find {d}/workspace/run -newermt '-{minutes} minutes' -type f -print -quit 2>/dev/null", timeout=60)
+    return "Y" if out.strip() else "n"
+
+def cell_row(camp, d, st, host):
+    dl = d / "driver.log"; ev = d / "events.jsonl"
+    txt = dl.read_text() if dl.is_file() else ""
+    warn = sum(txt.count(k) for k in ("aborting", "WARNING", "infrastructure", "GIVING", "exception", "turn failed", "context overflow"))
+    turns = txt.count("turn end"); fresh = txt.count("fresh session")
+    age = int(time.time() - ev.stat().st_mtime) if ev.is_file() else -1
+    evals = count(d / "iterations.jsonl")
+    best = None
+    try:
+        best = round(json.loads((d / "best.json").read_text())["score"], 5)
+    except Exception:
+        pass
+    procs = "?"
+    try:
+        last = Path(d / "run/procsample.jsonl").read_text().splitlines()[-1]
+        procs = json.loads(last).get("n", 0)
+    except Exception:
+        pass
+    started = ""
+    for l in txt.splitlines():
+        if "] start " in l:
+            started = l[8:24]; break
+    dba = ""
+    try:
+        if st == "RUN" and json.loads((d / "cell.json").read_text()).get("harness") == "bnbcode":
+            dba = f" db={db_age(camp, d.name, host):5}s"
+    except Exception:
+        pass
+    ws = ws_active(d) if st == "RUN" else "-"
+    return f"{camp}.{d.name:30} {st:5} {host:8} up={started[11:16]:5} warn={warn} turns={turns} fresh={fresh} last={age:5}s{dba} ws={ws} evals={evals:3} best={best!s:9} procs={procs}"
+
+def gpu(hp):
+    try:
+        with NOPROXY.open(f"http://{hp}/metrics", timeout=8) as r:
+            m = {}
+            for l in r.read().decode().splitlines():
+                for k in ("vllm:num_requests_running", "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc"):
+                    if l.startswith(k + "{"):
+                        m[k.split(":")[1]] = float(l.split()[-1])
+            return f"{hp}: running={m.get('num_requests_running')} waiting={m.get('num_requests_waiting')} kv={m.get('kv_cache_usage_perc', 0):.2f}"
+    except Exception as e:
+        return f"{hp}: unreachable ({type(e).__name__})"
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("campaigns", nargs="+"); ap.add_argument("--resubmit-dead", action="store_true")
+    ap.add_argument("--gpu", nargs="*", default=["rng-dl01-w26n16:8001", "rng-dl01-w26n10:8002", "rng-dl01-w26n09:8002"])
+    a = ap.parse_args()
+    jobs = lsf()
+    print(f"=== {time.strftime('%Y-%m-%d %H:%M')} ===")
+    states = {}
+    for j, (st, _) in jobs.items():
+        if j.split(".")[0] in a.campaigns:
+            states[st] = states.get(st, 0) + 1
+    print("LSF:", ", ".join(f"{k}={v}" for k, v in sorted(states.items())))
+    dead, finished, pend = [], [], []
+    for camp in a.campaigns:
+        for d in sorted((ROOT / camp).iterdir()):
+            if not (d / "cell.json").is_file():
+                continue
+            name = f"{camp}.{d.name}"
+            st, host = jobs.get(name, ("-", "-"))
+            if st == "RUN":
+                print(cell_row(camp, d, st, host))
+            elif st == "PEND":
+                pend.append(name)
+            else:
+                oc = None
+                if (d / "session.json").is_file():
+                    try:
+                        s = json.loads((d / "session.json").read_text()); oc = s.get("outcome") or "error"
+                    except Exception:
+                        oc = "error"
+                    if oc in ("time_limit", "ended", "iteration_limit", "refused"):
+                        finished.append(f"{name}: outcome={oc} evals={s.get('n_evals')} best={(s.get('best') or {}).get('score')}")
+                        continue
+                if (d / "driver.log").is_file():
+                    # never ran to its budget: crashed driver (no session.json) or gave up as "infrastructure"
+                    dead.append((camp, d, oc))
+    print(f"pending: {len(pend)}")
+    if pend:
+        jid = sh(f'bjobs -noheader -o jobid -J "{pend[0]}" 2>/dev/null').strip()
+        reason = " ".join(sh(f"bjobs -p {jid} 2>/dev/null").splitlines()[2:4]).strip() if jid else ""
+        print("  reason:", reason[:160])
+    for f in finished:
+        print("finished:", f)
+    for camp, d, oc in dead:
+        if (d / ".hold").is_file():
+            print(f"held (stopped on purpose, not resubmitted): {camp}.{d.name} | {(d / '.hold').read_text().strip()[:100]}")
+            continue
+        tail = sh(f"tail -1 {d}/driver.log").strip()[:160]
+        print(f"DEAD (not in LSF, outcome={oc}): {camp}.{d.name} | {tail}")
+        if a.resubmit_dead:
+            out = sh(f"{V2}/bin/submit {camp} --only '^{d.name}$' 2>&1 | grep -E 'submitted|FAILED'")
+            print("  resubmit ->", out.strip())
+    print("GPU:", " | ".join(gpu(hp) for hp in a.gpu))
+    print("hosts mem free:", " ".join(f"{l.split()[0][-6:]}={l.split()[-1]}" for l in sh("lsload rng-dl01-w24c01 rng-dl01-w24c02 rng-dl01-w24c03 rng-dl01-w24c04 2>/dev/null").splitlines()[1:]))
+    # home quota (~100 GB, invisible to df) killed every cell at once on 2026-09-08: probe it
+    t = Path.home() / ".health_write_test"
+    try:
+        t.write_bytes(b"x" * 1024 * 1024); t.unlink(); home = "writable"
+    except OSError as e:
+        home = f"WRITE FAILED: {e}"
+    log = Path.home() / ".local/share/opencode/log/opencode.log"
+    print(f"home: {home}; bnbcode log {log.stat().st_size / 1e6:.0f} MB" if log.is_file() else f"home: {home}")
+    print("run data on:", os.path.realpath(ROOT))
+    print("infra events:", sh(f"cat {' '.join(str(ROOT / c) + '/*/events.jsonl' for c in a.campaigns)} 2>/dev/null | grep -c '\"kind\": \"infra\"\\|harness_exception\\|stall_retry'").strip())
+
+if __name__ == "__main__":
+    main()

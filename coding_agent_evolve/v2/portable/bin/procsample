@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# procsample <run_dir> [interval_s]
+#
+# Records, every interval, which processes are actually working inside a run directory.
+# This is the only way to tell a genuine stop from an agent legitimately waiting on a
+# candidate evaluation: transcripts cannot distinguish them after the fact, and the pilot
+# mistook 44 correct waits for failures because of it.
+#
+# One JSON object per line to <run_dir>/run/procsample.jsonl:
+#   {"t": epoch, "n": <workers>, "top": "<cmd>", "cpu": <pcpu>, "procs":[...]}
+# A "worker" is a process of ours whose cwd is under the run dir, excluding the agent
+# harness itself and this sampler.
+set -u
+RUN="${1:?usage: procsample <run_dir> [interval_s]}"
+INT="${2:-15}"
+RUN="$(cd "$RUN" && pwd)"
+OUT="$RUN/run/procsample.jsonl"
+mkdir -p "$RUN/run"
+
+while :; do
+  python3 - "$RUN" "$OUT" <<"PY"
+import json, os, sys, time
+run, out = sys.argv[1], sys.argv[2]
+me = os.getpid()
+procs = []
+for pid in os.listdir("/proc"):
+    if not pid.isdigit() or int(pid) == me:
+        continue
+    try:
+        cwd = os.readlink("/proc/%s/cwd" % pid)
+    except OSError:
+        continue
+    if not (cwd == run or cwd.startswith(run + os.sep)):
+        continue
+    try:
+        cmd = open("/proc/%s/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        continue
+    if not cmd:
+        continue
+    low = cmd.lower()
+    # the harness itself and this sampler are not "work"
+    if any(k in low for k in ("bnbcode", "claude", "procsample", "bnb-nudge", "cc-keepalive")):
+        continue
+    try:
+        st = open("/proc/%s/stat" % pid).read().rsplit(") ", 1)[1].split()
+        utime, stime, start = int(st[11]), int(st[12]), int(st[19])
+        hz = os.sysconf("SC_CLK_TCK")
+        up = float(open("/proc/uptime").read().split()[0])
+        elapsed = up - start / hz
+        pcpu = round(100.0 * ((utime + stime) / hz) / elapsed, 1) if elapsed > 0 else 0.0
+    except (OSError, IndexError, ValueError, ZeroDivisionError):
+        elapsed, pcpu = 0.0, 0.0
+    procs.append({"pid": int(pid), "cpu": pcpu, "age": round(elapsed, 1), "cmd": cmd[:200]})
+
+procs.sort(key=lambda p: -p["cpu"])
+rec = {"t": int(time.time()), "n": len(procs),
+       "top": procs[0]["cmd"][:160] if procs else "",
+       "cpu": procs[0]["cpu"] if procs else 0.0,
+       "procs": procs[:8]}
+with open(out, "a") as f:
+    f.write(json.dumps(rec) + "\n")
+PY
+  sleep "$INT"
+done

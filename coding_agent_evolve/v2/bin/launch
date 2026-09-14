@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# launch <cell_dir> -- what the LSF job execs. Brings up the relay (+ LiteLLM for Claude cells,
+# + node-local postgres for bnbcode cells), then runs driver/run_cell.py, then scores the cell.
+set -u
+CELL="$(cd "${1:?usage: launch <cell_dir>}" && pwd)"
+V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$HOME/venvs/v2-driver/bin/python"
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+export XDG_RUNTIME_DIR=/tmp/xdg-$(id -u); mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+log () { echo "[launch $(date +%H:%M:%S)] $*" | tee -a "$CELL/driver.log"; }
+
+cfg () { "$PY" -c "import json,sys; c=json.load(open('$CELL/cell.json')); v=c
+for k in sys.argv[1].split('.'): v=v[k]
+print(v)" "$1"; }
+HARNESS=$(cfg harness); RELAY_PORT=$(cfg relay_port); RELAY_JOBS=$(cfg relay_jobs)
+SRV_MODEL=$(cfg model); LL_PORT=$(cfg litellm_port); AGENT_PY=$(cfg python)
+log "cell=$CELL harness=$HARNESS host=$(hostname -s) job=${LSB_JOBID:-none}"
+
+# --- relay: one per node per port, idempotent ----------------------------------------------
+relay_ok () { curl -sf --noproxy '*' --max-time 20 "http://127.0.0.1:$RELAY_PORT/v1/models" >/dev/null 2>&1; }
+if ! relay_ok; then
+  # A relay of ours that holds the port but does not answer is stale (dead upstream list,
+  # wedged) -- the campaign's :9003 relays did exactly this. Ours, same user: kill and restart.
+  STALE=$(pgrep -u "$(id -un)" -f "llm_relay.py.*--listen-port $RELAY_PORT" || true)
+  if [ -n "$STALE" ]; then
+    log "port $RELAY_PORT held by a non-answering relay (pid $STALE) -- killing it"
+    kill $STALE 2>/dev/null || true
+    # wait until the port is really free; a SIGTERMed relay stuck in bjobs took > 3 s and the new
+    # one died with "Address already in use" (2026-09-08 relaunch storm)
+    for i in $(seq 20); do
+      pgrep -u "$(id -un)" -f "llm_relay.py.*--listen-port $RELAY_PORT" >/dev/null 2>&1 || break
+      [ $i -eq 10 ] && kill -9 $STALE 2>/dev/null
+      sleep 1
+    done
+    for i in $(seq 15); do ss -ltn 2>/dev/null | grep -q ":$RELAY_PORT " || break; sleep 1; done
+  fi
+  log "starting relay :$RELAY_PORT -> jobs $RELAY_JOBS model $SRV_MODEL"
+  mkdir -p "$HOME/agent_runs/v2/_infra"
+  setsid nohup python3 "$V2/relay/llm_relay.py" --jobs "$RELAY_JOBS" --model "$SRV_MODEL" \
+      --listen-port "$RELAY_PORT" --verbose --wait 1800 \
+      --health-log "$HOME/agent_runs/v2/_infra/endpoint_health.$RELAY_PORT.$(hostname -s).json" \
+      >> "$HOME/agent_runs/v2/_infra/relay$RELAY_PORT.$(hostname -s).log" 2>&1 < /dev/null &
+  # first discovery probes every candidate server with a real tool call; allow minutes
+  for i in $(seq 100); do
+    relay_ok && break
+    pgrep -u "$(id -un)" -f "llm_relay.py.*--listen-port $RELAY_PORT" >/dev/null 2>&1 || { log "relay process died: $(tail -2 "$HOME/agent_runs/v2/_infra/relay$RELAY_PORT.$(hostname -s).log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"; break; }
+    sleep 3
+  done
+fi
+relay_ok || { log "relay :$RELAY_PORT will not answer -- aborting"; tail -5 "$HOME/agent_runs/v2/_infra/relay$RELAY_PORT.$(hostname -s).log" | tee -a "$CELL/driver.log"; exit 3; }
+log "relay :$RELAY_PORT up"
+
+# --- process sampler: tells a stopped agent from one waiting on a 1000 s eval -----------------
+setsid nohup "$V2/analysis/procsample" "$CELL" 15 >> "$CELL/run/procsample.err" 2>&1 < /dev/null &
+SAMPLER=$!
+PGSYNC=""
+cleanup () { kill "$SAMPLER" $PGSYNC 2>/dev/null || true; }
+trap cleanup EXIT
+
+case "$HARNESS" in
+  bnbcode)
+    # One postgres PER CELL (bnbcode-pg-node honours BNBCODE_PGDATA). A host-shared instance was
+    # owned by whichever job started it: that job stayed RUN holding its cores until the last
+    # bnbcode cell on the host ended, and killing that job took the other cells' DB down.
+    # Node-local: run data lives on scratch whose real path is too long for a Unix socket
+    # (105 chars + socket name > 107), which made pgserver put the socket elsewhere and every
+    # bnbcode start fail with "PgClient: Failed to connect" (2026-09-08). /tmp is short and dies
+    # with the node; a relaunch on another node starts a fresh session (files are kept).
+    export BNBCODE_PGDATA="/tmp/v2pg/$(basename "$(dirname "$CELL")").$(basename "$CELL")"
+    mkdir -p /tmp/v2pg
+    PGN="$V2/bin/bnbcode-pg-node"
+    PGBK="$CELL/pgbackup.sql"
+    # Restore the conversation unless the dump carries the RUNAWAY SIGNATURE of the 2026-09 wedges.
+    # Size is not the test: a healthy 15 h store reached 445 MB. Shape is -- a healthy store has
+    # 2-4 `event` rows per message `part` and a few thousand `message` rows; the two cells that
+    # wedged inside an ACP prompt had 1500-2600 events per part (4.7-5.5 M events), and the
+    # guard-storm cell had 223 k messages. Both relaunched cells restored such a store and never made
+    # a tool call again. Counting the COPY blocks streams the dump once (~15 s per GB).
+    PGBK_EVENT_PER_PART_MAX=${PGBK_EVENT_PER_PART_MAX:-50}
+    PGBK_MESSAGES_MAX=${PGBK_MESSAGES_MAX:-50000}
+    if [ -s "$PGBK" ]; then
+      read -r PG_EVENTS PG_PARTS PG_MSGS <<<"$("$PY" "$V2/bin/pgdump_shape" "$PGBK" 2>/dev/null || echo 0 0 0)"
+      RATIO=$(( PG_EVENTS / (PG_PARTS > 0 ? PG_PARTS : 1) ))
+      log "pgbackup.sql: $(du -h "$PGBK" | cut -f1), events=$PG_EVENTS parts=$PG_PARTS messages=$PG_MSGS (events/part=$RATIO)"
+      if [ "$RATIO" -gt "$PGBK_EVENT_PER_PART_MAX" ] || [ "$PG_MSGS" -gt "$PGBK_MESSAGES_MAX" ]; then
+        log "runaway session store (events/part > $PGBK_EVENT_PER_PART_MAX or messages > $PGBK_MESSAGES_MAX): NOT restoring it -- starting cold, files and official scores kept"
+        mv "$PGBK" "$CELL/pgbackup.runaway.$(date +%Y%m%d-%H%M%S).sql"
+      fi
+    fi
+    # RESUME: the agent's conversation lives in this DB. A dump on the shared filesystem (written
+    # every 2 min below) outranks whatever an earlier run left in this node's /tmp, so a relaunch on
+    # ANY node continues the same bnbcode session (harness adopts the newest session row).
+    if [ -s "$PGBK" ]; then
+      "$PGN" stop >/dev/null 2>&1 || true
+      rm -rf "$BNBCODE_PGDATA"
+    fi
+    "$PGN" start >>"$CELL/driver.log" 2>&1 || log "WARNING: bnbcode-pg-node start failed"
+    eval "$("$PGN" env)"; export BNBCODE_DATABASE_URL
+    log "postgres (per cell): $BNBCODE_DATABASE_URL"
+    if [ -s "$PGBK" ]; then
+      if "$PGN" restore "$PGBK" >> "$CELL/pgrestore.log" 2>&1; then
+        log "restored the bnbcode session DB from pgbackup.sql ($(du -h "$PGBK" | cut -f1), $("$PGN" psql -tAc 'select count(*) from session' 2>/dev/null | tr -d ' ') sessions)"
+      else
+        log "WARNING: restoring pgbackup.sql failed (see pgrestore.log) -- the agent starts cold"
+      fi
+    fi
+    ( while :; do
+        # keep the backup current whatever its size; a big store (legit or runaway) just dumps less often
+        if [ -s "$PGBK" ] && [ "$(du -m "$PGBK" | cut -f1)" -gt 500 ]; then sleep 600; else sleep 120; fi
+        "$PGN" dump "$PGBK" 2>>"$CELL/pgdump.err" || true
+      done ) &
+    PGSYNC=$!
+    ;;
+  claude)
+    LL_YAML=$(cfg litellm_yaml)
+    if ! curl -sf --noproxy '*' --max-time 5 "http://127.0.0.1:$LL_PORT/health/liveliness" >/dev/null 2>&1; then
+      log "starting litellm :$LL_PORT"
+      ( cd "$V2/config" && PYTHONPATH="$V2/config" setsid nohup "$HOME/venvs/ccproxy/bin/litellm" \
+          --config "$LL_YAML" --port "$LL_PORT" \
+          >> "$CELL/litellm.log" 2>&1 < /dev/null & )
+      for i in $(seq 45); do
+        curl -sf --noproxy '*' --max-time 3 "http://127.0.0.1:$LL_PORT/health/liveliness" >/dev/null 2>&1 && break
+        sleep 2
+      done
+    fi
+    # /health/liveliness only says the proxy listens. Probe the full path with a real completion.
+    CC_MODEL=$(cfg cc_model)
+    for i in $(seq 20); do
+      if curl -sf --max-time 60 --noproxy '*' -X POST "http://127.0.0.1:$LL_PORT/v1/chat/completions" \
+           -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-local' \
+           -d "{\"model\":\"$CC_MODEL\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word OK.\"}]}" \
+           2>/dev/null | grep -q '"choices"'; then
+        log "litellm end-to-end probe ok (attempt $i)"; break
+      fi
+      [ "$i" = 20 ] && log "WARNING: litellm probe never succeeded; starting anyway"
+      sleep 15
+    done
+    ;;
+esac
+
+log "driver start"
+"$PY" "$V2/driver/run_cell.py" "$CELL"
+RC=$?
+log "driver exit rc=$RC"
+# the agent's background candidates outlive the harness; kill them before scoring so the host
+# grader is not starved and the node is clean for the next cell
+"$PY" "$V2/bin/reap_workspace" "$CELL/workspace" 15 2>&1 | tee -a "$CELL/driver.log" | tail -3
+"$AGENT_PY" "$V2/tracker/score.py" "$CELL" --python "$AGENT_PY" >> "$CELL/driver.log" 2>&1 || true
+log "score: $(cat "$CELL/score.json" 2>/dev/null | "$PY" -c 'import json,sys; d=json.load(sys.stdin); print(d.get("score"), "ok" if d.get("ok") else d.get("error"))' 2>/dev/null)"
+[ "$HARNESS" = bnbcode ] && "$AGENT_PY" "$V2/analysis/stopclass.py" "$CELL" >> "$CELL/driver.log" 2>&1 || true
+
+# --- reap ------------------------------------------------------------------------------------
+# Relay and LiteLLM are per cell (unique ports): always kill ours. Detached children count as
+# live processes of this job, so without this the job stays RUN holding its cores until walltime.
+R=$(pgrep -u "$(id -un)" -f "llm_relay.py.*--listen-port $RELAY_PORT" || true)
+L=$(pgrep -u "$(id -un)" -f "litellm --config .*--port $LL_PORT" || true)
+log "reaping this cell's relay($R) litellm($L)"
+[ -n "$R$L" ] && kill $R $L 2>/dev/null || true
+# this cell's own postgres dies with the cell
+if [ "$HARNESS" = bnbcode ]; then
+  kill $PGSYNC 2>/dev/null || true
+  "$PGN" dump "$PGBK" 2>>"$CELL/pgdump.err" && log "final session-DB dump: $(du -h "$PGBK" | cut -f1)" || log "WARNING: final pg dump failed"
+  "$PGN" stop >> "$CELL/driver.log" 2>&1 || true
+  log "stopped this cell's postgres"
+fi
+touch "$CELL/.done"
+exit $RC

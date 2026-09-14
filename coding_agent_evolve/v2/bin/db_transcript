@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""db_transcript <cell_dir> [--thoughts] [--host HOST]
+
+Render a bnbcode cell's FULL conversation out of its node-local session database.
+
+Why this exists: bnbcode compacts a long session into a *successor* session (see
+`[perf] cliff-compaction` in the opencode log). Our ACP client keeps listening on the
+session it prompted, so `events.jsonl` goes silent from the first compaction onward even
+though the agent keeps working. The session database has everything, including every
+successor, so this is the authoritative transcript for bnbcode cells.
+
+The database lives in /tmp on the compute node that runs the cell, so the query is run
+there over ssh. When the cell is no longer running the database is gone; the cell's
+`pgbackup.sql` (dumped every 2 minutes by bin/launch) is then the only copy.
+"""
+import argparse, base64, json, os, subprocess, sys, time
+from pathlib import Path
+
+SQL = """
+select json_build_object(
+  'sid', p.session_id,
+  'mid', p.message_id,
+  'role', m.data->>'role',
+  't', p.time_created,
+  'type', p.data->>'type',
+  'text', left(p.data->>'text', 200000),
+  'tool', p.data->>'tool',
+  'title', left(p.data#>>'{state,title}', 400),
+  'status', p.data#>>'{state,status}',
+  'input', left(p.data#>>'{state,input}', 600),
+  'output', left(p.data#>>'{state,output}', 600),
+  'error', left(p.data#>>'{state,error}', 400)
+)::text
+from part p left join message m on m.id = p.message_id
+order by p.time_created, p.id
+"""
+
+
+def exec_host(camp, cell):
+    """Where is this cell running? Ask LSF, fall back to the last host in driver.log."""
+    try:
+        out = subprocess.run(["bjobs", "-w", "-noheader"], capture_output=True, text=True, timeout=60).stdout
+        for ln in out.splitlines():
+            f = ln.split()
+            if len(f) > 6 and f[6] == "%s.%s" % (camp, cell.name) and f[2] == "RUN":
+                return f[5].split("*")[-1].split(":")[0]
+    except Exception:
+        pass
+    try:
+        for ln in reversed((cell / "driver.log").read_text().splitlines()):
+            if " host=" in ln:
+                return ln.split(" host=")[1].split()[0]
+    except OSError:
+        pass
+    return None
+
+
+def fetch(camp, cell, host):
+    pgdata = "/tmp/v2pg/%s.%s" % (camp, cell.name)
+    v2 = Path(__file__).resolve().parent.parent
+    script = (
+        "export BNBCODE_PGDATA=%s\n" % pgdata
+        + "exec %s/bin/bnbcode-pg-node psql -t -A -c %s\n" % (v2, json.dumps(" ".join(SQL.split())))
+    )
+    b64 = base64.b64encode(script.encode()).decode()
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, "echo %s | base64 -d | bash" % b64]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError("psql on %s failed: %s" % (host, (r.stderr or "")[-400:]))
+    rows = []
+    for ln in r.stdout.splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            rows.append(json.loads(ln))
+        except ValueError:
+            pass
+    return rows
+
+
+def render(rows, thoughts):
+    out = []
+    sid = None
+    for r in rows:
+        t = time.strftime("%H:%M:%S", time.localtime((r.get("t") or 0) / 1000))
+        if r.get("sid") != sid:
+            sid = r.get("sid")
+            out.append("\n%s ###### SESSION %s\n" % (t, sid))
+        typ = r.get("type")
+        if typ == "text":
+            txt = (r.get("text") or "").strip()
+            if txt:
+                who = "USER/HOST" if r.get("role") == "user" else "assistant"
+                out.append("%s [%s] %s\n" % (t, who, txt))
+        elif typ == "reasoning":
+            if thoughts and (r.get("text") or "").strip():
+                out.append("%s   [thinking] %s\n" % (t, r["text"].strip().replace("\n", "\n   ")))
+        elif typ == "tool":
+            head = "%s >> %s: %s" % (t, r.get("tool"), (r.get("title") or "").replace("\n", " ")[:300])
+            body = ""
+            if r.get("output"):
+                body = "\n%s << %s" % (t, r["output"].replace("\n", " ")[:300])
+            if r.get("error"):
+                body += "\n%s << ERROR %s" % (t, r["error"].replace("\n", " ")[:300])
+            out.append(head + body)
+        elif typ == "compaction":
+            out.append("%s ###### COMPACTION (bnbcode moved this conversation to a successor session)" % t)
+    return "\n".join(out) + "\n"
+
+
+def cell_rows(cell, host=None):
+    camp = cell.parent.name
+    host = host or exec_host(camp, cell)
+    if not host:
+        raise RuntimeError("no host for %s/%s (not running, and driver.log has none)" % (camp, cell.name))
+    return fetch(camp, cell, host), host
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cell", type=Path)
+    ap.add_argument("--thoughts", action="store_true")
+    ap.add_argument("--host")
+    a = ap.parse_args()
+    rows, host = cell_rows(a.cell.resolve(), a.host)
+    sys.stderr.write("%d parts from %s\n" % (len(rows), host))
+    sys.stdout.write(render(rows, a.thoughts))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,265 @@
+# bnbcode findings — continual work, context growth, and agent stalls
+
+Field notes from running **bnbcode 0.50.0.dev24** as a long-horizon research agent, with
+the raw evidence to check them against. Written to be handed to the bnbcode authors.
+
+Everything here is measured unless a paragraph says otherwise; where a claim is an
+inference from the measurements, it says so.
+
+---
+
+## The setup
+
+Three mathematical-optimisation problems (autocorrelation-inequality bounds, Erdős minimum
+overlap), each handed to a coding agent as a self-contained folder with the task in
+`INITIAL_PROMPT.md`, an evaluator, and a starting `.npy`. The agent is asked to search for
+better constructions for hours, keeping a ledger of what it tried.
+
+- **Model:** `Qwen/Qwen3.6-27B-FP8`, self-hosted on vLLM 0.25.1, `--max-model-len 130000`,
+  `--enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3`.
+  Not a frontier model, and that matters for reading finding 3.
+- **bnbcode config:** `compaction.context_limit: 110000`, `compaction.notes: false`,
+  `agent.build.temperature: 0.6`, `top_p: 0.95`, a permission block that denies web access.
+- **Control arm:** the identical task, prompt, model and sampling driven by **Claude Code
+  2.1.234** through a LiteLLM shim (Anthropic Messages → OpenAI). Same vLLM process. This
+  exists to separate "the model is unreliable" from "the harness makes it worse".
+- 11 bnbcode sessions across 3 run folders; 1 Claude Code run. Small-n, one operator.
+
+---
+
+## Finding 1 — continual work re-injects the entire user prompt on every continuation turn
+
+**This is the main finding.** While a continual-work mode is active, the runtime inserts a
+user-role message before continuation turns. That message is not a short nudge. It is:
+
+```
+<continual-work-north-star>
+  … the ~500-character north_star …
+</continual-work-north-star>
+
+This is a direction, not a log. Use files, todos, and the codebase itself to
+track progress and intermediate state. …
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+The following recent user messages must be interpreted with the north_star
+direction above in mind. …
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+<recent-genuine-user-messages>
+  … THE COMPLETE ORIGINAL PROMPT, VERBATIM …
+</recent-genuine-user-messages>
+```
+
+Measured on session `ac2_evo_s1__ses_fac771e7effe3pOzSfM05IBIUo`:
+
+| | |
+|---|---|
+| one injection block | **16,360 characters** |
+| the user's `INITIAL_PROMPT.md` | 10,703 characters |
+| of that prompt embedded verbatim in the block | **100%** |
+| the harness's own wrapper text | 5,658 characters |
+| injections in this one session | **38** |
+| distinct md5 among those 38 | **5** |
+| total characters of injection | **572,579** (≈138,000 Qwen tokens) |
+
+`evidence/continual_work_injection_FULL.txt` is one complete block, unedited.
+`evidence/continual_work_injections_index.txt` lists all 38 with timestamps, sizes and
+hashes.
+
+### What that does to the context
+
+Tokenised with Qwen's own tokenizer, everything accumulated in each session, by category:
+
+| category | **bnbcode** `ac2_evo_s1` | **Claude Code** `ac2_evo_cc_s1` |
+|---|---|---|
+| **user / injected text** | **138,091 (68%)** | 15,973 (3%) |
+| tool calls (the request) | 27,712 (14%) | 155,052 (32%) |
+| assistant reasoning | 27,403 (13%) | 178,409 (37%) |
+| tool results (the output) | 8,222 (4%) | 52,095 (11%) |
+| attachments | — | 78,156 (16%) |
+| assistant text | 1,632 (1%) | 1,434 (0%) |
+| **total** | **203,060** | **481,119** |
+
+Same task, same prompt variant, same model, roughly the same wall-clock window.
+
+Two-thirds of what bnbcode accumulates is one message repeated. The evidence the agent
+actually needs to reason about — the output of the programs it ran — is **4%**. In the
+control arm the proportions are inverted: the work is ~80% of the context and the
+harness's own text is 3%.
+
+The agent also reasons three times less per turn under bnbcode: **347 tokens per reasoning
+block versus 1,031** in the control arm.
+
+### Why we think this matters (inference, not measurement)
+
+A model shown forty near-identical copies of an instruction it has already acted on is in
+a context that invites "this is handled" as the next token. That is consistent with
+finding 3 but we have not isolated it experimentally. The next run disables continual work
+with everything else held constant, which will settle it.
+
+### Suggestion
+
+Send the north_star and a short continuation instruction. If recent user messages need to
+be restated, restate a summary or a reference, not the entire original prompt, and not on
+every turn. At minimum, deduplicate: 33 of the 38 blocks were byte-identical to one of five
+variants, so the same text was re-sent dozens of times inside one context window.
+
+---
+
+## Finding 2 — the auto-disable safety bound fires on model unreliability, silently
+
+From the binary's own `continue_work` description:
+
+> "As a safety bound, the runtime also disables a mode after **three consecutive
+> mode-prompt cycles repeat the same activity**."
+
+That rule is aimed at an agent looping on completed work. What it actually caught here was
+a *model* failing to emit tool calls. Three consecutive turns where Qwen thought
+"let me continue optimizing" and emitted nothing were read as repeated activity, and
+continual work switched itself off.
+
+Observed on **3 of 3** bnbcode run folders. Session metadata before and after, from the
+`session` table:
+
+```
+ses_facbe99c3…  (pre-compaction)   "mode": "optimization",  northStar: "Maximize AC2…"
+ses_fac6a6e55…  (live)             "mode": "disabled",      northStar: gone
+```
+
+`ac2_evo_s1` reached the same state without ever compacting, so compaction is not the
+mechanism — the safety bound is.
+
+Two problems from an operator's seat:
+
+1. **It is invisible.** Nothing in the TUI said continual work had been disabled. The
+   symptom is "the agent stopped continuing", and the operator's response — nudge it again
+   — cannot work, because the machinery that generates continuations is off. We only found
+   it by reading `session.metadata` in postgres.
+2. **The north_star is discarded with it.** The successor session has no `northStar` key,
+   so re-enabling means the model has to reconstruct the direction from a compacted
+   context.
+
+### Suggestion
+
+Surface the transition in the UI, and distinguish "the agent repeated completed work" from
+"the agent produced no tool call three times" — the second is a provider/model
+reliability event, and disabling the continuation machinery is close to the opposite of
+the useful response. Keep the north_star across a disable so re-enabling is one call.
+
+---
+
+## Finding 3 — stall rate versus context, with a harness control
+
+A **stall** here is precise: an assistant turn where the model emits a reasoning block and
+nothing else. No text, no tool call, `finish_reason = "stop"` — a clean end-of-turn, not
+truncation, not an error, not a timeout. Verbatim examples in
+`evidence/stalled_turns_verbatim.txt`; a typical one is 43 output tokens reading
+
+> "The user wants me to continue optimizing. Let me keep pushing. The current best is
+> around 0.872. Let me run more extensive optimization with better starting points and
+> more parallel work."
+
+and then the turn ends.
+
+Rate against input-context size:
+
+| context | bnbcode run A | bnbcode run B | **Claude Code (control)** |
+|---|---|---|---|
+| 20–40k | 2% | 0% | **0%** |
+| 40–60k | 35% | 52% | **5%** |
+| 60–80k | 26% | 38% | **4%** |
+| 80k+ | 41% | **94%** | (never reached) |
+
+The control arm exhibits **the same failure** — 5 of 139 responses, `stop_reason:
+end_turn`, thinking block only — at roughly a tenth the rate in matched context bands.
+
+Two things this does *not* appear to be:
+
+- **Not raw prompt length.** Single-shot probes against the same vLLM at 52k, 75k, 97k and
+  120k prompt tokens all returned `finish_reason=tool_calls` with exactly one correct tool
+  call. Length alone does not break this model.
+- **Not the model alone.** Same model, same prompt, same sampling in both arms.
+
+What differs is what accumulates in the window — see finding 1.
+
+Caveats: one run per arm; the control never entered the 80k+ band; the operator interacted
+with both. Treat the ratio as a signal to investigate, not a measured effect size.
+
+Productive output over the same period, same task and prompt variant:
+
+| | candidate programs written | logs |
+|---|---|---|
+| bnbcode `ac2_evo_s1` | 7 | 0 |
+| Claude Code `ac2_evo_cc_s1` | 43 | 48 |
+
+---
+
+## Finding 4 — the shell tool's timeout, and how much wall-clock it costs
+
+The model settled on passing `timeout: 900000` to the shell tool. The task's programs are
+specified to run for up to 1000 s, so they are killed before returning:
+
+```
+<shell_metadata> shell tool terminated command after exceeding timeout 900000 ms. …
+```
+
+On one node, over 217 shell calls: **19 killed at the timeout, consuming 285 of 511
+minutes of shell wall-clock — 56%.** Every one of those returned nothing to the model.
+
+This is arguably correct behaviour given the argument the model chose, and there is no
+clamp in the binary that we could find. Worth noting anyway, because the tool's error text
+advises "retry with a larger timeout value" while the model is already passing the largest
+value it has ever tried, and because a killed command hands the model a turn where acting
+produced no information — which is exactly the state that precedes a stall.
+
+Observation, not a complaint: `background: true` exists and the model discovered it on its
+own 32 times. It is a good escape hatch; it is just not what the error message points at.
+
+---
+
+## What is in this folder
+
+```
+README.md                                   this file
+evidence/
+  continual_work_injection_FULL.txt         one complete injection block, unedited
+  continual_work_injections_index.txt       all 38, with timestamps, sizes, md5
+  stalled_turns_verbatim.txt                every stalled turn with its full reasoning
+  context_composition.md                    the tokenised tables and how they were produced
+transcripts/
+  <run>__<session_id>.jsonl                 faithful export: one JSON object per part
+  <run>__<session_id>.md                    the same, rendered for reading
+  _sessions_<host>.json                     session rows incl. continual-work metadata
+transcripts_claudecode/
+  ac2_evo_cc_s1__<uuid>.jsonl / .md         the control arm, same task and prompt
+scripts/
+  render_bnb.py                             the .jsonl → .md renderer
+```
+
+The `.jsonl` files are the record; the `.md` files truncate long tool output for reading.
+
+## Reproducing the measurements
+
+Session state lives in postgres (`~/.local/share/bnbcode/pgdata-<host>`). The continual-work
+state is on the session row:
+
+```sql
+select id, directory, metadata->'sessionContinualWork' from session order by id desc;
+```
+
+Stall rate by context bucket:
+
+```sql
+with t as (
+  select (m.data->'tokens'->>'input')::bigint as inp,
+         exists(select 1 from part p where p.message_id=m.id and p.data->>'type'='tool') as acted
+  from message m
+  where m.data->>'role'='assistant' and m.data->>'mode'='build'
+    and (m.data->'tokens'->>'input')::bigint > 0)
+select (inp/20000)*20000 as bucket, count(*),
+       count(*) filter (where not acted) as silent
+from t group by 1 order by 1;
+```
+
+One note for anyone reading part rows: **reasoning parts carry their content in
+`data->>'text'`, not `data->>'reasoning'`** — the latter is absent, and a query that reads
+it silently reports zero reasoning tokens.

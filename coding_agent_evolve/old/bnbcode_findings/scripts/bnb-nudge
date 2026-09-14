@@ -1,0 +1,113 @@
+#!/bin/bash
+# bnb-nudge -- keep a bnbcode run alive without re-injecting the prompt.
+#
+#   bnb-nudge <run_folder> <hours> [cycle_timeout_s]
+#
+# Why this exists. Measured on this cluster: Qwen3.6-27B ends a turn without calling a tool
+# with probability ~3-18% at low context and 26-94% above 40k, so an unattended run dies
+# after ~10 turns on average. bnbcode answers that with continual work, whose continuation
+# message re-embeds the whole task prompt -- 16 KB a time, 38 times in one session, 68% of
+# the context window. Context growth raises the stall rate, so that mitigation accelerates
+# the failure it exists to fix.
+#
+# This does the same job two ways, cheaply:
+#
+#   1. NUDGE      a fixed ~130-char message resumes the session by id. Nothing else is
+#                 re-sent. Good for an ordinary end-of-turn.
+#   2. RESTART    once a session is wedged -- answering every nudge with a ~20-token "stop"
+#                 at high context -- nudging is useless, measured. A fresh session in the
+#                 SAME folder resets the context while every attempt, log and best.npy on
+#                 disk survives, and the agent reads its own prior work back.
+#
+# The loop escalates 1 -> 2 automatically and keeps going until the time budget runs out.
+set -u
+
+RUN=${1:?usage: bnb-nudge <run_folder> <hours> [cycle_timeout_s]}
+HOURS=${2:-4}
+CYCLE_TIMEOUT=${3:-1800}
+PATIENCE=${NUDGE_PATIENCE:-3}
+
+NUDGE="Continue. Keep improving the score and recording every attempt under run/. Do not stop to report progress -- make the next tool call."
+RESUME_NOTE="
+
+Work from an earlier session is already in run/ -- read run/attempts/ and run/best.npy first, and continue from the best result found so far rather than starting over."
+
+export PATH="$HOME/.local/bin:$PATH"
+export XDG_RUNTIME_DIR=/tmp/xdg-$(id -u)
+eval "$("$HOME/bin/bnbcode-pg-node" env)" 2>/dev/null
+export BNBCODE_DATABASE_URL
+
+cd "$RUN" || { echo "no such run folder: $RUN" >&2; exit 1; }
+[ -f INITIAL_PROMPT.md ] || { echo "no INITIAL_PROMPT.md in $RUN" >&2; exit 1; }
+mkdir -p .nudge
+LOG=.nudge/nudge.log
+DEADLINE=$(( $(date +%s) + $(python3 -c "print(int(float('$HOURS')*3600))") ))
+
+say () { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
+
+sid_for_dir () {
+  "$HOME/bin/bnbcode-pg-node" psql -t -A -c \
+    "select id from session where directory='$PWD' order by id desc limit 1;" 2>/dev/null | tr -d ' '
+}
+
+tools_in () {
+  # `grep -c ... || echo 0` is WRONG: grep exits 1 on zero matches and still prints "0",
+  # so the caller gets "0\n0", every arithmetic test errors, and the loop never stops.
+  # That bug ran 516 barren cycles in 40 minutes before it was caught.
+  local n
+  n=$(grep -c '"type":"tool_use"' "$1" 2>/dev/null | head -1)
+  [ -n "$n" ] || n=0
+  echo "$n"
+}
+
+say "=== bnb-nudge start ==="
+say "run folder : $PWD"
+say "budget     : ${HOURS}h (until $(date -d @$DEADLINE '+%H:%M:%S'))"
+say "cycle cap  : ${CYCLE_TIMEOUT}s   patience: $PATIENCE barren cycles then a fresh session"
+
+CYCLE=0; BARREN=0; SESSION=0; SID=""; FRESH=1
+
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  CYCLE=$((CYCLE + 1))
+  EV=".nudge/cycle_$(printf '%03d' $CYCLE).json"
+
+  if [ "$FRESH" -eq 1 ]; then
+    SESSION=$((SESSION + 1))
+    MSG="$(cat INITIAL_PROMPT.md)"
+    [ "$SESSION" -gt 1 ] && MSG="$MSG$RESUME_NOTE"
+    say "cycle $CYCLE: opening session #$SESSION from INITIAL_PROMPT.md"
+    timeout "$CYCLE_TIMEOUT" bnbcode run --agent build --format json "$MSG" \
+        > "$EV" 2>> .nudge/stderr.txt
+    RC=$?
+    SID=$(grep -o '"sessionID":"[^"]*"' "$EV" 2>/dev/null | head -1 | cut -d'"' -f4)
+    [ -n "$SID" ] || SID=$(sid_for_dir)
+    FRESH=0; BARREN=0
+    say "cycle $CYCLE: session #$SESSION is $SID"
+  else
+    say "cycle $CYCLE: nudging $SID"
+    timeout "$CYCLE_TIMEOUT" bnbcode run --agent build --format json -s "$SID" "$NUDGE" \
+        > "$EV" 2>> .nudge/stderr.txt
+    RC=$?
+  fi
+
+  N=$(tools_in "$EV")
+  OUT=$(grep -o '"output":[0-9]*' "$EV" 2>/dev/null | tail -1 | cut -d: -f2)
+  INP=$(grep -o '"input":[0-9]*' "$EV" 2>/dev/null | tail -1 | cut -d: -f2)
+  say "cycle $CYCLE: exit=$RC tool_calls=$N ctx=${INP:-?} out=${OUT:-?} attempts=$(ls run/attempts 2>/dev/null | wc -l)"
+
+  if [ "$N" -eq 0 ]; then
+    BARREN=$((BARREN + 1))
+    if [ "$BARREN" -ge "$PATIENCE" ]; then
+      say "session $SID is wedged after $BARREN barren nudges at ctx=${INP:-?} -- starting a fresh one."
+      say "  Everything on disk is kept; only the context is reset."
+      FRESH=1
+    else
+      sleep 20
+    fi
+  else
+    BARREN=0
+  fi
+done
+
+say "=== bnb-nudge done: $CYCLE cycles across $SESSION session(s) ==="
+say "attempts: $(ls run/attempts 2>/dev/null | wc -l)   ledger: $([ -f run/LEDGER.md ] && wc -l < run/LEDGER.md || echo 'not written')"

@@ -1,0 +1,911 @@
+# Operator notes — the coding-agent arm for AC1 / AC2 / Erdős
+
+**This file is for you, not for the agent.** Nothing here goes into a prompt. It collects the venv,
+the node, the bnbcode configuration, and how to keep the agent pointed at a vLLM server that keeps
+moving.
+
+Everything marked **[verified]** was measured on 2026-08-29/30 against the live cluster.
+
+---
+
+## 0. What is here
+
+```
+experiments/
+├── OPERATOR_NOTES.md      this file
+├── llm_relay.py           fixed loopback address -> whichever vLLM is alive  (§4d)
+├── opencode.json          the per-run bnbcode config; copied into every run folder  (§5)
+                          (`~/bin/bnbcode-pg-node` lives outside the repo — see §6 step 4)
+├── AC1/
+│   ├── prompt_plain.md    arm A: problem + resources + rules, no methodology
+│   ├── prompt_evo.md      arm B: the same, plus the evolutionary search framework
+│   ├── eval.py            the grading function, byte-for-byte from the ICL env
+│   └── height_sequence_1.npy   the ICL arm's initial construction (6520 entries, scores 2.0)
+├── AC2/                   same four files (height_sequence_1.npy is the same array)
+└── Erdos/
+    ├── prompt_plain.md, prompt_evo.md, eval.py
+    └── initial_h_values.npy    n = 81, C₅ = 0.49399
+```
+
+The matrix is **3 problems × 2 prompt variants**. The two variants differ in exactly one block:
+
+| | `prompt_plain.md` | `prompt_evo.md` |
+|---|---|---|
+| Problem statement, objective, target | identical | identical |
+| Environment / compute / venv | identical | identical |
+| Scoring + rules + no-web | identical | identical |
+| Methodology | *"Find the best solution you can."* | `## Search Strategy` + `## Bookkeeping`: diverse portfolio, registry of approach families, independence before cross-pollination, creative streams, critical analysis, BLOCKED routes, `run/LEDGER.md` / `run/best.npy` / `run/NOTES.md` |
+
+Keep that the only difference — it is the whole comparison.
+
+---
+
+## 1. The venv
+
+`/home/crv1pi/venvs/agent-eval/bin/python` — **created 2026-08-30 for this arm.** Python 3.12.11,
+309 MB.
+
+```
+numpy 2.5.1   scipy 1.18.0   cvxpy 1.9.2
+solvers: CLARABEL, SCS, ECOS, ECOS_BB, SCIPY, HIGHS, OSQP
+```
+
+The versions are pinned to match `~/work/learning_evolve/src/.venv`, the interpreter the ICL sweeps
+grade with, so a candidate that scores X here scores X there. **It is deliberately a separate
+venv**: the agent is told it may not install anything, but if that instruction ever fails to hold, a
+resolver conflict lands here and not in the venv the ICL sweeps depend on.
+
+Rebuild it with:
+
+```bash
+uv venv --python 3.12 ~/venvs/agent-eval
+VIRTUAL_ENV=~/venvs/agent-eval uv pip install \
+    "numpy==2.5.1" "scipy==1.18.0" "cvxpy==1.9.2" ecos osqp highspy clarabel
+```
+
+Do that **on the login node** — compute nodes have no outbound network unless you activate P4S
+(§8), and you do not want the agent's job to need it.
+
+The prompts hard-code the absolute interpreter path, so nothing needs activating and there is no
+wrapper script to go stale.
+
+---
+
+## 2. Getting a node
+
+**Never run the agent on a login node.** A cgroup caps the user slice at 5 cores while `nproc`
+reports 64, invisibly to every tool, and evaluation runs ~12× slower (`docs/BOSCH_CLUSTER.md` §1).
+
+```bash
+bsub -Is -q batch_cpu -J cpu1 -P BH-000557-01 -n 32,128 -W 110:00 -M 4096 -R "rusage[mem=4096]" -R "span[hosts=1]" /bin/bash
+```
+
+- **`-P BH-000557-01` is mandatory.** Without a project ID esub rejects the submission outright
+  (`Request aborted by esub. Job not submitted.`) — it does not pend, it never enters the queue.
+  **[verified]**
+- **`-M` is per slot, not per job.** `-M 8192MB` on `-n 32` is a 256 GB ceiling. The site default is
+  1 GB/slot, which is enough here but not for anything larger.
+- `batch_cpu` showed 1020 jobs pending, and a 1-slot probe still placed in **2 seconds** — it
+  backfills well. A 32-slot request will take longer. **[verified]**
+- CPU nodes are `rng-dl01-w24c01..04`: 256 cores, 1.4 TB each. **[verified]**
+- `batch_cpu` `RUNLIMIT` is 10080 min (7 days), so `-W 24:00` is well inside it.
+
+**Use the same `-n` for every run in the matrix.** The prompts deliberately do not name the
+allocation size — they cap the agent at **24 cores at any one time** and tell it to read `nproc` for
+the rest — so `-n` can be anything comfortably above 24 without editing a prompt. But if `ac1_plain`
+runs on a 50-slot job and `ac1_evo` on a 38-slot one, the arms differ in something other than the
+prompt block, and that is exactly the confound this experiment exists to avoid. Pick one number and
+keep it.
+
+A compute node in `batch_cpu` **can** reach the GPU nodes' vLLM ports directly; `no_proxy` there is
+`rng-dl01-*,localhost,127.0.0.1`. **[verified — a `batch_cpu` job on w24c04 fetched
+`http://rng-dl01-w26n14:8001/v1/models` successfully.]**
+
+---
+
+## 3. Where run folders live
+
+**Never inside the repo.** An agent working here would inherit `CLAUDE.md`, the docs, `src/envs/`
+with the exact grading code and its literature prompts, and — for Erdős — the existing
+`coding_agent_evolve/erdos/` results next door.
+
+`~/agent_runs/<problem>_<variant>_s<seed>/`, one folder per run. Home is on weka with 102 TB free.
+There is no `CLAUDE.md` or `AGENTS.md` at `~` or in `~/.claude/`, so a run folder there starts with
+a clean instruction set. **[verified]** Keep it that way — if you ever add one at `~`, every run in
+this arm silently changes.
+
+The commands are in the recipe, §6.
+
+---
+
+## 4. Pointing bnbcode at a live vLLM
+
+### 4a. Where bnbcode actually is
+
+One installation, two ways to launch it — worth pinning down before the next two sections read as a
+choice between two different programs.
+
+```
+~/work/bnbcode/.venv/                        THE INSTALL -- a Python 3.11 venv, bnbcode 0.50.0.dev24
+  bin/bnbcode                                  wrapper: `from bnbcode._cli import main`
+  lib64/python3.11/site-packages/bnbcode/
+    _binary/bnbcode-linux-x64                  the real thing, a 160 MB native binary
+
+~/bin/bnbcode-go                             NOT an install -- a 3 KB bash script whose last line is
+                                               exec "$HOME/work/bnbcode/.venv/bin/bnbcode" "$@"
+```
+
+`bnbcode-go` is a wrapper. Everything it does — postgres, server discovery, the baseURL rewrite,
+NO_PROXY, stopping the stale backend — happens *before* handing off to that same executable.
+
+**`~/bin` is not on PATH**, and neither is the venv unless you activate it. **[verified]** A bare
+`bnbcode` or `bnbcode-go` is `command not found`. Write `~/bin/bnbcode-pg` in full, and
+`source ~/work/bnbcode/.venv/bin/activate` to get a bare `bnbcode`.
+
+Config and state use the *upstream* names, not bnbcode's own: `~/.config/opencode/opencode.jsonc`
+and `~/.local/state/opencode/`. Only the database pointer lives at `~/.config/bnbcode/database`.
+
+### 4b. Which servers are usable — probe, never assume
+
+A coding agent needs **tool calling**. A vLLM launched without
+`--enable-auto-tool-choice --tool-call-parser` answers `/v1/models` perfectly and then 400s on the
+first tool call: *`"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to
+be set`*. Indistinguishable from a good server until you ask it.
+
+Measured 2026-08-29/30 — **and note the ports**: **[verified]**
+
+| job | node | port | tool calls |
+|---|---|---|---|
+| **gpu2** | `rng-dl01-w26n14` (10.124.71.34) | **8001** | ✅ |
+| **gpu6** | `rng-dl01-w26n05` (10.124.71.25) | **8002** | ✅ |
+| gpu1 | `rng-dl01-w26n16` | 8001 | ❌ |
+| gpu4 | `rng-dl01-w26n05` (10.124.71.25) | 8001 | ❌ |
+
+**gpu6 is on 8002, not 8001.** Two vLLM jobs landed on `w26n05`; gpu4 took 8001 there, so gpu6 had
+to take 8002 — and gpu4 is *not* tool-capable. Anything that selects a server by hostname and
+assumes port 8001 finds gpu4's useless endpoint on that node and never finds gpu6. `~/bin/bnbcode-go`
+does exactly that (`PORT="${LLM_PORT:-8001}"`), so on gpu6's node it will pick the wrong server.
+Either run it as `LLM_PORT=8002 bnbcode-go` when you want gpu6, or use the relay below, which is
+port-aware.
+
+The model reports `max_model_len: 140000`; `~/.config/opencode/opencode.jsonc` declares
+`context: 130000`.
+
+### 4c. The one-shot path: `bnbcode-go`
+
+```bash
+~/bin/bnbcode-go            # or:  LLM_PORT=8002 ~/bin/bnbcode-go
+```
+
+It starts postgres if needed, walks `bjobs`, probes each RUNning job for tool support, writes the
+winner's IP into `~/.config/opencode/opencode.jsonc`, appends that literal IP to `no_proxy`/
+`NO_PROXY`, stops the stale shared backend, and launches bnbcode.
+
+**Pick one path, not both.** `bnbcode-go` rewrites `baseURL` to a hardcoded node IP every time it
+runs, so running it after you have set the relay address silently undoes §4d. Use it only if you are
+not using the relay.
+
+**It resolves the address once, at launch.** If the server moves or dies mid-run, the session keeps
+talking to an address that no longer answers. The cheap recovery is
+`~/bin/bnbcode-go --continue` — it rediscovers, restarts the backend, and resumes the last session
+from the postgres store. You lose the in-flight turn, not the run.
+
+### 4d. The durable path: `llm_relay.py` — a fixed address
+
+This is the answer to *"can the address be updated dynamically?"* **Yes — by not letting bnbcode
+hold the address at all.**
+
+Run the relay inside your interactive job, on the same node as bnbcode:
+
+```bash
+python3 ~/work/learning_evolve/coding_agent_evolve/experiments/llm_relay.py \
+        --jobs gpu2:8001,gpu6:8002 --verbose >> ~/agent_runs/relay.log 2>&1 &
+```
+
+and set the provider once, permanently:
+
+```jsonc
+"baseURL": "http://127.0.0.1:9001/v1"
+```
+
+Every new TCP connection is resolved fresh: the relay asks LSF where those jobs are running,
+resolves the host, checks `/v1/models`, **and issues a real `tool_choice:auto` request** before
+accepting a server — so it will never hand the agent a non-agentic endpoint. It memoises the choice
+for 30 s (`--ttl`), re-checks liveness cheaply on expiry, and only re-runs the expensive tool probe
+when it has to pick a new server. On a connect failure it invalidates and rediscovers, and when
+nothing is alive it returns a readable `503 {"error":{"message":"llm-relay: no live vLLM upstream"}}`
+rather than hanging — an opaque client-side timeout is much harder to read in a transcript.
+
+A server that moves then costs one failed request instead of a session. Job names are the stable
+handle (`gpu2` keeps its name across nodes); the relay never stores a node name.
+
+Verified end to end on 2026-08-30: a chat completion **with a real `tool_calls` response** came back
+through the relay, and given `--jobs gpu1:8001,gpu4:8001,gpu6:8002` it logged
+`10.124.71.36:8001 is live but has no tool support -- skipping`, then the same for gpu4, then
+`upstream -> gpu6 rng-dl01-w26n05 (10.124.71.25:8002)`. **[verified]**
+
+Stdlib only, so any `python3` runs it. It needs `bjobs` on PATH — confirmed working from a
+`batch_cpu` compute node. **[verified]**
+
+Sanity check at any time:
+
+```bash
+curl -sS --noproxy '*' http://127.0.0.1:9001/v1/models | head -c 120
+```
+
+### 4e. The proxy trap
+
+`no_proxy` on rng-dl01 is `rng-dl01-*,localhost,127.0.0.1` — glob patterns, and **no `10.*` entry**.
+`curl` honours the glob; `httpx` (and most HTTP clients) honour neither the glob nor a bare IP. So a
+literal `http://10.124.71.34:8001/v1` gets proxied and dies at the corporate proxy with an HTML
+`504 DNS look up failed`, which reads exactly like "the LLM is down" and is not.
+
+`bnbcode-go` handles this by appending the literal IP to `no_proxy`/`NO_PROXY`. The relay sidesteps
+it entirely: `127.0.0.1` is in `no_proxy` already, and the relay itself always builds a
+proxy-bypassing opener rather than trusting the environment.
+
+---
+
+## 5. bnbcode configuration
+
+`~/.config/opencode/opencode.jsonc`. bnbcode is `0.50.0.dev24`. **[verified]**
+
+### Compaction
+
+Available keys, with their defaults: **[verified against `config.schema.json`]**
+
+| key | default | what it does |
+|---|---|---|
+| `auto` | `true` | compact automatically when the context fills |
+| `context_limit` | model window | trigger at *this* many tokens instead of the full window |
+| `reserved` | — | token buffer kept free so compaction itself cannot overflow |
+| `notes` | `true` | scheduled compaction-note turns past 100k, where the agent writes incremental handoff notes into the trajectory |
+| `reminder_start` | `100000` | context size at which the first note is due |
+| `reminder_interval` | `50000` | token spacing between subsequent notes |
+| `tail_turns` | `2` | recent user turns kept verbatim through a compaction |
+| `preserve_recent_tokens` | — | cap on verbatim recent-turn tokens kept |
+| `prune` | `false` | drop old tool outputs |
+
+What I would run for these searches, and why:
+
+```jsonc
+"compaction": {
+  "auto": true,
+  "context_limit": 110000,
+  "notes": true,
+  "reminder_start": 60000,
+  "reminder_interval": 25000,
+  "prune": true,
+  "tail_turns": 3
+},
+"tool_output": { "max_lines": 400, "max_bytes": 20000 }
+```
+
+- **`context_limit: 110000`** against a declared 130000 / served 140000. Compacting early costs a
+  little history; compacting late means the model spends its last turns before each compaction at
+  the far end of a 27B model's window, which is where instruction-following degrades. These runs
+  compact many times, so the loss compounds.
+- **`reminder_start` / `reminder_interval` well below the defaults.** The default first note lands at
+  100k — for a run that will compact a dozen times, notes every 25k past 60k give the post-compaction
+  agent a much denser record of what it already tried. This matters far more for `prompt_evo.md`,
+  whose whole method is *don't re-explore a family you already exhausted*: the ledger on disk is the
+  durable memory, and the notes are what keep the agent writing to it.
+- **`prune: true`.** A single candidate prints progress for up to 1000 s. Stale candidate stdout is
+  the single largest and least useful thing in the window.
+- **`tool_output` caps.** Same reason, upstream: the defaults (2000 lines / 50 kB) let one candidate's
+  log eat a fifth of the window. Truncated output is written to disk, and the agent can still grep it.
+
+### Everything else
+
+- **Temperature** — the existing config sets `agent.build` and `agent.plan` to
+  `temperature: 0.6, top_p: 0.95`. That is Qwen's own recommendation; leave it. Note it is *not* the
+  ICL sweeps' `temperature: 1.0` — a difference between the arms, worth stating in the writeup.
+- **Permissions** — see the subsection below. Short version: the defaults already allow almost
+  everything, the only thing that ever prompts is a path outside the run folder, and the fix is a
+  `permission` block rather than blanket auto-approval.
+- **`continual_work`** (`enabled`, default `true`) drives the continuation prompts that keep the
+  agent going after it thinks it is finished. Leave it on — both prompts tell the agent not to stop
+  at the target.
+- **`small_model`** — title generation hits the same vLLM. Harmless.
+- **`instructions`** — leave empty. Anything you add here reaches *both* arms and quietly dilutes
+  the one difference the experiment is measuring.
+
+### Permissions — unattended, without blanket approval
+
+**bnbcode's default is already `"*": "allow"`.** Read out of the binary, the built-in rule set the
+`build` agent starts from is: **[verified 2026-08-30]**
+
+```js
+{ "*": "allow",
+  doom_loop: "ask",
+  external_directory: { "*": "ask", <project dirs>: "allow", <opencode tmp>: "allow" },
+  question: "deny", plan_enter: "deny", plan_exit: "deny",
+  read: { "*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow" } }
+```
+
+So only three things can ever stop an unattended run: a path outside the project directory, reading
+a `.env`, and the doom-loop detector. Nothing about `bash` or `edit` prompts by default.
+
+The log agrees. Across the first AC1 sessions, `~/.local/share/opencode/log/opencode.log` recorded
+162 `allow`, 10 `ask`, 1 `deny` — and **every single `ask` was `external_directory`**:
+**[verified 2026-08-30]**
+
+```
+4  external_directory  /home/crv1pi/work/*
+2  external_directory  /tmp/*
+1  external_directory  /sys/devices/system/cpu/*
+1  external_directory  /proc/self/*
+```
+
+That is the agent reaching for the ICL tree, a scratch file, and its own CPU topology — not anything
+alarming, and not anything a blanket auto-approve is needed for.
+
+#### How the matcher actually works
+
+Read from the binary; all of it matters when writing the block. **[verified 2026-08-30]**
+
+- Rules are a **flat list** and the winner is `findLast` — **not** the most specific match. Config
+  key order *is* rule order, so put the broad rule first and the exceptions after it.
+- Your `permission` block is appended **after** the built-in defaults, so it overrides them.
+- Patterns are regex-lite: `*` → `.*` and **it crosses `/`** (no `**` needed), `?` → one character,
+  anchored at both ends.
+- A pattern ending in `" *"` also matches the bare command, so `"sudo *"` catches plain `sudo`.
+- `~/` and `$HOME` expand to the home directory, but **only at the start of a pattern**.
+- `bash` is evaluated **per pipeline segment** — `ps aux | grep python | head -10` is three separate
+  decisions, so a pattern only ever has to match one command, not a whole line.
+- `edit` resources arrive **without the leading `/`** (`home/crv1pi/...`), so begin edit patterns
+  with `*`.
+- **`deny` does not prompt — it blocks.** This is the point: an unforeseen action returns an error
+  the agent can route around, instead of stalling the run until you come back to it.
+
+#### The block in `experiments/opencode.json`
+
+```json
+"permission": {
+  "doom_loop": "allow",
+  "question": "deny",
+  "webfetch": "deny", "codesearch": "deny", "arxiv": "deny", "wiki": "deny",
+
+  "external_directory": {
+    "*": "deny",
+    "/tmp/*": "allow"
+  },
+
+  "edit": {
+    "*": "allow",
+    "*/venvs/*": "deny", "*/work/*": "deny", "*/.ssh/*": "deny",
+    "*/.config/*": "deny", "*/.llmtun/*": "deny",
+    "/proc/*": "deny", "/sys/*": "deny"
+  },
+
+  "bash": {
+    "*": "allow",
+    "rm -rf *": "deny", "rm -fr *": "deny", "sudo *": "deny",
+    "ssh *": "deny", "scp *": "deny",
+    "bsub *": "deny", "bkill *": "deny",
+    "curl *": "deny", "wget *": "deny",
+    "pip install *": "deny", "uv pip install *": "deny",
+    "git push *": "deny"
+  }
+}
+```
+
+What each part is for:
+
+- **`external_directory` deny-by-default is the only real boundary here**, and the allow list is
+  deliberately one entry long. Two measurements from the log justify the shape: **[verified 2026-08-30]**
+  - **The run folder is never gated.** 52 `edit` operations landed inside `~/agent_runs/ac1_plain_s1`
+    and *zero* `external_directory` decisions ever named `agent_runs`. The check is only consulted
+    for paths **outside the project directory** — which for a run is its own folder. So it needs no
+    allow entry, and leaving one out is what stops `ac1_plain` reading `ac1_evo`'s ledger: a sibling
+    run folder *is* external, so it is denied. Keeping runs blind to each other is a correctness
+    property of the experiment, not just hygiene.
+  - **The venv needs no entry either.** 85 bash invocations of
+    `~/venvs/agent-eval/bin/python` and *zero* `external_directory` decisions naming `venvs`. `bash`
+    is not path-gated, so executing the interpreter never touches this check.
+
+  `/proc/*` and `/sys/devices/system/cpu/*` were each asked once — the agent inspecting its own core
+  topology. Denied, it gets an error and falls back to `nproc`, which is a bash call and always
+  works. Not worth an allowance.
+
+  `/tmp/*` is the one real entry: 7 requests, and the agent genuinely uses it as scratch. If you
+  want every artifact forced into `run/` where `run/LEDGER.md` can account for it, deny this too
+  — nothing breaks, bnbcode's own shell-job logs are reached over bash and are not gated.
+
+  The whole list is testable in one turn: if the *only-outside-the-project* inference is wrong, the
+  run fails loudly on its first file read rather than doing anything subtle.
+- **The `bash` denies are a guardrail against accidents, not a sandbox.** `bash` is not path-gated,
+  and a model that wanted the same effect could get it through `python -c` or a different spelling.
+  Do not treat them as containment. `bsub` and `bkill` are the two that earn their place: an agent
+  that starts killing LSF jobs takes the vLLM servers down with it.
+- **`pip install` denied** keeps `~/venvs/agent-eval` byte-identical across arms. A run that quietly
+  installs a solver is no longer comparable to its partner.
+- **`webfetch` / `codesearch` / `arxiv` / `wiki` denied** enforce the *No Web Access* section that
+  every prompt asserts and that nothing was previously checking. This is a validity control as much
+  as a safety one.
+- **`question: "deny"`** means the agent cannot park itself waiting for you. Set it back to `"allow"`
+  if you would rather be asked than have it guess.
+- **`doom_loop: "allow"`** because a long evolutionary loop is exactly what a stuck-loop detector is
+  built to catch, and its default is `ask` — i.e. a stall, overnight, at the worst moment.
+
+#### When a run dies on a denial
+
+```bash
+grep -a "action.action=deny\|action.action=ask" ~/.local/share/opencode/log/opencode.log | tail -20
+```
+
+The line names the action and the exact resource. Add it to the right allow list and restart. Keep
+the allow list in the template, not in one run folder, or the arms drift apart.
+
+**The one operational trap:** `external_directory` is scoped to *the directory bnbcode was launched
+in*. Launch from the run folder, as step 5 of the recipe does, and the boundary sits exactly where
+you want it. Launch from `~` by mistake and your whole home directory becomes "internal" — nothing
+is gated, and the `edit` deny list below is the only thing left standing. Check the header shows the
+run folder before you hand over the prompt.
+
+**The blanket escape hatch exists, and this block is the reason not to use it:** the TUI command
+palette has `permission.mode` — *"Enable auto-approve permissions"* — which approves everything for
+the session and records nothing in the run folder.
+
+### Where to put it: the run folder, not the global config
+
+**bnbcode merges an `opencode.json` found in the working directory over the global
+`~/.config/opencode/opencode.jsonc`.** Verified 2026-08-30: with the file below in the cwd,
+`bnbcode debug config` reported the local `compaction`, `tool_output` and `agent.*` values *and* the
+global `provider.vllm.options.baseURL` (the relay) and `model`. **[verified]** Local keys win; keys
+you leave out are inherited.
+
+That is the right place for it, and `experiments/opencode.json` is exactly that file — step 5 of the
+recipe copies it into every run folder. Three reasons it beats editing the global config:
+
+- **The config becomes part of the run's data.** Six months later you can read what `ac1_evo_s1`
+  actually ran with instead of reconstructing it from a global file that has changed since.
+- **It cannot drift between arms.** Every run folder gets the same copy, so `plain` and `evo` are
+  guaranteed to differ only in the prompt. Editing the global config mid-campaign silently splits
+  your matrix in two.
+- **The connection stays global.** `baseURL`, `model` and the API key live in
+  `~/.config/opencode/opencode.jsonc` and are inherited — the run config never mentions the server,
+  so pointing at a different relay or server never touches a run folder.
+
+Use plain JSON in the run folder (`opencode.json`, no comments); `//` comments belong in the global
+`.jsonc`.
+
+**The TUI's `/config` is not the mechanism.** It is a settings panel for display and behaviour
+preferences, and whatever you change there is not recorded in the run folder — so a run configured
+by hand in the interface is not reproducible and not verifiably identical to its partner arm. Use it
+to inspect, not to configure an experiment. (`/agent`, on the other hand, is the right way to check
+you are on **build** and not **plan**.)
+
+---
+
+## 6. The recipe — starting an agent run
+
+Steps 1–4 are once **per node**; steps 5–7 are once per run. You can run agents on as many nodes as
+you have jobs — each node gets its own relay and its own session database, and nothing is shared
+between them except `$HOME`.
+
+| scope | what |
+|---|---|
+| once, ever | `baseURL` → `http://127.0.0.1:9001/v1` in `~/.config/opencode/opencode.jsonc` (done) |
+| once per **node** | tmux, the interactive job, the relay, `bnbcode-pg-node start` |
+| once per **shell** on that node | `eval "$(~/bin/bnbcode-pg-node env)"` |
+| once per run | run folder + `bnbcode .` |
+
+### 1. tmux on the login node
+
+The interactive job dies with its terminal, so the allocation has to live inside tmux — not the
+other way round. Start it *before* `bsub`.
+
+```bash
+ssh cluster
+tmux new -s ac1_evo_s1                       # one session per run; reattach with `tmux a -t ac1_evo_s1`
+```
+
+### 2. Take an interactive CPU job
+
+```bash
+bsub -Is -q batch_cpu -n 32 -R "span[hosts=1] rusage[mem=8192]" -M 8192MB \
+     -W 24:00 -J ccagent -P BH-000557-01 \
+     -G rb_bd_dlp_rng-dl01_cr_AIQ_employees /bin/bash
+```
+
+`-P BH-000557-01` is mandatory (§2). Everything from here runs **on the compute node**. Confirm:
+
+```bash
+hostname; nproc                              # expect rng-dl01-w24cNN and 32
+```
+
+### 3. Start the relay
+
+Gives bnbcode an address that does not rot when a vLLM job moves (§4d). **One per node** — it
+listens on loopback, so it only serves bnbcode on the same machine. Since the whole campaign runs
+on one node, that means one relay, started once, shared by all six runs.
+
+```bash
+mkdir -p ~/agent_runs && python3 ~/work/learning_evolve/coding_agent_evolve/experiments/llm_relay.py \
+        --jobs gpu2:8001,gpu6:8002 >> ~/agent_runs/relay.log 2>&1 &
+
+sleep 5; curl -sS --noproxy '*' http://127.0.0.1:9001/v1/models | head -c 120; echo
+```
+
+**Keep the `mkdir` on the same line.** The shell expands the `>>` redirect *before* running anything,
+so with the two as separate commands a missing `~/agent_runs` kills the relay with
+`bash: /home/crv1pi/agent_runs/relay.log: No such file or directory` and `[1]+ Exit 1` — and the
+`&` makes that scroll past easily. There is then no relay and no log to explain why.
+
+That `curl` must print a model list before you go on. If it prints the relay's
+`503 no live vLLM upstream`, check `~/agent_runs/relay.log` and `bjobs -w` — no server is both alive
+and tool-capable right now, and nothing downstream will work.
+
+Make sure the provider points at it, once, permanently — in `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+"options": { "baseURL": "http://127.0.0.1:9001/v1", "apiKey": "dummy" }
+```
+
+**Do not run `bnbcode-go` after this** — it rewrites that key back to a hardcoded node IP.
+
+### 4. Start this node's session database
+
+bnbcode keeps sessions in PostgreSQL and reaches it over a **unix socket**, so it needs a server on
+*this* node — a socket does not cross hosts.
+
+```bash
+source ~/work/bnbcode/.venv/bin/activate
+~/bin/bnbcode-pg-node start                            # bootstraps on first use, idempotent after
+eval "$(~/bin/bnbcode-pg-node env)"                    # exports BNBCODE_DATABASE_URL
+bnbcode --version                                      # expect 0.50.0.dev24
+```
+
+**`bnbcode-pg-node`, never `bnbcode-pg`.** The stock `~/bin/bnbcode-pg` points every host at one
+`PGDATA` on shared GPFS, and a second host running it is not a harmless failure — it is mutually
+destructive. Observed 2026-08-30, two compute nodes:
+
+```
+pg_ctl: another server might be running; trying to start server anyway          <- the only warning
+LOG: lock file "postmaster.pid" contains wrong PID: 1792611 instead of 1235065
+LOG: performing immediate shutdown because data directory lock file is invalid  <- host A dies
+LOG: could not open file "postmaster.pid": No such file or directory
+LOG: performing immediate shutdown because data directory lock file is invalid  <- host B dies
+```
+
+Both postmasters were gone inside 60 s and bnbcode reported `Timed out waiting for the shared
+backend to become ready after 15s` / `PgClient: Failed to connect`. `bnbcode-pg status` on a host
+where the server is not running reports `no server running` even while another host has it up, so
+that message is not permission to start one.
+
+`bnbcode-pg-node` gives each host `~/.local/share/bnbcode/pgdata-$(hostname -s)` and its own
+database, so there is nothing to collide over. What it *does* share is read-only: the pgserver build
+and the hand-built `pg_trgm.so` under the venv, so bootstrapping a new node needs no compiler and
+takes seconds. **[verified 2026-08-30 — bootstrapped a second database, `bnbcode db` connected to it
+and ran its 17 migrations.]**
+
+**The `eval` is per shell, not per node.** `BNBCODE_DATABASE_URL` is an environment variable; a new
+tmux pane or a fresh `ssh` starts without it and bnbcode silently falls back to the shared GPFS
+database from `~/.config/bnbcode/database`. Re-run the `eval` in every shell that launches bnbcode,
+or put it in the node's tmux session once and launch all runs from panes of that session.
+`~/bin/bnbcode-pg-node where` prints which database the current shell would use.
+
+**Sessions do not follow you between nodes.** Each node's database is its own. Export what you want
+to keep with `bnbcode export <sessionID>` before switching nodes; `bnbcode db import` copies sessions
+between databases if you need them together.
+
+> **Why is postgres manual at all?** It is not a broken install — reinstalling reproduces it exactly.
+> bnbcode is PostgreSQL-only (`bnbcode db migrate-sqlite` exists solely to import *legacy* SQLite
+> into Postgres), and its own `bnbcode init` assumes a **system** PostgreSQL at
+> `/var/run/postgresql`. This cluster has none, so `install-bnbcode.sh` installs a userspace
+> `pgserver` instead — correctly — and userspace pgserver ships no init script and does not survive a
+> reboot. Hence a start/stop helper. `bnbcode-pg-node` is that helper, made host-aware.
+
+### 5. Create the run folder and put the prompt in it
+
+**Layout inside a run folder.** The prompts now tell the agent to put everything it produces under
+`run/`, which it creates on its first write. That keeps the inputs you place there and the outputs
+it generates from mixing:
+
+```
+<run folder>/
+  INITIAL_PROMPT.md   you put this here      (the agent reads it)
+  opencode.json       you put this here      (bnbcode reads it)
+  eval.py             you put this here      (the agent imports and runs it)
+  *.npy               you put this here      (the starting construction)
+  run/                the agent creates this — best.*, BEST.md, LEDGER.md, NOTES.md, attempts/
+```
+
+To see how a run is going, `ls -t <run folder>/run/attempts/ | head` and `tail <run folder>/run/LEDGER.md`.
+Nothing in the permission block needs changing for this: `run/` is inside the launch directory, so
+it is never subject to the `external_directory` check.
+
+
+```bash
+E=~/work/learning_evolve/coding_agent_evolve/experiments
+P=AC1                                                  # AC1 | AC2 | Erdos
+V=evo                                                  # evo | plain
+RUN=~/agent_runs/$(echo $P | tr A-Z a-z)_${V}_s1
+
+mkdir -p $RUN && cd $RUN
+cp $E/$P/eval.py .
+cp $E/$P/*.npy .                                       # height_sequence_1.npy, or initial_h_values.npy
+cp $E/$P/prompt_${V}.md INITIAL_PROMPT.md
+cp $E/opencode.json .                                  # per-run bnbcode config (§5)
+ls                                                     # INITIAL_PROMPT.md eval.py opencode.json <one>.npy
+```
+
+Copying the prompt in as `INITIAL_PROMPT.md` matches the convention in `../gpumode/*_task/`, and it
+earns its place: after a compaction the agent can re-read the task instead of relying on a summary
+of it. That matters most for `prompt_evo.md`, whose method only works if the agent still knows it is
+supposed to be running a portfolio.
+
+`opencode.json` is picked up automatically because bnbcode reads the working directory — that is why
+step 6 launches with a bare `bnbcode .` and no flags.
+
+Nothing else goes in the folder.
+
+### 6. Launch and hand over the prompt
+
+```bash
+cd $RUN
+bnbcode .                                              # add --auto for an unattended run (§5)
+```
+
+Then, as the first message, **paste the full contents of `INITIAL_PROMPT.md`**. Paste it rather than
+saying "read INITIAL_PROMPT.md": the two arms must differ only in that one block, and a
+read-it-yourself instruction adds a tool call and a summarisation step to both.
+
+Check the agent is on **build**, not **plan** — plan mode reasons at length and never writes a file,
+which reads exactly like a broken tool parser. Tab switches; the status line shows the current one.
+
+### 7. Afterwards
+
+```bash
+bnbcode session list                                   # find the session id
+bnbcode export <sessionID> > $RUN/session.json
+python3 ~/work/learning_evolve/coding_agent_evolve/local_model/render_transcript.py $RUN/session.json
+```
+
+Keep `$RUN` intact — everything under `run/` and the transcript are the run's data.
+
+### The six cells
+
+`ac1_plain_s1` · `ac1_evo_s1` · `ac2_plain_s1` · `ac2_evo_s1` · `erdos_plain_s1` · `erdos_evo_s1`.
+If you replicate, go seed-major (all six at s1, then all six at s2) so stopping early still leaves a
+balanced comparison.
+
+---
+
+## 7. ICL parity — the numbers the prompts are built on
+
+From `src/envs/registry.py`, `ac_inequalities.py`, `erdos_min_overlap.py`: **[verified]**
+
+| | AC1 | AC2 | Erdős |
+|---|---|---|---|
+| Entrypoint | `propose_candidate` | `construct_function` | `run` |
+| Direction | minimise | maximise | minimise |
+| Metric | upper bound | lower bound | C₅ bound |
+| Target in ICL prompt | 1.5030 | 0.97 | 0.38080 (record 0.38092) |
+| Stated budget | 1000 s | 1000 s | 1000 s |
+| `eval_timeout` (hard kill) | 1100 s | 1100 s | 1100 s |
+| **CPUs per candidate** | **2** | **2** | **1** |
+| Initial construction | 6520 × 0.22733602246716966 | same array | n = 81, seeded |
+| Initial score | 2.0000 | 0.6667 | 0.49399 |
+
+The `.npy` files were regenerated from the environments' own `create_initial_state`, seed 12345, so
+both arms start from the identical construction.
+
+**One caveat for the writeup.** `registry.py` gives AC1 and AC2 `num_cpus_per_task = 2` and Erdős
+`1`, which is what the prompts state and what you asked for. But **every sweep YAML overrides AC to
+1**, with the note *"eval children are single-threaded and 1-core-pinned; 2 stranded half the box."*
+So the coding-agent arm gives AC candidates twice the cores the ICL runs actually used. That is
+defensible — 2 is what the ICL *prompt* says, so the two arms are told the same thing — but it is a
+real difference between what the arms could *use*, and it belongs in the methods section rather than
+in a reviewer's question.
+
+Adaptations made to the ICL prompt text, all of them forced by the harness change:
+
+- The ICL sandbox injects `evaluate_sequence` / `evaluate_erdos_solution` and `height_sequence_1` /
+  `initial_h_values` as globals. An agent has no sandbox, so those arrive as `eval.py` and a `.npy`
+  in the working directory, and the prompt says to import and load them.
+- Dropped: *"make all helper functions top level, no closures or lambdas"* and *"do not import
+  evaluate_sequence yourself"*. Both are artefacts of the ICL sandbox's code injection and pickling,
+  not properties of the problem.
+- Dropped: *"first give your strategy between `<strategy>` tags, then return the program between
+  ```python fences"*. That is the ICL parser's contract; an agent writes files.
+- Added, with no ICL counterpart: the environment block, the no-web block, the reporting request,
+  and — in `prompt_evo.md` only — the search framework. **That addition is the experiment.**
+
+---
+
+## 8. Traps
+
+- **No project ID → no job.** esub rejects, it does not queue. Log: `~/.lsf_esub/log/rejected_job_submissions.log`.
+- **The login node lies about cores.** 64 visible, 5 usable. Always work inside the job.
+- **gpu6 is on port 8002.** See §4a. This is the single easiest way to end up debugging a
+  "broken" agent that is really talking to gpu4.
+- **`/v1/models` returning 200 proves nothing.** It answered for hours during the 2026-08-09 wedge
+  with a dead engine. The relay's tool probe is a real generation, which is why it is slow and why
+  it is the right check. `~/bin/vllm-health` and `~/bin/llmwatch` are the deeper diagnostics;
+  `llmwatch restart gpu1|gpu2` restarts a server *inside its existing LSF allocation* — never kill
+  the job, `batch_b200` had 2702 jobs pending.
+- **Qwen3.6 is a reasoning model.** `content` is `null` until thinking finishes. A short-`max_tokens`
+  probe returns `finish_reason: "length"` with null content and looks exactly like a broken endpoint.
+- **The GPU jobs are old.** gpu2 and gpu6 were submitted 2026-08-25 and 2026-08-29. They will move.
+  That is precisely what the relay is for.
+- **Compute nodes have no outbound network.** If you ever genuinely need it inside a job:
+  `source /fs/applications/modules/current/init/bash; module load proxy4server-access/2.0 && sleep 1;
+  source /fs/applications/p4s-access/2.0/ActivateP4S.sh -a`. Do not do this for an experiment run —
+  the prompts promise the agent there is no network, and P4S would also give it web access.
+- **Use `bnbcode-pg-node`, not `bnbcode-pg`.** The stock helper points every host at one PGDATA on
+  shared GPFS; a second host starting it kills both servers. See §6 step 4.
+- **`BNBCODE_DATABASE_URL` is per shell.** Without the `eval`, bnbcode silently uses the shared GPFS
+  database instead of this node's. `bnbcode-pg-node where` tells you which one you are on.
+- **Do not let the agent near `~/work/learning_evolve/src/.venv`.** That is the ICL grading
+  interpreter. The prompts point at `~/venvs/agent-eval` and forbid installing.
+
+## 9. The Claude Code arm
+
+A second harness driving the *same* model over the *same* six prompts. bnbcode and Claude
+Code differ in their system prompt, their tool set, their compaction strategy and their
+sub-agent machinery; holding Qwen3.6-27B-FP8, the prompts, the sampling and the permissions
+fixed is what turns that into a measurement instead of an anecdote.
+
+Everything here is the twin of §4–§6. Read those first; this section only records what is
+different and what had to be done to make the two comparable.
+
+### 9a. The extra hop
+
+```
+bnbcode         --(OpenAI)------------------------------> llm_relay.py :9001 --> vLLM :800x
+Claude Code     --(Anthropic)--> LiteLLM :4000 --(OpenAI)-> llm_relay.py :9001 --> vLLM :800x
+```
+
+Claude Code speaks the Anthropic Messages format and nothing else; vLLM speaks OpenAI and
+nothing else. LiteLLM is the whole translation layer — `POST /v1/messages` in,
+`/v1/chat/completions` out, and `/v1/messages/count_tokens` for context accounting. bnbcode
+is OpenAI-native and needs none of it.
+
+Both arms share one relay per node. Whichever of `agent-up` / `claude-up` runs first starts
+it; the second one finds it and leaves it alone. That is deliberate: a single relay means
+both arms are talking to the same vLLM process, not to two servers that could drift.
+
+### 9b. The files
+
+| file | what it is |
+|---|---|
+| `~/bin/claude-up` | the twin of `agent-up`. **Source it**, do not execute it. |
+| `experiments/litellm_claude.yaml` | the LiteLLM config: relay upstream, FP8 model, Qwen tokenizer |
+| `experiments/cc_sampling_hook.py` | pins temperature/top_p — the only way to match the bnbcode arm |
+| `experiments/claude_guard.json` | `--settings` file; the translation of `opencode.json`'s permission block |
+
+`claude-up` checks, in order: where you are, `claude` on PATH, the relay and a live vLLM
+behind it, LiteLLM up, token counting done with Qwen's tokenizer and not tiktoken, and a
+real `/v1/messages` round trip that comes back with a `tool_use` block. Then it exports the
+environment — which is why it has to be sourced.
+
+### 9c. What is held equal, and what is not
+
+| | bnbcode arm | Claude Code arm | equal? |
+|---|---|---|---|
+| model | `Qwen/Qwen3.6-27B-FP8` via the relay | same relay, same process | **yes** |
+| prompts | `prompt_{plain,evo}.md` | the same files, unchanged | **yes** |
+| starting `.npy`, `eval.py` | copied into the run folder | same | **yes** |
+| temperature / top_p | 0.6 / 0.95 (`opencode.json`) | 0.6 / 0.95, pinned by the hook | **yes**, verified in the proxy log |
+| web / search tools | `webfetch`,`codesearch`,`arxiv`,`wiki` → deny | `WebSearch`,`WebFetch` → deny | **yes** |
+| asking the operator | `question` → deny | `AskUserQuestion` → deny | **yes** |
+| outside the run folder | `external_directory` deny, `/tmp` allow | cwd-confined, `additionalDirectories: ["/tmp"]` | **yes** in effect |
+| bash | allow, minus a deny list | allow, minus the same deny list | **yes** |
+| edit targets denied | venvs, work, .ssh, .config, .llmtun, /proc, /sys | the same paths, absolute | **yes** |
+| token counting | vLLM's own tokenizer | LiteLLM `custom_tokenizer`, within 0.1% of it | **yes**, measured |
+| context ceiling | `compaction.context_limit` 110000 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 110000 | same number, **different semantics** |
+| max output tokens | 32000 | 16384 | **no**, deliberately |
+| session store | postgres, per node | `$CLAUDE_CONFIG_DIR`, per run folder | n/a |
+| config location | `opencode.json` *inside* the run folder | `claude_guard.json` *outside* it | **no**, deliberately |
+
+The five differences worth writing in the methods section:
+
+1. **Max output tokens.** vLLM rejects any request whose prompt + `max_tokens` exceeds
+   `--max-model-len` (130000). The Claude arm runs at 110000 + 16384 = 126384 and stays
+   under. The bnbcode arm declares `limit.output` 32000 against a 110000 compaction limit,
+   which is 142000 — it will start returning hard 400s once a session gets long enough.
+   **Left alone rather than changed under a running experiment**; if you restart the
+   bnbcode cells, drop its output limit to 16384 and the two arms become equal here too.
+2. **Ceiling semantics.** bnbcode compacts when the session passes its limit. Claude Code
+   treats the number as the model's whole window and compacts against a buffer below it, so
+   it compacts *earlier* at the same nominal ceiling. Equal ceiling, not equal cadence.
+3. **The harness's own background calls.** Claude Code sends conversation titles and file
+   summaries to whatever `ANTHROPIC_SMALL_FAST_MODEL` points at, which here is the same
+   Qwen. Those requests exist in this arm and not in the other.
+4. **Where the config lives.** `claude_guard.json` is passed with `--settings` and stays
+   outside the folder the agent can edit; `opencode.json` is copied *into* the run folder,
+   so in principle a bnbcode agent could edit its own permissions. Neither has been seen to
+   try, but the exposure is not symmetric.
+5. **The deny lists are guardrails, not sandboxes.** In both harnesses `bash` is not
+   path-gated, and `python -c` reaches everything the deny list forbids. They stop an
+   accident, not an attempt. If you ever need real confinement, the bubblewrap approach in
+   `local_model/run_guard_marvin_sandbox.json` is the one that actually holds.
+
+### 9d. The recipe
+
+```bash
+tmux new -s cpu2
+bsub -Is -q batch_cpu -J cpu2 -P BH-000557-01 -n 32,128 -W 110:00 -M 4096 \
+     -R "rusage[mem=4096]" -R "span[hosts=1]" /bin/bash
+
+source ~/bin/claude-up            # NOT ./claude-up -- it has to export into your shell
+
+E=$HOME/work/learning_evolve/coding_agent_evolve/experiments
+P=AC1; V=evo                                     # AC1|AC2|Erdos  x  plain|evo
+RUN=~/agent_runs/$(echo $P | tr A-Z a-z)_${V}_cc_s1
+mkdir -p $RUN && cd $RUN
+cp $E/$P/eval.py $E/$P/*.npy .
+cp $E/$P/prompt_${V}.md INITIAL_PROMPT.md
+export CLAUDE_CONFIG_DIR=$PWD/.cc                # per run: no shared history or memory
+claude --settings $E/claude_guard.json "$(cat INITIAL_PROMPT.md)"
+```
+
+`_cc` in the folder name is what keeps the two harnesses' cells apart. No `opencode.json` is
+copied — this arm's configuration is `claude_guard.json`, and it stays where it is. The
+agent still writes everything into `run/`, exactly as the prompts say; nothing about the
+prompts changed for this arm.
+
+Headless, if you would rather not sit in the session:
+
+```bash
+claude --settings $E/claude_guard.json --output-format stream-json --verbose \
+       -p "$(cat INITIAL_PROMPT.md)" 2>&1 | tee -a agent.jsonl
+```
+
+`local_model/render_transcript.py agent.jsonl` turns that into a readable transcript.
+
+### 9e. Traps found while building this
+
+- **`auth_token: null` in `custom_tokenizer` is required, and it logs an error.** LiteLLM
+  1.97 reads the key with a plain subscript, so removing it turns every `count_tokens` call
+  into a 500 (`KeyError: 'auth_token'`); keeping it makes LiteLLM log one red
+  `Error creating pretrained tokenizer ... Defaulting to version without 'auth_token'` per
+  call and then work correctly. **That line is expected.** Verified both ways 2026-08-30.
+- **Check the tokenizer against vLLM, not against a remembered number.** LiteLLM's
+  `count_tokens` and vLLM's `/tokenize` wrap a message differently, so they never agree
+  exactly on a short string — 28 vs 31 for a 21-token probe. On a 3500-token numeric table
+  they agree to 0.1%, and tiktoken would be ~49% off. `claude-up` uses the long probe.
+- **Neither binary is on PATH by default.** `claude` is a symlink in `~/.local/bin`;
+  `bnbcode` is a console script in `~/work/bnbcode/.venv/bin` and is now symlinked there
+  too. Both `claude-up` and `agent-up` prepend `~/.local/bin`. Prepending the *venv* instead
+  would also shadow `python3`, which changes what a bare `python3` means inside the agent's
+  own bash calls — don't.
+- **`claude-up` must be sourced.** Executed, it does all the work and then throws away the
+  environment it exists to export; it refuses rather than half-working, same as `agent-up`.
+- **The corporate proxy.** `no_proxy` on rng-dl01 is `rng-dl01-*,localhost,127.0.0.1`, which
+  already covers the shim and the relay. `claude-up` appends `127.0.0.1,localhost` anyway,
+  because a missing entry shows up as a Bosch HTML error page rather than a refused
+  connection, and that reads like an auth problem for an hour before you look at the body.
+
+## 10. Continual work — why it is now off, and what to watch
+
+`experiments/opencode.json` sets `continual_work.enabled: false` as of 2026-08-30. Backup:
+`opencode.json.bak.20260830-cw`. **Compaction was deliberately NOT changed** — `context_limit`
+stays at 110000, matching the Claude arm's `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so the next run
+changes exactly one variable.
+
+**Why.** Continual work injects a user-role continuation message that embeds the *entire*
+`INITIAL_PROMPT.md` verbatim on every continuation turn. Measured on `ac2_evo_s1`: 16,360
+characters per injection, of which 10,703 are the prompt; 38 injections, 5 distinct hashes,
+138,091 Qwen tokens — **68% of everything in that session's context**, against 4% for the
+output of the programs the agent ran. The Claude arm's harness text is 3%.
+
+Alongside that, the runtime's own safety bound ("disables a mode after three consecutive
+mode-prompt cycles repeat the same activity") fired on all three bnbcode run folders,
+switching continual work off silently and discarding the north_star. Nudging cannot restart
+it — the machinery that generates continuations is what got disabled.
+
+**What you lose with it off.** No mode, no north_star, no automatic continuation prompts.
+The agent stops when it thinks it is done and you nudge it by hand — which is how the Claude
+arm has been running all along, at a tenth the stall rate.
+
+**What to watch on the next run.** Stall rate by context bucket. Before, on bnbcode:
+2% below 40k, 35–52% at 40–60k, 41–94% above 80k. The Claude arm at matched context: 0%,
+5%, 4%. If disabling continual work moves bnbcode toward those numbers, the injection was
+the cause; if it does not, the cause is elsewhere and compaction is the next lever
+(`prune: true`, a lower `context_limit`).
+
+Full write-up, raw transcripts for all 11 bnbcode sessions and the Claude control, and the
+reproduction queries: **`coding_agent_evolve/bnbcode_findings/`**.

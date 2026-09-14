@@ -1,0 +1,52 @@
+#!/bin/bash
+#BSUB -q batch_cpu
+#BSUB -P BH-000557-01
+#BSUB -n 4
+#BSUB -R "span[hosts=1] rusage[mem=4096]"
+#BSUB -W 0:45
+#BSUB -J regwekatest
+#BSUB -o lsf.out
+#BSUB -e lsf.err
+# WekaFS smoke test for the registry: WAL on a compute node, 24 concurrent submits, one n=200k eval.
+set -u
+export PATH=$HOME/.local/bin:$PATH
+PY=$HOME/venvs/agent-eval/bin/python
+D=$HOME/agent_runs/registry_wekatest
+rm -rf $D; mkdir -p $D/run/attempts; cd $D
+echo "host=$(hostname) nproc=$(nproc) fs=$(df -T . | tail -1 | awk '{print $2}')"
+echo "=== init (WAL probe on compute node)"
+registry init --problem AC2 --eval-policy always --baseline-expect 0.6667 || exit 1
+registry config | grep journal_mode
+echo "=== 24 concurrent submits, n=2048 random non-negative sequences"
+$PY - <<'PYEOF'
+import numpy as np
+rng = np.random.default_rng(0)
+for i in range(1, 25):
+    np.save(f"run/attempts/r{i}.npy", rng.random(2048) + 0.05 * i)
+PYEOF
+t0=$(date +%s)
+seq 1 24 | xargs -P 24 -I{} sh -c 'registry submit --desc "random {}" --artifact run/attempts/r{}.npy --tag rnd --json' > submits.jsonl
+echo "24 submits took $(( $(date +%s) - t0 ))s"
+$PY - <<'PYEOF'
+import json, sqlite3, hashlib
+outs = [json.loads(l) for l in open("submits.jsonl")]
+ids = sorted(o["id"] for o in outs)
+c = sqlite3.connect("run/registry/registry.sqlite")
+print("ids gap-free:", ids == list(range(1, 25)))
+print("integrity:", c.execute("PRAGMA integrity_check").fetchone()[0])
+print("scored rows:", c.execute("SELECT count(*) FROM candidates WHERE score IS NOT NULL").fetchone()[0], "/ 25")
+best = c.execute("SELECT id, score, artifact_sha256 FROM candidates ORDER BY score DESC LIMIT 1").fetchone()
+bj = json.load(open("run/registry/best.json"))
+sha = hashlib.sha256(open("run/best.npy", "rb").read()).hexdigest()
+print("best row", best[0], best[1], "| best.json id", bj["id"], "| best.npy sha matches:", sha == best[2] == bj["sha256"])
+print("new_best flags:", sum(1 for o in outs if o["new_best"] == "yes"))
+PYEOF
+ls run/registry/ | tr '\n' ' '; echo
+echo "=== n=200000 candidate (exact eval takes minutes)"
+$PY -c "import numpy as np; n=200000; x=np.linspace(-1,1,n); np.save('run/attempts/big.npy', np.exp(-4*x*x))"
+t0=$(date +%s)
+registry submit --desc "gaussian n=200000" --artifact run/attempts/big.npy --tag gauss --parents 0
+echo "n=200k submit took $(( $(date +%s) - t0 ))s"
+registry list --last 5
+echo "=== journal files after last connection closed:"; ls -la run/registry/ | grep -E "sqlite" 
+echo DONE

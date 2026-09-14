@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# submit <campaign> [--only REGEX] [--dry]  -- one LSF job per cell under ~/agent_runs/v2/<campaign>/
+set -u
+CAMP=${1:?usage: submit <campaign> [--only REGEX] [--dry]}; shift
+ONLY=".*"; DRY=""
+while [ $# -gt 0 ]; do case "$1" in --only) ONLY="$2"; shift 2;; --dry) DRY=1; shift;; *) echo "unknown arg $1" >&2; exit 1;; esac; done
+V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$HOME/venvs/v2-driver/bin/python"
+ROOT="$HOME/agent_runs/v2/$CAMP"
+[ -d "$ROOT" ] || { echo "no such campaign dir: $ROOT" >&2; exit 1; }
+n=0
+for D in "$ROOT"/*/; do
+  D=${D%/}; NAME=$(basename "$D")
+  [ -f "$D/cell.json" ] || continue
+  echo "$NAME" | grep -Eq "$ONLY" || continue
+  read -r CORES HOURS MEM MLIM <<<"$("$PY" -c "import json; c=json.load(open('$D/cell.json')); print(c['cores'], c['hours'], c.get('mem_mb',4096), c.get('mem_limit_mb',8192))")"
+  # budget + 4 h: after the driver exits, launch still reaps the agent's processes and runs the host
+  # grade; with +30 min a cell lost its score.json to TERM_RUNLIMIT on 2026-09-10 (q38ac_r2/ac2_plain_cc)
+  WALL=$("$PY" -c "h=float('$HOURS'); m=int(h*60)+240; print(f'{m//60}:{m%60:02d}')")
+  if bjobs -J "$CAMP.$NAME" 2>&1 | grep -qv "is not found"; then echo "skip (in LSF): $NAME"; continue; fi
+  CMD="exec $V2/bin/launch $D"
+  # mem_mb > 0 reserves that much per task (core) against the hosts' limit_memory (blimits); on
+  # 2026-09-08 another user's pending jobs had that limit exhausted on all 4 batch_cpu hosts and
+  # every reserving job waited. mem_mb: 0 omits the reservation (MEMLIMIT 0 = unlimited) and dispatches.
+  RES="span[hosts=1]"; [ "${MEM:-0}" -gt 0 ] && RES="span[hosts=1] rusage[mem=$MEM]"
+  # -M is a CAP, not a reservation, so it costs nothing at dispatch (unlike rusage above).
+  # Without it the esub applies 1 GB per slot: a 32-slot cell is killed with TERM_MEMLIMIT the
+  # moment its parallel evaluations pass 32 GB, which is what happened to ac1_many_bnb at
+  # 02:14 on 2026-09-09 after 2.9 h of work. 8192 MB/slot = 256 GB for a 32-core cell, on
+  # hosts that hold ~1.4 TB free.  Override per campaign with mem_limit_mb.
+  if [ -n "$DRY" ]; then
+    echo "bsub -q batch_cpu -P BH-000557-01 -n $CORES -R '$RES' -M $MLIM -W $WALL -J $CAMP.$NAME -o $D/lsf.out -e $D/lsf.err \"$CMD\""
+  else
+    bsub -q batch_cpu -P BH-000557-01 -n "$CORES" -R "$RES" -M "$MLIM" -W "$WALL" \
+         -J "$CAMP.$NAME" -o "$D/lsf.out" -e "$D/lsf.err" "$CMD" && echo "submitted $NAME" || echo "FAILED $NAME"
+  fi
+  n=$((n+1))
+done
+echo "--- $n cell(s) in $CAMP ---"

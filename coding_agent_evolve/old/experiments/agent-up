@@ -1,0 +1,180 @@
+# agent-up -- bring this node up for a coding-agent run, and say what it found.
+#
+# SOURCE IT, do not execute it:
+#
+#     source ~/bin/agent-up
+#
+# It has to export BNBCODE_DATABASE_URL into your shell, and a child process cannot do
+# that. Run it once per node, and again in every new shell on that node -- it starts only
+# what is missing, so repeating it is always safe.
+#
+# What it checks, in order:
+#   1. where you are          -- host, LSF job, cores
+#   2. the LLM address        -- opencode.jsonc must point at the relay, not a node IP
+#   3. the relay              -- listening on this node? and is a vLLM behind it?
+#   4. this node's session DB -- running? bootstrapped? and does THIS shell point at it?
+
+# No `set -e`: this file is sourced, and a failed check must not kill the user's shell.
+
+# Executing this in a child process would do all the work and then throw away the one thing
+# that has to survive -- the exported BNBCODE_DATABASE_URL -- leaving bnbcode silently on the
+# shared GPFS database. Refuse rather than half-work.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  echo "agent-up must be SOURCED, not executed:" >&2
+  echo "    source ~/bin/agent-up" >&2
+  exit 1
+fi
+
+_au_exp="$HOME/work/learning_evolve/coding_agent_evolve/experiments"
+_au_cfg="$HOME/.config/opencode/opencode.jsonc"
+_au_relay_url="http://127.0.0.1:9001/v1"
+_au_jobs="gpu2:8001,gpu6:8002"
+_au_host="$(hostname -s)"
+_au_log="$HOME/agent_runs/relay.$_au_host.log"
+_au_bad=0
+
+printf '\n'
+
+# --- 1. where are we ------------------------------------------------------------------
+_au_cores="$(nproc)"
+_au_job="$(bjobs -w 2>/dev/null | awk -v h="$_au_host" '$3=="RUN" && $6 ~ h {print $7" ("$1")"; exit}')"
+if [ -z "$_au_job" ]; then
+  echo "Where   : $_au_host, $_au_cores cores -- but no LSF job of yours is running here."
+  echo "          If this is a login node, stop: a cgroup caps you at 5 cores while nproc"
+  echo "          reports $_au_cores, and evaluation runs ~12x slower. Get an interactive job first."
+  _au_bad=1
+else
+  echo "Where   : $_au_host, $_au_cores cores, LSF job $_au_job."
+fi
+
+# --- 1b. the binary -------------------------------------------------------------------
+# bnbcode is a console script inside ~/work/bnbcode/.venv, and nothing on this cluster puts
+# that on PATH -- so a fresh shell on a fresh node answers `bnbcode .` with "command not
+# found" even though everything else is ready. ~/.local/bin holds a symlink to it (and to
+# claude, for the other arm) and is prepended here rather than activating the venv: an
+# activated venv would also shadow python3, which changes what a bare `python3` means
+# inside the agent's own bash calls, and that must stay identical across runs.
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH"; export PATH ;; esac
+if command -v bnbcode >/dev/null 2>&1; then
+  echo "Binary  : bnbcode $(bnbcode --version 2>/dev/null | tail -1) at $(command -v bnbcode)."
+else
+  echo "Binary  : MISSING -- no 'bnbcode' on PATH. It lives at"
+  echo "          ~/work/bnbcode/.venv/bin/bnbcode; link it into ~/.local/bin:"
+  echo "              ln -sfn ~/work/bnbcode/.venv/bin/bnbcode ~/.local/bin/bnbcode"
+  _au_bad=1
+fi
+
+# --- 2. is bnbcode pointed at the relay at all? ---------------------------------------
+_au_base="$(grep -o '"baseURL"[^,]*' "$_au_cfg" 2>/dev/null | head -1 | sed 's/.*: *"//; s/"$//')"
+if [ "$_au_base" = "$_au_relay_url" ]; then
+  echo "Address : bnbcode is pointed at the relay ($_au_relay_url). Good."
+else
+  echo "Address : WRONG -- bnbcode points at '$_au_base', not the relay."
+  echo "          Something ran bnbcode-go, which rewrites this to a fixed GPU node IP and"
+  echo "          undoes the relay. Fix it in $_au_cfg:"
+  echo "              \"baseURL\": \"$_au_relay_url\""
+  _au_bad=1
+fi
+
+# --- 3. the relay ---------------------------------------------------------------------
+# Port binding and health are different questions. A bound port answering 503 means the
+# relay is fine and no vLLM is -- starting a second relay would only fail on EADDRINUSE.
+if (exec 3<>/dev/tcp/127.0.0.1/9001) 2>/dev/null; then
+  echo "Relay   : already running on this node. Left as is."
+else
+  mkdir -p "$HOME/agent_runs"
+  nohup python3 "$_au_exp/llm_relay.py" --jobs "$_au_jobs" --verbose \
+        < /dev/null >> "$_au_log" 2>&1 &
+  disown 2>/dev/null
+  sleep 5
+  if (exec 3<>/dev/tcp/127.0.0.1/9001) 2>/dev/null; then
+    echo "Relay   : started on this node (log: $_au_log)."
+  else
+    echo "Relay   : FAILED to start. Last lines of $_au_log:"
+    tail -5 "$_au_log" 2>/dev/null | sed 's/^/          /'
+    _au_bad=1
+  fi
+fi
+
+_au_models="$(curl -sS --noproxy '*' --max-time 20 "$_au_relay_url/models" 2>&1)"
+case "$_au_models" in
+  *'"data"'*)
+    _au_up="$(grep 'upstream ->' "$_au_log" 2>/dev/null | tail -1 | sed 's/.*upstream -> //')"
+    echo "LLM     : answering${_au_up:+ -- currently $_au_up}." ;;
+  *'no live vLLM upstream'*)
+    echo "LLM     : NOT available. The relay is healthy but no tool-capable vLLM is alive."
+    echo "          Check 'bjobs -w' for gpu2 / gpu6, and remember gpu6 serves on port 8002,"
+    echo "          not 8001. The relay retries by itself once one comes back."
+    _au_bad=1 ;;
+  *)
+    echo "LLM     : unexpected reply from the relay:"
+    printf '          %.120s\n' "$_au_models"
+    _au_bad=1 ;;
+esac
+
+# --- 4. this node's session database --------------------------------------------------
+# Each host gets its own PGDATA. The stock bnbcode-pg points every host at one directory
+# on shared GPFS, and a second host starting it kills both servers.
+_au_fresh=0
+if [ ! -f "$HOME/.local/share/bnbcode/pgdata-$_au_host/PG_VERSION" ]; then
+  _au_fresh=1
+  echo "Database: first run on this node -- creating its own session database (a few seconds)."
+fi
+_au_pgout="$("$HOME/bin/bnbcode-pg-node" start 2>&1)"
+case "$_au_pgout" in
+  # Bootstrapping leaves the server running, so a fresh node reports "already running"
+  # from `start`. Saying that back would read as if nothing had just been built.
+  *"already running"*) [ "$_au_fresh" -eq 1 ] \
+       && echo "Database: created and running for this node." \
+       || echo "Database: already running for this node. Left as is." ;;
+  *"server started"*)  echo "Database: started for this node." ;;
+  *) echo "Database: PROBLEM starting postgres:"
+     printf '%s\n' "$_au_pgout" | tail -4 | sed 's/^/          /'
+     _au_bad=1 ;;
+esac
+
+if ! "$HOME/bin/bnbcode-pg-node" status >/dev/null 2>&1; then
+  # Saying "this shell now points at ..." after a failed start is worse than saying nothing:
+  # the URL would be right and the server absent.
+  echo "          No server is running, so nothing to point this shell at yet."
+  _au_bad=1
+else
+eval "$("$HOME/bin/bnbcode-pg-node" env)"
+export BNBCODE_DATABASE_URL
+case "$BNBCODE_DATABASE_URL" in
+  *"pgdata-$_au_host"*) echo "          This shell now points at pgdata-$_au_host. Sessions stay on this node." ;;
+  *) echo "          WARNING: this shell points at '$BNBCODE_DATABASE_URL', not this node's database."
+     _au_bad=1 ;;
+esac
+fi
+
+# The old shared database should never be running. If it is, someone ran `bnbcode-pg`, and
+# a second host doing the same takes down both servers.
+if [ -f "$HOME/.local/share/bnbcode/pgdata/postmaster.pid" ]; then
+  echo "          WARNING: the OLD shared database (~/.local/share/bnbcode/pgdata) is running."
+  echo "          Somebody ran 'bnbcode-pg'. Stop it -- if a second host starts it too,"
+  echo "          both servers shut down and every agent loses its session store."
+fi
+
+# --- what now -------------------------------------------------------------------------
+printf '\n'
+if [ "$_au_bad" -eq 0 ]; then
+  echo "Ready. To start a run on this node:"
+  echo
+  echo "    E=$_au_exp"
+  echo '    P=AC1; V=evo                       # AC1|AC2|Erdos  x  plain|evo'
+  echo '    RUN=~/agent_runs/$(echo $P | tr A-Z a-z)_${V}_s1'
+  echo '    mkdir -p $RUN && cd $RUN'
+  echo '    cp $E/$P/eval.py $E/$P/*.npy .'
+  echo '    cp $E/$P/prompt_${V}.md INITIAL_PROMPT.md'
+  echo '    cp $E/opencode.json .'
+  echo '    bnbcode .'
+  echo
+  echo "Then paste INITIAL_PROMPT.md as the first message, and check /agent says 'build'."
+else
+  echo "Not ready -- fix what is flagged above, then 'source ~/bin/agent-up' again."
+fi
+printf '\n'
+
+unset _au_exp _au_cfg _au_relay_url _au_jobs _au_host _au_log _au_bad \
+      _au_cores _au_job _au_base _au_fresh _au_models _au_up _au_pgout

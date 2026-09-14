@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Per-node PostgreSQL for bnbcode, so several compute nodes can run agents at once.
+#
+# WHY THIS EXISTS
+#   The stock ~/bin/bnbcode-pg puts PGDATA at ~/.local/share/bnbcode/pgdata -- on shared
+#   GPFS -- and connects over a unix socket *inside* that directory. A unix socket only
+#   works on the host that created it, so a second node cannot use a running server, and
+#   `bnbcode-pg start` there is not a harmless failure: pg_ctl warns "another server might
+#   be running; trying to start server anyway", starts a second postmaster on the same
+#   data directory, and within a minute BOTH shut down with
+#   `performing immediate shutdown because data directory lock file is invalid`.
+#   Observed 2026-08-30.
+#
+#   This script gives each host its own PGDATA and its own database, so nothing is shared
+#   and nothing collides. The one thing that IS shared -- the pgserver build and the
+#   hand-built pg_trgm.so under the venv -- is read-only, so every host reuses it.
+#
+# USAGE
+#   bnbcode-pg-node start            # bootstrap if needed, then start (idempotent)
+#   eval "$(bnbcode-pg-node env)"    # export BNBCODE_DATABASE_URL for this shell
+#   bnbcode .                        # now talks to THIS node's database
+#
+#   bnbcode-pg-node status|stop|url|psql|where
+#   bnbcode-pg-node dump FILE        # plain-SQL dump of the bnbcode DB (atomic: FILE.tmp -> FILE)
+#   bnbcode-pg-node restore FILE     # load such a dump into a freshly bootstrapped DB
+#
+#   dump/restore exist so a per-cell, node-local DB (BNBCODE_PGDATA under /tmp) can follow a
+#   relaunched job to another node: v2/bin/launch dumps every 2 min to the cell dir on the shared
+#   filesystem and restores before starting bnbcode. Added 2026-09-08 (v2 copy of ~/bin's script).
+#
+# NOTE ON SESSION HISTORY
+#   Each node gets a fresh, empty session database. Sessions do not follow you between
+#   nodes. Export what you need with `bnbcode export <sessionID>` before switching, or
+#   copy sessions across with `bnbcode db import`.
+set -euo pipefail
+
+VENV="$HOME/work/bnbcode/.venv"
+HOST="$(hostname -s)"
+PGDATA="${BNBCODE_PGDATA:-$HOME/.local/share/bnbcode/pgdata-$HOST}"
+PGINSTALL="$("$VENV/bin/python" -c 'import pathlib,pgserver; print(pathlib.Path(pgserver.__file__).parent/"pginstall")')"
+CTL="$PGINSTALL/bin/pg_ctl"
+
+# bnbcode's URL parser rejects the `?host=/path` form that ~/.config/bnbcode/database
+# uses; it wants the socket directory percent-encoded into the host component, which is
+# the form `bnbcode init` itself prints. Verified 2026-08-30.
+url() { printf 'postgresql://postgres@%s/bnbcode\n' "$(printf '%s' "$PGDATA" | sed 's|/|%2F|g')"; }
+
+# pgserver puts its lockfile under platformdirs.user_runtime_path -- /run/user/$(id -u) on
+# Linux. systemd-logind creates that when you log in, so it exists on a login node and does
+# NOT exist inside an LSF job, where bootstrapping dies with
+#   PermissionError: [Errno 13] Permission denied: b'/run/user/120321'
+# platformdirs honours XDG_RUNTIME_DIR, so point it at a node-local directory we can create.
+# Node-local is also the right semantics: it is per-host runtime state, like the socket.
+runtime_dir() {
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -w "${XDG_RUNTIME_DIR:-}" ]; then
+    printf '%s' "$XDG_RUNTIME_DIR"; return
+  fi
+  local d="/tmp/xdg-$(id -u)"
+  mkdir -p "$d" && chmod 700 "$d"
+  printf '%s' "$d"
+}
+
+bootstrap() {
+  [ -f "$PGDATA/PG_VERSION" ] && return 0
+  echo "[bnbcode-pg-node] bootstrapping $PGDATA" >&2
+  XDG_RUNTIME_DIR="$(runtime_dir)"; export XDG_RUNTIME_DIR
+  # cleanup_mode=None is load-bearing: the default 'stop' shuts the server down when this
+  # python process exits, leaving a perfectly-built pgdata with nothing listening.
+  "$VENV/bin/python" - "$PGDATA" <<'PY'
+import pathlib, sys, pgserver
+p = pathlib.Path(sys.argv[1]); p.mkdir(parents=True, exist_ok=True)
+srv = pgserver.get_server(str(p), cleanup_mode=None)
+if "bnbcode" not in srv.psql("SELECT datname FROM pg_database"):
+    srv.psql("CREATE DATABASE bnbcode")
+PY
+  # pgserver's build ships only plpgsql + vector; a bnbcode migration needs pg_trgm. The
+  # .so was built once by install-bnbcode.sh and lives in the shared venv, so this is just
+  # a CREATE EXTENSION -- no compiler needed on a compute node.
+  "$PGINSTALL/bin/psql" -h "$PGDATA" -U postgres -d bnbcode \
+      -c "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;" >/dev/null
+  echo "[bnbcode-pg-node] bootstrapped" >&2
+}
+
+case "${1:-status}" in
+  start)
+    bootstrap
+    if "$CTL" -D "$PGDATA" status >/dev/null 2>&1; then
+      echo "[bnbcode-pg-node] already running on $HOST ($PGDATA)"
+    else
+      # Never "start anyway": on a per-host PGDATA a live postmaster.pid means a real
+      # server on THIS host, so refusing is correct.
+      "$CTL" -D "$PGDATA" -o "-h '' -k $PGDATA" -l "$PGDATA/log" start
+    fi
+    echo "[bnbcode-pg-node] eval \"\$($(basename "$0") env)\"  to point bnbcode at it" >&2 ;;
+  stop)   "$CTL" -D "$PGDATA" stop ;;
+  status) "$CTL" -D "$PGDATA" status ;;
+  url)    url ;;
+  env)    echo "export BNBCODE_DATABASE_URL='$(url)'" ;;
+  where)  echo "host=$HOST"; echo "pgdata=$PGDATA"; echo "url=$(url)" ;;
+  psql)   shift; "$PGINSTALL/bin/psql" -h "$PGDATA" -U postgres -d bnbcode "$@" ;;
+  dump)
+    f="${2:?dump FILE}"
+    "$PGINSTALL/bin/pg_dump" -h "$PGDATA" -U postgres --clean --if-exists --no-owner -d bnbcode > "$f.tmp" \
+      && mv -f "$f.tmp" "$f" ;;
+  restore)
+    f="${2:?restore FILE}"
+    # --clean in the dump drops and recreates every table, so this also works over a DB that
+    # bnbcode already migrated; ON_ERROR_STOP off because DROP ... IF EXISTS notices are noise
+    "$PGINSTALL/bin/psql" -q -h "$PGDATA" -U postgres -d bnbcode -v ON_ERROR_STOP=0 -f "$f" ;;
+  *) echo "usage: bnbcode-pg-node {start|stop|status|url|env|where|psql}" >&2; exit 1 ;;
+esac
