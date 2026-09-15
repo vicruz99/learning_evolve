@@ -127,7 +127,7 @@ def alive(ip: str, port: int, timeout: float) -> bool:
         return False
 
 
-def agentic(ip: str, port: int, model: str, timeout: float) -> bool:
+def agentic(ip: str, port: int, model: str, timeout: float) -> bool | None:
     """Does this server actually do tool calls?
 
     A server launched without `--enable-auto-tool-choice --tool-call-parser` answers /v1/models
@@ -155,7 +155,13 @@ def agentic(ip: str, port: int, model: str, timeout: float) -> bool:
             log(f"  {ip}:{port} is live but has no tool support -- skipping")
         return False
     except Exception:
-        return False
+        # 2026-09-15: a timeout on a SATURATED server is not "no tool support". Returning False here
+        # made every relay drop its upstream and re-probe every 5 s (a full completion each), which
+        # is exactly the load that made the probe time out -- a storm that held 12 cells at 503.
+        return None
+
+
+AGENTIC_TTL = 600.0   # seconds a tool-capability verdict stays valid without re-probing
 
 
 class Upstream:
@@ -170,6 +176,9 @@ class Upstream:
         self._name = ""
         self._at = 0.0
         self._lock = threading.Lock()
+        # (ip, port) -> (verdict, when). The tool probe is a full completion; run it at most once
+        # per AGENTIC_TTL per address, and never let a timeout overturn a positive verdict.
+        self._agentic: dict[tuple[str, int], tuple[bool, float]] = {}
 
     def invalidate(self) -> None:
         with self._lock:
@@ -202,7 +211,19 @@ class Upstream:
                     ip = resolve(host)
                     if not ip or not alive(ip, port, self.probe_timeout):
                         continue
-                    if not agentic(ip, port, self.model, self.tool_timeout):
+                    cached = self._agentic.get((ip, port))
+                    if cached and (time.time() - cached[1]) < AGENTIC_TTL:
+                        verdict = cached[0]
+                    else:
+                        verdict = agentic(ip, port, self.model, self.tool_timeout)
+                        if verdict is None:
+                            # busy or flaky: keep an earlier positive verdict, otherwise try later
+                            verdict = bool(cached and cached[0])
+                            if cached and cached[0]:
+                                log(f"  tool probe of {ip}:{port} timed out; keeping earlier positive verdict")
+                        else:
+                            self._agentic[(ip, port)] = (verdict, time.time())
+                    if not verdict:
                         continue
                     if (ip, port) != self._addr:
                         log(f"upstream -> {cname} {host} ({ip}:{port})")
@@ -245,8 +266,10 @@ def wait_for_upstream(up: "Upstream", wait_s: float) -> tuple[tuple[str, int] | 
     began = time.time()
     log(f"no upstream; holding the connection for up to {int(wait_s)}s")
     OUTAGES.append({"start": began})
+    pause = 5.0
     while time.time() - began < wait_s:
-        time.sleep(5.0)
+        time.sleep(pause)
+        pause = min(pause * 2, 30.0)   # 2026-09-15: 5 s flat re-probing was itself a load source
         up.invalidate()
         addr, name = up.get()
         if addr is not None:

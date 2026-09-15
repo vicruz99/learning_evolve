@@ -144,6 +144,30 @@ class BnbcodeHarness:
         env["HF_HUB_OFFLINE"] = "1"; env["TRANSFORMERS_OFFLINE"] = "1"
         return env
 
+    def store_activity_t(self) -> float:
+        """Wall time (s) of the newest message part in the node-local session store, across ALL
+        sessions of this workspace -- including successor sessions whose ACP updates never reach us.
+        The stall watchdog reads it; cached for 60 s so the 2-min check costs one psql per call."""
+        import subprocess
+        now = time.time()
+        cache = getattr(self, "_store_t_cache", (0.0, 0.0))
+        if now - cache[1] < 60:
+            return cache[0]
+        dirs = ", ".join(f"'{d}'" for d in {str(self.ws), str(self.ws.resolve())})
+        q = (f"SELECT coalesce(max(p.time_created), 0) FROM part p JOIN session s ON s.id = p.session_id "
+             f"WHERE s.directory IN ({dirs})")
+        t = cache[0]
+        try:
+            out = subprocess.run([str(Path(self.cell["v2"]) / "bin" / "bnbcode-pg-node"), "psql", "-t", "-A", "-c", q],
+                                 capture_output=True, text=True, timeout=30, env=self.env()).stdout.strip()
+            ms = float(out.splitlines()[-1].strip()) if out else 0.0
+            if ms > 0:
+                t = ms / 1000.0
+        except Exception:
+            pass
+        self._store_t_cache = (t, now)
+        return t
+
     def latest_session_id(self, exclude: str | None = None) -> str | None:
         """Newest bnbcode session for this workspace, from the node-local postgres. bnbcode's
         cliff-compaction continues the work in a SUCCESSOR session with a new id; prompting the

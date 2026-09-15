@@ -34,13 +34,14 @@ RESUME_RESTORED = ("[host] Your session was interrupted by an infrastructure res
                    "been restored with its history. Every file in the workspace and every official score is intact. "
                    "Any candidate that was still being evaluated at the moment of the interruption was NOT scored; "
                    "re-run those evaluations if they matter. Continue exactly where you left off.")
-MAX_INFRA = 20
+MAX_INFRA = 60   # 2026-09-15: 20 (~32 min of back-off) did not outlast a 42 min weka ENOSPC burst
 STALL_CHECK_S = 120
 def last_activity(cell_dir: Path, ws: Path, harness, window_s: float) -> float:
     """Newest sign that the agent is doing anything: an official evaluation, a file written anywhere
     under the workspace, a live candidate process (run/procsample.jsonl), the harness's last tool
-    call, and for Claude Code the continuous events.jsonl stream (bnbcode's stream goes quiet at its
-    first compaction, so it is not used there). Text-only chatter deliberately does not count: the
+    call, for bnbcode the newest part in its session store (successor sessions included -- the ACP
+    stream goes quiet at the first compaction, so it is not used there), and for Claude Code the
+    continuous events.jsonl stream. Text-only chatter deliberately does not count: the
     2026-09 guard storms produced thousands of text messages while doing nothing."""
     now = time.time(); cands = [0.0]
     paths = [cell_dir / "iterations.jsonl"]
@@ -52,6 +53,13 @@ def last_activity(cell_dir: Path, ws: Path, harness, window_s: float) -> float:
         except OSError:
             pass
     cands.append(float(getattr(harness, "last_tool_t", 0.0) or 0.0))
+    # bnbcode: the session store sees successor sessions the ACP stream does not (2026-09-15)
+    store_t = getattr(harness, "store_activity_t", None)
+    if callable(store_t):
+        try:
+            cands.append(float(store_t() or 0.0))
+        except Exception:
+            pass
     ps = cell_dir / "run" / "procsample.jsonl"
     try:
         if json.loads(ps.read_text().splitlines()[-1]).get("n", 0) > 0:
@@ -82,7 +90,10 @@ async def watch_limits(cell_dir: Path, started: float, budget_s: float) -> str:
     while True:
         await asyncio.sleep(1)
         if time.time() - started >= budget_s:
-            (cell_dir / "STOP").write_text("time_limit\n")
+            try:
+                (cell_dir / "STOP").write_text("time_limit\n")
+            except OSError as exc:            # the driver ends the run regardless (2026-09-15 ENOSPC)
+                log(cell_dir, f"STOP write failed ({exc})")
             return "time_limit"
         reason = stop_reason_file(cell_dir)
         if reason:
@@ -122,7 +133,10 @@ async def run(cell_dir: Path) -> dict:
                       f"already used, {clock.remaining_at_start / 3600:.2f}h remaining")
     deadline = clock.deadline
     if clock.remaining_at_start <= 60:
-        (cell_dir / "STOP").write_text("time_limit\n")
+        try:
+            (cell_dir / "STOP").write_text("time_limit\n")
+        except OSError:
+            pass
         log(cell_dir, "budget already exhausted at relaunch -- nothing to do")
         events.close()
         return finish(cell_dir, cell, clock, [], 0, 0, "time_limit", "budget exhausted before relaunch")
@@ -330,7 +344,14 @@ def finish(cell_dir: Path, cell: dict, clock: Clock, turns: list, continues: int
         "n_turns": len(turns), "n_evals": len(rows), "n_valid_evals": sum(1 for r in rows if r.get("score") is not None),
         "best": best, "cutoff": stop_reason_file(cell_dir), "turns": turns,
     }
-    (cell_dir / "session.json").write_text(json.dumps(record, indent=2) + "\n")
+    # 2026-09-15: weka ENOSPC bursts -- session.json is the run's record; retry for up to 30 min
+    for attempt in range(60):
+        try:
+            (cell_dir / "session.json").write_text(json.dumps(record, indent=2) + "\n")
+            break
+        except OSError as exc:
+            log(cell_dir, f"session.json write failed ({exc}); retry {attempt + 1}/60 in 30 s")
+            time.sleep(30)
     log(cell_dir, f"finished: outcome={outcome} evals={len(rows)} best={best.get('score') if best else None} "
                   f"turns={len(turns)} continues={continues}")
     return record

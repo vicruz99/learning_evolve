@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import math
 import os
 import re
@@ -21,6 +22,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tracker import best_record, read_iterations, stop_reason_file  # noqa: E402
 
 
+
+def _write_retry(path, text, tries=60, delay=30.0):
+    """2026-09-15: weka ENOSPC bursts; score.json is the run's result, wait up to 30 min for it."""
+    for i in range(tries):
+        try:
+            path.write_text(text)
+            return
+        except OSError as exc:
+            if i == tries - 1:
+                raise
+            print(f"score.py: writing {path.name} failed ({exc}); retrying in {delay:.0f}s", file=sys.stderr, flush=True)
+            time.sleep(delay)
+
 def score_cell(cell_dir: Path, python: str, timeout: int = int(os.environ.get("SCORE_TIMEOUT_S", "10800"))) -> dict:
     cell_dir = cell_dir.resolve()
     ws = cell_dir / "workspace"
@@ -31,7 +45,7 @@ def score_cell(cell_dir: Path, python: str, timeout: int = int(os.environ.get("S
            "score": None, "ok": False}
     if rec is None:
         out["error"] = "no official evaluation ever improved on nothing -- best.json missing"
-        (cell_dir / "score.json").write_text(json.dumps(out, indent=2) + "\n")
+        _write_retry(cell_dir / "score.json", json.dumps(out, indent=2) + "\n")
         return out
     snap = cell_dir / "submissions" / rec["snap"]
     out["snapshot"] = str(snap.relative_to(cell_dir))
@@ -50,7 +64,7 @@ def score_cell(cell_dir: Path, python: str, timeout: int = int(os.environ.get("S
         # but say so: ok stays False and the flag is explicit.
         out["error"] = f"grader timed out after {timeout}s; agent_reported score kept"
         out["score"] = rec.get("score"); out["agent_reported_used"] = True
-        (cell_dir / "score.json").write_text(json.dumps(out, indent=2) + "\n")
+        _write_retry(cell_dir / "score.json", json.dumps(out, indent=2) + "\n")
         return out
     out["returncode"] = proc.returncode
     out["stdout"] = proc.stdout[-2000:]
@@ -64,7 +78,7 @@ def score_cell(cell_dir: Path, python: str, timeout: int = int(os.environ.get("S
                 out["ok"] = True
         except ValueError:
             pass
-    (cell_dir / "score.json").write_text(json.dumps(out, indent=2) + "\n")
+    _write_retry(cell_dir / "score.json", json.dumps(out, indent=2) + "\n")
     return out
 
 

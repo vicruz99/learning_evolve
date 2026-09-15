@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import os
 import re
 import time
@@ -35,16 +36,40 @@ class EventLog:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._fh = open(self.path, "a", buffering=1)
+        self._fh = None
+        try:
+            self._fh = open(self.path, "a", buffering=1)
+        except OSError as exc:         # ENOSPC at start-up: open lazily on the first write instead
+            print(f"[events] open failed ({exc}); will retry on the first write", file=sys.stderr, flush=True)
 
     def write(self, kind: str, **fields) -> None:
         rec = {"t": round(time.time(), 3), "kind": kind, **fields}
-        self._fh.write(json.dumps(rec, default=str) + "\n")
+        line = json.dumps(rec, default=str) + "\n"
+        # 2026-09-15: a transient ENOSPC burst on the scratch filesystem (weka, 445 TB free) raised here
+        # and killed all six running Claude Code cells at 16:17:26 -- the events stream is diagnostics,
+        # never worth the run. Drop the record, remember how many, and keep going.
+        try:
+            if self._fh is None or self._fh.closed:
+                # 2026-09-15 (2): after a failed reopen the handle stayed CLOSED and the next write raised
+                # ValueError, which the except below did not catch -- every Claude Code cell died of it.
+                self._fh = open(self.path, "a", buffering=1)
+            self._fh.write(line)
+        except (OSError, ValueError) as exc:
+            self.dropped = getattr(self, "dropped", 0) + 1
+            if self.dropped in (1, 10, 100, 1000) or self.dropped % 10000 == 0:
+                print(f"[events] write failed ({exc}); {self.dropped} record(s) dropped so far", file=sys.stderr, flush=True)
+            try:                      # the handle may be poisoned after ENOSPC; reopen lazily
+                if self._fh is not None:
+                    self._fh.close()
+            except (OSError, ValueError):
+                pass
+            self._fh = None
 
     def close(self) -> None:
         try:
-            self._fh.close()
-        except OSError:
+            if self._fh is not None:
+                self._fh.close()
+        except (OSError, ValueError):
             pass
 
 
@@ -76,7 +101,10 @@ def tail(path: Path, n: int = 4000) -> str:
 
 def log(cell_dir: Path, msg: str) -> None:
     line = f"[driver {time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)      # stdout is LSF's lsf.out on weka: ENOSPC bursts raise here too (2026-09-15)
+    except OSError:
+        pass
     try:
         with open(Path(cell_dir) / "driver.log", "a") as fh:
             fh.write(line + "\n")

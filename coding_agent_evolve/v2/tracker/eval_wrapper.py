@@ -32,6 +32,20 @@ _META = _HERE / "_adrs_track.json"
 _OFFICIAL = _HERE / "_official_evaluator.py"
 
 
+def _retry_io(fn, what, tries=40, delay=15.0):
+    """2026-09-15: the weka filesystems refuse writes for minutes at a time (ENOSPC with hundreds of TB
+    free). A recording failure must not turn a 1000 s official grade into an error for the agent;
+    wait and retry (default up to 10 min) before giving up."""
+    for i in range(tries):
+        try:
+            return fn()
+        except OSError as exc:
+            if i == tries - 1:
+                raise
+            sys.stderr.write(f"eval.py: {what} failed ({exc}); retrying in {delay:.0f}s\n")
+            time.sleep(delay)
+
+
 def _lock(path: Path, timeout: float = 60.0):
     """mkdir-based lock: atomic on every filesystem, no flock semantics to trust."""
     deadline = time.time() + timeout
@@ -122,11 +136,11 @@ def main(argv: list[str]) -> int:
     try:
         counter = cell / ".tracker.counter"
         n = int(counter.read_text()) + 1 if counter.is_file() else 1
-        counter.write_text(str(n))
-        snaps.mkdir(exist_ok=True)
+        _retry_io(lambda: counter.write_text(str(n)), "counter write")
+        _retry_io(lambda: snaps.mkdir(exist_ok=True), "snapshot dir")
         snap = snaps / f"{n:03d}{src.suffix or '.npy'}"
         if src.is_file():
-            shutil.copy2(src, snap)
+            _retry_io(lambda: shutil.copy2(src, snap), "snapshot copy")
     finally:
         _unlock(lock)
 
@@ -143,8 +157,10 @@ def main(argv: list[str]) -> int:
         rec["error"] = (err.strip().splitlines() or ["non-zero exit"])[-1][:300]
     _lock(lock)
     try:
-        with open(log, "a") as fh:
-            fh.write(json.dumps(rec) + "\n")
+        def _append():
+            with open(log, "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        _retry_io(_append, "iterations.jsonl append")
         best_json = cell / "best.json"
         best_score = None
         if best_json.is_file():
@@ -153,11 +169,11 @@ def main(argv: list[str]) -> int:
             except ValueError:
                 best_score = None
         if _better(score, best_score, meta["maximize"]) and snap.is_file():
-            shutil.copy2(snap, cell / "best.npy")
-            best_json.write_text(json.dumps({**rec, "best": True}, indent=2) + "\n")
+            _retry_io(lambda: shutil.copy2(snap, cell / "best.npy"), "best.npy copy")
+            _retry_io(lambda: best_json.write_text(json.dumps({**rec, "best": True}, indent=2) + "\n"), "best.json write")
         cap = int(meta.get("max_evals") or 0)
         if cap and n >= cap:
-            (cell / "STOP").write_text("iteration_limit\n")
+            _retry_io(lambda: (cell / "STOP").write_text("iteration_limit\n"), "STOP write")
     finally:
         _unlock(lock)
     return rc
