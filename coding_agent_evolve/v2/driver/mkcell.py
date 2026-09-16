@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render cells from cells.yaml into run folders.
 
     mkcell.py --campaign smoke [--cells cells.yaml] [--only 'ac2_.*bnb'] [--set hours=0.25 --set min_evals=3]
@@ -202,9 +201,44 @@ def litellm_yaml(c: dict) -> str:
     return re.sub(r"api_base: http://127\.0\.0\.1:\d+/v1", f"api_base: http://127.0.0.1:{c['relay_port']}/v1", src)
 
 
+SCRATCH_HINT = "/fs/scratch/rb_bd_dlp_rng-dl01_cr_AIQ_employees/vicruz/agent_runs_v2"
+
+
+def check_not_home(cell_dir: Path) -> None:
+    """Refuse to put a cell's data on /home.
+
+    /home/<user> on rng-dl01 carries a ~100 GB per-user quota that weka reports as
+    `[Errno 28] No space left on device`, not EDQUOT, while `df` shows ~100 TB free. On
+    2026-09-15 `q38ac_r3` was the only campaign whose cells were real directories in home
+    (every other campaign resolves into scratch); its pg dumps and .npy snapshots pushed home
+    over the cap and killed all 15 cells, several of them repeatedly.
+
+    The check resolves symlinks on purpose: a cell reached through
+    `~/agent_runs/v2/<camp>/<cell>` is fine as long as it *lands* on scratch, which is the
+    layout every healthy campaign uses. A cell that already exists as a symlink into scratch
+    therefore still re-renders; only a cell that would be created in home is refused.
+    """
+    if cell_dir.exists():
+        real = cell_dir.resolve()
+    else:
+        parent = cell_dir.parent
+        while not parent.exists() and parent != parent.parent:
+            parent = parent.parent
+        real = parent.resolve() / cell_dir.name
+    home = Path(os.path.expanduser("~")).resolve()
+    if real == home or home in real.parents:
+        raise SystemExit(
+            f"refusing to create {cell_dir.name} at {real}: that is the home filesystem, which\n"
+            f"has a ~100 GB per-user quota reported as ENOSPC and killed the q38ac_r3 wave on\n"
+            f"2026-09-15. Put the campaign on scratch instead, e.g.\n"
+            f"  mkdir -p {SCRATCH_HINT}/{cell_dir.parent.name}\n"
+            f"  ln -s {SCRATCH_HINT}/{cell_dir.parent.name} {cell_dir.parent}"
+        )
+
 def build_cell(c: dict, runs_root: Path, campaign: str, dry: bool, force: bool, index: int = 0) -> Path:
     assign_ports(c, campaign, index)
     cell_dir = runs_root / campaign / c["name"]
+    check_not_home(cell_dir)
     meta = load_meta(V2 / "problems" / c["problem"] / "meta.yaml")
     prompt = render_prompt(c, meta, c["prompt"])
     plain = render_prompt(c, meta, "plain")
