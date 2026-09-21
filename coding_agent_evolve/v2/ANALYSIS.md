@@ -1,6 +1,7 @@
 # v2 results and transcripts — where everything is
 
-Hand-off for an analysis session on `rng-dl01` (`ssh cluster`). Written 2026-09-16.
+Hand-off for an analysis session on `rng-dl01` (`ssh cluster`). Written 2026-09-16,
+updated 2026-09-17 when `q38ac_r3` finished.
 Companion to `GUADIANA.md` (the Kimi port). Everything here is **read-only work**; do not
 touch a cell that is still running.
 
@@ -15,9 +16,9 @@ touch a cell that is still running.
   `$S/agent_runs_v2/<campaign>`. Home has a ~100 GB quota that weka reports as
   `[Errno 28] No space left on device`; it killed a whole wave on 2026-09-15. Never write
   analysis output to `$HOME`. `mkcell` now refuses to create cells there.
-- **`q38ac_r3` is still running** (as of 2026-09-16). Report health only for it; do not draw
-  conclusions from its endpoints until every cell has spent its 18 h budget.
-- **The finished campaigns are `q38ac_r2`, `q36ac2_r2` and `q36ac2_r3`.** The `q38ac` /
+- **Everything has finished.** `q38ac_r3` completed on 2026-09-17: all 15 cells reached
+  `outcome=time_limit` with `.done` and a host `score.json`. The whole v2 set is now analysable.
+- **The campaigns to analyse are `q38ac_r2`, `q38ac_r3`, `q36ac2_r2` and `q36ac2_r3`.** The `q38ac` /
   `q36ac2` (no suffix) campaigns are the aborted 2026-09-08 pilots, all `.hold`, run under
   different config — **excluded from analysis**.
 - Score direction: **AC1 is minimised** (ICL best 1.50444, published 1.50287).
@@ -141,6 +142,36 @@ keep `OMP_NUM_THREADS=1` as the bsub does.
 - **`q38ac_r3` cells are resumed runs.** Several carry multiple launches and restored state
   after the 2026-09-15 quota outage; one q36 evo cell took a watchdog restart at 09:36 that
   interrupted live work.
+- **A 7.75 h server outage sits inside `q38ac_r3`, and the budget was SPENT, not paused.** The
+  private Qwen3.8 server died 2026-09-16 14:41 and did not return until 22:26; every cell had a
+  single relay upstream, so all 10 running cells sat at `no upstream` throughout. `driver/clock.py`
+  has no outage accounting. **Four cells are labelled `wedged` with `healthy_until` at 14:36-15:06
+  on 09-16 — that is the server dying, not the agent failing.** The ledger's `q38ac_r3` campaign
+  note states this; read it before attributing anything to agent behaviour. Cells that *dispatched*
+  during the window died at launch (`exit 3`) which stops the clock, so they lost a dispatch but no
+  budget.
+- **`q38ac_r3/ac2_evo_bnb_rxhigh_s2` spent ~7.7 h in a repetition loop**, re-emitting one plan line
+  with no tool call and no eval while its stated precondition was already satisfied. It reports a
+  full 18 h; only ~10 h was search. Flagged `repetition_loop`.
+- **All 23 v2 scores are host-verified (`ok=true`).** One needed rescuing:
+  `q38ac_r3/ac2_many_cc_rxhigh_s2` first came back `ok=false` with `agent_reported_used=true`
+  because the host grader timed out at 10800 s on its 8M-element candidate — `SCORE_THREADS`
+  defaults to **2**, making the host pass ~10x slower than the agent's own evaluation, which used
+  the cell's full core allocation. Re-graded 2026-09-17 with 16 threads: **0.882542384248086,
+  identical to the agent-reported value to all 15 digits**. The pre-regrade file is kept at
+  `score.json.agent_reported.bak`. Raise `SCORE_THREADS` for any future campaign with large-n
+  candidates.
+- **There is no Qwen3.6 AC1 arm at all.** Both q36 campaigns are `q36ac2` — AC2 only, seed 1 only.
+  Any AC1 model comparison is Qwen3.8-only.
+- **`healthy_h` changed meaning on 2026-09-17.** It used to sum LSF wall-clock launch windows,
+  which also cover relay setup, pg restore and the post-driver grade — three r3 cells reported
+  20.0-20.6 h inside an 18 h budget. It now apportions `clock.json`'s real `active_s` across those
+  windows, so it is bounded by `active_h`. Regenerate any figure built from an older ledger.
+- **The bnbcode wedge is auto-recovered in r3 but not in r2.** r3 cells run with `stall_hours=2`
+  and a watchdog that reads the postgres session store, so a wedge costs ~2 h instead of ending the
+  run. `q38ac_r3/ac2_many_bnb_rxhigh_s2` wedged twice, recovered twice, and produced the campaign's
+  best AC2 score. This is a **harness difference between r2 and r3**, not a model difference —
+  do not compare r2 and r3 bnbcode survival rates as if they were the same setup.
 - Wall-clock start times differ by up to 18 h across cells. Align on `clock.json`.
 
 ## 6. Older, non-v2 results
