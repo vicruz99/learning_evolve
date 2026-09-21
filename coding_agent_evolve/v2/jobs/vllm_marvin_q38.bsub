@@ -1,0 +1,59 @@
+#!/bin/bash
+#BSUB -q gpu
+#BSUB -m gpu
+#BSUB -gpu "num=2:mode=exclusive_process:j_exclusive=yes"
+#BSUB -n 8
+#BSUB -R "span[hosts=1] rusage[mem=8192] affinity[core]"
+#BSUB -M 8192
+#BSUB -W 160:00
+# 2026-09-21: 168:00 pended with "Not enough slots or resources for whole duration": the walltime must END before the
+# next system reservation (brsvs: MAINT_Q3202, 9/28 02:00 - 9/29 20:00). Re-check brsvs before every submit.
+#BSUB -app shell
+# 2026-09-21: Marvin has no CUDA toolkit, and vLLM 0.25.1 + FlashInfer 0.6.13 JIT-compile several kernels for this model
+# (GDN prefill, top-k/top-p sampler, allreduce fusion): without nvcc the engine dies at warmup. So a minimal CUDA 13.0
+# (bin, nvvm, include, cudart + stubs; 0.5 GB) is mirrored from rng-dl01's /fs/applications/cuda/13.0 to ~/cuda-13.0
+# and the host compiler is Marvin's gcc-toolset-14 (system gcc is 8.5). Same kernels as the rng-dl01 servers.
+# With nvcc present the allreduce+RMSNorm fusion (FlashInfer, auto backend 'mnnvl' on this H100 pair) initialised and the
+# CUDA-graph capture died with 'illegal memory access' in the GDN layer. The rng-dl01 servers were TP=1 (no allreduce), so
+# fuse_allreduce_rms=false is the faithful setting; norm_quant/act_quant fusions stay on.
+#BSUB -o /home/crv1pi/work/vllm_marvin_%J.lsf.out
+#BSUB -e /home/crv1pi/work/vllm_marvin_%J.lsf.err
+# Qwen/Qwen3.8-27B-FP8 on two Marvin H100s (TP=2), tool-capable, for the m48_q38 agent campaign (2026-09-21).
+# Submit twice with different names/ports:  bsub -J v2q38a -env "all,PORT=8003" < this ; bsub -J v2q38b -env "all,PORT=8004" < this
+# The relay (v2/relay/llm_relay.py) finds the server by LSF job name + port, or by the fixed GPU hostnames.
+# Marvin is RHEL 8 (glibc 2.28), rng-dl01 RHEL 9 (2.34): the mirrored venv needed cryptography 48.0.1 (2_28 wheel)
+# and a stub for llguidance (no wheel below glibc 2.31 exists) -- so the structured-output backend is pinned to
+# xgrammar; a request that needs the guidance backend would fail. Tool calling does not use either.
+set -u
+PORT=${PORT:-8003}
+export HF_HOME=/home/crv1pi/models/hf HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export no_proxy='localhost,127.0.0.1,rb-hpc-*' NO_PROXY='localhost,127.0.0.1,rb-hpc-*'
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+source /home/crv1pi/envs/vllm/bin/activate
+export TRITON_CACHE_DIR=/tmp/triton-$LSB_JOBID VLLM_CACHE_ROOT=/tmp/vllm-cache-$LSB_JOBID
+export NCCL_P2P_LEVEL=NVL
+unset OMP_NUM_THREADS
+LOG=/home/crv1pi/work/vllm_marvin_${LSB_JOBNAME}.log
+echo "[$(date)] $LSB_JOBNAME on $(hostname) port=$PORT gpus=$CUDA_VISIBLE_DEVICES job=$LSB_JOBID" | tee -a "$LOG"
+export CUDA_HOME=/home/crv1pi/cuda-13.0 CUDA_PATH=/home/crv1pi/cuda-13.0
+export PATH=$CUDA_HOME/bin:$PATH LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+source /opt/rh/gcc-toolset-14/enable
+export FLASHINFER_WORKSPACE_BASE=/home/crv1pi/.cache/flashinfer-marvin   # JIT cache on home (persistent across jobs; H100 = sm_90a)
+echo "nvcc: $(nvcc --version | tail -1) gcc: $(gcc --version | head -1)" >> "$LOG"
+nvidia-smi --query-gpu=index,name,memory.used --format=csv >> "$LOG" 2>&1
+df -h /tmp | tail -1 >> "$LOG"
+exec vllm serve Qwen/Qwen3.8-27B-FP8 \
+    --host 0.0.0.0 --port "$PORT" \
+    --tensor-parallel-size 2 \
+    --max-model-len 262144 \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --enable-prefix-caching \
+    --gpu-memory-utilization 0.92 \
+    --max-num-seqs 24 \
+    --max-num-batched-tokens 16384 \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+    --structured-outputs-config '{"backend":"xgrammar"}' \
+    --compilation-config '{"pass_config":{"fuse_allreduce_rms":false}}' \
+    >> "$LOG" 2>&1

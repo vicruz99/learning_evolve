@@ -87,6 +87,7 @@ def lsf_hosts(job_names: list[str]) -> list[tuple[str, str]]:
         log(f"bjobs failed: {exc}")
         return []
     found: dict[str, str] = {}
+    jobid: dict[str, str] = {}
     for line in out.splitlines()[1:]:
         f = line.split()
         if len(f) < 7 or f[2] != "RUN":
@@ -94,6 +95,18 @@ def lsf_hosts(job_names: list[str]) -> list[tuple[str, str]]:
         name, host = f[6], f[5].split("*")[-1]
         if name not in found:
             found[name] = host
+            jobid[name] = f[0]
+    # Marvin (rb-hpc) prints the host GROUP in EXEC_HOST ("8*gpu"), not the node; the node is in
+    # alloc_slot ("8*rb-hpc-b20gpd01"). Only consulted when the -w host does not resolve (2026-09-21).
+    for name, host in list(found.items()):
+        if (job_names == ["*"] or name in job_names) and resolve(host) is None:
+            try:
+                slot = subprocess.run(["bjobs", "-noheader", "-o", "alloc_slot", jobid[name]],
+                                      capture_output=True, text=True, timeout=30).stdout.split()
+                if slot:
+                    found[name] = slot[0].split("*")[-1]
+            except Exception as exc:
+                log(f"bjobs alloc_slot failed for {name}: {exc}")
     # "*" means "any running job": the probes below still insist on the right model and on
     # tool-capability, so scanning everything is safe -- and it is what lets a REPLACEMENT
     # server with a brand new job name be picked up without touching any config.
@@ -284,8 +297,37 @@ def wait_for_upstream(up: "Upstream", wait_s: float) -> tuple[tuple[str, int] | 
     return None, ""
 
 
+STATUS_PATH = b"GET /_relay/status"
+
+
+def status_json(up: Upstream) -> bytes:
+    """Answer for /_relay/status: the current upstream WITHOUT holding the request (the driver's
+    pause logic polls this every minute; a poll that blocked for --wait would be useless). Uses the
+    memoised pick when it is fresh, otherwise one discovery pass (seconds, never --wait)."""
+    addr, name = up.get()
+    body = json.dumps({"upstream": f"{addr[0]}:{addr[1]}" if addr else None, "name": name or None,
+                       "t": time.time(), "outages": len(OUTAGES)}).encode()
+    return (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
 def handle(client: socket.socket, up: Upstream, verbose: bool, wait_s: float = 900.0) -> None:
     with client:
+        # 2026-09-21: peek at the first bytes -- a status probe is answered locally, everything
+        # else is spliced unchanged (the bytes read here are forwarded first).
+        try:
+            client.settimeout(30)
+            first = client.recv(65536)
+        except OSError:
+            return
+        if not first:
+            return
+        if first.startswith(STATUS_PATH):
+            try:
+                client.sendall(status_json(up))
+            except OSError:
+                pass
+            return
         addr, name = wait_for_upstream(up, wait_s)
         if addr is None:
             # Answer rather than hang: a 503 surfaces in the agent's transcript as a readable
@@ -309,6 +351,10 @@ def handle(client: socket.socket, up: Upstream, verbose: bool, wait_s: float = 9
         with server:
             server.settimeout(None)
             client.settimeout(None)
+            try:
+                server.sendall(first)
+            except OSError:
+                return
             t = threading.Thread(target=splice, args=(server, client), daemon=True)
             t.start()
             splice(client, server)

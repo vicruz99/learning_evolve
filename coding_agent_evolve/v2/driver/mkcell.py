@@ -31,6 +31,10 @@ sys.path.insert(0, str(V2 / "tracker"))
 from tracker import install_tracker, load_meta  # noqa: E402
 
 HARNESS_SHORT = {"bnbcode": "bnb", "claude": "cc"}
+# `site` (campaign key): where the cells run. Names the cluster in the prompt, decides whether the
+# "no cells on /home" guard applies (rng-dl01's ~100 GB quota; Marvin's home is the only fs there)
+# and which submitter bin/submit uses (bsub on rng-dl01, subbin on Marvin). 2026-09-21.
+SITES = {"rngdl01": "rng-dl01", "marvin": "rb-hpc (Marvin)"}
 REASONING = ("low", "medium", "xhigh", "off")
 PROMPTS = ("plain", "evo", "many")
 
@@ -105,6 +109,7 @@ def render_prompt(c: dict, meta: dict, variant: str) -> str:
         "PYTHON": c["python"], "MIN_EVALS": int(c["min_evals"]), "MAX_EVALS": int(c.get("max_evals") or 0),
         "EVALS_PER_HOUR": max(1, math.ceil(int(c["min_evals"]) / max(hours, 1e-9))),
         "BUDGET_S": int(c.get("budget_s") or meta["budget_s"]), "KILL_S": int(c.get("kill_s") or meta["kill_s"]),
+        "SITE": SITES[c.get("site", "rngdl01")],
         "method_file": f"method_{variant}.md",
     }
     text = env.get_template("prompt.md.j2").render(**ctx)
@@ -169,8 +174,9 @@ def claude_settings(c: dict, cell_dir: Path) -> dict:
     extra.append("Bash(chmod:*)")
     s["permissions"]["deny"] = s["permissions"]["deny"] + extra
     if c["claude"]["stop_hook"]:
+        # the driver's interpreter, not `python3`: on Marvin `python3` is 3.6 (2026-09-21)
         s["hooks"] = {"Stop": [{"matcher": "", "hooks": [{"type": "command",
-                      "command": f"python3 {V2 / 'hooks' / 'cc_stop_hook.py'}"}]}]}
+                      "command": f"{sys.executable} {V2 / 'hooks' / 'cc_stop_hook.py'}"}]}]}
     return s
 
 
@@ -186,6 +192,7 @@ def assign_ports(c: dict, campaign: str, index: int) -> None:
     h = zlib.crc32(campaign.encode()) % 20
     c["relay_port"] = int(c.get("relay_port_base") or 9300 + 100 * h) + index
     c["litellm_port"] = int(c.get("litellm_port_base") or 4300 + 100 * h) + index
+    c["cliff_port"] = c["litellm_port"] + 2000        # CliffCompaction proxy in front of LiteLLM (claude.cliff)
     toks = [t.strip() for t in str(c["relay_jobs"]).split(",") if t.strip()]
     if c.get("balance", True) and len(toks) > 1:
         k = index % len(toks)
@@ -238,7 +245,10 @@ def check_not_home(cell_dir: Path) -> None:
 def build_cell(c: dict, runs_root: Path, campaign: str, dry: bool, force: bool, index: int = 0) -> Path:
     assign_ports(c, campaign, index)
     cell_dir = runs_root / campaign / c["name"]
-    check_not_home(cell_dir)
+    if c.get("site", "rngdl01") not in SITES:
+        raise SystemExit(f"unknown site {c.get('site')!r}; one of {sorted(SITES)}")
+    if c.get("site", "rngdl01") == "rngdl01":
+        check_not_home(cell_dir)
     meta = load_meta(V2 / "problems" / c["problem"] / "meta.yaml")
     prompt = render_prompt(c, meta, c["prompt"])
     plain = render_prompt(c, meta, "plain")

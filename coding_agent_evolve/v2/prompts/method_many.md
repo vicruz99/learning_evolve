@@ -7,9 +7,13 @@ constructions, and never finds out what the other twenty ideas would have done. 
 A search that scores many diverse candidates finds the good basins; a search that polishes one
 candidate finds one local optimum.
 
-- **Volume target.** Aim for **at least {{ MIN_EVALS }} officially scored candidates** over the run —
+{% if MIN_EVALS %}- **Volume target.** Aim for **at least {{ MIN_EVALS }} officially scored candidates** over the run —
   that is about {{ EVALS_PER_HOUR }} per hour — and treat that as a floor, not a goal. The host counts
   official evaluations; it will tell you how many you have made when it checks in.
+{% else %}- **Volume matters.** There is no fixed quota, but the host counts official evaluations and will tell
+  you how many you have made when it checks in; a run that has scored hundreds of diverse candidates
+  has learned more about the problem than one that has scored ten.
+{% endif %}
 - **Time-box every candidate.** From idea to official score should take **at most 20 minutes of your
   own attention**. If a candidate is not scored within that, score whatever it has produced so far
   and move on; you can always come back to it with a new mechanism.

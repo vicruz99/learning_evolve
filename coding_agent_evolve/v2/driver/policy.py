@@ -58,6 +58,7 @@ def host_line(remaining_s: float, hours: float, evals: int, min_evals: int, max_
               best: float | None, metric_word: str) -> str:
     rem = max(0, int(remaining_s)) // 60
     cap = f", cap {max_evals}" if max_evals else ""
+    mins = f" (minimum {min_evals}{cap})" if (min_evals or max_evals) else ""   # 2026-09-21: no quota -> no "(minimum 0)"
     best_txt = f"best official {metric_word} so far {best!r}" if best is not None else "no valid official score yet"
-    return (f"[host] {rem} min remaining of the {hours:g}h budget; {evals} official evaluations so far "
-            f"(minimum {min_evals}{cap}); {best_txt}.")
+    return (f"[host] {rem} min remaining of the {hours:g}h budget; {evals} official evaluations so far"
+            f"{mins}; {best_txt}.")

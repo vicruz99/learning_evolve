@@ -111,7 +111,7 @@ def live_cells() -> dict:
     none either (q38ac_r2/ac2_plain_cc_rxhigh_s1 lost its .done to an LSF walltime kill)."""
     try:
         out = subprocess.run(["bjobs", "-noheader", "-o", "job_name:60 stat:8"],
-                             capture_output=True, text=True, timeout=60).stdout
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         return {}
     live = {}

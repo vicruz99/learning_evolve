@@ -26,6 +26,10 @@
 | `hours` | wall budget: stated in the prompt, enforced by the driver (agent killed at `hours`), LSF walltime = hours + 30 min | prompt `{{HOURS}}`, driver, `bsub -W` |
 | `seeds` | replicate indices; nothing else changes between seeds (sampling is stochastic on the server) | cell name `_sN` |
 
+| `site` | `rngdl01` (default) or `marvin`: names the cluster in the prompt, skips the rng-dl01 "/home quota" guard on Marvin (home is the only filesystem there), and selects the submitter (`bin/submit` = bsub, `bin/submit_marvin` = subbin). 2026-09-21 |
+| `host_type` | Marvin only: `subbin -h` (`amd` = 64-core Genoa nodes; `intel` = 48 cores and 1.9x slower on the graders' `np.convolve`) |
+| `wall_extra_h` | LSF walltime = `hours` + this (default 4). A paused run (LLM outage, `bin/pause`) waits inside the job, so a 48 h budget gets 24 |
+
 ## Problem-level (in `problems/<P>/meta.yaml`, not per cell)
 
 `cpus_per_candidate` (AC1/AC2: 2, Erdős: 1, from `src/envs/registry.py`) sets the per-candidate
@@ -53,6 +57,7 @@ followed by `prompts/continuation.md`.
 | `nudge_min_gap_s` | throttle after the minima are met: at most one nudge per this many seconds; the driver waits out the remainder before nudging (Tim's `CONTINUE_MIN_GAP_S`, but waiting instead of ending) |
 | `hours` (resume) | the budget is ACTIVE time across relaunches (`clock.json`); a resubmitted cell resumes its conversation and gets only the remaining hours -- see README "Relaunch = resume" |
 | `patience` | consecutive turns with zero tool calls before a fresh session in the same workspace (context reset, files kept, prompt + resume note). 0 = never. From the campaign's `bnb-nudge`, not Tim's code |
+| pause / resume | not a key: the driver polls the relay's `/_relay/status` every minute; no live upstream for 5 min, or a `<cell>/PAUSE` file (`bin/pause <campaign> on|off`), stops the harness cleanly, stops the budget clock (`clock.json` `paused_s`, `pauses`) and resumes with the conversation restored when an upstream answers again. Turns with API errors and no tool call are infrastructure, not agent stops. 2026-09-21 |
 | `give_up` | consecutive turns with zero tool calls before recording `outcome: refused`. 0 = never |
 
 Turns that never reached the model (error in < 60 s, fault signature in stderr, dead process) are
@@ -79,6 +84,7 @@ infrastructure: back-off 30 s / 120 s, restart, give up after 20 in a row; never
 | `max_output_tokens` | undocumented for a non-Anthropic model id | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` |
 | `max_context_tokens` | undocumented | `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; the window Claude Code assumes |
 | `autocompact` | `auto` | `--autocompact <auto|tokens>`; the campaign used `160k` |
+| `cliff` / `cliff_threshold` / `cliff_keep_recent` | off / 110000 / 3 | CliffCompaction proxy (`~/venvs/ccproxy/bin/cliff serve`) per cell in front of LiteLLM; Claude Code gets `ANTHROPIC_BASE_URL` = cliff and `DISABLE_AUTO_COMPACT=1`, so compaction is cliff-style in both harnesses (bnbcode has it built in; its threshold is `compaction_context_limit`). 2026-09-21 |
 | `stop_hook` | off | `hooks/cc_stop_hook.py` runs whenever Claude Code wants to end its turn and answers `block` + nudge, so the agent continues in-turn until the deadline or `give_up` blocks without a new tool call. Headless Claude Code honours one block then exits, so the driver's own nudge (`--continue`) sits on top |
 
 Sampling for Claude Code is pinned to 0.6 / 0.95 by `config/cc_sampling_hook.py` in LiteLLM.

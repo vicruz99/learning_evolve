@@ -6,6 +6,9 @@ CELL="$(cd "${1:?usage: launch <cell_dir>}" && pwd)"
 V2="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$HOME/venvs/v2-driver/bin/python"
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+# Marvin has no ~/.local/bin/bnbcode shim (rng-dl01 does): fall back to the mirrored venv, same checkout/version
+# (2026-09-21: smoke cell looped on "No such file or directory: 'bnbcode'" for 5 min before this).
+command -v bnbcode >/dev/null 2>&1 || { [ -x "$HOME/work/bnbcode/.venv/bin/bnbcode" ] && export PATH="$PATH:$HOME/work/bnbcode/.venv/bin"; }
 export XDG_RUNTIME_DIR=/tmp/xdg-$(id -u); mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 log () { echo "[launch $(date +%H:%M:%S)] $*" | tee -a "$CELL/driver.log"; }
@@ -46,7 +49,7 @@ if ! relay_ok; then
   fi
   log "starting relay :$RELAY_PORT -> jobs $RELAY_JOBS model $SRV_MODEL"
   mkdir -p "$HOME/agent_runs/v2/_infra"
-  setsid nohup python3 "$V2/relay/llm_relay.py" --jobs "$RELAY_JOBS" --model "$SRV_MODEL" \
+  setsid nohup "$PY" "$V2/relay/llm_relay.py" --jobs "$RELAY_JOBS" --model "$SRV_MODEL" \
       --listen-port "$RELAY_PORT" --verbose --wait 1800 \
       --health-log "$HOME/agent_runs/v2/_infra/endpoint_health.$RELAY_PORT.$(hostname -s).json" \
       >> "$HOME/agent_runs/v2/_infra/relay$RELAY_PORT.$(hostname -s).log" 2>&1 < /dev/null &
@@ -64,7 +67,24 @@ log "relay :$RELAY_PORT up"
 setsid nohup "$V2/analysis/procsample" "$CELL" 15 >> "$CELL/run/procsample.err" 2>&1 < /dev/null &
 SAMPLER=$!
 PGSYNC=""
-cleanup () { kill "$SAMPLER" $PGSYNC 2>/dev/null || true; }
+# --- disk guard (2026-09-21): the filesystem holding the cell is finite (Marvin: the 250 GB home is the ONLY
+# filesystem; rng-dl01: scratch). One r2 cell wrote 684k candidate files (34 GB). Log the workspace size every
+# 30 min; when the filesystem has less than DISK_PAUSE_FREE_GB free, set PAUSE so the driver stops the harness
+# cleanly and the operator decides -- a full filesystem kills every cell on it (2026-09-15 ENOSPC wave).
+DISK_PAUSE_FREE_GB=${DISK_PAUSE_FREE_GB:-3}
+( n=0; while :; do
+    sleep 600; n=$((n+1))
+    FREE_KB=$(df --output=avail "$CELL" 2>/dev/null | tail -1 | tr -d " ")
+    if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt $((DISK_PAUSE_FREE_GB * 1024 * 1024)) ] && [ ! -f "$CELL/PAUSE" ]; then
+      echo "[launch $(date +%H:%M:%S)] DISK: only $((FREE_KB / 1024)) MB free on the cell filesystem -- setting PAUSE (remove it to resume)" >> "$CELL/driver.log"
+      touch "$CELL/PAUSE"
+    fi
+    if [ $((n % 3)) = 0 ]; then
+      echo "[launch $(date +%H:%M:%S)] disk: workspace $(du -sm "$CELL/workspace" 2>/dev/null | cut -f1) MB, submissions $(du -sm "$CELL/submissions" 2>/dev/null | cut -f1) MB, fs free $((${FREE_KB:-0} / 1024)) MB" >> "$CELL/driver.log"
+    fi
+  done ) &
+DISKGUARD=$!
+cleanup () { kill "$SAMPLER" $PGSYNC $DISKGUARD 2>/dev/null || true; }
 trap cleanup EXIT
 
 case "$HARNESS" in
@@ -133,6 +153,19 @@ case "$HARNESS" in
         sleep 2
       done
     fi
+    # claude.cliff: CliffCompaction proxy in front of LiteLLM (2026-09-21). Claude Code is pointed at it
+    # by the harness (ANTHROPIC_BASE_URL) with DISABLE_AUTO_COMPACT=1; the proxy compacts cliff-style
+    # at claude.cliff_threshold tokens, the counterpart of bnbcode's compaction_context_limit.
+    if [ "$(cfg claude.cliff 2>/dev/null)" = "True" ]; then
+      CLIFF_PORT=$(cfg cliff_port); CLIFF_THR=$(cfg claude.cliff_threshold); CLIFF_KEEP=$(cfg claude.cliff_keep_recent)
+      if ! curl -sf --noproxy '*' --max-time 5 "http://127.0.0.1:$CLIFF_PORT/" >/dev/null 2>&1; then
+        log "starting cliff :$CLIFF_PORT -> litellm :$LL_PORT (threshold $CLIFF_THR, keep-recent $CLIFF_KEEP)"
+        setsid nohup "$HOME/venvs/ccproxy/bin/cliff" serve --host 127.0.0.1 --port "$CLIFF_PORT" \
+            --anthropic-upstream "http://127.0.0.1:$LL_PORT" --threshold "$CLIFF_THR" --keep-recent "$CLIFF_KEEP" \
+            -v >> "$CELL/cliff.log" 2>&1 < /dev/null &
+        for i in $(seq 30); do ss -ltn 2>/dev/null | grep -q ":$CLIFF_PORT " && break; sleep 1; done
+      fi
+    fi
     # /health/liveliness only says the proxy listens. Probe the full path with a real completion.
     CC_MODEL=$(cfg cc_model)
     for i in $(seq 20); do
@@ -155,7 +188,9 @@ log "driver exit rc=$RC"
 # the agent's background candidates outlive the harness; kill them before scoring so the host
 # grader is not starved and the node is clean for the next cell
 "$PY" "$V2/bin/reap_workspace" "$CELL/workspace" 15 2>&1 | tee -a "$CELL/driver.log" | tail -3
-"$AGENT_PY" "$V2/tracker/score.py" "$CELL" --python "$AGENT_PY" >> "$CELL/driver.log" 2>&1 || true
+# 2026-09-21: the host re-grade used 2 threads and timed out (3 h) on an 8 M-entry construction; the
+# cell's cores are idle by now, give the grader all of them.
+SCORE_THREADS=$(cfg cores) "$AGENT_PY" "$V2/tracker/score.py" "$CELL" --python "$AGENT_PY" >> "$CELL/driver.log" 2>&1 || true
 log "score: $(cat "$CELL/score.json" 2>/dev/null | "$PY" -c 'import json,sys; d=json.load(sys.stdin); print(d.get("score"), "ok" if d.get("ok") else d.get("error"))' 2>/dev/null)"
 [ "$HARNESS" = bnbcode ] && "$AGENT_PY" "$V2/analysis/stopclass.py" "$CELL" >> "$CELL/driver.log" 2>&1 || true
 
@@ -164,8 +199,9 @@ log "score: $(cat "$CELL/score.json" 2>/dev/null | "$PY" -c 'import json,sys; d=
 # live processes of this job, so without this the job stays RUN holding its cores until walltime.
 R=$(pgrep -u "$(id -un)" -f "llm_relay.py.*--listen-port $RELAY_PORT" || true)
 L=$(pgrep -u "$(id -un)" -f "litellm --config .*--port $LL_PORT" || true)
-log "reaping this cell's relay($R) litellm($L)"
-[ -n "$R$L" ] && kill $R $L 2>/dev/null || true
+C=$(pgrep -u "$(id -un)" -f "cliff serve .*--port ${CLIFF_PORT:-none}" || true)
+log "reaping this cell's relay($R) litellm($L) cliff($C)"
+[ -n "$R$L$C" ] && kill $R $L $C 2>/dev/null || true
 # this cell's own postgres dies with the cell
 if [ "$HARNESS" = bnbcode ]; then
   kill $PGSYNC 2>/dev/null || true

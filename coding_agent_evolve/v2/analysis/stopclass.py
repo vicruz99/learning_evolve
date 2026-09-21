@@ -92,7 +92,7 @@ def bnb_turns(run):
     """Assistant build turns for one run directory, oldest first."""
     try:
         out = subprocess.run(PG + ["psql", "-t", "-A", "-F", "\x1f", "-c", SQL.format(run=run)],
-                             capture_output=True, text=True, timeout=180).stdout
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=180).stdout
     except Exception as exc:
         sys.stderr.write("psql failed for %s: %s\n" % (run, exc))
         return []

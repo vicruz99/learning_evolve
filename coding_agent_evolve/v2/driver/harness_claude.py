@@ -37,8 +37,13 @@ class ClaudeHarness:
         env = dict(os.environ)
         env["PATH"] = f"{Path.home() / '.local/bin'}:{Path.home() / 'bin'}:" + env.get("PATH", "")
         alias = self.cell["cc_model"]
+        # claude.cliff: Claude Code talks to a per-cell CliffCompaction proxy (bin/launch starts it in
+        # front of LiteLLM) and its own auto-compaction is disabled, so compaction is cliff-style in
+        # both harnesses (bnbcode has it built in). 2026-09-21.
+        use_cliff = bool(c.get("cliff"))
+        base_port = self.cell["cliff_port"] if use_cliff else self.cell["litellm_port"]
         env.update({
-            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{self.cell['litellm_port']}",
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{base_port}",
             "ANTHROPIC_AUTH_TOKEN": "sk-local",
             "ANTHROPIC_MODEL": alias, "ANTHROPIC_DEFAULT_OPUS_MODEL": alias,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": alias, "ANTHROPIC_DEFAULT_HAIKU_MODEL": alias,
@@ -59,6 +64,8 @@ class ClaudeHarness:
             "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "100000",
             "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
         })
+        if use_cliff:
+            env["DISABLE_AUTO_COMPACT"] = "1"
         env["no_proxy"] = (env.get("no_proxy", "") + ",127.0.0.1,localhost").lstrip(",")
         env["NO_PROXY"] = env["no_proxy"]
         return env
@@ -101,6 +108,15 @@ class ClaudeHarness:
         t0 = time.time()
         self.events.write("prompt", chars=len(text), head=text[:200], continue_=self.has_conversation and not fresh)
         tools = 0; text_chars = 0; result_stop = None; api_errors = 0
+        # Claude Code refuses some prompts locally, before any HTTP request: the stream then carries a
+        # synthetic assistant message (model "<synthetic>", duration_api_ms 0) and a result with
+        # is_error and terminal_reason "blocking_limit". The one seen in the wild is "Prompt is too
+        # long" -- once the saved conversation is over the limit EVERY --continue fails that way, in
+        # under half a second, forever. Two cells of m48_q38 died like that on 2026-09-21 (60 identical
+        # retries over 2 h). It is not visible in stderr and never reaches the relay, so it has to be
+        # read off the stream. Recovery is the conversation_lost path: drop --continue, start a fresh
+        # session on the same workspace, keep every file and score.
+        local_refusal = None
         with open(self.stderr_path, "ab") as err:
             # stream-json puts a whole assistant message or tool result on one line; asyncio's
             # default 64 KB StreamReader limit raised "Separator is found, but chunk is longer than
@@ -135,6 +151,11 @@ class ClaudeHarness:
                     continue
                 typ = ev.get("type")
                 if typ == "assistant":
+                    msg = ev.get("message") or {}
+                    if msg.get("model") == "<synthetic>":
+                        for blk in msg.get("content") or []:
+                            if blk.get("type") == "text" and (blk.get("text") or "").strip():
+                                local_refusal = (blk["text"] or "").strip()[:200]
                     for blk in (ev.get("message") or {}).get("content") or []:
                         if blk.get("type") == "tool_use":
                             tools += 1
@@ -146,6 +167,8 @@ class ClaudeHarness:
                                 api_errors += 1
                 elif typ == "result":
                     result_stop = ev.get("subtype") or "result"
+                    if ev.get("is_error") and ev.get("terminal_reason") == "blocking_limit":
+                        local_refusal = local_refusal or f"blocking_limit ({ev.get('subtype')})"
                 self.events.write("cc", **{k: v for k, v in ev.items() if k in ("type", "subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd")},
                                   payload=ev if typ in ("assistant", "user", "result", "system") else None)
             rc = await self.proc.wait()
@@ -157,10 +180,16 @@ class ClaudeHarness:
             # the saved transcript could not be continued: the driver re-sends the initial prompt
             self.has_conversation = False; self.conversation_lost = True; self.restored = False
             log(self.cell_dir, "claude refused --continue (no conversation found) -- next prompt starts cold")
+        elif local_refusal and tools == 0 and used_continue:
+            # refused locally before the model was reached (see local_refusal above): the saved
+            # conversation is unusable from here on, so take the same route as a lost transcript.
+            self.has_conversation = False; self.conversation_lost = True; self.restored = False
+            log(self.cell_dir, f"claude refused the prompt locally ({local_refusal!r}) -- "
+                               f"conversation retired, next prompt starts a fresh session")
         stop = result_stop or ("end_turn" if rc == 0 else "error")
         te = TurnEnd(stop_reason=stop, ran_s=ran, tools=tools, text_chars=text_chars, rc=rc,
                      error=None if rc == 0 else f"claude exited rc={rc}", stderr_tail=err_tail,
-                     extra={"api_errors": api_errors})
+                     extra={"api_errors": api_errors, "local_refusal": local_refusal})
         self.events.write("turn_end", **{k: v for k, v in te.__dict__.items() if k != "stderr_tail"})
         self.proc = None
         return te

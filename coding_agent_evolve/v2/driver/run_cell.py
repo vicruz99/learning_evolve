@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -36,6 +37,62 @@ RESUME_RESTORED = ("[host] Your session was interrupted by an infrastructure res
                    "re-run those evaluations if they matter. Continue exactly where you left off.")
 MAX_INFRA = 60   # 2026-09-15: 20 (~32 min of back-off) did not outlast a 42 min weka ENOSPC burst
 STALL_CHECK_S = 120
+# --- pause / resume (2026-09-21) --------------------------------------------------------------
+# q38ac_r3 lost 7.7 h of an 18 h budget to a vLLM server outage: headless Claude Code sat in
+# 58-min API timeouts that the driver booked as barren agent turns, bnbcode wedged silently, and
+# the clock kept charging. Now the driver polls the relay's /_relay/status once a minute; when no
+# upstream has been live for PAUSE_AFTER_S, or an operator touched <cell>/PAUSE, the harness is
+# stopped cleanly (files, official scores and the conversation are kept), the clock stops, and the
+# run resumes -- with the "session restored" note -- once an upstream answers again and the PAUSE
+# file is gone. Agent-side failures (loops, polling its own optimisers) are NOT paused: the
+# 2 h inactivity restart stays the only intervention there.
+PAUSE_CHECK_S = 60
+PAUSE_AFTER_S = 300
+RESUME_CONFIRM = 2       # consecutive status probes with an upstream before resuming
+_NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def relay_status(relay_port: int) -> dict | None:
+    """The relay's view of its upstream, or None if the relay itself does not answer."""
+    try:
+        with _NOPROXY.open(f"http://127.0.0.1:{relay_port}/_relay/status", timeout=60) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def pause_requested(cell_dir: Path) -> bool:
+    return (cell_dir / "PAUSE").exists()
+
+
+async def watch_pause(cell_dir: Path, relay_port: int) -> str:
+    """Resolves with the reason when the run should pause: PAUSE file, or no upstream for PAUSE_AFTER_S."""
+    down_since: float | None = None
+    while True:
+        await asyncio.sleep(PAUSE_CHECK_S)
+        if pause_requested(cell_dir):
+            return "PAUSE file present"
+        st = await asyncio.to_thread(relay_status, relay_port)
+        up = st.get("upstream") if st else None
+        if up:
+            down_since = None
+            continue
+        down_since = down_since or time.time()
+        if time.time() - down_since >= PAUSE_AFTER_S:
+            return ("relay not answering" if st is None else "no live LLM upstream") + f" for {int(time.time() - down_since)}s"
+
+
+async def wait_resume(cell_dir: Path, relay_port: int) -> str:
+    """Blocks while the run is paused; returns why it resumed (or 'stop' if a STOP file appeared)."""
+    ok = 0
+    while True:
+        if stop_reason_file(cell_dir):
+            return "stop"
+        st = await asyncio.to_thread(relay_status, relay_port)
+        ok = ok + 1 if (st and st.get("upstream") and not pause_requested(cell_dir)) else 0
+        if ok >= RESUME_CONFIRM:
+            return f"upstream {st.get('name') or st.get('upstream')} live" + (", PAUSE file gone" if not pause_requested(cell_dir) else "")
+        await asyncio.sleep(30)
 def last_activity(cell_dir: Path, ws: Path, harness, window_s: float) -> float:
     """Newest sign that the agent is doing anything: an official evaluation, a file written anywhere
     under the workspace, a live candidate process (run/procsample.jsonl), the harness's last tool
@@ -86,10 +143,10 @@ async def watch_stall(cell_dir: Path, ws: Path, harness, stall_s: float, turn_t0
             return f"no official evaluation, file write, live worker or tool call for {idle / 3600:.1f} h"
 
 
-async def watch_limits(cell_dir: Path, started: float, budget_s: float) -> str:
+async def watch_limits(cell_dir: Path, clock: Clock) -> str:
     while True:
         await asyncio.sleep(1)
-        if time.time() - started >= budget_s:
+        if clock.remaining() <= 0:          # active time: a paused clock does not run down
             try:
                 (cell_dir / "STOP").write_text("time_limit\n")
             except OSError as exc:            # the driver ends the run regardless (2026-09-15 ENOSPC)
@@ -131,7 +188,7 @@ async def run(cell_dir: Path) -> dict:
     else:
         log(cell_dir, f"relaunch #{clock.launches}: {clock.active_before / 3600:.2f}h of the {cell['hours']}h budget "
                       f"already used, {clock.remaining_at_start / 3600:.2f}h remaining")
-    deadline = clock.deadline
+    relay_port = int(cell["relay_port"])
     if clock.remaining_at_start <= 60:
         try:
             (cell_dir / "STOP").write_text("time_limit\n")
@@ -140,9 +197,9 @@ async def run(cell_dir: Path) -> dict:
         log(cell_dir, "budget already exhausted at relaunch -- nothing to do")
         events.close()
         return finish(cell_dir, cell, clock, [], 0, 0, "time_limit", "budget exhausted before relaunch")
-    harness = make_harness(cell, events, deadline)
+    harness = make_harness(cell, events, clock.deadline)
     turns: list[dict] = []
-    continues = 0; last_nudge_at = started; barren = 0; infra = 0; fresh_sessions = 0
+    continues = 0; last_nudge_at = started; barren = 0; infra = 0; fresh_sessions = 0; pauses = 0
     outcome = "budget"; outcome_detail = None
     log(cell_dir, f"start {cell['name']} harness={cell['harness']} hours={cell['hours']} min_evals={rules.min_evals} "
                   f"min_hours={rules.min_hours} keep_going={rules.keep_going} reasoning={cell['reasoning']} "
@@ -166,15 +223,16 @@ async def run(cell_dir: Path) -> dict:
         events.close()
         return finish(cell_dir, cell, clock, turns, continues, fresh_sessions, outcome, outcome_detail)
 
-    watcher = asyncio.create_task(watch_limits(cell_dir, started, clock.remaining_at_start))
+    watcher = asyncio.create_task(watch_limits(cell_dir, clock))
     beat = asyncio.create_task(clock.heartbeat())
+    pauser = asyncio.create_task(watch_pause(cell_dir, relay_port))
 
     def resume_text() -> str:
         """What a relaunched/restarted agent is told. If the harness restored the conversation the
         initial prompt is already in it: send only the host line + a short note. Otherwise the agent
         starts cold and needs the whole prompt plus the pointer to its files."""
         evals_now = len(read_iterations(cell_dir)); b = best_record(cell_dir)
-        line = host_line(deadline - time.time(), float(cell["hours"]), evals_now, rules.min_evals,
+        line = host_line(clock.remaining(), float(cell["hours"]), evals_now, rules.min_evals,
                          int(cell.get("max_evals") or 0), b.get("score") if b else None, meta["metric_word"])
         if getattr(harness, "restored", False):
             log(cell_dir, "conversation restored by the harness -- sending the short resume note")
@@ -191,14 +249,46 @@ async def run(cell_dir: Path) -> dict:
     try:
         while True:
             t_turn = time.time()
+            harness.deadline = clock.deadline        # Claude Code's stop hook reads it (CC_DEADLINE_EPOCH)
             prompt_task = asyncio.create_task(harness.prompt(next_text, fresh=fresh) if harness.name == "claude"
                                               else harness.prompt(next_text))
             fresh = False
             staller = asyncio.create_task(watch_stall(cell_dir, ws, harness, stall_s, t_turn)) if stall_s > 0 else None
-            waitset = {prompt_task, watcher} | ({staller} if staller else set())
+            waitset = {prompt_task, watcher, pauser} | ({staller} if staller else set())
             done, _ = await asyncio.wait(waitset, return_when=asyncio.FIRST_COMPLETED)
             if staller and not staller.done():
                 staller.cancel()
+            if pauser in done:
+                # --- pause: the LLM is gone (or an operator asked). Stop the harness cleanly, stop
+                #     the clock, wait, restore the conversation, continue. Not the agent's fault. ---
+                why = pauser.result(); pauses += 1
+                log(cell_dir, f"PAUSE: {why} -- stopping the harness; the budget clock stops (files, scores and conversation kept)")
+                events.write("pause", why=why, ran_s=round(time.time() - t_turn, 1), evals=len(read_iterations(cell_dir)))
+                if not prompt_task.done():
+                    prompt_task.cancel()
+                    try:
+                        await prompt_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await harness.terminate()
+                clock.pause(why)
+                turns.append({"t": t_turn, "stop_reason": "paused", "ran_s": round(time.time() - t_turn, 1),
+                              "evals": len(read_iterations(cell_dir)), "why": why})
+                how = await wait_resume(cell_dir, relay_port)
+                paused_s = clock.resume()
+                log(cell_dir, f"RESUME after {paused_s / 3600:.2f} h paused ({how}); {clock.remaining() / 3600:.2f} h of budget remain")
+                events.write("resume", how=how, paused_s=round(paused_s, 1))
+                pauser = asyncio.create_task(watch_pause(cell_dir, relay_port))
+                if how == "stop":
+                    outcome = stop_reason_file(cell_dir) or "stopped"; outcome_detail = "STOP file during pause"
+                    break
+                infra = 0; barren = 0
+                if not await start_harness():
+                    outcome = "infrastructure"; outcome_detail = "harness restart after pause failed"; break
+                fresh_sessions += 1
+                next_text = resume_text()
+                fresh = not getattr(harness, "restored", False)
+                continue
             if watcher in done:
                 reason = watcher.result()
                 log(cell_dir, f"limit reached: {reason} -- terminating agent")
@@ -223,7 +313,7 @@ async def run(cell_dir: Path) -> dict:
                               "evals": len(read_iterations(cell_dir)), "why": why})
                 await harness.restart(); fresh_sessions += 1; barren = 0
                 now = time.time(); evals = len(read_iterations(cell_dir)); best = best_record(cell_dir)
-                next_text = host_line(deadline - now, float(cell["hours"]), evals, rules.min_evals,
+                next_text = host_line(clock.remaining(), float(cell["hours"]), evals, rules.min_evals,
                                       int(cell.get("max_evals") or 0), best.get("score") if best else None,
                                       meta["metric_word"]) + "\n\n" + initial + RESUME_NOTE
                 fresh = True
@@ -248,13 +338,21 @@ async def run(cell_dir: Path) -> dict:
                 events.write("context_overflow", error=(te.error or "")[:500])
                 await harness.restart(); fresh_sessions += 1; barren = 0
                 now = time.time()
-                next_text = host_line(deadline - now, float(cell["hours"]), evals, rules.min_evals,
+                next_text = host_line(clock.remaining(), float(cell["hours"]), evals, rules.min_evals,
                                       int(cell.get("max_evals") or 0), rec["best"], meta["metric_word"]) + "\n\n" + initial + RESUME_NOTE
                 fresh = True
                 continue
             # --- infrastructure, not a model stop -------------------------------------------
             fault = harness_fault(blob)
-            if te.is_error() and (te.ran_s < INFRA_FAST_S or fault or not harness.alive()):
+            api_errors = int((te.extra or {}).get("api_errors") or 0)
+            # 2026-09-21: a turn that saw API errors and made NO tool call never reached a working
+            # model (q38ac_r3: 58-min "Request timed out" turns during the server outage were booked as
+            # barren agent turns and charged). Same for a turn that ended while the relay had no upstream.
+            st = relay_status(relay_port) if (te.tools == 0) else None
+            no_upstream = st is not None and not st.get("upstream")
+            if te.tools == 0 and (api_errors > 0 or no_upstream):
+                fault = fault or (f"{api_errors} API error(s), no tool call" if api_errors else "relay has no live upstream")
+            if te.is_error() and (te.ran_s < INFRA_FAST_S or fault or not harness.alive()) or (te.tools == 0 and (api_errors > 0 or no_upstream)):
                 infra += 1
                 rec["infra"] = fault or f"errored in {te.ran_s:.0f}s"
                 turns.append(rec)
@@ -299,17 +397,17 @@ async def run(cell_dir: Path) -> dict:
                 outcome = "ended" if not st.stop_reason else st.stop_reason; outcome_detail = why
                 break
             if why.startswith("WAIT"):
-                wait_s = min(float(why.split()[1].rstrip("s")), max(0.0, deadline - now - 5))
+                wait_s = min(float(why.split()[1].rstrip("s")), max(0.0, clock.remaining() - 5))
                 if wait_s > 0:
                     events.write("throttle", wait_s=wait_s)
                     await asyncio.sleep(wait_s)
                 now = time.time()
-                if now >= deadline or stop_reason_file(cell_dir):
+                if clock.remaining() <= 0 or stop_reason_file(cell_dir):
                     outcome = stop_reason_file(cell_dir) or "time_limit"; outcome_detail = "budget reached during throttle"
                     break
                 evals = len(read_iterations(cell_dir)); best = best_record(cell_dir); rec["best"] = best.get("score") if best else None
             continues += 1; last_nudge_at = now
-            line = host_line(deadline - now, float(cell["hours"]), evals, rules.min_evals,
+            line = host_line(clock.remaining(), float(cell["hours"]), evals, rules.min_evals,
                              int(cell.get("max_evals") or 0), rec["best"], meta["metric_word"])
             if patience > 0 and barren >= patience:
                 # the session is wedged (reasoning-only turns); reset context, keep the disk
@@ -321,13 +419,17 @@ async def run(cell_dir: Path) -> dict:
             else:
                 next_text = line + "\n\n" + continuation
     finally:
-        for t in (watcher, beat):
+        for t in (watcher, beat, pauser):
             if not t.done():
                 t.cancel()
+        if clock.paused:
+            clock.resume()
         clock.save()
         await harness.terminate()
         events.close()
-    return finish(cell_dir, cell, clock, turns, continues, fresh_sessions, outcome, outcome_detail)
+    rec = finish(cell_dir, cell, clock, turns, continues, fresh_sessions, outcome, outcome_detail)
+    rec["pauses"] = pauses
+    return rec
 
 
 def finish(cell_dir: Path, cell: dict, clock: Clock, turns: list, continues: int, fresh_sessions: int,
@@ -340,6 +442,7 @@ def finish(cell_dir: Path, cell: dict, clock: Clock, turns: list, continues: int
         "reasoning": cell["reasoning"], "seed": cell["seed"], "started": clock.started,
         "first_started": clock.first_started, "launches": clock.launches,
         "elapsed_s": round(clock.elapsed(), 1), "hours_budget": cell["hours"],
+        "paused_s": round(clock.paused_before + clock._paused_now(), 1),
         "outcome": outcome, "outcome_detail": detail, "continues": continues, "fresh_sessions": fresh_sessions,
         "n_turns": len(turns), "n_evals": len(rows), "n_valid_evals": sum(1 for r in rows if r.get("score") is not None),
         "best": best, "cutoff": stop_reason_file(cell_dir), "turns": turns,
